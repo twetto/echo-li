@@ -1,0 +1,12 @@
+target/
+debug/
+release/
+*.rs.bk
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+.claude/
+continue_claude.sh
