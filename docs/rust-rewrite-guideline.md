@@ -8,17 +8,17 @@ The rewrite is feasible and well-motivated:
 
 - **Small, well-scoped codebases** — liepp-python (~1.9k LOC), gift-python (~2.2k LOC), ECHO-LI-python (~9.4k LOC). Total ~13.5k Python LOC.
 - **Rudolf-V already exists** (~13k LOC Rust) covering most of gift-python's functionality (FAST, Harris, KLT, image pyramids, camera models, essential matrix, NMS). Only ZNCC/LBP/ORB occlusion checks remain to be ported.
-- **Math-heavy, performance-critical code** — matrix exponentials, Lie group operations, inverse-compositional KLT, Vogiatzis depth filters with numba-JIT kernels, dense per-pixel Kalman filtering. Rust's zero-cost abstractions and SIMD support are a natural fit.
-- **No complex Python-specific dependencies** — NumPy/SciPy operations map directly to nalgebra; numba kernels (FlowDep splatting, depth triangulation, Vogiatzis update) become native Rust loops with no JIT overhead.
+- **Math-heavy, performance-critical code** — matrix exponentials, Lie group operations, inverse-compositional KLT, Gaussian-Beta depth filters with numba-JIT kernels, dense per-pixel Kalman filtering. Rust's zero-cost abstractions and SIMD support are a natural fit.
+- **No complex Python-specific dependencies** — NumPy/SciPy operations map directly to nalgebra; numba kernels (FlowDep splatting, depth triangulation, Gaussian-Beta update) become native Rust loops with no JIT overhead.
 - **Existing Rust ecosystem** — nalgebra for linear algebra + Lie groups, image/imageproc for I/O, rayon for parallelism, `r2r` or `rclrs` for ROS 2.
 
 ## Repository Mapping
 
 | Python Package | Rust Target | Notes |
 |----------------|-------------|-------|
-| **liepp-python** | `liepp` crate (new) | SO(3), SE(3), SEn(3), SOT(3), SO(n), SL(n), GL(n) |
+| **liepp-python** | `echo-lie` crate (new) | SO(3), SE(3), SEn(3), SOT(3), SO(n), SL(n), GL(n) |
 | **gift-python** | **Rudolf-V** (existing) | After ZNCC/LBP/ORB feature porting is complete |
-| **ECHO-LI-python** | **ECHO-LI** (this repo) | EqF VIO with planar landmarks, FlowDep, Sparse Vogiatzis |
+| **ECHO-LI-python** | **ECHO-LI** (this repo) | EqF VIO with planar landmarks, FlowDep, sparse Gaussian-Beta filter |
 
 ## Architecture
 
@@ -28,7 +28,7 @@ Cargo workspace with ROS-agnostic core:
 echo-li/
 ├── Cargo.toml                          # workspace root
 ├── echo-li-core/                       # pure algorithm library (no ROS dependency)
-│   ├── Cargo.toml
+│   ├── Cargo.toml                      # depth::flowdep is pub — other projects can depend on echo-li-core for standalone FlowDep use
 │   └── src/
 │       ├── lib.rs
 │       ├── mathematical/
@@ -49,8 +49,8 @@ echo-li/
 │       │   ├── mod.rs
 │       │   ├── flowdep.rs              # Dense per-pixel inverse-depth Kalman filter
 │       │   ├── flowdep_kernels.rs      # depth_densification, bilinear_splatting, vogiatzis_update
-│       │   ├── sparse_vogiatzis.rs     # Per-feature 1D Vogiatzis (EUCLIDEAN/INVDEPTH/POLAR)
-│       │   ├── sparse_vogiatzis_3d.rs  # 3D Local IEKF on Normal chart (SOT(3) manifold)
+│       │   ├── sparse_gb.rs            # Per-feature 1D Gaussian-Beta filter (EUCLIDEAN/INVDEPTH/POLAR)
+│       │   ├── sparse_gb_3d.rs         # 3D Local IEKF on Normal chart (SOT(3) manifold)
 │       │   ├── keyframe_pool.rs        # Keyframe selection + DIS flow management
 │       │   └── optical_flow.rs         # Dense optical flow backend (DIS or custom)
 │       ├── plane_detection/
@@ -81,6 +81,7 @@ echo-li/
 │   └── src/
 │       ├── lib.rs                      # #[pymodule] entry point
 │       ├── pipeline.rs                 # run_euroc() one-liner, internal orchestration
+│       ├── flowdep.rs                  # FlowDepFilter + FlowDepSettings as #[pyclass]
 │       ├── types.rs                    # numpy ↔ nalgebra, result dataclasses
 │       └── config.rs                   # YAML/dict → Rust settings bridge
 ├── echo-li-cli/                        # standalone CLI (no ROS dependency)
@@ -91,7 +92,7 @@ echo-li/
 └── tests/
 ```
 
-## Phase 1: liepp → Rust `liepp` Crate
+## Phase 1: liepp → Rust `echo-lie` Crate
 
 **Scope:** ~1.9k Python LOC → new Rust library crate.
 
@@ -156,7 +157,7 @@ Rudolf-V currently depends on lalir for geometric verification (essential matrix
 
 ### Dependencies
 
-- `liepp` crate (Phase 1)
+- `echo-lie` crate (Phase 1)
 - `rudolf-v` crate (Phase 2, as the visual frontend)
 - `nalgebra` (matrices, rotations)
 - `image` (I/O)
@@ -168,10 +169,10 @@ Rudolf-V currently depends on lalir for geometric verification (essential matrix
 Port bottom-up following the dependency graph:
 
 1. **`dataserver/`** — EuRoC dataset reader (file I/O, CSV parsing, image loading). No math dependencies. Good warm-up.
-2. **`coordinate_suite/`** — Landmark coordinate representations. Depends on liepp (SO3, SE3). Small, self-contained.
+2. **`coordinate_suite/`** — Landmark coordinate representations. Depends on echo-lie (SO3, SE3). Small, self-contained.
 3. **`depth/flowdep_kernels.rs`** — The numba-JIT kernels (`_depth_densification`, `_bilinear_splatting`, `_bilinear_splatting_ab`, `_vogiatzis_update`). These are pure numerical loops over 2D grids — translate directly to Rust with no JIT overhead. Prime candidates for rayon parallelism and SIMD.
-4. **`depth/sparse_vogiatzis.rs`** — Per-feature 1D Vogiatzis filter. Depends on coordinate_suite (Normal chart conversions: `conv_euc2normal`, `conv_normal2euc`, `point_chart_normal_inv`). Three parametrizations (EUCLIDEAN, INVDEPTH, POLAR) with unified prediction/update.
-5. **`depth/sparse_vogiatzis_3d.rs`** — 3D Local IEKF variant. Full 3×3 covariance on SOT(3) manifold with sequential bearing + depth updates. Depends on Normal chart Jacobians from coordinate_suite.
+4. **`depth/sparse_gb.rs`** — Per-feature 1D Gaussian-Beta filter. Depends on coordinate_suite (Normal chart conversions: `conv_euc2normal`, `conv_normal2euc`, `point_chart_normal_inv`). Three parametrizations (EUCLIDEAN, INVDEPTH, POLAR) with unified prediction/update.
+5. **`depth/sparse_gb_3d.rs`** — 3D Local IEKF variant. Full 3×3 covariance on SOT(3) manifold with sequential bearing + depth updates. Depends on Normal chart Jacobians from coordinate_suite.
 6. **`depth/flowdep.rs`** + **`depth/keyframe_pool.rs`** — Dense depth filter orchestration. Keyframe pool management, DIS optical flow wrapping, predict/observe/update cycle. Note: OpenCV's DIS optical flow will need either an OpenCV-rust binding or a custom Rust implementation.
 7. **`mathematical/`** — Core EqF. Port in order: `vio_state` → `vio_group` → `eqf_matrices` → `vision_measurement` / `imu_velocity` / `plane_measurement` → `vio_eqf`.
 8. **`plane_detection/`** — Delaunay, RANSAC fitting, CP refinement. Depends on nalgebra SVD. Consider `spade` crate for Delaunay triangulation.
@@ -185,9 +186,86 @@ Port bottom-up following the dependency graph:
 - **SciPy `least_squares` with Cauchy loss** (used in plane fitting): Use `levenberg-marquardt` or `argmin` crate. The Cauchy robust kernel is straightforward to implement manually.
 - **Delaunay triangulation** (used in plane detection): Use the `spade` crate (pure Rust, well-maintained).
 - **Dense optical flow**: FlowDep uses OpenCV's DIS optical flow. Options: (a) `opencv-rust` bindings for DIS, (b) custom Rust DIS implementation, (c) alternative dense flow (e.g. Farneback via opencv-rust). Decision can be deferred.
-- **Matrix exponentials / Jacobians**: Already handled by liepp crate. The Python code uses SymPy for validation — keep a Python script for cross-validation during development.
+- **Matrix exponentials / Jacobians**: Already handled by echo-lie crate. The Python code uses SymPy for validation — keep a Python script for cross-validation during development.
 - **Config system**: Replace PyYAML with `serde_yaml`. The existing YAML configs can be reused as-is.
 - **Visualization**: Optional. Use `minifb` (already in Rudolf-V) or `egui` for live display. Can be feature-gated.
+
+### Allocation Strategy: Fixed-Capacity Heap
+
+The only dynamically-sized dimension in the system is the number of active landmarks — in-state for EqF, and out-of-state for the Gaussian-Beta filter. These two have fundamentally different data layouts and should use different strategies.
+
+#### EqF Covariance (in-state) — Boxed Fixed-Capacity Matrix
+
+The EqF Riccati covariance `Σ` is a dense `d × d` matrix where `d = 21 + 3·n_pt + 6·n_plane`. In Python, every landmark add/remove triggers a numpy resize (heap allocation + copy). In Rust, we use a **Boxed fixed-capacity matrix** to eliminate reallocations while maintaining memory safety.
+
+| Parameter | Value | Rationale |
+|-----------|-------|-----------|
+| `N_MAX_PT` | 40 | Config default `max_landmarks: 30`, tests go up to 60 |
+| `N_MAX_PLANE` | 10 | Typical planar scenes have 3–8 active planes |
+| **Max state dim** | **201** | `21 + 3×40 + 6×10 = 201` |
+| **Σ memory** | ~314 KB | `201 × 201 × 8 bytes`. Fixed heap allocation. |
+
+**Why Boxed instead of Stack?** 
+A 314 KB object is too large for many thread stacks (which often default to 2 MB or less). Wrapping the fixed-size `SMatrix` in a `Box` puts it on the heap exactly once, preventing stack overflows while still allowing the compiler to use fixed-size SIMD optimizations.
+
+**Marginalization: Swap and Pop**
+To remove a landmark from the state without reallocating:
+1. Identify the index of the landmark to be marginalized.
+2. **Swap** its rows and columns with the rows and columns of the *last active* landmark in the matrix.
+3. Decrement the `active_dim` counter.
+4. Use `.fixed_view::<D, D>(0, 0)` for subsequent operations to strictly process the contiguous active block.
+
+Implementation:
+
+```rust
+use nalgebra::SMatrix;
+
+const STATE_DIM_MAX: usize = 201; // 21 + 3*40 + 6*10
+type CovMatrix = SMatrix<f64, STATE_DIM_MAX, STATE_DIM_MAX>;
+
+struct EqFState {
+    /// Active state dimension (≤ STATE_DIM_MAX).
+    dim: usize,
+    /// Riccati covariance. Only the top-left dim × dim block is live.
+    /// Boxed to avoid stack overflow (314 KB is too large for many stacks).
+    sigma: Box<CovMatrix>,
+    // ...
+}
+```
+```
+
+All matrix operations (predict, update, landmark add/marginalize) operate on `sigma.view((0,0), (dim, dim))` slices. Landmark removal is a row/column deletion on the live block — no reallocation. Landmark addition extends the live block and initializes the new rows/columns from the prior.
+
+The `Box<SMatrix>` gives the same contiguous fixed-size memory layout as a raw `SMatrix` (cache-friendly, SIMD-compatible), but safely heap-allocated once at filter construction. No resize, no fragmentation, no stack overflow risk.
+
+#### Sparse Gaussian-Beta Filter (out-of-state) — HashMap
+
+Each feature in the GB filter carries independent per-feature state: canonical depth, variance, Beta a/b counts. There is **no joint covariance** — features are decoupled. The access pattern is keyed by feature ID (add on first observation, remove on track loss, query by ID).
+
+```rust
+struct GBFeatureState {
+    depth: f64,
+    variance: f64,
+    beta_a: f64,
+    beta_b: f64,
+    track_length: u32,
+    // ...  (~48 bytes per feature)
+}
+
+struct SparseGBFilter {
+    features: FxHashMap<u32, GBFeatureState>, // rustc_hash, NOT std HashMap
+    max_pool_size: usize,                     // default: 300
+    // ...
+}
+```
+
+**Do not use `std::collections::HashMap` here.** Rust's std HashMap uses SipHash (DoS-resistant, cryptographic) which is needlessly slow for integer keys queried hundreds of times per frame. Use `rustc_hash::FxHashMap` instead — the same non-cryptographic hash used by the Rust compiler, a drop-in replacement with significantly lower per-lookup cost.
+
+Alternative: the `slab` crate provides an arena-backed pool where insert returns a `usize` key and lookup is a direct array index (zero hashing). Better cache locality than any hashmap. Trade-off: feature IDs from the tracker must be mapped to slab keys, adding a small indirection layer.
+
+#### FlowDep Dense Grid — Heap
+
+FlowDep operates on per-pixel grids (`depth_map`, `variance_map`, `beta_a`, `beta_b`) at configurable `image_scale` (typically 0.25–0.5 of input resolution). For EuRoC at 752×480 with `image_scale=0.25`, grids are 188×120 ≈ 22.5K pixels × 4 maps × 8 bytes ≈ 720 KB. This should be **heap-allocated** (`Vec<f64>` or `ndarray::Array2`) as the size depends on runtime image resolution.
 
 ## Phase 4: ROS 2 Integration
 
@@ -215,7 +293,7 @@ Port bottom-up following the dependency graph:
 ### Design Principles
 
 - **Zero-copy where possible.** Use ROS 2 zero-copy transport for images. The `Image` message buffer can be borrowed directly into Rudolf-V's `Image<u8>` type.
-- **Parameter server integration.** Expose all `FlowDepSettings`, `SparseVogSettings`, and EqF config as dynamic ROS parameters with runtime reconfiguration.
+- **Parameter server integration.** Expose all `FlowDepSettings`, `SparseGBSettings`, and EqF config as dynamic ROS parameters with runtime reconfiguration.
 - **Lifecycle node.** Use ROS 2 lifecycle management for clean startup/shutdown, sensor discovery, and parameter validation.
 
 ## Phase 5: Python Wrapper (`echo-li-py`)
@@ -243,7 +321,25 @@ result = echo_li.run_euroc("/path/to/V1_01_easy", config="configs/eqvio_euroc.ya
 # result.write_tum("out/estimated_trajectory.txt")
 ```
 
-All pipeline options (FlowDep, SparseVogiatzis, plane detection, feature tracker settings, coordinate chart, max landmarks, etc.) are controlled by the YAML config, matching the same format as the CLI and `ECHO-LI-python`.
+All pipeline options (FlowDep, sparse Gaussian-Beta filter, plane detection, feature tracker settings, coordinate chart, max landmarks, etc.) are controlled by the YAML config, matching the same format as the CLI and `ECHO-LI-python`.
+
+#### Standalone FlowDep
+
+FlowDep is also exposed as a standalone module for use in other projects (e.g. dense depth estimation without the full VIO pipeline):
+
+```python
+from echo_li import FlowDepFilter, FlowDepSettings
+
+settings = FlowDepSettings.from_yaml("configs/flowdep.yaml")
+fdf = FlowDepFilter(settings, intrinsics)
+
+# Per-frame update cycle
+fdf.predict(pose_delta)
+fdf.observe(image, pose)
+depth_map = fdf.query()           # np.ndarray (H, W), inverse-depth
+```
+
+> **Future:** The sparse Gaussian-Beta depth filter (`SparseGBFilter`) may be exposed in the same way for standalone per-feature depth estimation.
 
 ### Implementation
 
@@ -251,8 +347,9 @@ The `echo-li-py` crate depends on `echo-li-core` and re-uses the same orchestrat
 
 1. **`config.rs`** — Parse a YAML file path or Python dict into Rust `VIOFilterSettings` / `FlowDepSettings` / etc. via serde.
 2. **`pipeline.rs`** — `#[pyfunction] fn run_euroc(dataset: &str, config: &str) -> PyResult<RunResult>`. Internally constructs the full event loop (dataset reader → IMU propagation → feature tracking → vision update → depth filters → plane detection), identical to what `echo-li-cli/src/main.rs` does.
-3. **`types.rs`** — `RunResult` as a `#[pyclass]` with numpy array accessors via `numpy` crate. Trajectory, aligned trajectory, timing stats.
-4. **`lib.rs`** — `#[pymodule]` registering `run_euroc` and `RunResult`.
+3. **`flowdep.rs`** — `FlowDepFilter` and `FlowDepSettings` as `#[pyclass]` wrappers around `echo_li_core::depth::flowdep`. Exposes `predict()`, `observe()`, `query()` with numpy I/O. (Future: `SparseGBFilter` may be added similarly.)
+4. **`types.rs`** — `RunResult` as a `#[pyclass]` with numpy array accessors via `numpy` crate. Trajectory, aligned trajectory, timing stats.
+5. **`lib.rs`** — `#[pymodule]` registering `run_euroc`, `RunResult`, `FlowDepFilter`, `FlowDepSettings`.
 
 ### Build & Distribution
 
@@ -287,17 +384,17 @@ maturin build --release
 - **Unit tests**: Port all Python pytest cases to `#[cfg(test)]` modules. Maintain the same numerical tolerances.
 - **Integration tests**: Run on EuRoC MAV sequences, compare trajectory outputs against the Python baseline.
 - **Cross-validation**: During development, run Python and Rust side-by-side on the same dataset, compare state vectors at each timestep. A Python script that loads both outputs and computes max divergence is useful.
-- **Benchmarks**: Use `criterion` (already in Rudolf-V) for performance-critical paths: EqF prediction/update, Vogiatzis kernels, plane fitting, KLT tracking.
+- **Benchmarks**: Use `criterion` (already in Rudolf-V) for performance-critical paths: EqF prediction/update, Gaussian-Beta kernels, plane fitting, KLT tracking.
 - **ROS 2 tests**: rosbag replay with recorded EuRoC bags, latency measurement, topic rate verification.
 
 ## Milestones
 
 | Milestone | Deliverable | Blocked By |
 |-----------|-------------|------------|
-| **M0** | liepp crate with full test coverage | — |
+| **M0** | echo-lie crate with full test coverage | — |
 | **M1** | Rudolf-V: ZNCC/LBP/ORB ported, lalir→nalgebra migration | — |
 | **M2** | ECHO-LI core: EqF filter running on EuRoC (point landmarks only) | M0, M1 |
-| **M3** | ECHO-LI core: FlowDep + Sparse Vogiatzis depth filters | M2 |
+| **M3** | ECHO-LI core: FlowDep + sparse Gaussian-Beta depth filters | M2 |
 | **M4** | ECHO-LI core: Planar landmark support | M3 |
 | **M5** | ECHO-LI core: Feature parity with ECHO-LI-python, trajectory validation | M4 |
 | **M6** | ECHO-LI ROS 2: Node with full topic interface, launch files, param config | M5 |
