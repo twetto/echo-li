@@ -27,6 +27,7 @@ Cargo workspace with ROS-agnostic core:
 ```
 echo-li/
 ├── Cargo.toml                          # workspace root
+├── echo-lie/                           # Lie group library
 ├── echo-li-core/                       # pure algorithm library (no ROS dependency)
 │   ├── Cargo.toml                      # depth::flowdep is pub — other projects can depend on echo-li-core for standalone FlowDep use
 │   └── src/
