@@ -2,11 +2,11 @@
 RudolfV:
   equaliseImageHistogram: true
   # useFastFeatures: false
-  featureDist: 96.0
+  featureDist: 128.0
   # featureDist: 20.0
   featureSearchThreshold: 0.8
   # maxError: 50.0
-  maxFeatures: 100  # LK tracker pool (feeds sparse_vog). EqF cap is --max-features.
+  maxFeatures: 40  # LK tracker pool (feeds sparse_vog). EqF cap is --max-features.
   maxLevel: 3
   # minHarrisQuality: 0.05
   # ransacParams:
@@ -17,7 +17,7 @@ RudolfV:
   # trackedFeatureDist: 15.0
   # winSize: 21
 eqf:
-  maxFeatures: 100           # core EqF landmark cap
+  maxFeatures: 40           # core EqF landmark cap
   initialValue:
     sceneDepth: 3.0
   initialVariance:
@@ -44,14 +44,17 @@ eqf:
     position: 9.981466095928483e-06
     velocity: 0.025317333863551263
   settings:
-    coordinateChoice: Euclidean
+    # coordinateChoice: Euclidean
     # coordinateChoice: InvDepth
-    # coordinateChoice: Normal   # aka Polar (sphere-normal bearing + log-depth)
-    fastRiccati: true
+    coordinateChoice: Normal   # aka Polar (sphere-normal bearing + log-depth)
+    # fastRiccati: true
+    fastRiccati: false
     useDiscreteInnovationLift: false
-    # useDiscreteVelocityLift: true
+    # useDiscreteInnovationLift: true
+    # useDiscreteVelocityLift: true # TODO: has bug
     useDiscreteVelocityLift: false
     useEquivariantOutput: true
+    # useEquivariantOutput: false
     useFeaturePredictions: true
     # useFeaturePredictions: false
     # useMedianDepth: false

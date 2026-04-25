@@ -1,5 +1,5 @@
 use nalgebra::{DMatrix, DVector, Matrix2x3, Vector2, Vector3};
-use echo_lie::SOT3;
+
 use crate::mathematical::vio_state::VIOState;
 use crate::mathematical::vio_group::{VIOGroup, VIOAlgebra};
 use crate::mathematical::imu_velocity::IMUVelocity;
@@ -28,10 +28,11 @@ pub trait EqFCoordinateSuite: Send + Sync {
                 let ci_star = if use_equivariance {
                     self.output_matrix_ci_star(&q0, q_hat, cam, &uv)
                 } else {
+                    // Non-equivariant: evaluate C* at the predicted measurement
+                    // so the averaging in ci_star is a no-op (y_hat = y_tru).
                     let p_c = q_hat.inverse().act(&q0);
-                    let j_proj = cam.projection_jacobian(&p_c);
-                    let j_action = q_hat.inverse().rotation.as_matrix() * q_hat.inverse().scale;
-                    j_proj * j_action
+                    let y_hat = cam.project(&p_c);
+                    self.output_matrix_ci_star(&q0, q_hat, cam, &y_hat)
                 };
                 c.fixed_view_mut::<2, 3>(2 * i, 21 + 3 * pos).copy_from(&ci_star);
             }

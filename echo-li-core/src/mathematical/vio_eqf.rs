@@ -129,11 +129,15 @@ impl VIOEqF {
             let y_pred = cam.project(q);
             let y_obs = y_coords.get(&id).expect("Observed ID must exist in coordinates");
             y_tilde.fixed_rows_mut::<2>(2 * j).copy_from(&(y_obs - y_pred));
-
         }
 
         // Output matrix C*
         let ct = suite.output_matrix_C(&self.xi0, &self.x, y_ids, y_coords, cam, use_equivariance);
+
+        // Skip update if C* contains NaN (degenerate landmark)
+        if !ct.iter().all(|v| v.is_finite()) {
+            return;
+        }
 
         self.perform_stacked_update(suite, &y_tilde, &ct, output_gain, use_discrete_correction);
     }
@@ -158,12 +162,25 @@ impl VIOEqF {
         // S = C * Sigma * C^T + R
         let s = c_star * sigma_active * c_star.transpose() + r_noise;
 
+        // Skip if S is degenerate
+        if !s.iter().all(|v| v.is_finite()) {
+            return;
+        }
+
         // K = Sigma * C^T * S^{-1}
-        let s_inv = s.try_inverse().expect("Innovation covariance S must be invertible");
+        let s_inv = match s.try_inverse() {
+            Some(inv) => inv,
+            None => return,
+        };
         let k = sigma_active * c_star.transpose() * s_inv;
 
         // Gamma = K * residual
         let gamma = &k * residual;
+
+        // Skip if gain is degenerate
+        if !gamma.iter().all(|v| v.is_finite()) {
+            return;
+        }
 
         // Lift to group correction
         if use_discrete_correction {
@@ -254,7 +271,7 @@ impl VIOEqF {
 
     pub fn remove_invalid_landmarks(&mut self) {
         let invalid_ids: Vec<u64> = self.x.id.iter().zip(self.x.q.iter())
-            .filter(|(_, q)| q.scale <= 1e-8 || q.scale > 1e8)
+            .filter(|(_, q)| !q.scale.is_finite() || q.scale <= 1e-8 || q.scale > 1e8)
             .map(|(&id, _)| id)
             .collect();
         for id in invalid_ids {

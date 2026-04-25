@@ -217,6 +217,13 @@ impl VIOFilter {
         // 1. Propagate observer state (updates X)
         self.eqf.integrate_observer_state(&imu, dt, self.settings.use_discrete_velocity_lift);
 
+        // Remove landmarks that became degenerate during propagation
+        let n_before = self.eqf.x.id.len();
+        self.eqf.remove_invalid_landmarks();
+        if self.eqf.x.id.len() != n_before {
+            self.invalidate_gain_cache();
+        }
+
         // 2. Propagate Riccati (uses updated X)
         self.eqf.integrate_riccati_fast(
             self.suite.as_ref(), &imu, dt, &self.input_gain, &self.state_gain,

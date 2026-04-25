@@ -86,8 +86,16 @@ impl EqFCoordinateSuite for EuclideanSuite {
         if n > 0 {
             for i in 0..n {
                 let qi = &x.q[i];
+
+                // Guard: skip degenerate landmarks (zero-norm position or invalid scale)
+                let qhat_i_pos = xi_hat.camera_landmarks[i].p;
+                let qq = qhat_i_pos.norm_squared();
+                if qq < 1e-20 || !qi.scale.is_finite() || qi.scale.abs() < 1e-12 {
+                    continue; // degenerate landmark, leave block as zero
+                }
+
                 let qhat_i = qi.rotation.as_matrix() * qi.scale;
-                
+
                 // Velocity -> Landmarks
                 let block_vel = -(qhat_i * m_vel);
                 a0t.fixed_view_mut::<3, 3>(s + 3 * i, 12).copy_from(&block_vel);
@@ -101,12 +109,10 @@ impl EqFCoordinateSuite for EuclideanSuite {
                 a0t.fixed_view_mut::<3, 6>(s + 3 * i, 15).copy_from(&block_offset);
 
                 // Landmark -> Landmark
-                let qhat_i_pos = xi_hat.camera_landmarks[i].p;
-                let qq = qhat_i_pos.norm_squared();
                 let skew_qhat = base_skew(&qhat_i_pos);
                 let skew_vc = base_skew(&v_c);
                 let inner = skew_qhat * skew_vc - (v_c * qhat_i_pos.transpose() * 2.0) + qhat_i_pos * v_c.transpose();
-                
+
                 let qhat_inv = qi.rotation.as_matrix().transpose() / qi.scale;
                 let a_qi = -(qhat_i * inner * qhat_inv) / qq;
                 a0t.fixed_view_mut::<3, 3>(s + 3 * i, s + 3 * i).copy_from(&a_qi);

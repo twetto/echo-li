@@ -198,6 +198,10 @@ impl EqFCoordinateSuite for InvDepthSuite {
             let m_i2e = conv_ind2euc(&q0);
             let qhat_p = xi_hat.camera_landmarks[i].p;
 
+            if q0.norm() < 1e-10 || qhat_p.norm() < 1e-10 || !qi.scale.is_finite() || qi.scale.abs() < 1e-12 {
+                continue; // degenerate landmark, leave as zero block
+            }
+
             // Bias -> Landmarks (cols 0:6): A[lm, 0:6] = -B_invdepth[lm, 0:6]
             // B_euc landmark block is only in cols 0:3 (gyro)
             let inner_b = base_skew(&qhat_p) * r_ic.transpose() + term_x_ic;
@@ -248,6 +252,9 @@ impl EqFCoordinateSuite for InvDepthSuite {
         for i in 0..n {
             let q0 = xi0.camera_landmarks[i].p;
             let qi = &x.q[i];
+            if q0.norm() < 1e-10 || !qi.scale.is_finite() || qi.scale.abs() < 1e-12 {
+                continue; // leave as Euclidean B block (from base call)
+            }
             let qhat_i = qi.rotation.as_matrix() * qi.scale;
             let qhat_p = xi_hat.camera_landmarks[i].p;
             let m_e2i = conv_euc2ind(&q0);

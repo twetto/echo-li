@@ -147,8 +147,12 @@ pub fn lift_velocity(state: &VIOState, velocity: &crate::mathematical::imu_veloc
         let p = lm.p;
         let pp = p.norm_squared();
         let mut wi = Vector4::zeros();
-        wi.fixed_rows_mut::<3>(0).copy_from(&(omega_c + p.cross(&v_c) / pp));
-        wi[3] = p.dot(&v_c) / pp;
+        if pp > 1e-20 {
+            wi.fixed_rows_mut::<3>(0).copy_from(&(omega_c + p.cross(&v_c) / pp));
+            wi[3] = p.dot(&v_c) / pp;
+        } else {
+            wi.fixed_rows_mut::<3>(0).copy_from(&omega_c);
+        }
         w_vec.push(wi);
         id_vec.push(lm.id);
     }
@@ -207,9 +211,15 @@ pub fn lift_velocity_discrete(state: &VIOState, velocity: &crate::mathematical::
     for lm in &state.camera_landmarks {
         let p0 = lm.p;
         let p1 = camera_pose_change_inv.act(&p0);
-        let rot = SO3::from_vectors(&(p1.normalize()), &(p0.normalize()));
-        let scale = p0.norm() / p1.norm();
-        q_vec.push(SOT3::new(rot, scale));
+        let p1_norm = p1.norm();
+        if p1_norm < 1e-12 || p0.norm() < 1e-12 {
+            // Degenerate: landmark at camera origin, use identity
+            q_vec.push(SOT3::identity());
+        } else {
+            let rot = SO3::from_vectors(&(p1 / p1_norm), &(p0.normalize()));
+            let scale = (p0.norm() / p1_norm).clamp(1e-8, 1e8);
+            q_vec.push(SOT3::new(rot, scale));
+        }
         id_vec.push(lm.id);
     }
 

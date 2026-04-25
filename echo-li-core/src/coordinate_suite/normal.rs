@@ -258,15 +258,20 @@ impl EqFCoordinateSuite for NormalSuite {
         &m * b_euc
     }
 
-    fn output_matrix_ci_star(&self, q0: &Vector3<f64>, q_hat: &SOT3, cam: &dyn CameraModel, _y: &Vector2<f64>) -> Matrix2x3<f64> {
-        // Port of: EqFoutputMatrixCiStar_normal in normal.cpp
-        // proj_jac(Q_hat.R^{-1} * y0) @ Q_hat.R^T @ sphere_chart_normal_inv_diff0(q0)
-        // Third column (log-depth) is zero.
+    fn output_matrix_ci_star(&self, q0: &Vector3<f64>, q_hat: &SOT3, cam: &dyn CameraModel, y: &Vector2<f64>) -> Matrix2x3<f64> {
+        // Equivariant C* for Normal chart:
+        // Average proj_jac at predicted and observed bearings, then apply
+        // the rotation and chart differential.
+        // Third column (log-depth) is zero since bearing measurements
+        // carry no direct depth information.
         let y0 = q0.normalize();
-        let y_hat = q_hat.rotation.inverse().act(&y0);
-        let proj_jac = cam.projection_jacobian(&y_hat);
+        let y_hat_bearing = q_hat.rotation.inverse().act(&y0);
+        let y_tru_bearing = cam.undistort(y);
+
+        let avg_proj_jac = 0.5 * (cam.projection_jacobian(&y_tru_bearing)
+                                 + cam.projection_jacobian(&y_hat_bearing));
         let inv_diff = sphere_chart_normal_inv_diff0(q0);
-        let block_2x2 = proj_jac * q_hat.rotation.as_matrix().transpose() * inv_diff;
+        let block_2x2 = avg_proj_jac * q_hat.rotation.as_matrix().transpose() * inv_diff;
         let mut c0i = Matrix2x3::zeros();
         c0i.fixed_view_mut::<2, 2>(0, 0).copy_from(&block_2x2);
         c0i

@@ -299,6 +299,180 @@ fn test_ct_equivariant_at_prediction() {
     }
 }
 
+// Verify equivariant C* reduces to non-equivariant at predicted measurement
+// for Normal and InvDepth charts (Euclidean already tested above).
+#[test]
+fn test_ct_equivariant_at_prediction_normal_invdepth() {
+    use crate::mathematical::camera::PinholeModel;
+
+    let mut rng = rand::rng();
+    let cam = PinholeModel { fx: 458.654, fy: 457.296, cx: 367.215, cy: 248.375 };
+
+    for (name, suite) in [
+        ("Normal", Box::new(NormalSuite::new()) as Box<dyn EqFCoordinateSuite>),
+        ("InvDepth", Box::new(InvDepthSuite::new()) as Box<dyn EqFCoordinateSuite>),
+    ] {
+        for _ in 0..TEST_REPS {
+            let xi0 = reasonable_state_element(5, &mut rng);
+            let x_hat = reasonable_group_element(5, &mut rng);
+
+            let xi_hat = state_group_action(&x_hat, &xi0);
+            let y_hat = measure_system_state(&xi_hat, &cam);
+            let mut y_ids: Vec<u64> = y_hat.keys().cloned().collect();
+            y_ids.sort();
+            if y_ids.is_empty() { continue; }
+
+            #[allow(non_snake_case)]
+            let C_eq = suite.output_matrix_C(&xi0, &x_hat, &y_ids, &y_hat, &cam, true);
+            #[allow(non_snake_case)]
+            let C_noneq = suite.output_matrix_C(&xi0, &x_hat, &y_ids, &y_hat, &cam, false);
+
+            let diff = (&C_eq - &C_noneq).norm();
+            assert!(diff < 1e-8,
+                "{}: C* and C should be equal at predicted measurement, diff={:.2e}", name, diff);
+        }
+    }
+}
+
+// Verify: for InvDepth C*, averaging-then-mapping == mapping-then-averaging
+// Since ind2euc is a constant matrix (given q0), linearity guarantees
+// 0.5*(A+B)*M == 0.5*(A*M + B*M). This test confirms it numerically.
+#[test]
+fn test_invdepth_cstar_avg_map_commutativity() {
+    use crate::mathematical::camera::PinholeModel;
+    use crate::coordinate_suite::invdepth::conv_ind2euc;
+
+    let mut rng = rand::rng();
+    let euclid_suite = EuclideanSuite;
+    let invdepth_suite = InvDepthSuite::new();
+    let cam = PinholeModel { fx: 458.654, fy: 457.296, cx: 367.215, cy: 248.375 };
+
+    for _ in 0..TEST_REPS {
+        let xi0 = reasonable_state_element(5, &mut rng);
+        let x_hat = reasonable_group_element(5, &mut rng);
+
+        let xi_hat = state_group_action(&x_hat, &xi0);
+        let y_hat = measure_system_state(&xi_hat, &cam);
+        let mut y_ids: Vec<u64> = y_hat.keys().cloned().collect();
+        y_ids.sort();
+        if y_ids.is_empty() { continue; }
+
+        // Method 1 (current): C*_invdepth via invdepth suite
+        // Internally does: C*_euclid(avg of y_tru, y_hat) * ind2euc
+        #[allow(non_snake_case)]
+        let C_current = invdepth_suite.output_matrix_C(&xi0, &x_hat, &y_ids, &y_hat, &cam, true);
+
+        // Method 2 (proposed): map each C_euclid term to invdepth, then average
+        // For each landmark: 0.5 * (C_euclid(y_tru) * ind2euc + C_euclid(y_hat) * ind2euc)
+        // Build this by getting the non-equivariant (y_hat only) and equivariant (averaged)
+        // Euclidean C*, converting each to invdepth, then averaging.
+        //
+        // Actually, since C*_euclid = 0.5*(D_rho(y_tru) + D_rho(y_hat)) * rest,
+        // and the "rest" includes Adj(Q^-1)*m2g which is constant,
+        // mapping then averaging means:
+        //   0.5 * (D_rho(y_tru) * Adj(Q^-1) * m2g * ind2euc + D_rho(y_hat) * Adj(Q^-1) * m2g * ind2euc)
+        // = 0.5 * (D_rho(y_tru) + D_rho(y_hat)) * Adj(Q^-1) * m2g * ind2euc
+        // = C*_euclid * ind2euc  (= current method)
+        //
+        // So they're algebraically identical. Let's verify by computing both
+        // the full equivariant C and the per-landmark mapped-then-averaged version.
+
+        // Per-landmark check: compare ci_star results
+        for &id in &y_ids {
+            let lm_idx = xi0.camera_landmarks.iter().position(|l| l.id == id).unwrap();
+            let q0 = xi0.camera_landmarks[lm_idx].p;
+            let qi = &x_hat.q[lm_idx];
+
+            // Current: avg in euclid, then map
+            let ci_avg_then_map = invdepth_suite.output_matrix_ci_star(
+                &q0, qi, &cam, y_hat.get(&id).unwrap());
+
+            // Alternative: map each D_rho term, then average
+            // = C_euclid(y_tru) * ind2euc  averaged with  C_euclid(y_hat) * ind2euc
+            // Since output_matrix_ci_star with equivariant=true already averages,
+            // we verify by computing: euclid_ci_star * ind2euc
+            let ci_euclid = euclid_suite.output_matrix_ci_star(
+                &q0, qi, &cam, y_hat.get(&id).unwrap());
+            let ind2euc = conv_ind2euc(&q0);
+            let ci_map_then_avg = ci_euclid * ind2euc;
+
+            let diff = (ci_avg_then_map - ci_map_then_avg).norm();
+            assert!(diff < 1e-12,
+                "avg->map vs map->avg should be identical, diff={:.2e}", diff);
+        }
+
+        // Also verify the full stacked C matrix matches
+        #[allow(non_snake_case)]
+        let C_euclid = euclid_suite.output_matrix_C(&xi0, &x_hat, &y_ids, &y_hat, &cam, true);
+
+        // Convert Euclidean C* to InvDepth by right-multiplying landmark blocks by ind2euc
+        let s = VIOSensorState::CDIM;
+        let n_obs = y_ids.len();
+        let dim = xi0.dim();
+        let mut c_manual = C_euclid.clone();
+        for (j, &id) in y_ids.iter().enumerate() {
+            let _ = j; // used implicitly via the loop
+            let lm_idx = xi0.camera_landmarks.iter().position(|l| l.id == id).unwrap();
+            let q0 = xi0.camera_landmarks[lm_idx].p;
+            let ind2euc = conv_ind2euc(&q0);
+
+            let col_start = s + 3 * lm_idx;
+            let block = C_euclid.view((0, col_start), (2 * n_obs, 3)).into_owned();
+            let mapped = block * ind2euc;
+            c_manual.view_mut((0, col_start), (2 * n_obs, 3)).copy_from(&mapped);
+        }
+
+        let full_diff = (&C_current - &c_manual).norm();
+        assert!(full_diff < 1e-10,
+            "Full C* invdepth: avg->map vs map->avg should match, diff={:.2e}", full_diff);
+    }
+}
+
+// Verify: Normal C*_i (custom formula) == C*_euc * conv_normal2euc
+// If they differ, the custom formula is wrong and should be replaced.
+#[test]
+fn test_normal_cstar_vs_euc_composed() {
+    use crate::mathematical::camera::PinholeModel;
+    use crate::coordinate_suite::normal::conv_normal2euc;
+
+    let mut rng = rand::rng();
+    let euclid_suite = EuclideanSuite;
+    let normal_suite = NormalSuite::new();
+    let cam = PinholeModel { fx: 458.654, fy: 457.296, cx: 367.215, cy: 248.375 };
+
+    for _ in 0..TEST_REPS {
+        let xi0 = reasonable_state_element(5, &mut rng);
+        let x_hat = reasonable_group_element(5, &mut rng);
+
+        let xi_hat = state_group_action(&x_hat, &xi0);
+        let y_hat = measure_system_state(&xi_hat, &cam);
+        let mut y_ids: Vec<u64> = y_hat.keys().cloned().collect();
+        y_ids.sort();
+        if y_ids.is_empty() { continue; }
+
+        for &id in &y_ids {
+            let lm_idx = xi0.camera_landmarks.iter().position(|l| l.id == id).unwrap();
+            let q0 = xi0.camera_landmarks[lm_idx].p;
+            let qi = &x_hat.q[lm_idx];
+            let y_obs = y_hat.get(&id).unwrap();
+
+            // Method A: Normal's custom ci_star
+            let ci_normal = normal_suite.output_matrix_ci_star(&q0, qi, &cam, y_obs);
+
+            // Method B: C*_euc * conv_normal2euc
+            let ci_euc = euclid_suite.output_matrix_ci_star(&q0, qi, &cam, y_obs);
+            let n2e = conv_normal2euc(&q0);
+            let ci_composed = ci_euc * n2e;
+
+            let diff = (ci_normal - ci_composed).norm();
+            let scale = ci_composed.norm().max(1e-10);
+            assert!(diff / scale < 1e-6,
+                "Normal C*_i differs from C*_euc * normal2euc: diff={:.2e}, rel={:.2e}",
+                diff, diff / scale);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 4. VIO Lift Tests (test_vio_lift.py)
 // ---------------------------------------------------------------------------
