@@ -1,13 +1,14 @@
 use clap::Parser;
+use echo_li_core::config::VIOConfig;
 use echo_li_core::dataserver::ASLDatasetReader;
-use echo_li_core::{VIOFilter, VIOFilterSettings};
-use echo_li_core::mathematical::*;
 use echo_li_core::initialization::{check_stationary, estimate_initial_pose};
 use echo_li_core::mathematical::camera::{CameraModel, PinholeModel, RadTanModel};
-use echo_li_core::config::VIOConfig;
+use echo_li_core::mathematical::*;
+use echo_li_core::{VIOFilter, VIOFilterSettings};
 use nalgebra::Vector2;
 use rudolf_v::frontend::{Frontend, FrontendConfig};
 use rudolf_v::image::Image as RudolfImage;
+use rudolf_v::klt::LkMethod;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -20,7 +21,7 @@ struct Args {
     #[arg(short, long)]
     config: Option<String>,
 
-    #[arg(short, long, default_value = "Normal")]
+    #[arg(long, default_value = "Normal")]
     coord: String,
 
     #[arg(short = 'l', long, default_value_t = 0.0)]
@@ -44,9 +45,11 @@ fn write_trajectory(path: &std::path::Path, entries: &[(f64, VIOState)]) -> std:
     for (t, state) in entries {
         let pos = state.sensor.pose.translation;
         let q = state.sensor.pose.rotation.as_xyzw();
-        writeln!(f, "{:.9} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6}",
-            t, pos[0], pos[1], pos[2],
-            q[0], q[1], q[2], q[3])?;
+        writeln!(
+            f,
+            "{:.9} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6}",
+            t, pos[0], pos[1], pos[2], q[0], q[1], q[2], q[3]
+        )?;
     }
     Ok(())
 }
@@ -60,9 +63,11 @@ fn write_groundtruth(path: &std::path::Path, poses: &[StampedPose]) -> std::io::
     for sp in poses {
         let pos = sp.pose.translation;
         let q = sp.pose.rotation.as_xyzw();
-        writeln!(f, "{:.9} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6}",
-            sp.stamp, pos[0], pos[1], pos[2],
-            q[0], q[1], q[2], q[3])?;
+        writeln!(
+            f,
+            "{:.9} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6}",
+            sp.stamp, pos[0], pos[1], pos[2], q[0], q[1], q[2], q[3]
+        )?;
     }
     Ok(())
 }
@@ -98,30 +103,61 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         s
     };
 
-    println!("Filter: chart={}, max_landmarks={}", settings.coordinate_choice, settings.max_landmarks);
+    println!(
+        "Filter: chart={}, max_landmarks={}",
+        settings.coordinate_choice, settings.max_landmarks
+    );
 
-    let (cam_model, img_w, img_h): (Box<dyn CameraModel>, usize, usize) = if let Some(intr) = &reader.intrinsics {
-        println!("Camera intrinsics: {}x{} fx={:.1} fy={:.1} cx={:.1} cy={:.1}",
-            intr.width, intr.height, intr.fx, intr.fy, intr.cx, intr.cy);
-        let model: Box<dyn CameraModel> = match (intr.distortion_model.as_deref(), &intr.distortion_coefficients) {
-            (Some("radial-tangential"), Some(d)) if d.len() >= 4 => {
-                println!("Distortion: radial-tangential k1={:.4} k2={:.4} p1={:.6} p2={:.6}",
-                    d[0], d[1], d[2], d[3]);
-                Box::new(RadTanModel {
-                    fx: intr.fx, fy: intr.fy, cx: intr.cx, cy: intr.cy,
-                    k1: d[0], k2: d[1], p1: d[2], p2: d[3],
-                })
-            }
-            _ => {
-                println!("Distortion: none (pinhole)");
-                Box::new(PinholeModel { fx: intr.fx, fy: intr.fy, cx: intr.cx, cy: intr.cy })
-            }
+    let (cam_model, img_w, img_h): (Box<dyn CameraModel>, usize, usize) =
+        if let Some(intr) = &reader.intrinsics {
+            println!(
+                "Camera intrinsics: {}x{} fx={:.1} fy={:.1} cx={:.1} cy={:.1}",
+                intr.width, intr.height, intr.fx, intr.fy, intr.cx, intr.cy
+            );
+            let model: Box<dyn CameraModel> = match (
+                intr.distortion_model.as_deref(),
+                &intr.distortion_coefficients,
+            ) {
+                (Some("radial-tangential"), Some(d)) if d.len() >= 4 => {
+                    println!(
+                        "Distortion: radial-tangential k1={:.4} k2={:.4} p1={:.6} p2={:.6}",
+                        d[0], d[1], d[2], d[3]
+                    );
+                    Box::new(RadTanModel {
+                        fx: intr.fx,
+                        fy: intr.fy,
+                        cx: intr.cx,
+                        cy: intr.cy,
+                        k1: d[0],
+                        k2: d[1],
+                        p1: d[2],
+                        p2: d[3],
+                    })
+                }
+                _ => {
+                    println!("Distortion: none (pinhole)");
+                    Box::new(PinholeModel {
+                        fx: intr.fx,
+                        fy: intr.fy,
+                        cx: intr.cx,
+                        cy: intr.cy,
+                    })
+                }
+            };
+            (model, intr.width, intr.height)
+        } else {
+            println!("No intrinsics found, using EuRoC defaults");
+            (
+                Box::new(PinholeModel {
+                    fx: 458.65,
+                    fy: 457.3,
+                    cx: 367.2,
+                    cy: 248.3,
+                }) as Box<dyn CameraModel>,
+                752,
+                480,
+            )
         };
-        (model, intr.width, intr.height)
-    } else {
-        println!("No intrinsics found, using EuRoC defaults");
-        (Box::new(PinholeModel { fx: 458.65, fy: 457.3, cx: 367.2, cy: 248.3 }) as Box<dyn CameraModel>, 752, 480)
-    };
 
     // Initialize Rudolf-V Frontend
     let mut frontend_config = FrontendConfig::default();
@@ -137,6 +173,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         frontend_config.cell_size = 100;
         frontend_config.histeq = rudolf_v::histeq::HistEqMethod::Global;
     }
+    frontend_config.klt_method = LkMethod::InverseCompositional;
     let tracker_max_features = frontend_config.max_features;
     let mut frontend = Frontend::new(frontend_config, img_w, img_h);
     println!("Tracker: Rudolf-V, max_features={}", tracker_max_features);
@@ -149,17 +186,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("Rerun viewer connected");
 
                 // Send blueprint: camera 2D + world 3D side by side
-                use rerun::blueprint::{Blueprint, Horizontal, Spatial2DView, Spatial3DView, ContainerLike};
-                let blueprint = Blueprint::new(
-                    Horizontal::new(vec![
-                        ContainerLike::from(Spatial2DView::new("Camera")
+                use rerun::blueprint::{
+                    Blueprint, ContainerLike, Horizontal, Spatial2DView, Spatial3DView,
+                };
+                let blueprint = Blueprint::new(Horizontal::new(vec![
+                    ContainerLike::from(
+                        Spatial2DView::new("Camera")
                             .with_origin("camera")
-                            .with_contents(["camera/**"])),
-                        ContainerLike::from(Spatial3DView::new("World")
+                            .with_contents(["camera/**"]),
+                    ),
+                    ContainerLike::from(
+                        Spatial3DView::new("World")
                             .with_origin("world")
-                            .with_contents(["world/**"])),
-                    ])
-                );
+                            .with_contents(["world/**"]),
+                    ),
+                ]));
                 blueprint.send(&r, Default::default()).ok();
 
                 Some(r)
@@ -194,7 +235,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         if let Some(next_img) = image_it.peek() {
             while let Some(imu) = imu_it.peek() {
-                if imu.stamp > next_img.stamp { break; }
+                if imu.stamp > next_img.stamp {
+                    break;
+                }
                 let imu = imu_it.next().unwrap();
                 imu_count += 1;
 
@@ -243,7 +286,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 if let Some(f) = &mut filter {
                     #[cfg(feature = "rerun")]
-                    let tracker_points: Vec<(f32, f32)> = features.iter()
+                    let tracker_points: Vec<(f32, f32)> = features
+                        .iter()
                         .map(|feat| (feat.x as f32, feat.y as f32))
                         .collect();
 
@@ -270,17 +314,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         rec.set_time("log_time", Duration::from_secs_f64(img_data.stamp));
 
                         // Camera image (grayscale)
-                        rec.log("camera/image",
+                        rec.log(
+                            "camera/image",
                             &rerun::Image::from_l8(gray_data, [img_w as u32, img_h as u32]),
-                        ).ok();
+                        )
+                        .ok();
 
                         // Tracked features on image
                         if !tracker_points.is_empty() {
-                            rec.log("camera/image/features",
+                            rec.log(
+                                "camera/image/features",
                                 &rerun::Points2D::new(tracker_points)
                                     .with_colors([0xFFFF00FFu32])
                                     .with_radii([2.0f32]),
-                            ).ok();
+                            )
+                            .ok();
                         }
 
                         // Accumulate trajectory
@@ -288,50 +336,80 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                         // 3D trajectory line
                         if trajectory_vis.len() >= 2 {
-                            let strip: Vec<[f32; 3]> = trajectory_vis.iter()
+                            let strip: Vec<[f32; 3]> = trajectory_vis
+                                .iter()
                                 .map(|p| [p[0] as f32, p[1] as f32, p[2] as f32])
                                 .collect();
-                            rec.log("world/trajectory",
-                                &rerun::LineStrips3D::new([strip])
-                                    .with_colors([0x00FFFFFFu32]),
-                            ).ok();
+                            rec.log(
+                                "world/trajectory",
+                                &rerun::LineStrips3D::new([strip]).with_colors([0x00FFFFFFu32]),
+                            )
+                            .ok();
                         }
 
                         // 3D landmarks
-                        let lm_pts: Vec<(f32, f32, f32)> = feat_global.values()
+                        let lm_pts: Vec<(f32, f32, f32)> = feat_global
+                            .values()
                             .map(|p| (p[0] as f32, p[1] as f32, p[2] as f32))
                             .collect();
                         if !lm_pts.is_empty() {
-                            rec.log("world/landmarks",
+                            rec.log(
+                                "world/landmarks",
                                 &rerun::Points3D::new(lm_pts)
                                     .with_colors([0x00FF00FFu32])
                                     .with_radii([0.02f32]),
-                            ).ok();
+                            )
+                            .ok();
                         }
 
                         // Camera pose as RGB arrows (X=red, Y=green, Z=blue)
                         let origin = [p_cam[0] as f32, p_cam[1] as f32, p_cam[2] as f32];
                         let r = r_cam.as_matrix();
                         let scale = 0.1f32;
-                        rec.log("world/camera_axes",
+                        rec.log(
+                            "world/camera_axes",
                             &rerun::Arrows3D::from_vectors([
-                                [r[(0,0)] as f32 * scale, r[(1,0)] as f32 * scale, r[(2,0)] as f32 * scale],
-                                [r[(0,1)] as f32 * scale, r[(1,1)] as f32 * scale, r[(2,1)] as f32 * scale],
-                                [r[(0,2)] as f32 * scale, r[(1,2)] as f32 * scale, r[(2,2)] as f32 * scale],
+                                [
+                                    r[(0, 0)] as f32 * scale,
+                                    r[(1, 0)] as f32 * scale,
+                                    r[(2, 0)] as f32 * scale,
+                                ],
+                                [
+                                    r[(0, 1)] as f32 * scale,
+                                    r[(1, 1)] as f32 * scale,
+                                    r[(2, 1)] as f32 * scale,
+                                ],
+                                [
+                                    r[(0, 2)] as f32 * scale,
+                                    r[(1, 2)] as f32 * scale,
+                                    r[(2, 2)] as f32 * scale,
+                                ],
                             ])
                             .with_origins([origin, origin, origin])
-                            .with_colors([0xFF0000FFu32, 0x00FF00FFu32, 0x0000FFFFu32]),
-                        ).ok();
+                            .with_colors([
+                                0xFF0000FFu32,
+                                0x00FF00FFu32,
+                                0x0000FFFFu32,
+                            ]),
+                        )
+                        .ok();
                     }
 
                     if vision_count % 100 == 0 || vision_count <= 5 {
                         let pos = states_out.last().unwrap().1.sensor.pose.translation;
                         let vel = states_out.last().unwrap().1.sensor.velocity;
-                        println!("  [{:4}] t={:.3}  pos=({:+.2}, {:+.2}, {:+.2})  vel=({:+.3}, {:+.3}, {:+.3})  lm={}",
-                            vision_count, img_data.stamp,
-                            pos[0], pos[1], pos[2],
-                            vel[0], vel[1], vel[2],
-                            feat_global.len());
+                        println!(
+                            "  [{:4}] t={:.3}  pos=({:+.2}, {:+.2}, {:+.2})  vel=({:+.3}, {:+.3}, {:+.3})  lm={}",
+                            vision_count,
+                            img_data.stamp,
+                            pos[0],
+                            pos[1],
+                            pos[2],
+                            vel[0],
+                            vel[1],
+                            vel[2],
+                            feat_global.len()
+                        );
                     }
                 }
             }
@@ -341,7 +419,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let elapsed = t_start.elapsed().as_secs_f64();
-    println!("\nProcessed {} IMU + {} vision in {:.2}s", imu_count, vision_count, elapsed);
+    println!(
+        "\nProcessed {} IMU + {} vision in {:.2}s",
+        imu_count, vision_count, elapsed
+    );
 
     // Write trajectory output
     let dataset_name = PathBuf::from(&args.dataset)
@@ -349,7 +430,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "output".to_string());
     let output_dir = PathBuf::from(
-        args.output.unwrap_or_else(|| format!("eqvio_output_{}", dataset_name))
+        args.output
+            .unwrap_or_else(|| format!("eqvio_output_{}", dataset_name)),
     );
 
     if !states_out.is_empty() {
@@ -366,11 +448,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Aligned trajectory
         if !states_out.is_empty() {
-            let est_poses: Vec<(f64, echo_lie::SE3)> = states_out.iter()
+            let est_poses: Vec<(f64, echo_lie::SE3)> = states_out
+                .iter()
                 .map(|(t, s)| (*t, s.sensor.pose.clone()))
                 .collect();
             let alignment = echo_li_core::alignment::align_trajectories(&est_poses, &gt_poses);
-            let aligned: Vec<(f64, VIOState)> = states_out.iter()
+            let aligned: Vec<(f64, VIOState)> = states_out
+                .iter()
                 .map(|(t, s)| {
                     let mut s_aligned = s.clone();
                     let aligned_pose = alignment.compose(&s.sensor.pose);
