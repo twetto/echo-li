@@ -122,35 +122,21 @@ echo-li/
 
 ## Phase 2: gift-python → Rudolf-V (Feature Completion)
 
-**Scope:** Port remaining occlusion-check features from gift-python to Rudolf-V.
+**Scope:** Standardize on RI-FAST-LBP for occlusion detection and finalize the frontend.
 
-### Remaining Features
+### Occlusion Detection: RI-FAST-LBP
 
-Rudolf-V already implements: image pyramids, camera models (pinhole, radtan, equidistant, double-sphere), FAST detection, Harris detection, inverse-compositional KLT tracking, NMS, occupancy grid, essential matrix RANSAC, histogram equalization.
+We have standardized on **Rotation-Invariant FAST-LBP (RI-FAST-LBP)** as the primary method for detecting tracking failures and occlusions. This replaces the need for ZNCC or ORB descriptors, providing a compact, hardware-friendly, and rotationally robust verification step.
 
-Still needed:
-
-| Feature | gift-python Location | Description |
-|---------|---------------------|-------------|
-| **ZNCC verification** | `tracker.py:46` (`_zncc`) | Reference-patch zero-normalized cross-correlation for occlusion detection |
-| **LBP descriptors** | `tracker.py:102-161` | Local Binary Pattern vector computation + chi-squared distance |
-| **ORB descriptors** | `tracker.py:168-189` | ORB descriptor computation + Hamming distance |
-| **Occlusion check framework** | `tracker.py:233-265` | `OcclusionCheckMethod` enum, threshold config, per-feature reference storage |
-
-A plan for ZNCC already exists at `Rudolf-V/reference_patch_zncc_plan.md`.
-
-### Migration Checklist
-
-1. Add `reference_patch` field to `Feature` struct
-2. Implement ZNCC as a standalone function in a new `zncc.rs` module
-3. Implement LBP computation (uniform LBP, rotation-invariant histogram)
-4. Implement ORB descriptor (oriented BRIEF) — or depend on a Rust ORB crate if one matures
-5. Add `OcclusionCheckMethod` enum and integrate into `frontend.rs` tracking loop
-6. Validate against gift-python's test suite on EuRoC sequences
+| Feature | Status | Description |
+|---------|--------|-------------|
+| **RI-LBP computation** | Implemented | Local Binary Pattern vector (Rotation-Invariant) integrated into `fast.rs` |
+| **Occlusion check** | Implemented | Hamming/Chi-squared distance check integrated into `frontend.rs` tracking loop |
+| **Reference storage** | Implemented | Per-feature reference LBP storage for long-term track validation |
 
 ### lalir → nalgebra Migration
 
-Rudolf-V currently depends on lalir for geometric verification (essential matrix). This should be migrated to nalgebra as part of this phase to unify the linear algebra backend across the stack. The essential matrix code in `essential.rs` (~611 LOC) uses SVD and matrix operations that map directly to nalgebra.
+Rudolf-V currently depends on lalir for geometric verification (essential matrix). This is being migrated to nalgebra (outside this session) to unify the linear algebra backend across the stack. The essential matrix code in `essential.rs` (~611 LOC) uses SVD and matrix operations that map directly to nalgebra.
 
 ## Phase 3: ECHO-LI-python → ECHO-LI (This Repo)
 
@@ -393,7 +379,7 @@ maturin build --release
 | Milestone | Deliverable | Blocked By |
 |-----------|-------------|------------|
 | **M0** | echo-lie crate with full test coverage | — |
-| **M1** | Rudolf-V: ZNCC/LBP/ORB ported, lalir→nalgebra migration | — |
+| **M1** | Rudolf-V: RI-FAST-LBP finalized, lalir→nalgebra migration | — |
 | **M2** | ECHO-LI core: EqF filter running on EuRoC (point landmarks only) | M0, M1 |
 | **M3** | ECHO-LI core: FlowDep + sparse Gaussian-Beta depth filters | M2 |
 | **M4** | ECHO-LI core: Planar landmark support | M3 |

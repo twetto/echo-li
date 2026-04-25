@@ -11,3 +11,5 @@ __pycache__/
 .claude/
 continue_*.sh
 *_ref/
+docs/
+eqvio_output*/

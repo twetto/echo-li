@@ -5,9 +5,8 @@ edition = "2024"
 description = "Lie group implementations for robotics and computer vision"
 
 [dependencies]
-nalgebra = "0.33"
-rand = "0.9"
-rand_distr = "0.5"
+nalgebra.workspace = true
+rand.workspace = true
 
 [dev-dependencies]
-approx = "0.5"
+approx.workspace = true

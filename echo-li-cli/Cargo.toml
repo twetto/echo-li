@@ -1,0 +1,19 @@
+[package]
+name = "echo-li-cli"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+rerun = ["dep:rerun"]
+
+[dependencies]
+echo-li-core = { path = "../echo-li-core" }
+echo-lie = { path = "../echo-lie" }
+rudolf-v.workspace = true
+nalgebra.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true
+image.workspace = true
+rand.workspace = true
+rerun = { workspace = true, optional = true }

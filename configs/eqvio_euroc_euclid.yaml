@@ -1,0 +1,120 @@
+# GIFT:
+RudolfV:
+  equaliseImageHistogram: true
+  # useFastFeatures: false
+  featureDist: 96.0
+  # featureDist: 20.0
+  featureSearchThreshold: 0.8
+  # maxError: 50.0
+  maxFeatures: 100  # LK tracker pool (feeds sparse_vog). EqF cap is --max-features.
+  maxLevel: 3
+  # minHarrisQuality: 0.05
+  # ransacParams:
+    # inlierThreshold: 0.003
+    # maxIterations: 30
+    # minDataPoints: 5
+    # minInliers: 15
+  # trackedFeatureDist: 15.0
+  # winSize: 21
+eqf:
+  maxFeatures: 100           # core EqF landmark cap
+  initialValue:
+    sceneDepth: 3.0
+  initialVariance:
+    attitude: 0.13565029126052572
+    biasAcc: 1.5813333765300104
+    biasGyr: 97162.79515771076
+    cameraAttitude: 0.0010228558965517584
+    cameraPosition: 0.023501400846134893
+    point: 129.90415638150924
+    position: 0.1
+    velocity: 8.974852995731e-08
+  measurementNoise:
+    feature: 2.0
+    featureOutlierAbs: 5.0
+    featureOutlierProb: 0.03229809583062128
+    featureRetention: 0.18594708334486176
+  processVariance:
+    attitude: 6.025875320811407e-05
+    biasAcc: 0.0
+    biasGyr: 0.0
+    cameraAttitude: 5.075382174045239e-06
+    cameraPosition: 1.2188313140115635e-05
+    point: 0.00029845436136043135
+    position: 9.981466095928483e-06
+    velocity: 0.025317333863551263
+  settings:
+    coordinateChoice: Euclidean
+    # coordinateChoice: InvDepth
+    # coordinateChoice: Normal   # aka Polar (sphere-normal bearing + log-depth)
+    fastRiccati: true
+    useDiscreteInnovationLift: false
+    # useDiscreteVelocityLift: true
+    useDiscreteVelocityLift: false
+    useEquivariantOutput: true
+    useFeaturePredictions: true
+    # useFeaturePredictions: false
+    # useMedianDepth: false
+    useMedianDepth: true
+  velocityNoise:
+    acc: 0.012438843268295521
+    accBias: 0.004462289865453429
+    gyr: 0.000243153572917808
+    gyrBias: 0.00013372703521098622
+main:
+  writeState: true
+  cameraLag: 0.00
+FlowDep:
+  image_scale: 0.25     # state grid scale
+  flow_scale: 0.25      # DIS flow scale (0 = same as image_scale)
+  # chart_type: invdepth  # landmark parametrization: invdepth, euclidean, polar
+  chart_type: euclidean  # landmark parametrization: invdepth, euclidean, polar
+  # enable_warmstart: true
+  enable_warmstart: false
+  dis_preset: ultrafast
+  dis_finest_scale: 0
+  grid_stride: 8
+  # texture_mask: true
+  texture_mask: false
+  # texture_threshold: 20
+  keyframe_flow_threshold: 0.0
+  max_keyframes: 1
+  grid_var_threshold: 0.1
+  process_invdepth_var: 0.1
+  # Vogiatzis Gaussian-Beta mixture update (SVO-style)
+  uniform_rho_max: 1.0       # 1/Z_min density upper bound
+  a_init: 10.0               # inlier prior (Beta shape)
+  b_init: 2.0                # outlier prior — asymmetric from DIS noise study
+  ab_min: 1.0
+  ab_max: 20.0
+  min_inlier_ratio: 0.5      # gate query() landmark init
+  mahalanobis_reset_chi2: 9.0  # reset stuck outlier pixels when obs disagrees (<=0 disables)
+SparseVog:
+  # Per-feature Vogiatzis filter.
+  # parametrization: euclidean, invdepth, polar (1D scalar)
+  #                   polar3d (3D Local IEKF on Normal chart)
+  parametrization: euclidean
+  # parametrization: polar3d
+  max_pool_size: 300
+  min_track_length: 5
+  conv_inlier_ratio: 0.7        # a/(a+b) gate for query()
+  conv_variance_threshold: 0.02 # var(z) gate for query()
+  init_depth_var: 1.0
+  sigma_pixel: 0.5              # pixel noise for obs tau^2 = z^4 * sigma^2 / drive^2
+  uniform_z_max: 20.0           # outlier uniform density: 1/z_max
+  a_init: 10.0
+  b_init: 2.0
+  ab_min: 1.0
+  ab_max: 20.0
+  min_inlier_ratio: 0.5         # gate for Mahalanobis stuck-outlier reset
+  mahalanobis_reset_chi2: 4.5
+  process_depth_var: 0.01       # fallback when P_vv unavailable
+  min_parallax: 1.0e-4
+  min_cos_sim: 0.95
+  min_depth: 0.1
+  max_depth: 100.0
+  # PlaneDetector (separate instance, fed by sparse_vog pool)
+  pd_max_tri_side_px: 200
+  pd_max_dist_between_z: 0.15
+  pd_max_norm_deg: 25
+  pd_min_plane_features: 4
