@@ -160,16 +160,15 @@ fn sensor_chart_inv_normal(eps: &nalgebra::SVector<f64, 21>, xi0: &VIOSensorStat
 }
 
 // ===========================================================================
-// Coordinate differential M: normal <- euclid (analytical)
+// Coordinate differential M: normal <- euclid (analytical, sensor block only)
 // ===========================================================================
 
-/// Build the analytical M matrix such that eps_normal = M @ eps_euc at eps=0.
-fn build_m_analytical(xi0: &VIOState) -> DMatrix<f64> {
-    let dim = xi0.dim();
-    let s = VIOSensorState::CDIM;
-    let mut m = DMatrix::<f64>::identity(dim, dim);
+/// Build only the 21x21 sensor block of M (eps_normal_sensor = M_s @ eps_euc_sensor at eps=0).
+/// The full M is block-diagonal: diag(M_s, conv_euc2normal(q0_1), ..., conv_euc2normal(q0_n)),
+/// so we never materialize the full matrix or invert it as a whole.
+fn build_m_sensor(xi0: &VIOState) -> nalgebra::SMatrix<f64, 21, 21> {
+    let mut m = nalgebra::SMatrix::<f64, 21, 21>::identity();
 
-    // Sensor block (indices 6:21):
     // v_A(12:15) <- theta_pose(6:9): -skew(vel0)
     let vel0 = xi0.sensor.velocity;
     m[(12, 7)] = vel0[2];
@@ -178,20 +177,13 @@ fn build_m_analytical(xi0: &VIOState) -> DMatrix<f64> {
     m[(13, 8)] = vel0[0];
     m[(14, 6)] = vel0[1];
     m[(14, 7)] = -vel0[0];
+
     // SE3.log(B) (15:21) <- (theta_pose, x_pose) (6:12): Ad_{Tc0^{-1}}
     let ad_tc_inv = xi0.sensor.camera_offset.inverse().adjoint();
     for i in 0..6 {
         for j in 0..6 {
             m[(15 + i, 6 + j)] = ad_tc_inv[(i, j)];
         }
-    }
-
-    // Landmark blocks
-    let n = xi0.camera_landmarks.len();
-    for i in 0..n {
-        let q0 = xi0.camera_landmarks[i].p;
-        let block = conv_euc2normal(&q0);
-        m.fixed_view_mut::<3, 3>(s + 3 * i, s + 3 * i).copy_from(&block);
     }
 
     m
@@ -244,18 +236,69 @@ impl EqFCoordinateSuite for NormalSuite {
     }
 
     fn state_matrix_a(&self, x: &VIOGroup, xi0: &VIOState, imu_vel: &IMUVelocity) -> DMatrix<f64> {
-        // A_normal = M @ A_euc @ M^{-1}
-        let m = build_m_analytical(xi0);
+        // A_normal = M @ A_euc @ M^{-1}, exploiting block-diagonal M.
+        // A_euc has only sensor-sensor, landmark<-sensor, and landmark-self (diagonal) non-zero blocks,
+        // so the conjugation reduces to a 21x21 sensor block transform plus per-landmark 3x21 / 3x3 transforms.
         let a_euc = EuclideanSuite.state_matrix_a(x, xi0, imu_vel);
-        let m_inv = m.clone().try_inverse().expect("M must be invertible");
-        &m * a_euc * m_inv
+        let n = xi0.camera_landmarks.len();
+        let s = VIOSensorState::CDIM;
+        let dim = xi0.dim();
+
+        let m_s = build_m_sensor(xi0);
+        let m_s_inv = m_s.try_inverse().expect("M_s must be invertible");
+
+        let mut a_normal = DMatrix::<f64>::zeros(dim, dim);
+
+        // Sensor-sensor block: M_s * A_ss * M_s^{-1}
+        let a_ss = a_euc.fixed_view::<21, 21>(0, 0).into_owned();
+        let new_ss = m_s * a_ss * m_s_inv;
+        a_normal.fixed_view_mut::<21, 21>(0, 0).copy_from(&new_ss);
+
+        for i in 0..n {
+            let q0 = xi0.camera_landmarks[i].p;
+            let m_e2n = conv_euc2normal(&q0);
+            let m_n2e = conv_normal2euc(&q0);
+
+            // Landmark<-sensor row: M_e2n * A[lm_i, sensor] * M_s^{-1}
+            let a_li_s = a_euc.fixed_view::<3, 21>(s + 3 * i, 0).into_owned();
+            let new_li_s = m_e2n * a_li_s * m_s_inv;
+            a_normal.fixed_view_mut::<3, 21>(s + 3 * i, 0).copy_from(&new_li_s);
+
+            // Landmark<-self diagonal: M_e2n * A[lm_i, lm_i] * M_n2e
+            let a_li_li = a_euc.fixed_view::<3, 3>(s + 3 * i, s + 3 * i).into_owned();
+            let new_li_li = m_e2n * a_li_li * m_n2e;
+            a_normal.fixed_view_mut::<3, 3>(s + 3 * i, s + 3 * i).copy_from(&new_li_li);
+        }
+
+        a_normal
     }
 
     fn input_matrix_b(&self, x: &VIOGroup, xi0: &VIOState) -> DMatrix<f64> {
-        // B_normal = M @ B_euc
-        let m = build_m_analytical(xi0);
+        // B_normal = M @ B_euc, applied block-wise.
         let b_euc = EuclideanSuite.input_matrix_b(x, xi0);
-        &m * b_euc
+        let n = xi0.camera_landmarks.len();
+        let s = VIOSensorState::CDIM;
+        let dim = xi0.dim();
+
+        let m_s = build_m_sensor(xi0);
+
+        let mut b_normal = DMatrix::<f64>::zeros(dim, 12);
+
+        // Sensor block: M_s * B_ss
+        let b_ss = b_euc.fixed_view::<21, 12>(0, 0).into_owned();
+        let new_ss = m_s * b_ss;
+        b_normal.fixed_view_mut::<21, 12>(0, 0).copy_from(&new_ss);
+
+        for i in 0..n {
+            let q0 = xi0.camera_landmarks[i].p;
+            let m_e2n = conv_euc2normal(&q0);
+
+            let b_li = b_euc.fixed_view::<3, 12>(s + 3 * i, 0).into_owned();
+            let new_li = m_e2n * b_li;
+            b_normal.fixed_view_mut::<3, 12>(s + 3 * i, 0).copy_from(&new_li);
+        }
+
+        b_normal
     }
 
     fn output_matrix_ci_star(&self, q0: &Vector3<f64>, q_hat: &SOT3, cam: &dyn CameraModel, y: &Vector2<f64>) -> Matrix2x3<f64> {
@@ -278,10 +321,31 @@ impl EqFCoordinateSuite for NormalSuite {
     }
 
     fn lift_innovation(&self, total_innovation: &DVector<f64>, xi0: &VIOState) -> VIOAlgebra {
-        // Continuous lift: M^{-1} @ innovation -> Euclidean lift
-        let m = build_m_analytical(xi0);
-        let m_inv = m.try_inverse().expect("M must be invertible");
-        let inn_euc = &m_inv * total_innovation;
+        // Continuous lift: convert normal-coord innovation to Euclidean coords block-wise,
+        // then call the Euclidean lift.
+        let s = VIOSensorState::CDIM;
+        let n = xi0.camera_landmarks.len();
+        let dim = xi0.dim();
+
+        let m_s = build_m_sensor(xi0);
+        let m_s_inv = m_s.try_inverse().expect("M_s must be invertible");
+
+        let mut inn_euc = DVector::<f64>::zeros(dim);
+
+        // Sensor part: M_s^{-1} * innovation_sensor
+        let inn_s = total_innovation.fixed_rows::<21>(0).into_owned();
+        let inn_euc_s = m_s_inv * inn_s;
+        inn_euc.fixed_rows_mut::<21>(0).copy_from(&inn_euc_s);
+
+        // Landmark parts: conv_normal2euc(q0_i) * innovation_lm_i
+        for i in 0..n {
+            let q0 = xi0.camera_landmarks[i].p;
+            let m_n2e = conv_normal2euc(&q0);
+            let inn_lm = total_innovation.fixed_rows::<3>(s + 3 * i).into_owned();
+            let inn_euc_lm = m_n2e * inn_lm;
+            inn_euc.fixed_rows_mut::<3>(s + 3 * i).copy_from(&inn_euc_lm);
+        }
+
         EuclideanSuite.lift_innovation(&inn_euc, xi0)
     }
 
