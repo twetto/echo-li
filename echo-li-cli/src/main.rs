@@ -414,7 +414,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize Rudolf-V Frontend
     let mut frontend_config = FrontendConfig::default();
     if let Some(conf) = &vio_config {
-        frontend_config.max_features = conf.eqf.max_features;
+        frontend_config.max_features = conf.rudolf_v.max_features;
         frontend_config.pyramid_levels = conf.rudolf_v.max_level;
         if conf.rudolf_v.equalise_image_histogram {
             frontend_config.histeq = rudolf_v::histeq::HistEqMethod::Global;

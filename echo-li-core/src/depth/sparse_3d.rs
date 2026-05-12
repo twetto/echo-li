@@ -143,6 +143,12 @@ impl Sparse3DFilter {
                 continue;
             }
 
+            if !self.pending.contains_key(&fid)
+                && self.features.len() + self.pending.len() >= self.settings.max_pool_size
+            {
+                continue;
+            }
+
             let pending = self
                 .pending
                 .entry(fid)
@@ -152,10 +158,6 @@ impl Sparse3DFilter {
                     ref_stamp: self.prev_stamp,
                 })
                 .clone();
-
-            if self.features.len() + self.pending.len() > self.settings.max_pool_size {
-                continue;
-            }
 
             let t_curr_ref = t_cw_curr * pending.ref_t_wc;
             let r_ref = t_curr_ref.fixed_view::<3, 3>(0, 0).into_owned();

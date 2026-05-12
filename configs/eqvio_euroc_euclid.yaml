@@ -1,11 +1,12 @@
 RudolfV:
   equaliseImageHistogram: true
   # useFastFeatures: false
-  featureDist: 128.0
-  # featureDist: 20.0
+  # featureDist: 128.0
+  featureDist: 16.0
   featureSearchThreshold: 0.8
   # maxError: 50.0
-  maxFeatures: 40  # LK tracker pool (feeds sparse_vog). EqF cap is --max-features.
+  # maxFeatures: 40  # LK tracker pool (feeds sparse_vog). EqF cap is --max-features.
+  maxFeatures: 1410
   maxLevel: 3
   # minHarrisQuality: 0.05
   # ransacParams:
@@ -13,7 +14,7 @@ RudolfV:
     # maxIterations: 30
     # minDataPoints: 5
     # minInliers: 15
-  # trackedFeatureDist: 15.0
+  trackedFeatureDist: 16.0
   # winSize: 21
 eqf:
   maxFeatures: 40           # core EqF landmark cap
@@ -69,9 +70,9 @@ main:
 SparseVog:
   # Per-feature Vogiatzis filter.
   # parametrization: euclidean, invdepth, polar (1D scalar)
-  #                   polar3d (3D Local IEKF on Normal chart)
+  #                  invdepth3d, polar3d (3D Local IEKF on Normal chart)
   parametrization: invdepth3d
-  max_pool_size: 300
+  max_pool_size: 1410
   min_track_length: 5
   conv_inlier_ratio: 0.7        # a/(a+b) gate for query()
   conv_variance_threshold: 0.02 # var(z) gate for query()

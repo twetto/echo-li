@@ -9353,6 +9353,7 @@ dependencies = [
  "minifb",
  "nalgebra",
  "pollster 0.3.0",
+ "rayon",
  "wgpu 22.1.0",
 ]
 
