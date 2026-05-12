@@ -1,27 +1,28 @@
-pub mod mathematical;
-pub mod dataserver;
-pub mod coordinate_suite;
-pub mod depth;
-pub mod initialization;
 pub mod alignment;
 pub mod config;
+pub mod coordinate_suite;
+pub mod core_types;
+pub mod dataserver;
+pub mod depth;
+pub mod initialization;
+pub mod mathematical;
 
 #[cfg(test)]
 pub mod tests;
 
-use std::collections::{HashMap, HashSet};
-use nalgebra::{DMatrix, Vector2, Vector3, Matrix3, SMatrix};
 use echo_lie::SO3;
+use nalgebra::{DMatrix, Matrix3, SMatrix, Vector2, Vector3};
+use std::collections::{HashMap, HashSet};
 
-use crate::mathematical::vio_state::{VIOState, VIOSensorState, Landmark};
-use crate::mathematical::vio_eqf::VIOEqF;
-use crate::mathematical::eqf_matrices::EqFCoordinateSuite;
-use crate::mathematical::camera::CameraModel;
-use crate::mathematical::imu_velocity::IMUVelocity;
-use crate::mathematical::vision_measurement::VisionMeasurement;
 use crate::coordinate_suite::euclid::EuclideanSuite;
 use crate::coordinate_suite::invdepth::InvDepthSuite;
 use crate::coordinate_suite::normal::NormalSuite;
+use crate::mathematical::camera::CameraModel;
+use crate::mathematical::eqf_matrices::EqFCoordinateSuite;
+use crate::mathematical::imu_velocity::IMUVelocity;
+use crate::mathematical::vio_eqf::VIOEqF;
+use crate::mathematical::vio_state::{Landmark, VIOSensorState, VIOState};
+use crate::mathematical::vision_measurement::VisionMeasurement;
 
 // ---------------------------------------------------------------------------
 // Settings (matches Python VIOFilterSettings)
@@ -110,10 +111,14 @@ impl Default for VIOFilterSettings {
 impl VIOFilterSettings {
     pub fn input_gain_matrix(&self) -> SMatrix<f64, 12, 12> {
         let mut q = SMatrix::<f64, 12, 12>::zeros();
-        q.fixed_view_mut::<3, 3>(0, 0).copy_from(&(Matrix3::identity() * self.sigma_gyroscope.powi(2)));
-        q.fixed_view_mut::<3, 3>(3, 3).copy_from(&(Matrix3::identity() * self.sigma_accelerometer.powi(2)));
-        q.fixed_view_mut::<3, 3>(6, 6).copy_from(&(Matrix3::identity() * self.sigma_gyroscope_bias.powi(2)));
-        q.fixed_view_mut::<3, 3>(9, 9).copy_from(&(Matrix3::identity() * self.sigma_accelerometer_bias.powi(2)));
+        q.fixed_view_mut::<3, 3>(0, 0)
+            .copy_from(&(Matrix3::identity() * self.sigma_gyroscope.powi(2)));
+        q.fixed_view_mut::<3, 3>(3, 3)
+            .copy_from(&(Matrix3::identity() * self.sigma_accelerometer.powi(2)));
+        q.fixed_view_mut::<3, 3>(6, 6)
+            .copy_from(&(Matrix3::identity() * self.sigma_gyroscope_bias.powi(2)));
+        q.fixed_view_mut::<3, 3>(9, 9)
+            .copy_from(&(Matrix3::identity() * self.sigma_accelerometer_bias.powi(2)));
         q
     }
 
@@ -126,17 +131,33 @@ impl VIOFilterSettings {
         let dim = s + 3 * n_landmarks;
         let mut sigma = DMatrix::<f64>::zeros(dim, dim);
 
-        sigma.fixed_view_mut::<3, 3>(0, 0).copy_from(&(Matrix3::identity() * self.initial_bias_omega_variance));
-        sigma.fixed_view_mut::<3, 3>(3, 3).copy_from(&(Matrix3::identity() * self.initial_bias_accel_variance));
-        sigma.fixed_view_mut::<3, 3>(6, 6).copy_from(&(Matrix3::identity() * self.initial_attitude_variance));
-        sigma.fixed_view_mut::<3, 3>(9, 9).copy_from(&(Matrix3::identity() * self.initial_position_variance));
-        sigma.fixed_view_mut::<3, 3>(12, 12).copy_from(&(Matrix3::identity() * self.initial_velocity_variance));
-        sigma.fixed_view_mut::<3, 3>(15, 15).copy_from(&(Matrix3::identity() * self.initial_camera_attitude_variance));
-        sigma.fixed_view_mut::<3, 3>(18, 18).copy_from(&(Matrix3::identity() * self.initial_camera_position_variance));
+        sigma
+            .fixed_view_mut::<3, 3>(0, 0)
+            .copy_from(&(Matrix3::identity() * self.initial_bias_omega_variance));
+        sigma
+            .fixed_view_mut::<3, 3>(3, 3)
+            .copy_from(&(Matrix3::identity() * self.initial_bias_accel_variance));
+        sigma
+            .fixed_view_mut::<3, 3>(6, 6)
+            .copy_from(&(Matrix3::identity() * self.initial_attitude_variance));
+        sigma
+            .fixed_view_mut::<3, 3>(9, 9)
+            .copy_from(&(Matrix3::identity() * self.initial_position_variance));
+        sigma
+            .fixed_view_mut::<3, 3>(12, 12)
+            .copy_from(&(Matrix3::identity() * self.initial_velocity_variance));
+        sigma
+            .fixed_view_mut::<3, 3>(15, 15)
+            .copy_from(&(Matrix3::identity() * self.initial_camera_attitude_variance));
+        sigma
+            .fixed_view_mut::<3, 3>(18, 18)
+            .copy_from(&(Matrix3::identity() * self.initial_camera_position_variance));
 
         for i in 0..n_landmarks {
             let start = s + 3 * i;
-            sigma.fixed_view_mut::<3, 3>(start, start).copy_from(&(Matrix3::identity() * self.initial_point_variance));
+            sigma
+                .fixed_view_mut::<3, 3>(start, start)
+                .copy_from(&(Matrix3::identity() * self.initial_point_variance));
         }
         sigma
     }
@@ -146,16 +167,32 @@ impl VIOFilterSettings {
         let dim = s + 3 * n_landmarks;
         let mut q = DMatrix::<f64>::zeros(dim, dim);
 
-        for k in 0..3 { q[(k, k)] = self.process_bias_gyr; }
-        for k in 3..6 { q[(k, k)] = self.process_bias_acc; }
-        for k in 6..9 { q[(k, k)] = self.process_attitude; }
-        for k in 9..12 { q[(k, k)] = self.process_position; }
-        for k in 12..15 { q[(k, k)] = self.process_velocity; }
-        for k in 15..18 { q[(k, k)] = self.process_camera_attitude; }
-        for k in 18..21 { q[(k, k)] = self.process_camera_position; }
+        for k in 0..3 {
+            q[(k, k)] = self.process_bias_gyr;
+        }
+        for k in 3..6 {
+            q[(k, k)] = self.process_bias_acc;
+        }
+        for k in 6..9 {
+            q[(k, k)] = self.process_attitude;
+        }
+        for k in 9..12 {
+            q[(k, k)] = self.process_position;
+        }
+        for k in 12..15 {
+            q[(k, k)] = self.process_velocity;
+        }
+        for k in 15..18 {
+            q[(k, k)] = self.process_camera_attitude;
+        }
+        for k in 18..21 {
+            q[(k, k)] = self.process_camera_position;
+        }
         for i in 0..n_landmarks {
             let start = s + 3 * i;
-            for k in 0..3 { q[(start + k, start + k)] = self.process_point; }
+            for k in 0..3 {
+                q[(start + k, start + k)] = self.process_point;
+            }
         }
         q
     }
@@ -178,11 +215,12 @@ pub struct VIOFilter {
 
 impl VIOFilter {
     pub fn new(settings: VIOFilterSettings, xi0: VIOState) -> Self {
-        let suite: Box<dyn EqFCoordinateSuite> = match settings.coordinate_choice.to_lowercase().as_str() {
-            "euclidean" => Box::new(EuclideanSuite),
-            "invdepth" => Box::new(InvDepthSuite::new()),
-            _ => Box::new(NormalSuite::new()),
-        };
+        let suite: Box<dyn EqFCoordinateSuite> =
+            match settings.coordinate_choice.to_lowercase().as_str() {
+                "euclidean" => Box::new(EuclideanSuite),
+                "invdepth" => Box::new(InvDepthSuite::new()),
+                _ => Box::new(NormalSuite::new()),
+            };
 
         let input_gain = settings.input_gain_matrix();
         let n_lm = xi0.camera_landmarks.len();
@@ -212,10 +250,13 @@ impl VIOFilter {
         }
 
         let dt = imu.stamp - self.eqf.current_time;
-        if dt <= 0.0 { return; }
+        if dt <= 0.0 {
+            return;
+        }
 
         // 1. Propagate observer state (updates X)
-        self.eqf.integrate_observer_state(&imu, dt, self.settings.use_discrete_velocity_lift);
+        self.eqf
+            .integrate_observer_state(&imu, dt, self.settings.use_discrete_velocity_lift);
 
         // Remove landmarks that became degenerate during propagation
         let n_before = self.eqf.x.id.len();
@@ -226,7 +267,11 @@ impl VIOFilter {
 
         // 2. Propagate Riccati (uses updated X)
         self.eqf.integrate_riccati_fast(
-            self.suite.as_ref(), &imu, dt, &self.input_gain, &self.state_gain,
+            self.suite.as_ref(),
+            &imu,
+            dt,
+            &self.input_gain,
+            &self.state_gain,
         );
 
         self.eqf.current_time = imu.stamp;
@@ -247,12 +292,10 @@ impl VIOFilter {
     // Vision processing (matches Python process_vision)
     // ------------------------------------------------------------------
 
-    pub fn process_vision(
-        &mut self,
-        measurement: VisionMeasurement,
-        cam: &dyn CameraModel,
-    ) {
-        if self.eqf.current_time < 0.0 { return; }
+    pub fn process_vision(&mut self, measurement: VisionMeasurement, cam: &dyn CameraModel) {
+        if self.eqf.current_time < 0.0 {
+            return;
+        }
 
         let current_ids: HashSet<u64> = self.eqf.x.id.iter().cloned().collect();
         let observed_ids: HashSet<u64> = measurement.cam_coordinates.keys().cloned().collect();
@@ -272,11 +315,16 @@ impl VIOFilter {
 
         // --- Add new landmarks ---
         let current_ids_after: HashSet<u64> = self.eqf.x.id.iter().cloned().collect();
-        let new_ids: Vec<u64> = observed_ids.difference(&current_ids_after).cloned().collect();
+        let new_ids: Vec<u64> = observed_ids
+            .difference(&current_ids_after)
+            .cloned()
+            .collect();
 
         let mut new_landmarks = Vec::new();
         for &id in &new_ids {
-            if self.eqf.x.id.len() + new_landmarks.len() >= self.settings.max_landmarks { break; }
+            if self.eqf.x.id.len() + new_landmarks.len() >= self.settings.max_landmarks {
+                break;
+            }
             let uv = measurement.cam_coordinates.get(&id).unwrap();
             let bearing = cam.undistort(&Vector2::new(uv[0] as f64, uv[1] as f64));
             let p = bearing * self.settings.initial_scene_depth;
@@ -287,7 +335,8 @@ impl VIOFilter {
             let n_new = new_landmarks.len();
             let mut new_cov = DMatrix::<f64>::zeros(3 * n_new, 3 * n_new);
             for i in 0..n_new {
-                new_cov.fixed_view_mut::<3, 3>(3 * i, 3 * i)
+                new_cov
+                    .fixed_view_mut::<3, 3>(3 * i, 3 * i)
                     .copy_from(&(Matrix3::identity() * self.settings.initial_point_variance));
             }
             self.eqf.add_new_landmarks(new_landmarks, &new_cov);

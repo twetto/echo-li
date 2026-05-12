@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use nalgebra::{Matrix3, Matrix4, Vector2, Vector3};
+use std::collections::HashMap;
 
 use crate::mathematical::VisionMeasurement;
 
@@ -35,6 +35,7 @@ pub struct SparseVogSettings {
     pub min_cos_sim: f64,
     pub min_depth: f64,
     pub max_depth: f64,
+    pub reanchor_flow_px: f64,
 }
 
 impl Default for SparseVogSettings {
@@ -63,6 +64,7 @@ impl Default for SparseVogSettings {
             min_cos_sim: 0.95,
             min_depth: 0.1,
             max_depth: 100.0,
+            reanchor_flow_px: 3.0,
         }
     }
 }
@@ -88,7 +90,7 @@ pub struct SparseGBFilter {
     k: Matrix3<f64>,
     settings: SparseVogSettings,
     sigma_norm_sq: f64,
-    
+
     features: HashMap<u64, FeatureState>,
     prev_uvs: HashMap<u64, Vector2<f64>>,
     prev_t_wc: Option<Matrix4<f64>>,
@@ -117,7 +119,9 @@ impl SparseGBFilter {
         p_vv: Option<&Matrix3<f64>>,
     ) {
         let stamp = measurement.stamp;
-        let curr_uvs: HashMap<u64, Vector2<f64>> = measurement.cam_coordinates.iter()
+        let curr_uvs: HashMap<u64, Vector2<f64>> = measurement
+            .cam_coordinates
+            .iter()
             .map(|(&id, &uv)| (id, Vector2::new(uv[0] as f64, uv[1] as f64)))
             .collect();
 
@@ -130,7 +134,7 @@ impl SparseGBFilter {
 
         let dt = (stamp - self.prev_stamp).max(0.0);
         let t_wc_prev = self.prev_t_wc.as_ref().unwrap();
-        
+
         let t_cw_curr = t_wc.try_inverse().unwrap_or_else(Matrix4::identity);
         let t_curr_prev = t_cw_curr * t_wc_prev;
         let r = t_curr_prev.fixed_view::<3, 3>(0, 0).into_owned();
@@ -138,35 +142,67 @@ impl SparseGBFilter {
 
         for (&fid, &uv_curr) in &curr_uvs {
             if let Some(&uv_prev) = self.prev_uvs.get(&fid) {
-                let (z_obs, drive) = triangulate_pixel(&self.k, &self.settings, &uv_prev, &uv_curr, &r, &t);
-                
+                let (z_obs, drive) =
+                    triangulate_pixel(&self.k, &self.settings, &uv_prev, &uv_curr, &r, &t);
+
                 if let Some(feat) = self.features.get_mut(&fid) {
                     if feat.canonical > 0.0 {
-                        predict_feature_state(&self.k, &self.settings, feat, &uv_prev, &r, &t, p_vv, dt);
+                        predict_feature_state(
+                            &self.k,
+                            &self.settings,
+                            feat,
+                            &uv_prev,
+                            &r,
+                            &t,
+                            p_vv,
+                            dt,
+                        );
                     }
                 }
 
-                if z_obs <= 0.0 { continue; }
+                if z_obs <= 0.0 {
+                    continue;
+                }
 
                 if let Some(feat) = self.features.get_mut(&fid) {
                     if feat.canonical <= 0.0 {
                         feat.canonical = depth_to_canonical(&self.settings, z_obs);
-                        feat.canonical_var = depth_var_to_canonical_var(&self.settings, z_obs, self.settings.init_depth_var);
+                        feat.canonical_var = depth_var_to_canonical_var(
+                            &self.settings,
+                            z_obs,
+                            self.settings.init_depth_var,
+                        );
                         feat.a = self.settings.a_init;
                         feat.b = self.settings.b_init;
                     }
-                    vogiatzis_update_feature_state(&self.settings, self.sigma_norm_sq, feat, z_obs, drive);
+                    vogiatzis_update_feature_state(
+                        &self.settings,
+                        self.sigma_norm_sq,
+                        feat,
+                        z_obs,
+                        drive,
+                    );
                     feat.track_length += 1;
                 } else if self.features.len() < self.settings.max_pool_size {
                     let mut feat = FeatureState {
                         feat_id: fid,
                         canonical: depth_to_canonical(&self.settings, z_obs),
-                        canonical_var: depth_var_to_canonical_var(&self.settings, z_obs, self.settings.init_depth_var),
+                        canonical_var: depth_var_to_canonical_var(
+                            &self.settings,
+                            z_obs,
+                            self.settings.init_depth_var,
+                        ),
                         a: self.settings.a_init,
                         b: self.settings.b_init,
                         track_length: 1,
                     };
-                    vogiatzis_update_feature_state(&self.settings, self.sigma_norm_sq, &mut feat, z_obs, drive);
+                    vogiatzis_update_feature_state(
+                        &self.settings,
+                        self.sigma_norm_sq,
+                        &mut feat,
+                        z_obs,
+                        drive,
+                    );
                     self.features.insert(fid, feat);
                 }
             }
@@ -183,7 +219,9 @@ impl SparseGBFilter {
             if feat.canonical <= 0.0 || feat.track_length < self.settings.min_track_length {
                 return (-1.0, f64::INFINITY);
             }
-            if feat.inlier_ratio() < self.settings.conv_inlier_ratio || feat.canonical_var > self.settings.conv_variance_threshold {
+            if feat.inlier_ratio() < self.settings.conv_inlier_ratio
+                || feat.canonical_var > self.settings.conv_variance_threshold
+            {
                 return (-1.0, f64::INFINITY);
             }
             let depth = canonical_to_depth(&self.settings, feat.canonical);
@@ -199,7 +237,14 @@ impl SparseGBFilter {
     }
 }
 
-fn triangulate_pixel(k: &Matrix3<f64>, settings: &SparseVogSettings, uv_prev: &Vector2<f64>, uv_curr: &Vector2<f64>, r: &Matrix3<f64>, t: &Vector3<f64>) -> (f64, f64) {
+fn triangulate_pixel(
+    k: &Matrix3<f64>,
+    settings: &SparseVogSettings,
+    uv_prev: &Vector2<f64>,
+    uv_curr: &Vector2<f64>,
+    r: &Matrix3<f64>,
+    t: &Vector3<f64>,
+) -> (f64, f64) {
     let fx = k[(0, 0)];
     let fy = k[(1, 1)];
     let cx = k[(0, 2)];
@@ -212,7 +257,9 @@ fn triangulate_pixel(k: &Matrix3<f64>, settings: &SparseVogSettings, uv_prev: &V
 
     let bearing_prev = Vector3::new(x_prev, y_prev, 1.0);
     let aligned = r * bearing_prev;
-    if aligned[2] <= 1e-6 { return (-1.0, 0.0); }
+    if aligned[2] <= 1e-6 {
+        return (-1.0, 0.0);
+    }
 
     let x_prev_rect = aligned[0] / aligned[2];
     let y_prev_rect = aligned[1] / aligned[2];
@@ -226,21 +273,38 @@ fn triangulate_pixel(k: &Matrix3<f64>, settings: &SparseVogSettings, uv_prev: &V
     let ideal_mag = geom_mag_sq.sqrt();
     let obs_mag = (den_x * den_x + den_y * den_y).sqrt();
 
-    if ideal_mag < settings.min_parallax || obs_mag < 1e-6 { return (-1.0, 0.0); }
+    if ideal_mag < settings.min_parallax || obs_mag < 1e-6 {
+        return (-1.0, 0.0);
+    }
 
     let dot = num_x * den_x + num_y * den_y;
-    if dot <= 1e-6 { return (-1.0, 0.0); }
+    if dot <= 1e-6 {
+        return (-1.0, 0.0);
+    }
 
     let cos_sim = dot / (ideal_mag * obs_mag);
-    if cos_sim < settings.min_cos_sim { return (-1.0, 0.0); }
+    if cos_sim < settings.min_cos_sim {
+        return (-1.0, 0.0);
+    }
 
     let z_curr = geom_mag_sq / dot;
-    if z_curr < settings.min_depth || z_curr > settings.max_depth { return (-1.0, 0.0); }
+    if z_curr < settings.min_depth || z_curr > settings.max_depth {
+        return (-1.0, 0.0);
+    }
 
     (z_curr, ideal_mag)
 }
 
-fn predict_feature_state(k: &Matrix3<f64>, settings: &SparseVogSettings, feat: &mut FeatureState, uv_prev: &Vector2<f64>, r: &Matrix3<f64>, t: &Vector3<f64>, p_vv: Option<&Matrix3<f64>>, dt: f64) {
+fn predict_feature_state(
+    k: &Matrix3<f64>,
+    settings: &SparseVogSettings,
+    feat: &mut FeatureState,
+    uv_prev: &Vector2<f64>,
+    r: &Matrix3<f64>,
+    t: &Vector3<f64>,
+    p_vv: Option<&Matrix3<f64>>,
+    dt: f64,
+) {
     let fx = k[(0, 0)];
     let fy = k[(1, 1)];
     let cx = k[(0, 2)];
@@ -269,8 +333,12 @@ fn predict_feature_state(k: &Matrix3<f64>, settings: &SparseVogSettings, feat: &
     if let Some(p_vv) = p_vv {
         if dt > 0.0 {
             let b_norm_sq = x * x + y * y + 1.0;
-            let num = x * x * p_vv[(0, 0)] + y * y * p_vv[(1, 1)] + p_vv[(2, 2)]
-                    + 2.0 * x * y * p_vv[(0, 1)] + 2.0 * x * p_vv[(0, 2)] + 2.0 * y * p_vv[(1, 2)];
+            let num = x * x * p_vv[(0, 0)]
+                + y * y * p_vv[(1, 1)]
+                + p_vv[(2, 2)]
+                + 2.0 * x * y * p_vv[(0, 1)]
+                + 2.0 * x * p_vv[(0, 2)]
+                + 2.0 * y * p_vv[(1, 2)];
             let sigma_v_along = num / b_norm_sq;
             let q_z = dt * dt * sigma_v_along;
             var_new += match settings.parametrization {
@@ -287,7 +355,13 @@ fn predict_feature_state(k: &Matrix3<f64>, settings: &SparseVogSettings, feat: &
     feat.canonical_var = var_new.max(1e-8);
 }
 
-fn vogiatzis_update_feature_state(settings: &SparseVogSettings, sigma_norm_sq: f64, feat: &mut FeatureState, z_obs: f64, drive: f64) {
+fn vogiatzis_update_feature_state(
+    settings: &SparseVogSettings,
+    sigma_norm_sq: f64,
+    feat: &mut FeatureState,
+    z_obs: f64,
+    drive: f64,
+) {
     let obs = depth_to_canonical(settings, z_obs);
     let tau_sq = match settings.parametrization {
         DepthParametrization::Euclidean => (z_obs.powi(2) * sigma_norm_sq) / (drive * drive),
@@ -303,7 +377,11 @@ fn vogiatzis_update_feature_state(settings: &SparseVogSettings, sigma_norm_sq: f
     let s_total = sigma_sq + tau_sq;
     let m_dist_sq = (obs - mu).powi(2) / s_total;
 
-    if settings.mahalanobis_reset_chi2 > 0.0 && (a + b) > 0.0 && (a / (a + b)) < settings.min_inlier_ratio && m_dist_sq > settings.mahalanobis_reset_chi2 {
+    if settings.mahalanobis_reset_chi2 > 0.0
+        && (a + b) > 0.0
+        && (a / (a + b)) < settings.min_inlier_ratio
+        && m_dist_sq > settings.mahalanobis_reset_chi2
+    {
         feat.canonical = obs;
         feat.canonical_var = tau_sq;
         feat.a = settings.a_init;
@@ -314,7 +392,11 @@ fn vogiatzis_update_feature_state(settings: &SparseVogSettings, sigma_norm_sq: f
     let m = (mu * tau_sq + obs * sigma_sq) / s_total;
     let s_sq = (sigma_sq * tau_sq) / s_total;
 
-    let gauss_pdf = if m_dist_sq > 100.0 { 0.0 } else { (-0.5 * m_dist_sq).exp() / (2.0 * std::f64::consts::PI * s_total).sqrt() };
+    let gauss_pdf = if m_dist_sq > 100.0 {
+        0.0
+    } else {
+        (-0.5 * m_dist_sq).exp() / (2.0 * std::f64::consts::PI * s_total).sqrt()
+    };
     let u_prior = match settings.parametrization {
         DepthParametrization::Euclidean => 1.0 / settings.uniform_z_max,
         DepthParametrization::InvDepth => 1.0 / settings.uniform_rho_max,

@@ -13,3 +13,5 @@ continue_*.sh
 *_ref/
 docs/
 eqvio_output*/
+profile*
+run.sh

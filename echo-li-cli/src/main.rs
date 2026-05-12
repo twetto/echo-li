@@ -1,11 +1,13 @@
 use clap::Parser;
 use echo_li_core::config::VIOConfig;
 use echo_li_core::dataserver::ASLDatasetReader;
+use echo_li_core::depth::sparse_3d::{Sparse3DChart, Sparse3DFilter};
+use echo_li_core::depth::sparse_gb::SparseVogSettings;
 use echo_li_core::initialization::{check_stationary, estimate_initial_pose};
 use echo_li_core::mathematical::camera::{CameraModel, PinholeModel, RadTanModel};
 use echo_li_core::mathematical::*;
 use echo_li_core::{VIOFilter, VIOFilterSettings};
-use nalgebra::Vector2;
+use nalgebra::{Matrix3, Matrix4, Vector2};
 use rudolf_v::frontend::{Frontend, FrontendConfig};
 use rudolf_v::image::Image as RudolfImage;
 use rudolf_v::klt::LkMethod;
@@ -34,6 +36,14 @@ struct Args {
     /// Enable Rerun visualization (requires --features rerun)
     #[arg(long, default_value_t = false)]
     vis: bool,
+
+    /// Run the out-of-state sparse depth filter alongside EqVIO.
+    #[arg(long, default_value_t = true)]
+    sparse: bool,
+
+    /// Sparse filter chart: polar3d or invdepth3d.
+    #[arg(long, default_value = "polar3d")]
+    sparse_chart: String,
 }
 
 fn write_trajectory(path: &std::path::Path, entries: &[(f64, VIOState)]) -> std::io::Result<()> {
@@ -69,6 +79,242 @@ fn write_groundtruth(path: &std::path::Path, poses: &[StampedPose]) -> std::io::
             sp.stamp, pos[0], pos[1], pos[2], q[0], q[1], q[2], q[3]
         )?;
     }
+    Ok(())
+}
+
+fn parse_sparse_chart(name: &str) -> Sparse3DChart {
+    match name.to_ascii_lowercase().as_str() {
+        "invdepth" | "invdepth3d" | "inverse-depth" => Sparse3DChart::InvDepth,
+        _ => Sparse3DChart::Polar,
+    }
+}
+
+fn camera_pose_matrix(state: &VIOState) -> Matrix4<f64> {
+    state
+        .sensor
+        .pose
+        .compose(&state.sensor.camera_offset)
+        .as_matrix()
+}
+
+fn undistorted_pinhole_measurement(
+    stamp: f64,
+    raw_uvs: &HashMap<u64, Vector2<f32>>,
+    cam_model: &dyn CameraModel,
+    k: &Matrix3<f64>,
+) -> VisionMeasurement {
+    let fx = k[(0, 0)];
+    let fy = k[(1, 1)];
+    let cx = k[(0, 2)];
+    let cy = k[(1, 2)];
+    let mut undistorted_uvs = HashMap::with_capacity(raw_uvs.len());
+
+    for (&id, uv) in raw_uvs {
+        let raw = Vector2::new(uv[0] as f64, uv[1] as f64);
+        let bearing = cam_model.undistort(&raw);
+        if bearing[2].abs() <= 1e-12 {
+            continue;
+        }
+        let x = bearing[0] / bearing[2];
+        let y = bearing[1] / bearing[2];
+        undistorted_uvs.insert(id, Vector2::new((fx * x + cx) as f32, (fy * y + cy) as f32));
+    }
+
+    VisionMeasurement::new(stamp, undistorted_uvs)
+}
+
+#[cfg(feature = "rerun")]
+fn clip_image_point(x: f64, y: f64, img_w: usize, img_h: usize) -> Option<(f32, f32)> {
+    (x >= 0.0 && x < img_w as f64 && y >= 0.0 && y < img_h as f64).then_some((x as f32, y as f32))
+}
+
+#[cfg(feature = "rerun")]
+fn color_for_inverse_depth(invdepth: f64, min_invdepth: f64, max_invdepth: f64) -> u32 {
+    const JET: [(f64, u8, u8, u8); 5] = [
+        (0.0, 0, 0, 128),
+        (0.25, 0, 255, 255),
+        (0.5, 0, 255, 0),
+        (0.75, 255, 255, 0),
+        (1.0, 128, 0, 0),
+    ];
+
+    let t = if max_invdepth > min_invdepth {
+        ((invdepth - min_invdepth) / (max_invdepth - min_invdepth)).clamp(0.0, 1.0)
+    } else {
+        0.5
+    };
+
+    let idx = JET
+        .windows(2)
+        .position(|window| t <= window[1].0)
+        .unwrap_or(JET.len() - 2);
+    let (t0, r0, g0, b0) = JET[idx];
+    let (t1, r1, g1, b1) = JET[idx + 1];
+    let local_t = if t1 > t0 { (t - t0) / (t1 - t0) } else { 0.0 };
+    let lerp =
+        |a: u8, b: u8| -> u32 { (a as f64 + (b as f64 - a as f64) * local_t).round() as u32 };
+
+    (lerp(r0, r1) << 24) | (lerp(g0, g1) << 16) | (lerp(b0, b1) << 8) | 0xFF
+}
+
+#[cfg(feature = "rerun")]
+fn sparse_points_for_vis(
+    sparse_filter: &Sparse3DFilter,
+    cam_model: &dyn CameraModel,
+    p_cam: &nalgebra::Vector3<f64>,
+    r_cam: &echo_lie::SO3,
+    img_w: usize,
+    img_h: usize,
+) -> (Vec<(f32, f32)>, Vec<u32>, Vec<(f32, f32, f32)>, Vec<u32>) {
+    struct SparseVisPoint {
+        image_point: Option<(f32, f32)>,
+        world_point: (f32, f32, f32),
+        invdepth: f64,
+    }
+
+    let mut points = Vec::new();
+
+    for feat in sparse_filter.features().values() {
+        let q = feat.position;
+        if q[2] <= 1e-6 {
+            continue;
+        }
+
+        let uv = cam_model.project(&q);
+        let image_point = clip_image_point(uv[0], uv[1], img_w, img_h);
+        let p_world = p_cam + r_cam.act(&q);
+        points.push(SparseVisPoint {
+            image_point,
+            world_point: (p_world[0] as f32, p_world[1] as f32, p_world[2] as f32),
+            invdepth: 1.0 / q[2],
+        });
+    }
+
+    let mut image_points = Vec::new();
+    let mut image_colors = Vec::new();
+    let mut world_points = Vec::new();
+    let mut world_colors = Vec::new();
+
+    let min_invdepth = points
+        .iter()
+        .map(|point| point.invdepth)
+        .fold(f64::INFINITY, f64::min);
+    let max_invdepth = points
+        .iter()
+        .map(|point| point.invdepth)
+        .fold(f64::NEG_INFINITY, f64::max);
+
+    for point in points {
+        let color = color_for_inverse_depth(point.invdepth, min_invdepth, max_invdepth);
+        if let Some(image_point) = point.image_point {
+            image_points.push(image_point);
+            image_colors.push(color);
+        }
+        world_points.push(point.world_point);
+        world_colors.push(color);
+    }
+
+    (image_points, image_colors, world_points, world_colors)
+}
+
+#[cfg(feature = "rerun")]
+fn send_rerun_blueprint(
+    rec: &rerun::RecordingStream,
+    img_w: usize,
+    img_h: usize,
+) -> rerun::RecordingStreamResult<()> {
+    use rerun::external::re_log_types::{BlueprintActivationCommand, LogMsg, RecordingId};
+    use rerun::external::re_sdk_types::blueprint::archetypes::{
+        ContainerBlueprint, ViewBlueprint, ViewContents, ViewportBlueprint, VisualBounds2D,
+    };
+    use rerun::external::re_sdk_types::blueprint::components::{
+        AutoLayout, AutoViews, ContainerKind, IncludedContent, RootContainer, ViewOrigin,
+    };
+    use rerun::external::re_sdk_types::components::{Name, Visible};
+    use rerun::external::re_sdk_types::datatypes::{Bool, EntityPath, Range2D, Uuid};
+
+    let app_id = rec
+        .store_info()
+        .map(|info| info.application_id().to_string())
+        .unwrap_or_else(|| "echo-li".to_owned());
+
+    let (bp, storage) = rerun::RecordingStreamBuilder::new(app_id)
+        .recording_id(RecordingId::random())
+        .blueprint()
+        .memory()?;
+    bp.set_time_sequence("blueprint", 0);
+
+    let camera_view_id = Uuid::random();
+    let world_view_id = Uuid::random();
+    let root_container_id = Uuid::random();
+    let camera_view_path = format!("view/{camera_view_id}");
+    let world_view_path = format!("view/{world_view_id}");
+    let root_container_path = format!("container/{root_container_id}");
+
+    bp.log(
+        camera_view_path.as_str(),
+        &ViewBlueprint::new("2D")
+            .with_display_name(Name("Camera".into()))
+            .with_space_origin(ViewOrigin("camera".into()))
+            .with_visible(Visible(Bool(true))),
+    )?;
+    bp.log(
+        format!("{camera_view_path}/ViewContents"),
+        &ViewContents::new(["camera/**"]),
+    )?;
+    bp.log(
+        format!("{camera_view_path}/VisualBounds2D"),
+        &VisualBounds2D::new(Range2D {
+            x_range: [0.0, img_w as f64].into(),
+            y_range: [0.0, img_h as f64].into(),
+        }),
+    )?;
+
+    bp.log(
+        world_view_path.as_str(),
+        &ViewBlueprint::new("3D")
+            .with_display_name(Name("World".into()))
+            .with_space_origin(ViewOrigin("world".into()))
+            .with_visible(Visible(Bool(true))),
+    )?;
+    bp.log(
+        format!("{world_view_path}/ViewContents"),
+        &ViewContents::new(["world/**"]),
+    )?;
+
+    bp.log(
+        root_container_path.as_str(),
+        &ContainerBlueprint::new(ContainerKind::Horizontal).with_contents([
+            IncludedContent(EntityPath(camera_view_path.into())),
+            IncludedContent(EntityPath(world_view_path.into())),
+        ]),
+    )?;
+    bp.log(
+        "viewport",
+        &ViewportBlueprint::new()
+            .with_root_container(RootContainer(root_container_id))
+            .with_auto_layout(AutoLayout(Bool(false)))
+            .with_auto_views(AutoViews(Bool(false))),
+    )?;
+
+    let msgs = storage.take();
+    let blueprint_id = msgs
+        .first()
+        .and_then(|msg| match msg {
+            LogMsg::SetStoreInfo(info) => Some(info.info.store_id.clone()),
+            _ => None,
+        })
+        .expect("blueprint memory stream should contain SetStoreInfo");
+
+    rec.send_blueprint(
+        msgs,
+        BlueprintActivationCommand {
+            blueprint_id,
+            make_active: true,
+            make_default: true,
+        },
+    );
+
     Ok(())
 }
 
@@ -108,7 +354,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         settings.coordinate_choice, settings.max_landmarks
     );
 
-    let (cam_model, img_w, img_h): (Box<dyn CameraModel>, usize, usize) =
+    let (cam_model, k_matrix, img_w, img_h): (Box<dyn CameraModel>, Matrix3<f64>, usize, usize) =
         if let Some(intr) = &reader.intrinsics {
             println!(
                 "Camera intrinsics: {}x{} fx={:.1} fy={:.1} cx={:.1} cy={:.1}",
@@ -144,7 +390,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     })
                 }
             };
-            (model, intr.width, intr.height)
+            (
+                model,
+                Matrix3::new(intr.fx, 0.0, intr.cx, 0.0, intr.fy, intr.cy, 0.0, 0.0, 1.0),
+                intr.width,
+                intr.height,
+            )
         } else {
             println!("No intrinsics found, using EuRoC defaults");
             (
@@ -154,6 +405,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     cx: 367.2,
                     cy: 248.3,
                 }) as Box<dyn CameraModel>,
+                Matrix3::new(458.65, 0.0, 367.2, 0.0, 457.3, 248.3, 0.0, 0.0, 1.0),
                 752,
                 480,
             )
@@ -184,24 +436,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match rerun::RecordingStreamBuilder::new("echo-li").spawn() {
             Ok(r) => {
                 println!("Rerun viewer connected");
-
-                // Send blueprint: camera 2D + world 3D side by side
-                use rerun::blueprint::{
-                    Blueprint, ContainerLike, Horizontal, Spatial2DView, Spatial3DView,
-                };
-                let blueprint = Blueprint::new(Horizontal::new(vec![
-                    ContainerLike::from(
-                        Spatial2DView::new("Camera")
-                            .with_origin("camera")
-                            .with_contents(["camera/**"]),
-                    ),
-                    ContainerLike::from(
-                        Spatial3DView::new("World")
-                            .with_origin("world")
-                            .with_contents(["world/**"]),
-                    ),
-                ]));
-                blueprint.send(&r, Default::default()).ok();
+                send_rerun_blueprint(&r, img_w, img_h).ok();
 
                 Some(r)
             }
@@ -220,6 +455,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut filter: Option<VIOFilter> = None;
+    let mut sparse_filter = if let Some(conf) = &vio_config {
+        if let Some(sparse_conf) = &conf.sparse_vog {
+            if sparse_conf.enabled {
+                let sparse_chart = parse_sparse_chart(&sparse_conf.parametrization);
+                let sparse_settings = sparse_conf.to_sparse_settings();
+                println!(
+                    "Sparse filter: {:?}, max_pool_size={}",
+                    sparse_chart, sparse_settings.max_pool_size
+                );
+                Some(Sparse3DFilter::new(k_matrix, sparse_chart, sparse_settings))
+            } else {
+                println!("Sparse filter: disabled by config");
+                None
+            }
+        } else if args.sparse {
+            let sparse_chart = parse_sparse_chart(&args.sparse_chart);
+            let mut sparse_settings = SparseVogSettings::default();
+            sparse_settings.max_pool_size = tracker_max_features.max(300);
+            println!(
+                "Sparse filter: {:?}, max_pool_size={}",
+                sparse_chart, sparse_settings.max_pool_size
+            );
+            Some(Sparse3DFilter::new(k_matrix, sparse_chart, sparse_settings))
+        } else {
+            None
+        }
+    } else if args.sparse {
+        let sparse_chart = parse_sparse_chart(&args.sparse_chart);
+        let mut sparse_settings = SparseVogSettings::default();
+        sparse_settings.max_pool_size = tracker_max_features.max(300);
+        println!(
+            "Sparse filter: {:?}, max_pool_size={}",
+            sparse_chart, sparse_settings.max_pool_size
+        );
+        Some(Sparse3DFilter::new(k_matrix, sparse_chart, sparse_settings))
+    } else {
+        None
+    };
     let mut initial_imu = Vec::new();
     let mut initialized = false;
     let mut states_out: Vec<(f64, VIOState)> = Vec::new();
@@ -288,7 +561,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     #[cfg(feature = "rerun")]
                     let tracker_points: Vec<(f32, f32)> = features
                         .iter()
-                        .map(|feat| (feat.x as f32, feat.y as f32))
+                        .filter_map(|feat| {
+                            clip_image_point(feat.x as f64, feat.y as f64, img_w, img_h)
+                        })
                         .collect();
 
                     let mut feat_uvs = HashMap::new();
@@ -297,10 +572,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     let measurement = VisionMeasurement::new(img_data.stamp, feat_uvs);
-                    f.process_vision(measurement, cam_model.as_ref());
+                    let sparse_measurement = undistorted_pinhole_measurement(
+                        img_data.stamp,
+                        &measurement.cam_coordinates,
+                        cam_model.as_ref(),
+                        &k_matrix,
+                    );
+                    f.process_vision(measurement.clone(), cam_model.as_ref());
                     vision_count += 1;
 
                     let state = f.eqf.state_estimate();
+                    let t_wc = camera_pose_matrix(&state);
+                    if let Some(sparse) = &mut sparse_filter {
+                        sparse.update(&sparse_measurement, &t_wc, None);
+                    }
+
                     #[cfg(feature = "rerun")]
                     let (feat_global, p_cam, r_cam) = echo_li_core::landmarks_to_global(&state);
                     #[cfg(not(feature = "rerun"))]
@@ -327,6 +613,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 &rerun::Points2D::new(tracker_points)
                                     .with_colors([0xFFFF00FFu32])
                                     .with_radii([2.0f32]),
+                            )
+                            .ok();
+                        }
+
+                        let (
+                            sparse_img_pts,
+                            sparse_img_colors,
+                            sparse_world_pts,
+                            sparse_world_colors,
+                        ) = if let Some(sparse) = &sparse_filter {
+                            sparse_points_for_vis(
+                                sparse,
+                                cam_model.as_ref(),
+                                &p_cam,
+                                &r_cam,
+                                img_w,
+                                img_h,
+                            )
+                        } else {
+                            (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+                        };
+                        if !sparse_img_pts.is_empty() {
+                            rec.log(
+                                "camera/image/sparse_out_of_state",
+                                &rerun::Points2D::new(sparse_img_pts)
+                                    .with_colors(sparse_img_colors)
+                                    .with_radii([3.0f32]),
                             )
                             .ok();
                         }
@@ -358,6 +671,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 &rerun::Points3D::new(lm_pts)
                                     .with_colors([0x00FF00FFu32])
                                     .with_radii([0.02f32]),
+                            )
+                            .ok();
+                        }
+
+                        if !sparse_world_pts.is_empty() {
+                            rec.log(
+                                "world/sparse_out_of_state",
+                                &rerun::Points3D::new(sparse_world_pts)
+                                    .with_colors(sparse_world_colors)
+                                    .with_radii([0.015f32]),
                             )
                             .ok();
                         }

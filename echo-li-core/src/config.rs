@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::path::Path;
 
+use crate::depth::sparse_gb::{DepthParametrization, SparseVogSettings};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RudolfVConfig {
@@ -93,10 +95,155 @@ pub struct MainConfig {
     pub camera_lag: f64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SparseVogConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_sparse_parametrization")]
+    pub parametrization: String,
+    #[serde(default)]
+    pub max_pool_size: Option<usize>,
+    #[serde(default)]
+    pub min_track_length: Option<usize>,
+    #[serde(default)]
+    pub conv_inlier_ratio: Option<f64>,
+    #[serde(default)]
+    pub conv_variance_threshold: Option<f64>,
+    #[serde(default)]
+    pub init_depth_var: Option<f64>,
+    #[serde(default)]
+    pub init_invdepth_var: Option<f64>,
+    #[serde(default)]
+    pub sigma_pixel: Option<f64>,
+    #[serde(default)]
+    pub uniform_z_max: Option<f64>,
+    #[serde(default)]
+    pub uniform_rho_max: Option<f64>,
+    #[serde(default)]
+    pub uniform_d_min: Option<f64>,
+    #[serde(default)]
+    pub uniform_d_max: Option<f64>,
+    #[serde(default)]
+    pub a_init: Option<f64>,
+    #[serde(default)]
+    pub b_init: Option<f64>,
+    #[serde(default)]
+    pub ab_min: Option<f64>,
+    #[serde(default)]
+    pub ab_max: Option<f64>,
+    #[serde(default)]
+    pub min_inlier_ratio: Option<f64>,
+    #[serde(default)]
+    pub mahalanobis_reset_chi2: Option<f64>,
+    #[serde(default)]
+    pub process_depth_var: Option<f64>,
+    #[serde(default)]
+    pub min_parallax: Option<f64>,
+    #[serde(default)]
+    pub min_cos_sim: Option<f64>,
+    #[serde(default)]
+    pub min_depth: Option<f64>,
+    #[serde(default)]
+    pub max_depth: Option<f64>,
+    #[serde(default)]
+    pub reanchor_flow_px: Option<f64>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_sparse_parametrization() -> String {
+    "invdepth3d".to_string()
+}
+
+impl SparseVogConfig {
+    pub fn to_sparse_settings(&self) -> SparseVogSettings {
+        let mut settings = SparseVogSettings::default();
+        settings.parametrization = match self.parametrization.to_ascii_lowercase().as_str() {
+            "euclidean" => DepthParametrization::Euclidean,
+            "polar" | "polar3d" => DepthParametrization::Polar,
+            _ => DepthParametrization::InvDepth,
+        };
+        if let Some(v) = self.max_pool_size {
+            settings.max_pool_size = v;
+        }
+        if let Some(v) = self.min_track_length {
+            settings.min_track_length = v;
+        }
+        if let Some(v) = self.conv_inlier_ratio {
+            settings.conv_inlier_ratio = v;
+        }
+        if let Some(v) = self.conv_variance_threshold {
+            settings.conv_variance_threshold = v;
+        }
+        if let Some(v) = self.init_depth_var {
+            settings.init_depth_var = v;
+        }
+        if let Some(v) = self.init_invdepth_var {
+            settings.init_invdepth_var = v;
+        }
+        if let Some(v) = self.sigma_pixel {
+            settings.sigma_pixel = v;
+        }
+        if let Some(v) = self.uniform_z_max {
+            settings.uniform_z_max = v;
+        }
+        if let Some(v) = self.uniform_rho_max {
+            settings.uniform_rho_max = v;
+        }
+        if let Some(v) = self.uniform_d_min {
+            settings.uniform_d_min = v;
+        }
+        if let Some(v) = self.uniform_d_max {
+            settings.uniform_d_max = v;
+        }
+        if let Some(v) = self.a_init {
+            settings.a_init = v;
+        }
+        if let Some(v) = self.b_init {
+            settings.b_init = v;
+        }
+        if let Some(v) = self.ab_min {
+            settings.ab_min = v;
+        }
+        if let Some(v) = self.ab_max {
+            settings.ab_max = v;
+        }
+        if let Some(v) = self.min_inlier_ratio {
+            settings.min_inlier_ratio = v;
+        }
+        if let Some(v) = self.mahalanobis_reset_chi2 {
+            settings.mahalanobis_reset_chi2 = v;
+        }
+        if let Some(v) = self.process_depth_var {
+            settings.process_depth_var = v;
+        }
+        if let Some(v) = self.min_parallax {
+            settings.min_parallax = v;
+        }
+        if let Some(v) = self.min_cos_sim {
+            settings.min_cos_sim = v;
+        }
+        if let Some(v) = self.min_depth {
+            settings.min_depth = v;
+        }
+        if let Some(v) = self.max_depth {
+            settings.max_depth = v;
+        }
+        if let Some(v) = self.reanchor_flow_px {
+            settings.reanchor_flow_px = v;
+        }
+        settings
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VIOConfig {
     #[serde(rename = "RudolfV")]
     pub rudolf_v: RudolfVConfig,
+    #[serde(rename = "SparseVog", default)]
+    pub sparse_vog: Option<SparseVogConfig>,
     pub eqf: EqfConfig,
     pub main: MainConfig,
 }
