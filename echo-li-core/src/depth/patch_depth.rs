@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
 use nalgebra::{Matrix3, Matrix4, Vector2, Vector3};
+use rudolf_v::image::{interpolate_bilinear, Image};
+use rudolf_v::pyramid::Pyramid;
 
 use crate::core_types::{CameraIntrinsics, DepthMap};
 use crate::depth::sparse_3d::Sparse3DFilter;
@@ -108,16 +110,9 @@ pub struct SparseDepthPrior {
 #[derive(Debug, Clone)]
 struct DepthKeyframe {
     frame: Arc<FrameProducts>,
-    ref_pyramid: Vec<ImageF32>,
-    grad_x_pyramid: Vec<ImageF32>,
-    grad_y_pyramid: Vec<ImageF32>,
-}
-
-#[derive(Debug, Clone)]
-struct ImageF32 {
-    width: usize,
-    height: usize,
-    data: Vec<f32>,
+    ref_pyramid: Vec<Image<f32>>,
+    grad_x_pyramid: Vec<Image<f32>>,
+    grad_y_pyramid: Vec<Image<f32>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -391,18 +386,17 @@ impl PatchDepthMapper {
     }
 
     fn make_keyframe(&self, frame: Arc<FrameProducts>) -> DepthKeyframe {
-        let base =
-            scaled_image_from_u8(&frame.gray, frame.width, frame.height, self.settings.scale);
-        let mut ref_pyramid = Vec::with_capacity(self.settings.n_pyramid_levels);
+        let ref_pyramid = build_pyramid_from_u8(
+            &frame.gray,
+            frame.width,
+            frame.height,
+            self.settings.scale,
+            self.settings.n_pyramid_levels,
+        );
         let mut grad_x_pyramid = Vec::with_capacity(self.settings.n_pyramid_levels);
         let mut grad_y_pyramid = Vec::with_capacity(self.settings.n_pyramid_levels);
-        let mut img = base;
-        for level in 0..self.settings.n_pyramid_levels {
-            if level > 0 {
-                img = pyr_down(&img);
-            }
-            let (gx, gy) = gradients(&img);
-            ref_pyramid.push(img.clone());
+        for img in &ref_pyramid {
+            let (gx, gy) = gradients(img);
             grad_x_pyramid.push(gx);
             grad_y_pyramid.push(gy);
         }
@@ -429,8 +423,8 @@ impl PatchDepthMapper {
             self.settings.scale,
             self.settings.n_pyramid_levels,
         );
-        let width = curr_pyramid[0].width;
-        let height = curr_pyramid[0].height;
+        let width = curr_pyramid[0].width();
+        let height = curr_pyramid[0].height();
         let scaled_intrinsics =
             scaled_intrinsics(self.settings.scale, self.settings.n_pyramid_levels);
         let scaled_seeds = scale_seeds(seeds, self.settings.scale);
@@ -469,7 +463,7 @@ impl PatchDepthMapper {
         cv: f64,
         seeds: &[SparseDepthPrior],
         seed_grid: &SeedGrid,
-        curr_pyramid: &[ImageF32],
+        curr_pyramid: &[Image<f32>],
         ref_keyframe: &DepthKeyframe,
         intrinsics_by_level: &[ScaledIntrinsics],
         t_ref_curr: &Matrix4<f64>,
@@ -576,7 +570,7 @@ impl PatchDepthMapper {
         rho_init: f64,
         rho_min: f64,
         rho_max: f64,
-        curr_pyramid: &[ImageF32],
+        curr_pyramid: &[Image<f32>],
         ref_keyframe: &DepthKeyframe,
         intrinsics_by_level: &[ScaledIntrinsics],
         t_ref_curr: &Matrix4<f64>,
@@ -619,8 +613,8 @@ impl PatchDepthMapper {
         cu: f64,
         cv: f64,
         rho: f64,
-        curr_img: &ImageF32,
-        ref_img: &ImageF32,
+        curr_img: &Image<f32>,
+        ref_img: &Image<f32>,
         intr: &ScaledIntrinsics,
         t_ref_curr: &Matrix4<f64>,
     ) -> (f64, usize) {
@@ -631,14 +625,14 @@ impl PatchDepthMapper {
             for dx in -(half as isize)..half as isize {
                 let pu = cu + dx as f64;
                 let pv = cv + dy as f64;
-                let Some(i_curr) = curr_img.sample_nearest(pu, pv) else {
+                let Some(i_curr) = sample_nearest(curr_img, pu, pv) else {
                     continue;
                 };
                 let Some((u_ref, v_ref, _)) = self.warp_scaled_pixel(pu, pv, rho, intr, t_ref_curr)
                 else {
                     continue;
                 };
-                let Some(i_ref) = ref_img.sample_bilinear(u_ref, v_ref) else {
+                let Some(i_ref) = sample_bilinear(ref_img, u_ref, v_ref) else {
                     continue;
                 };
                 let r = i_ref as f64 - i_curr as f64;
@@ -659,7 +653,7 @@ impl PatchDepthMapper {
         cu: f64,
         cv: f64,
         rho: f64,
-        curr_pyramid: &[ImageF32],
+        curr_pyramid: &[Image<f32>],
         ref_keyframe: &DepthKeyframe,
         intrinsics_by_level: &[ScaledIntrinsics],
         t_ref_curr: &Matrix4<f64>,
@@ -699,10 +693,10 @@ impl PatchDepthMapper {
         cu: f64,
         cv: f64,
         rho: f64,
-        curr_img: &ImageF32,
-        ref_img: &ImageF32,
-        ref_grad_x: &ImageF32,
-        ref_grad_y: &ImageF32,
+        curr_img: &Image<f32>,
+        ref_img: &Image<f32>,
+        ref_grad_x: &Image<f32>,
+        ref_grad_y: &Image<f32>,
         intr: &ScaledIntrinsics,
         t_ref_curr: &Matrix4<f64>,
         sigma_warp_sq: f64,
@@ -719,7 +713,7 @@ impl PatchDepthMapper {
             for dx in -(half as isize)..half as isize {
                 let pu = cu + dx as f64;
                 let pv = cv + dy as f64;
-                let Some(i_curr) = curr_img.sample_nearest(pu, pv) else {
+                let Some(i_curr) = sample_nearest(curr_img, pu, pv) else {
                     continue;
                 };
                 let Some((u_ref, v_ref, x_ref)) =
@@ -727,13 +721,13 @@ impl PatchDepthMapper {
                 else {
                     continue;
                 };
-                let Some(i_ref) = ref_img.sample_bilinear(u_ref, v_ref) else {
+                let Some(i_ref) = sample_bilinear(ref_img, u_ref, v_ref) else {
                     continue;
                 };
-                let Some(gx) = ref_grad_x.sample_bilinear(u_ref, v_ref) else {
+                let Some(gx) = sample_bilinear(ref_grad_x, u_ref, v_ref) else {
                     continue;
                 };
-                let Some(gy) = ref_grad_y.sample_bilinear(u_ref, v_ref) else {
+                let Some(gy) = sample_bilinear(ref_grad_y, u_ref, v_ref) else {
                     continue;
                 };
 
@@ -859,47 +853,6 @@ impl PatchDepthMapper {
     }
 }
 
-impl ImageF32 {
-    fn new(width: usize, height: usize, data: Vec<f32>) -> Self {
-        Self {
-            width,
-            height,
-            data,
-        }
-    }
-
-    fn sample_nearest(&self, u: f64, v: f64) -> Option<f32> {
-        let x = u as isize;
-        let y = v as isize;
-        if x < 0 || y < 0 || x >= self.width as isize || y >= self.height as isize {
-            return None;
-        }
-        Some(self.data[y as usize * self.width + x as usize])
-    }
-
-    fn sample_bilinear(&self, u: f64, v: f64) -> Option<f32> {
-        let ix = u.floor() as isize;
-        let iy = v.floor() as isize;
-        if ix < 0 || iy < 0 || ix >= self.width as isize - 1 || iy >= self.height as isize - 1 {
-            return None;
-        }
-        let dx = u - ix as f64;
-        let dy = v - iy as f64;
-        let x = ix as usize;
-        let y = iy as usize;
-        let i00 = self.data[y * self.width + x] as f64;
-        let i10 = self.data[y * self.width + x + 1] as f64;
-        let i01 = self.data[(y + 1) * self.width + x] as f64;
-        let i11 = self.data[(y + 1) * self.width + x + 1] as f64;
-        Some(
-            ((1.0 - dx) * (1.0 - dy) * i00
-                + dx * (1.0 - dy) * i10
-                + (1.0 - dx) * dy * i01
-                + dx * dy * i11) as f32,
-        )
-    }
-}
-
 impl SeedGrid {
     fn new(seeds: &[SparseDepthPrior], cell_size: f64, width: usize, height: usize) -> Self {
         let cell_size = cell_size.max(1.0);
@@ -967,9 +920,27 @@ fn compute_sigma_warp_sq(
     (f / median_depth).powi(2) * var_t_mag
 }
 
-fn scaled_image_from_u8(gray: &[u8], width: usize, height: usize, scale: f64) -> ImageF32 {
+fn sample_nearest(img: &Image<f32>, u: f64, v: f64) -> Option<f32> {
+    let x = u as isize;
+    let y = v as isize;
+    if x < 0 || y < 0 || x >= img.width() as isize || y >= img.height() as isize {
+        return None;
+    }
+    Some(img.get(x as usize, y as usize))
+}
+
+fn sample_bilinear(img: &Image<f32>, u: f64, v: f64) -> Option<f32> {
+    let ix = u.floor() as isize;
+    let iy = v.floor() as isize;
+    if ix < 0 || iy < 0 || ix >= img.width() as isize - 1 || iy >= img.height() as isize - 1 {
+        return None;
+    }
+    Some(interpolate_bilinear(img, u as f32, v as f32))
+}
+
+fn scaled_image_from_u8(gray: &[u8], width: usize, height: usize, scale: f64) -> Image<f32> {
     if (scale - 1.0).abs() < f64::EPSILON {
-        return ImageF32::new(width, height, gray.iter().map(|&v| v as f32).collect());
+        return Image::from_vec(width, height, gray.iter().map(|&v| v as f32).collect());
     }
     let out_w = ((width as f64) * scale + 0.5).floor().max(1.0) as usize;
     let out_h = ((height as f64) * scale + 0.5).floor().max(1.0) as usize;
@@ -981,7 +952,7 @@ fn scaled_image_from_u8(gray: &[u8], width: usize, height: usize, scale: f64) ->
             data[y * out_w + x] = sample_u8_bilinear(gray, width, height, src_x, src_y);
         }
     }
-    ImageF32::new(out_w, out_h, data)
+    Image::from_vec(out_w, out_h, data)
 }
 
 fn build_pinhole_to_raw_lut(
@@ -1040,62 +1011,31 @@ fn build_pyramid_from_u8(
     height: usize,
     scale: f64,
     levels: usize,
-) -> Vec<ImageF32> {
-    let mut pyramid = Vec::with_capacity(levels);
-    let mut img = scaled_image_from_u8(gray, width, height, scale);
-    for level in 0..levels {
-        if level > 0 {
-            img = pyr_down(&img);
-        }
-        pyramid.push(img.clone());
-    }
-    pyramid
+) -> Vec<Image<f32>> {
+    let base = scaled_image_from_u8(gray, width, height, scale);
+    Pyramid::build(&base, levels, 1.0).levels
 }
 
-fn pyr_down(img: &ImageF32) -> ImageF32 {
-    let out_w = (img.width / 2).max(1);
-    let out_h = (img.height / 2).max(1);
-    let mut data = vec![0.0f32; out_w * out_h];
-    for y in 0..out_h {
-        for x in 0..out_w {
-            let sx = (2 * x).min(img.width - 1);
-            let sy = (2 * y).min(img.height - 1);
-            let mut sum = 0.0;
-            let mut count = 0.0;
-            for yy in sy.saturating_sub(1)..=(sy + 1).min(img.height - 1) {
-                for xx in sx.saturating_sub(1)..=(sx + 1).min(img.width - 1) {
-                    sum += img.data[yy * img.width + xx];
-                    count += 1.0;
-                }
-            }
-            data[y * out_w + x] = sum / count;
-        }
-    }
-    ImageF32::new(out_w, out_h, data)
-}
-
-fn gradients(img: &ImageF32) -> (ImageF32, ImageF32) {
-    let mut gx = vec![0.0f32; img.width * img.height];
-    let mut gy = vec![0.0f32; img.width * img.height];
-    if img.width >= 3 {
-        for y in 0..img.height {
-            for x in 1..img.width - 1 {
-                gx[y * img.width + x] =
-                    0.5 * (img.data[y * img.width + x + 1] - img.data[y * img.width + x - 1]);
+fn gradients(img: &Image<f32>) -> (Image<f32>, Image<f32>) {
+    let mut gx = vec![0.0f32; img.width() * img.height()];
+    let mut gy = vec![0.0f32; img.width() * img.height()];
+    if img.width() >= 3 {
+        for y in 0..img.height() {
+            for x in 1..img.width() - 1 {
+                gx[y * img.width() + x] = 0.5 * (img.get(x + 1, y) - img.get(x - 1, y));
             }
         }
     }
-    if img.height >= 3 {
-        for y in 1..img.height - 1 {
-            for x in 0..img.width {
-                gy[y * img.width + x] =
-                    0.5 * (img.data[(y + 1) * img.width + x] - img.data[(y - 1) * img.width + x]);
+    if img.height() >= 3 {
+        for y in 1..img.height() - 1 {
+            for x in 0..img.width() {
+                gy[y * img.width() + x] = 0.5 * (img.get(x, y + 1) - img.get(x, y - 1));
             }
         }
     }
     (
-        ImageF32::new(img.width, img.height, gx),
-        ImageF32::new(img.width, img.height, gy),
+        Image::from_vec(img.width(), img.height(), gx),
+        Image::from_vec(img.width(), img.height(), gy),
     )
 }
 
