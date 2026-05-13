@@ -87,7 +87,7 @@ SparseVog:
   ab_max: 20.0
   min_inlier_ratio: 0.5         # gate for Mahalanobis stuck-outlier reset
   # mahalanobis_reset_chi2: 4.5
-  mahalanobis_reset_chi2: 1.0
+  mahalanobis_reset_chi2: 0.1
   process_depth_var: 0.01       # fallback when P_vv unavailable
   min_parallax: 1.0e-4
   min_cos_sim: 0.95
@@ -100,10 +100,10 @@ SparseVog:
   pd_min_plane_features: 15
 PatchDepth:
   camera_mode: undistorted_pinhole
-  scale: 1.0
-  patch_size: 8
-  patch_stride: 4
-  cell_size: 8
+  scale: 0.5
+  patch_size: 4
+  patch_stride: 2
+  cell_size: 4
   seed_radius_px: 32
   min_baseline_ratio: 0.005
   max_baseline_ratio: 0.3
@@ -111,3 +111,4 @@ PatchDepth:
   max_depth: 150.0
   vis_min_depth: 0.5
   vis_max_depth: 5.0
+  n_search_candidates: 1

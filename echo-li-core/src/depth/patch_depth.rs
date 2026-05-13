@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use nalgebra::{Matrix3, Matrix4, Vector2, Vector3};
-use rudolf_v::image::{interpolate_bilinear, Image};
+use rayon::prelude::*;
+use rudolf_v::image::Image;
 use rudolf_v::pyramid::Pyramid;
 
 use crate::core_types::{CameraIntrinsics, DepthMap};
@@ -117,7 +118,7 @@ pub struct SparseDepthPrior {
 struct DepthKeyframe {
     frame: Arc<FrameProducts>,
     ref_pyramid: Vec<Image<f32>>,
-    valid_pyramid: Option<Vec<Image<f32>>>,
+    bilinear_valid_pyramid: Option<Vec<Image<f32>>>,
     grad_x_pyramid: Vec<Image<f32>>,
     grad_y_pyramid: Vec<Image<f32>>,
 }
@@ -467,6 +468,9 @@ impl PatchDepthMapper {
                 self.settings.n_pyramid_levels,
             )
         });
+        let bilinear_valid_pyramid = valid_pyramid
+            .as_ref()
+            .map(|pyramid| build_bilinear_valid_pyramid(pyramid));
         let mut grad_x_pyramid = Vec::with_capacity(self.settings.n_pyramid_levels);
         let mut grad_y_pyramid = Vec::with_capacity(self.settings.n_pyramid_levels);
         for img in &ref_pyramid {
@@ -477,7 +481,7 @@ impl PatchDepthMapper {
         DepthKeyframe {
             frame,
             ref_pyramid,
-            valid_pyramid,
+            bilinear_valid_pyramid,
             grad_x_pyramid,
             grad_y_pyramid,
         }
@@ -521,9 +525,15 @@ impl PatchDepthMapper {
         );
 
         let half = self.settings.patch_size / 2;
-        let mut patches = Vec::new();
+        let mut patch_centers = Vec::new();
         for v in (half..height.saturating_sub(half)).step_by(self.settings.patch_stride) {
             for u in (half..width.saturating_sub(half)).step_by(self.settings.patch_stride) {
+                patch_centers.push((u, v));
+            }
+        }
+        let patches: Vec<_> = patch_centers
+            .par_iter()
+            .map(|&(u, v)| {
                 let estimate = self.solve_one_patch(
                     u as f64,
                     v as f64,
@@ -536,9 +546,9 @@ impl PatchDepthMapper {
                     t_ref_curr,
                     sigma_warp_sq,
                 );
-                patches.push((u as f64, v as f64, estimate));
-            }
-        }
+                (u as f64, v as f64, estimate)
+            })
+            .collect();
 
         fuse_cells(&patches, width, height, &self.settings)
     }
@@ -688,7 +698,7 @@ impl PatchDepthMapper {
                 &curr_pyramid[0],
                 curr_valid_pyramid.map(|p| &p[0]),
                 &ref_keyframe.ref_pyramid[0],
-                ref_keyframe.valid_pyramid.as_ref().map(|p| &p[0]),
+                ref_keyframe.bilinear_valid_pyramid.as_ref().map(|p| &p[0]),
                 &intrinsics_by_level[0],
                 t_ref_curr,
             );
@@ -726,14 +736,12 @@ impl PatchDepthMapper {
                 if !sample_valid_nearest(curr_valid, pu, pv) {
                     continue;
                 }
-                let Some((u_ref, v_ref, _)) = self.warp_scaled_pixel(pu, pv, rho, intr, &rel_pose)
+                let Some((u_ref, v_ref, _, _)) =
+                    self.warp_scaled_pixel(pu, pv, rho, intr, &rel_pose)
                 else {
                     continue;
                 };
-                if !sample_valid_bilinear(ref_valid, u_ref, v_ref) {
-                    continue;
-                }
-                let Some(i_ref) = sample_bilinear(ref_img, u_ref, v_ref) else {
+                let Some(i_ref) = sample_bilinear_valid(ref_img, ref_valid, u_ref, v_ref) else {
                     continue;
                 };
                 let r = i_ref as f64 - i_curr as f64;
@@ -776,7 +784,10 @@ impl PatchDepthMapper {
                 &curr_pyramid[level],
                 curr_valid_pyramid.map(|p| &p[level]),
                 &ref_keyframe.ref_pyramid[level],
-                ref_keyframe.valid_pyramid.as_ref().map(|p| &p[level]),
+                ref_keyframe
+                    .bilinear_valid_pyramid
+                    .as_ref()
+                    .map(|p| &p[level]),
                 &ref_keyframe.grad_x_pyramid[level],
                 &ref_keyframe.grad_y_pyramid[level],
                 &intrinsics_by_level[level],
@@ -813,6 +824,8 @@ impl PatchDepthMapper {
         let mut sum_abs_res = 0.0;
         let mut n_valid = 0;
         let sigma_photo_sq = self.settings.sigma_photo * self.settings.sigma_photo;
+        let dx_curr_drho_scale = -1.0 / (rho * rho);
+        let r_dx_curr_drho = rel_pose.r * dx_curr_drho_scale;
 
         for dy in -(half as isize)..half as isize {
             for dx in -(half as isize)..half as isize {
@@ -824,28 +837,18 @@ impl PatchDepthMapper {
                 if !sample_valid_nearest(curr_valid, pu, pv) {
                     continue;
                 }
-                let Some((u_ref, v_ref, x_ref)) =
+                let Some((u_ref, v_ref, x_ref, bearing)) =
                     self.warp_scaled_pixel(pu, pv, rho, intr, rel_pose)
                 else {
                     continue;
                 };
-                if !sample_valid_bilinear(ref_valid, u_ref, v_ref) {
-                    continue;
-                }
-                let Some(i_ref) = sample_bilinear(ref_img, u_ref, v_ref) else {
-                    continue;
-                };
-                let Some(gx) = sample_bilinear(ref_grad_x, u_ref, v_ref) else {
-                    continue;
-                };
-                let Some(gy) = sample_bilinear(ref_grad_y, u_ref, v_ref) else {
+                let Some((i_ref, gx, gy)) = sample_bilinear_valid_with_grad(
+                    ref_img, ref_valid, ref_grad_x, ref_grad_y, u_ref, v_ref,
+                ) else {
                     continue;
                 };
 
-                let Some(bearing) = self.bearing_for_scaled_pixel(pu, pv, intr) else {
-                    continue;
-                };
-                let dx_ref_drho = rel_pose.r * (-bearing / (rho * rho));
+                let dx_ref_drho = r_dx_curr_drho * bearing;
                 let du_dxref = self.projection_jacobian(&x_ref) * dx_ref_drho;
                 let du_drho = intr.scale_from_original * du_dxref[0];
                 let dv_drho = intr.scale_from_original * du_dxref[1];
@@ -878,7 +881,7 @@ impl PatchDepthMapper {
         rho: f64,
         intr: &ScaledIntrinsics,
         rel_pose: &RelativePose,
-    ) -> Option<(f64, f64, Vector3<f64>)> {
+    ) -> Option<(f64, f64, Vector3<f64>, Vector3<f64>)> {
         if rho <= 0.0 {
             return None;
         }
@@ -888,12 +891,8 @@ impl PatchDepthMapper {
         if x_ref[2] <= 1e-6 {
             return None;
         }
-        let uv_ref = self.project(&x_ref);
-        Some((
-            uv_ref[0] * intr.scale_from_original,
-            uv_ref[1] * intr.scale_from_original,
-            x_ref,
-        ))
+        let (u_ref, v_ref) = self.project_scaled(&x_ref, intr.scale_from_original);
+        Some((u_ref, v_ref, x_ref, bearing))
     }
 
     fn bearing_for_scaled_pixel(
@@ -923,13 +922,19 @@ impl PatchDepthMapper {
         }
     }
 
-    fn project(&self, p: &Vector3<f64>) -> Vector2<f64> {
+    fn project_scaled(&self, p: &Vector3<f64>, scale_from_original: f64) -> (f64, f64) {
         match self.camera_mode {
-            PatchDepthCameraMode::RawDistorted => self.camera.project(p),
-            PatchDepthCameraMode::UndistortedPinhole => Vector2::new(
-                self.intrinsics.fx * p[0] / p[2] + self.intrinsics.cx,
-                self.intrinsics.fy * p[1] / p[2] + self.intrinsics.cy,
-            ),
+            PatchDepthCameraMode::RawDistorted => {
+                let uv = self.camera.project(p);
+                (uv[0] * scale_from_original, uv[1] * scale_from_original)
+            }
+            PatchDepthCameraMode::UndistortedPinhole => {
+                let z_inv = 1.0 / p[2];
+                (
+                    (self.intrinsics.fx * p[0] * z_inv + self.intrinsics.cx) * scale_from_original,
+                    (self.intrinsics.fy * p[1] * z_inv + self.intrinsics.cy) * scale_from_original,
+                )
+            }
         }
     }
 
@@ -955,8 +960,8 @@ impl PatchDepthMapper {
         if u < 0.0 || v < 0.0 || u >= (self.width - 1) as f64 || v >= (self.height - 1) as f64 {
             return None;
         }
-        let ix = u.floor() as usize;
-        let iy = v.floor() as usize;
+        let ix = u as usize;
+        let iy = v as usize;
         let dx = u - ix as f64;
         let dy = v - iy as f64;
         let b00 = self.bearing_lut[iy * self.width + ix];
@@ -1045,16 +1050,84 @@ fn sample_nearest(img: &Image<f32>, u: f64, v: f64) -> Option<f32> {
     if x < 0 || y < 0 || x >= img.width() as isize || y >= img.height() as isize {
         return None;
     }
-    Some(img.get(x as usize, y as usize))
+    // SAFETY: bounds were checked above.
+    Some(unsafe { img.get_unchecked(x as usize, y as usize) })
 }
 
-fn sample_bilinear(img: &Image<f32>, u: f64, v: f64) -> Option<f32> {
-    let ix = u.floor() as isize;
-    let iy = v.floor() as isize;
-    if ix < 0 || iy < 0 || ix >= img.width() as isize - 1 || iy >= img.height() as isize - 1 {
+fn sample_bilinear_valid(
+    img: &Image<f32>,
+    mask: Option<&Image<f32>>,
+    u: f64,
+    v: f64,
+) -> Option<f32> {
+    let (x, y, weights) = bilinear_footprint(img, u, v)?;
+    if !valid_bilinear_footprint(mask, x, y) {
         return None;
     }
-    Some(interpolate_bilinear(img, u as f32, v as f32))
+    Some(unsafe { bilinear_unchecked(img, x, y, weights) })
+}
+
+fn sample_bilinear_valid_with_grad(
+    img: &Image<f32>,
+    mask: Option<&Image<f32>>,
+    grad_x: &Image<f32>,
+    grad_y: &Image<f32>,
+    u: f64,
+    v: f64,
+) -> Option<(f32, f32, f32)> {
+    let (x, y, weights) = bilinear_footprint(img, u, v)?;
+    if !valid_bilinear_footprint(mask, x, y) {
+        return None;
+    }
+    // SAFETY: all three pyramids are built from the same image dimensions, and
+    // the bilinear footprint was checked against the reference image above.
+    unsafe {
+        Some((
+            bilinear_unchecked(img, x, y, weights),
+            bilinear_unchecked(grad_x, x, y, weights),
+            bilinear_unchecked(grad_y, x, y, weights),
+        ))
+    }
+}
+
+fn bilinear_footprint(img: &Image<f32>, u: f64, v: f64) -> Option<(usize, usize, [f32; 4])> {
+    if u < 0.0 || v < 0.0 || u >= (img.width() - 1) as f64 || v >= (img.height() - 1) as f64 {
+        return None;
+    }
+    let x = u as usize;
+    let y = v as usize;
+    let dx = (u - x as f64) as f32;
+    let dy = (v - y as f64) as f32;
+    let one_minus_dx = 1.0 - dx;
+    let one_minus_dy = 1.0 - dy;
+    Some((
+        x,
+        y,
+        [
+            one_minus_dx * one_minus_dy,
+            dx * one_minus_dy,
+            one_minus_dx * dy,
+            dx * dy,
+        ],
+    ))
+}
+
+fn valid_bilinear_footprint(mask: Option<&Image<f32>>, x: usize, y: usize) -> bool {
+    let Some(mask) = mask else {
+        return true;
+    };
+    // SAFETY: callers check the bilinear image footprint before passing x/y.
+    unsafe { mask.get_unchecked(x, y) > 0.5 }
+}
+
+unsafe fn bilinear_unchecked(img: &Image<f32>, x: usize, y: usize, weights: [f32; 4]) -> f32 {
+    unsafe {
+        let p00 = img.get_unchecked(x, y);
+        let p10 = img.get_unchecked(x + 1, y);
+        let p01 = img.get_unchecked(x, y + 1);
+        let p11 = img.get_unchecked(x + 1, y + 1);
+        weights[0] * p00 + weights[1] * p10 + weights[2] * p01 + weights[3] * p11
+    }
 }
 
 fn sample_valid_nearest(mask: Option<&Image<f32>>, u: f64, v: f64) -> bool {
@@ -1066,24 +1139,8 @@ fn sample_valid_nearest(mask: Option<&Image<f32>>, u: f64, v: f64) -> bool {
     if x < 0 || y < 0 || x >= mask.width() as isize || y >= mask.height() as isize {
         return false;
     }
-    mask.get(x as usize, y as usize) > 0.5
-}
-
-fn sample_valid_bilinear(mask: Option<&Image<f32>>, u: f64, v: f64) -> bool {
-    let Some(mask) = mask else {
-        return true;
-    };
-    let ix = u.floor() as isize;
-    let iy = v.floor() as isize;
-    if ix < 0 || iy < 0 || ix >= mask.width() as isize - 1 || iy >= mask.height() as isize - 1 {
-        return false;
-    }
-    let x = ix as usize;
-    let y = iy as usize;
-    mask.get(x, y) > 0.5
-        && mask.get(x + 1, y) > 0.5
-        && mask.get(x, y + 1) > 0.5
-        && mask.get(x + 1, y + 1) > 0.5
+    // SAFETY: bounds were checked above.
+    unsafe { mask.get_unchecked(x as usize, y as usize) > 0.5 }
 }
 
 fn scaled_image_from_u8(gray: &[u8], width: usize, height: usize, scale: f64) -> Image<f32> {
@@ -1164,6 +1221,34 @@ fn build_mask_pyramid(
         out.push(Image::from_vec(next_w, next_h, next));
     }
     out
+}
+
+fn build_bilinear_valid_pyramid(valid_pyramid: &[Image<f32>]) -> Vec<Image<f32>> {
+    valid_pyramid.iter().map(bilinear_valid_image).collect()
+}
+
+fn bilinear_valid_image(mask: &Image<f32>) -> Image<f32> {
+    let width = mask.width();
+    let height = mask.height();
+    let mut data = vec![0.0f32; width * height];
+    if width < 2 || height < 2 {
+        return Image::from_vec(width, height, data);
+    }
+    for y in 0..height - 1 {
+        for x in 0..width - 1 {
+            // SAFETY: x/y are constrained so the full bilinear footprint is in bounds.
+            let valid = unsafe {
+                mask.get_unchecked(x, y) > 0.5
+                    && mask.get_unchecked(x + 1, y) > 0.5
+                    && mask.get_unchecked(x, y + 1) > 0.5
+                    && mask.get_unchecked(x + 1, y + 1) > 0.5
+            };
+            if valid {
+                data[y * width + x] = 1.0;
+            }
+        }
+    }
+    Image::from_vec(width, height, data)
 }
 
 fn mask_pyrdown_footprint_valid(mask: &Image<f32>, cx: usize, cy: usize) -> bool {
