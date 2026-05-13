@@ -1,4 +1,5 @@
 use nalgebra::{Matrix3, Vector3};
+#[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
 /// Per-pixel depth triangulation via derotated epipolar geometry.
@@ -22,7 +23,7 @@ pub fn depth_densification(
     let ty = p[1];
     let tz = p[2];
 
-    invdepth_map.par_chunks_mut(w).enumerate().zip(geom_drive_map.par_chunks_mut(w)).for_each(|((v, row_inv), row_geom)| {
+    let compute_row = |v: usize, row_inv: &mut [f32], row_geom: &mut [f32]| {
         for u in 0..w {
             let idx = (v * w + u) * 2;
             let flow_u = flow[idx] as f64;
@@ -37,7 +38,7 @@ pub fn depth_densification(
             if u_prev >= 0.0 && u_prev < w as f64 && v_prev >= 0.0 && v_prev < h as f64 {
                 let x_prev_norm = (u_prev - cx) / fx;
                 let y_prev_norm = (v_prev - cy) / fy;
-                
+
                 let bearing_prev_raw = Vector3::new(x_prev_norm, y_prev_norm, 1.0);
                 let bearing_prev_aligned = dr * bearing_prev_raw;
 
@@ -69,7 +70,22 @@ pub fn depth_densification(
                 }
             }
         }
-    });
+    };
+
+    #[cfg(feature = "parallel")]
+    invdepth_map
+        .par_chunks_mut(w)
+        .enumerate()
+        .zip(geom_drive_map.par_chunks_mut(w))
+        .for_each(|((v, row_inv), row_geom)| compute_row(v, row_inv, row_geom));
+    #[cfg(not(feature = "parallel"))]
+    for (v, (row_inv, row_geom)) in invdepth_map
+        .chunks_mut(w)
+        .zip(geom_drive_map.chunks_mut(w))
+        .enumerate()
+    {
+        compute_row(v, row_inv, row_geom);
+    }
 
     (invdepth_map, geom_drive_map)
 }
@@ -122,7 +138,12 @@ pub fn bilinear_splatting(
             add(&mut predicted_var_accum, vf + 1, uf, w_ul * var_p);
             add(&mut weights_accum, vf + 1, uf, w_ul);
 
-            add(&mut predicted_invdepth_accum, vf + 1, uf + 1, w_ur * inv_z_p);
+            add(
+                &mut predicted_invdepth_accum,
+                vf + 1,
+                uf + 1,
+                w_ur * inv_z_p,
+            );
             add(&mut predicted_var_accum, vf + 1, uf + 1, w_ur * var_p);
             add(&mut weights_accum, vf + 1, uf + 1, w_ur);
         }
@@ -213,11 +234,11 @@ pub fn vogiatzis_update(
 
     let u_rho = uniform_rho_max;
 
-    updated_invdepth.par_chunks_mut(w).enumerate()
-        .zip(updated_var.par_chunks_mut(w))
-        .zip(updated_a.par_chunks_mut(w))
-        .zip(updated_b.par_chunks_mut(w))
-        .for_each(|((((r, row_inv), row_var), row_a), row_b)| {
+    let update_row = |r: usize,
+                      row_inv: &mut [f32],
+                      row_var: &mut [f32],
+                      row_a: &mut [f32],
+                      row_b: &mut [f32]| {
         for c in 0..w {
             let idx = r * w + c;
             let mu = predicted_invdepth[idx] as f64;
@@ -236,7 +257,10 @@ pub fn vogiatzis_update(
                 let m_dist_sq = (x - mu).powi(2) / s_total;
 
                 // Outlier reset branch
-                if a + b > 0.0 && (a / (a + b)) < min_inlier_ratio as f64 && m_dist_sq > mahal_reset_chi2 as f64 {
+                if a + b > 0.0
+                    && (a / (a + b)) < min_inlier_ratio as f64
+                    && m_dist_sq > mahal_reset_chi2 as f64
+                {
                     row_inv[c] = x as f32;
                     row_var[c] = tau_sq as f32;
                     row_a[c] = a_init;
@@ -285,7 +309,9 @@ pub fn vogiatzis_update(
                         new_b = b + w2;
                     } else {
                         let mut factor = e_pi * (1.0 - e_pi) / v_pi - 1.0;
-                        if factor < 0.5 { factor = 0.5; }
+                        if factor < 0.5 {
+                            factor = 0.5;
+                        }
                         new_a = e_pi * factor;
                         new_b = (1.0 - e_pi) * factor;
                     }
@@ -310,7 +336,28 @@ pub fn vogiatzis_update(
                 row_b[c] = b as f32;
             }
         }
-    });
+    };
+
+    #[cfg(feature = "parallel")]
+    updated_invdepth
+        .par_chunks_mut(w)
+        .enumerate()
+        .zip(updated_var.par_chunks_mut(w))
+        .zip(updated_a.par_chunks_mut(w))
+        .zip(updated_b.par_chunks_mut(w))
+        .for_each(|((((r, row_inv), row_var), row_a), row_b)| {
+            update_row(r, row_inv, row_var, row_a, row_b)
+        });
+    #[cfg(not(feature = "parallel"))]
+    for (r, (((row_inv, row_var), row_a), row_b)) in updated_invdepth
+        .chunks_mut(w)
+        .zip(updated_var.chunks_mut(w))
+        .zip(updated_a.chunks_mut(w))
+        .zip(updated_b.chunks_mut(w))
+        .enumerate()
+    {
+        update_row(r, row_inv, row_var, row_a, row_b);
+    }
 
     (updated_invdepth, updated_var, updated_a, updated_b)
 }

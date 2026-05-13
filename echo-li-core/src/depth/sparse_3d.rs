@@ -373,10 +373,7 @@ fn bearing_update_3d(
     if det_s < 1e-30 {
         return true;
     }
-    if settings.mahalanobis_reset_chi2 > 0.0
-        && feat.inlier_ratio() < settings.min_inlier_ratio
-        && maha_sq > settings.mahalanobis_reset_chi2
-    {
+    if settings.mahalanobis_reset_chi2 > 0.0 && maha_sq > settings.mahalanobis_reset_chi2 {
         return false;
     }
     let gauss_pdf = (-0.5 * maha_sq).exp() / ((2.0 * std::f64::consts::PI).powi(2) * det_s).sqrt();
@@ -578,18 +575,20 @@ mod tests {
     fn mahalanobis_reset_removes_bad_3d_feature() {
         let mut settings = settings();
         settings.mahalanobis_reset_chi2 = 1.0;
-        settings.min_inlier_ratio = 0.5;
         let mut filter = Sparse3DFilter::invdepth3d(k(), settings);
         let point = Vector3::new(1.0, 0.5, 3.0);
         for i in 0..8 {
             update_with_point(&mut filter, i, point);
         }
-        let feat = filter
-            .features
-            .get_mut(&42)
-            .expect("feature should initialize before reset");
-        feat.a = 0.1;
-        feat.b = 10.0;
+        assert!(
+            filter
+                .features
+                .get(&42)
+                .expect("feature should initialize before reset")
+                .inlier_ratio()
+                > 0.5,
+            "test should cover immediate hard rejection, not only low-inlier reset"
+        );
 
         let t_wc = pose(8.0 * 0.05);
         let mut coords = HashMap::new();
@@ -598,7 +597,7 @@ mod tests {
 
         assert!(
             !filter.features.contains_key(&42),
-            "low-inlier feature with large Mahalanobis innovation should be removed"
+            "large Mahalanobis bearing innovation should immediately remove the feature"
         );
     }
 }

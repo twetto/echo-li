@@ -3,6 +3,9 @@ name = "echo-li-core"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+parallel = ["dep:rayon"]
+
 [dependencies]
 echo-lie.workspace = true
 rudolf-v.workspace = true
@@ -12,7 +15,7 @@ rand.workspace = true
 rand_distr.workspace = true
 serde.workspace = true
 serde_yaml.workspace = true
-rayon.workspace = true
+rayon = { workspace = true, optional = true }
 image.workspace = true
 csv.workspace = true
 spade.workspace = true

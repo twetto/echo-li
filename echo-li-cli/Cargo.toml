@@ -5,7 +5,7 @@ edition = "2024"
 
 [features]
 rerun = ["dep:rerun"]
-parallel = ["rudolf-v/parallel"]
+parallel = ["echo-li-core/parallel", "rudolf-v/parallel"]
 
 [dependencies]
 echo-li-core = { path = "../echo-li-core" }

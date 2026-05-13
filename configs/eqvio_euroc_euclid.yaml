@@ -7,7 +7,10 @@ RudolfV:
   # maxError: 50.0
   # maxFeatures: 40  # LK tracker pool (feeds sparse_vog). EqF cap is --max-features.
   maxFeatures: 1410
+  # maxFeatures: 500
   maxLevel: 3
+  lbpPolicy: HardReject
+  # lbpPolicy: SoftPenalty
   # minHarrisQuality: 0.05
   ransacParams:
     inlierThreshold: 0.00001
@@ -73,6 +76,7 @@ SparseVog:
   #                  invdepth3d, polar3d (3D Local IEKF on Normal chart)
   parametrization: invdepth3d
   max_pool_size: 1410
+  # max_pool_size: 500
   min_track_length: 5
   conv_inlier_ratio: 0.7        # a/(a+b) gate for query()
   # conv_variance_threshold: 0.02 # var(z) gate for query()
@@ -81,13 +85,15 @@ SparseVog:
   init_depth_var: 10.0
   sigma_pixel: 0.5              # pixel noise for obs tau^2 = z^4 * sigma^2 / drive^2
   uniform_z_max: 20.0           # outlier uniform density: 1/z_max
-  a_init: 10.0
-  b_init: 2.0
+  # a_init: 10.0
+  # b_init: 2.0
+  a_init: 100000000.0
+  b_init: 0.00000001
   ab_min: 1.0
-  ab_max: 20.0
+  # ab_max: 20.0
+  ab_max: 200.0
   min_inlier_ratio: 0.5         # gate for Mahalanobis stuck-outlier reset
-  # mahalanobis_reset_chi2: 4.5
-  mahalanobis_reset_chi2: 0.1
+  mahalanobis_reset_chi2: 0.2
   process_depth_var: 0.01       # fallback when P_vv unavailable
   min_parallax: 1.0e-4
   min_cos_sim: 0.95

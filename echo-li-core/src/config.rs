@@ -11,6 +11,8 @@ pub struct RudolfVConfig {
     pub equalise_image_histogram: bool,
     pub feature_dist: f64,
     pub feature_search_threshold: f64,
+    #[serde(default)]
+    pub lbp_policy: Option<String>,
     pub max_features: usize,
     pub max_level: usize,
 }

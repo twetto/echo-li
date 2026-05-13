@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use nalgebra::{Matrix3, Matrix4, Vector2, Vector3};
+#[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use rudolf_v::image::Image;
 use rudolf_v::pyramid::Pyramid;
@@ -531,8 +532,28 @@ impl PatchDepthMapper {
                 patch_centers.push((u, v));
             }
         }
+        #[cfg(feature = "parallel")]
         let patches: Vec<_> = patch_centers
             .par_iter()
+            .map(|&(u, v)| {
+                let estimate = self.solve_one_patch(
+                    u as f64,
+                    v as f64,
+                    &scaled_seeds,
+                    &seed_grid,
+                    &curr_pyramid,
+                    curr_valid_pyramid.as_deref(),
+                    ref_keyframe,
+                    &scaled_intrinsics,
+                    t_ref_curr,
+                    sigma_warp_sq,
+                );
+                (u as f64, v as f64, estimate)
+            })
+            .collect();
+        #[cfg(not(feature = "parallel"))]
+        let patches: Vec<_> = patch_centers
+            .iter()
             .map(|&(u, v)| {
                 let estimate = self.solve_one_patch(
                     u as f64,

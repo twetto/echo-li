@@ -13,7 +13,7 @@ use echo_li_core::mathematical::camera::{CameraModel, PinholeModel, RadTanModel}
 use echo_li_core::mathematical::*;
 use echo_li_core::{VIOFilter, VIOFilterSettings};
 use nalgebra::{Matrix3, Matrix4, Vector2};
-use rudolf_v::frontend::{Frontend, FrontendConfig};
+use rudolf_v::frontend::{Frontend, FrontendConfig, LbpPolicy};
 use rudolf_v::image::Image as RudolfImage;
 use rudolf_v::klt::LkMethod;
 use std::collections::HashMap;
@@ -219,11 +219,15 @@ fn color_for_depth(depth: f64, min_depth: f64, max_depth: f64) -> u32 {
 
 #[cfg(feature = "rerun")]
 fn color_for_scalar(value: f64, min_value: f64, max_value: f64) -> u32 {
-    const JET: [(f64, u8, u8, u8); 5] = [
+    // Approximate OpenCV COLORMAP_JET in RGB order. OpenCV's LUT has saturated
+    // blue/red shoulders, which makes nearby inverse-depth values easier to
+    // separate than a simple dark-blue -> cyan -> green -> yellow -> dark-red ramp.
+    const JET: [(f64, u8, u8, u8); 6] = [
         (0.0, 0, 0, 128),
-        (0.25, 0, 255, 255),
-        (0.5, 0, 255, 0),
-        (0.75, 255, 255, 0),
+        (0.125, 0, 0, 255),
+        (0.375, 0, 255, 255),
+        (0.625, 255, 255, 0),
+        (0.875, 255, 0, 0),
         (1.0, 128, 0, 0),
     ];
 
@@ -561,6 +565,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             frontend_config.histeq = rudolf_v::histeq::HistEqMethod::Global;
         }
         frontend_config.cell_size = conf.rudolf_v.feature_dist as usize;
+        if let Some(policy) = &conf.rudolf_v.lbp_policy {
+            frontend_config.lbp_policy = match policy.to_ascii_lowercase().as_str() {
+                "softpenalty" | "soft_penalty" | "soft-penalty" => LbpPolicy::SoftPenalty,
+                "hardreject" | "hard_reject" | "hard-reject" => LbpPolicy::HardReject,
+                _ => {
+                    return Err(format!(
+                        "unsupported RudolfV.lbpPolicy '{}'; expected SoftPenalty or HardReject",
+                        policy
+                    )
+                    .into());
+                }
+            };
+        }
     } else {
         frontend_config.max_features = 40;
         frontend_config.cell_size = 100;
