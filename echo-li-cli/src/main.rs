@@ -1,6 +1,10 @@
 use clap::Parser;
 use echo_li_core::config::VIOConfig;
+use echo_li_core::core_types::CameraIntrinsics;
 use echo_li_core::dataserver::ASLDatasetReader;
+use echo_li_core::depth::patch_depth::{
+    FrameProducts, PatchDepthMapper, PatchDepthOutput, PatchDepthSettings, PatchStatus,
+};
 use echo_li_core::depth::sparse_3d::{Sparse3DChart, Sparse3DFilter};
 use echo_li_core::depth::sparse_gb::SparseVogSettings;
 use echo_li_core::initialization::{check_stationary, estimate_initial_pose};
@@ -13,6 +17,7 @@ use rudolf_v::image::Image as RudolfImage;
 use rudolf_v::klt::LkMethod;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -44,6 +49,10 @@ struct Args {
     /// Sparse filter chart: polar3d or invdepth3d.
     #[arg(long, default_value = "polar3d")]
     sparse_chart: String,
+
+    /// Run patch-grid direct depth mapper. Enabled automatically by PatchDepth config.
+    #[arg(long, default_value_t = false)]
+    patch_depth: bool,
 }
 
 fn write_trajectory(path: &std::path::Path, entries: &[(f64, VIOState)]) -> std::io::Result<()> {
@@ -123,6 +132,74 @@ fn undistorted_pinhole_measurement(
     VisionMeasurement::new(stamp, undistorted_uvs)
 }
 
+fn patch_depth_status_counts(output: &PatchDepthOutput) -> (usize, usize, usize, usize) {
+    let mut unknown = 0;
+    let mut seed_only = 0;
+    let mut photo_refined = 0;
+    let mut rejected = 0;
+    for status in &output.status_cells.data {
+        match status {
+            PatchStatus::Unknown => unknown += 1,
+            PatchStatus::SeedOnly => seed_only += 1,
+            PatchStatus::PhotoRefined => photo_refined += 1,
+            PatchStatus::Rejected => rejected += 1,
+        }
+    }
+    (unknown, seed_only, photo_refined, rejected)
+}
+
+#[cfg(feature = "rerun")]
+fn patch_depth_rgb_for_vis(
+    output: &PatchDepthOutput,
+    img_w: usize,
+    img_h: usize,
+    vis_min_depth: f64,
+    vis_max_depth: f64,
+) -> Vec<u8> {
+    let mut rgb = vec![0u8; img_w * img_h * 3];
+    if vis_min_depth <= 0.0 || vis_max_depth <= vis_min_depth {
+        return rgb;
+    }
+    let cell_w = (img_w / output.depth_cells.width.max(1)).max(1);
+    let cell_h = (img_h / output.depth_cells.height.max(1)).max(1);
+
+    for cy in 0..output.depth_cells.height {
+        for cx in 0..output.depth_cells.width {
+            let idx = cy * output.depth_cells.width + cx;
+            let depth = output.depth_cells.data[idx];
+            if !depth.is_finite() || depth <= 0.0 {
+                continue;
+            }
+            let color = color_for_depth(depth as f64, vis_min_depth, vis_max_depth);
+            let r = ((color >> 24) & 0xFF) as u8;
+            let g = ((color >> 16) & 0xFF) as u8;
+            let b = ((color >> 8) & 0xFF) as u8;
+            let x0 = cx * cell_w;
+            let y0 = cy * cell_h;
+            let x1 = if cx + 1 == output.depth_cells.width {
+                img_w
+            } else {
+                ((cx + 1) * cell_w).min(img_w)
+            };
+            let y1 = if cy + 1 == output.depth_cells.height {
+                img_h
+            } else {
+                ((cy + 1) * cell_h).min(img_h)
+            };
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let out = (y * img_w + x) * 3;
+                    rgb[out] = r;
+                    rgb[out + 1] = g;
+                    rgb[out + 2] = b;
+                }
+            }
+        }
+    }
+
+    rgb
+}
+
 #[cfg(feature = "rerun")]
 fn clip_image_point(x: f64, y: f64, img_w: usize, img_h: usize) -> Option<(f32, f32)> {
     (x >= 0.0 && x < img_w as f64 && y >= 0.0 && y < img_h as f64).then_some((x as f32, y as f32))
@@ -130,6 +207,17 @@ fn clip_image_point(x: f64, y: f64, img_w: usize, img_h: usize) -> Option<(f32, 
 
 #[cfg(feature = "rerun")]
 fn color_for_inverse_depth(invdepth: f64, min_invdepth: f64, max_invdepth: f64) -> u32 {
+    color_for_scalar(invdepth, min_invdepth, max_invdepth)
+}
+
+#[cfg(feature = "rerun")]
+fn color_for_depth(depth: f64, min_depth: f64, max_depth: f64) -> u32 {
+    let flipped_depth = max_depth + min_depth - depth;
+    color_for_scalar(flipped_depth, min_depth, max_depth)
+}
+
+#[cfg(feature = "rerun")]
+fn color_for_scalar(value: f64, min_value: f64, max_value: f64) -> u32 {
     const JET: [(f64, u8, u8, u8); 5] = [
         (0.0, 0, 0, 128),
         (0.25, 0, 255, 255),
@@ -138,8 +226,8 @@ fn color_for_inverse_depth(invdepth: f64, min_invdepth: f64, max_invdepth: f64) 
         (1.0, 128, 0, 0),
     ];
 
-    let t = if max_invdepth > min_invdepth {
-        ((invdepth - min_invdepth) / (max_invdepth - min_invdepth)).clamp(0.0, 1.0)
+    let t = if max_value > min_value {
+        ((value - min_value) / (max_value - min_value)).clamp(0.0, 1.0)
     } else {
         0.5
     };
@@ -245,10 +333,14 @@ fn send_rerun_blueprint(
     bp.set_time_sequence("blueprint", 0);
 
     let camera_view_id = Uuid::random();
+    let patch_depth_view_id = Uuid::random();
     let world_view_id = Uuid::random();
+    let left_container_id = Uuid::random();
     let root_container_id = Uuid::random();
     let camera_view_path = format!("view/{camera_view_id}");
+    let patch_depth_view_path = format!("view/{patch_depth_view_id}");
     let world_view_path = format!("view/{world_view_id}");
+    let left_container_path = format!("container/{left_container_id}");
     let root_container_path = format!("container/{root_container_id}");
 
     bp.log(
@@ -271,6 +363,25 @@ fn send_rerun_blueprint(
     )?;
 
     bp.log(
+        patch_depth_view_path.as_str(),
+        &ViewBlueprint::new("2D")
+            .with_display_name(Name("Patch Depth".into()))
+            .with_space_origin(ViewOrigin("patch_depth".into()))
+            .with_visible(Visible(Bool(true))),
+    )?;
+    bp.log(
+        format!("{patch_depth_view_path}/ViewContents"),
+        &ViewContents::new(["patch_depth/**"]),
+    )?;
+    bp.log(
+        format!("{patch_depth_view_path}/VisualBounds2D"),
+        &VisualBounds2D::new(Range2D {
+            x_range: [0.0, img_w as f64].into(),
+            y_range: [0.0, img_h as f64].into(),
+        }),
+    )?;
+
+    bp.log(
         world_view_path.as_str(),
         &ViewBlueprint::new("3D")
             .with_display_name(Name("World".into()))
@@ -283,9 +394,16 @@ fn send_rerun_blueprint(
     )?;
 
     bp.log(
+        left_container_path.as_str(),
+        &ContainerBlueprint::new(ContainerKind::Vertical).with_contents([
+            IncludedContent(EntityPath(camera_view_path.into())),
+            IncludedContent(EntityPath(patch_depth_view_path.into())),
+        ]),
+    )?;
+    bp.log(
         root_container_path.as_str(),
         &ContainerBlueprint::new(ContainerKind::Horizontal).with_contents([
-            IncludedContent(EntityPath(camera_view_path.into())),
+            IncludedContent(EntityPath(left_container_path.into())),
             IncludedContent(EntityPath(world_view_path.into())),
         ]),
     )?;
@@ -354,13 +472,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         settings.coordinate_choice, settings.max_landmarks
     );
 
-    let (cam_model, k_matrix, img_w, img_h): (Box<dyn CameraModel>, Matrix3<f64>, usize, usize) =
+    let (cam_model, k_matrix, img_w, img_h): (Arc<dyn CameraModel>, Matrix3<f64>, usize, usize) =
         if let Some(intr) = &reader.intrinsics {
             println!(
                 "Camera intrinsics: {}x{} fx={:.1} fy={:.1} cx={:.1} cy={:.1}",
                 intr.width, intr.height, intr.fx, intr.fy, intr.cx, intr.cy
             );
-            let model: Box<dyn CameraModel> = match (
+            let model: Arc<dyn CameraModel> = match (
                 intr.distortion_model.as_deref(),
                 &intr.distortion_coefficients,
             ) {
@@ -369,7 +487,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "Distortion: radial-tangential k1={:.4} k2={:.4} p1={:.6} p2={:.6}",
                         d[0], d[1], d[2], d[3]
                     );
-                    Box::new(RadTanModel {
+                    Arc::new(RadTanModel {
                         fx: intr.fx,
                         fy: intr.fy,
                         cx: intr.cx,
@@ -382,7 +500,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 _ => {
                     println!("Distortion: none (pinhole)");
-                    Box::new(PinholeModel {
+                    Arc::new(PinholeModel {
                         fx: intr.fx,
                         fy: intr.fy,
                         cx: intr.cx,
@@ -399,17 +517,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             println!("No intrinsics found, using EuRoC defaults");
             (
-                Box::new(PinholeModel {
+                Arc::new(PinholeModel {
                     fx: 458.65,
                     fy: 457.3,
                     cx: 367.2,
                     cy: 248.3,
-                }) as Box<dyn CameraModel>,
+                }) as Arc<dyn CameraModel>,
                 Matrix3::new(458.65, 0.0, 367.2, 0.0, 457.3, 248.3, 0.0, 0.0, 1.0),
                 752,
                 480,
             )
         };
+
+    let patch_depth_enabled = args.patch_depth
+        || vio_config
+            .as_ref()
+            .and_then(|conf| conf.patch_depth.as_ref())
+            .is_some();
+    let patch_depth_settings = vio_config
+        .as_ref()
+        .and_then(|conf| conf.patch_depth.as_ref())
+        .map(|conf| conf.to_patch_depth_settings())
+        .unwrap_or_else(PatchDepthSettings::default);
+    #[cfg(feature = "rerun")]
+    let (patch_depth_vis_min_depth, patch_depth_vis_max_depth) = vio_config
+        .as_ref()
+        .and_then(|conf| conf.patch_depth.as_ref())
+        .map(|conf| {
+            (
+                conf.vis_min_depth.unwrap_or(0.1),
+                conf.vis_max_depth.unwrap_or(5.0),
+            )
+        })
+        .unwrap_or((0.1, 5.0));
 
     // Initialize Rudolf-V Frontend
     let mut frontend_config = FrontendConfig::default();
@@ -455,6 +595,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut filter: Option<VIOFilter> = None;
+    let mut patch_depth_mapper = if patch_depth_enabled {
+        let mapper = PatchDepthMapper::new(
+            Arc::clone(&cam_model),
+            CameraIntrinsics::from_matrix(&k_matrix),
+            img_w,
+            img_h,
+            patch_depth_settings.clone(),
+        )?;
+        println!(
+            "Patch depth: enabled scale={:.2}, patch={} stride={} cell={} levels={}",
+            patch_depth_settings.scale,
+            patch_depth_settings.patch_size,
+            patch_depth_settings.patch_stride,
+            patch_depth_settings.cell_size,
+            patch_depth_settings.n_pyramid_levels
+        );
+        #[cfg(feature = "rerun")]
+        println!(
+            "Patch depth visualization: fixed depth range [{:.2}, {:.2}] m",
+            patch_depth_vis_min_depth, patch_depth_vis_max_depth
+        );
+        Some(mapper)
+    } else {
+        println!("Patch depth: disabled");
+        None
+    };
     let mut sparse_filter = if let Some(conf) = &vio_config {
         if let Some(sparse_conf) = &conf.sparse_vog {
             if sparse_conf.enabled {
@@ -498,6 +664,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut states_out: Vec<(f64, VIOState)> = Vec::new();
     let mut imu_count: usize = 0;
     let mut vision_count: usize = 0;
+    let mut last_patch_depth_counts: Option<(usize, usize, usize, usize)> = None;
+    #[cfg(feature = "rerun")]
+    let mut last_patch_depth_output: Option<PatchDepthOutput> = None;
+    #[cfg(feature = "rerun")]
+    let mut patch_depth_vis_announced = false;
     let t_start = std::time::Instant::now();
 
     #[cfg(feature = "rerun")]
@@ -544,16 +715,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(img_data) = image_it.next() {
             if let Ok(dynamic_img) = image::open(&img_data.image_path) {
                 let gray_img = dynamic_img.to_luma8();
+                let gray_data = gray_img.into_raw();
 
                 // Clone raw pixels for Rerun before consuming into Rudolf-V
                 #[cfg(feature = "rerun")]
-                let gray_data = if rec.is_some() {
-                    gray_img.clone().into_raw()
+                let rerun_gray_data = if rec.is_some() {
+                    gray_data.clone()
                 } else {
                     vec![]
                 };
 
-                let rudolf_img = RudolfImage::from_vec(img_w, img_h, gray_img.into_raw());
+                let patch_gray_data = if patch_depth_mapper.is_some() {
+                    gray_data.clone()
+                } else {
+                    Vec::new()
+                };
+
+                let rudolf_img = RudolfImage::from_vec(img_w, img_h, gray_data);
 
                 let (features, _stats) = frontend.process(&rudolf_img);
 
@@ -585,6 +763,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let t_wc = camera_pose_matrix(&state);
                     if let Some(sparse) = &mut sparse_filter {
                         sparse.update(&sparse_measurement, &t_wc, None);
+                        if let Some(mapper) = &mut patch_depth_mapper {
+                            if !patch_gray_data.is_empty() {
+                                let frame = FrameProducts {
+                                    frame_id: vision_count as u64,
+                                    stamp: img_data.stamp,
+                                    gray: patch_gray_data.clone(),
+                                    width: img_w,
+                                    height: img_h,
+                                    pose_t_wc: t_wc,
+                                };
+                                let patch_output = mapper.update(sparse, &measurement, frame);
+                                last_patch_depth_counts =
+                                    patch_output.as_ref().map(patch_depth_status_counts);
+                                #[cfg(feature = "rerun")]
+                                {
+                                    last_patch_depth_output = patch_output;
+                                }
+                            }
+                        }
                     }
 
                     #[cfg(feature = "rerun")]
@@ -602,9 +799,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // Camera image (grayscale)
                         rec.log(
                             "camera/image",
-                            &rerun::Image::from_l8(gray_data, [img_w as u32, img_h as u32]),
+                            &rerun::Image::from_l8(rerun_gray_data, [img_w as u32, img_h as u32]),
                         )
                         .ok();
+
+                        if let Some(output) = &last_patch_depth_output {
+                            let rgb = patch_depth_rgb_for_vis(
+                                output,
+                                img_w,
+                                img_h,
+                                patch_depth_vis_min_depth,
+                                patch_depth_vis_max_depth,
+                            );
+                            rec.log(
+                                "patch_depth/image",
+                                &rerun::Image::from_rgb24(rgb, [img_w as u32, img_h as u32]),
+                            )
+                            .ok();
+                            if !patch_depth_vis_announced {
+                                println!("Patch depth Rerun entity: patch_depth/image");
+                                patch_depth_vis_announced = true;
+                            }
+                        }
 
                         // Tracked features on image
                         if !tracker_points.is_empty() {
@@ -721,18 +937,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if vision_count % 100 == 0 || vision_count <= 5 {
                         let pos = states_out.last().unwrap().1.sensor.pose.translation;
                         let vel = states_out.last().unwrap().1.sensor.velocity;
-                        println!(
-                            "  [{:4}] t={:.3}  pos=({:+.2}, {:+.2}, {:+.2})  vel=({:+.3}, {:+.3}, {:+.3})  lm={}",
-                            vision_count,
-                            img_data.stamp,
-                            pos[0],
-                            pos[1],
-                            pos[2],
-                            vel[0],
-                            vel[1],
-                            vel[2],
-                            feat_global.len()
-                        );
+                        if let Some((unk, seed, photo, rej)) = last_patch_depth_counts {
+                            println!(
+                                "  [{:4}] t={:.3}  pos=({:+.2}, {:+.2}, {:+.2})  vel=({:+.3}, {:+.3}, {:+.3})  lm={}  patch=(photo:{} seed:{} unk:{} rej:{})",
+                                vision_count,
+                                img_data.stamp,
+                                pos[0],
+                                pos[1],
+                                pos[2],
+                                vel[0],
+                                vel[1],
+                                vel[2],
+                                feat_global.len(),
+                                photo,
+                                seed,
+                                unk,
+                                rej
+                            );
+                        } else {
+                            println!(
+                                "  [{:4}] t={:.3}  pos=({:+.2}, {:+.2}, {:+.2})  vel=({:+.3}, {:+.3}, {:+.3})  lm={}",
+                                vision_count,
+                                img_data.stamp,
+                                pos[0],
+                                pos[1],
+                                pos[2],
+                                vel[0],
+                                vel[1],
+                                vel[2],
+                                feat_global.len()
+                            );
+                        }
                     }
                 }
             }

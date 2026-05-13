@@ -75,7 +75,8 @@ SparseVog:
   max_pool_size: 1410
   min_track_length: 5
   conv_inlier_ratio: 0.7        # a/(a+b) gate for query()
-  conv_variance_threshold: 0.02 # var(z) gate for query()
+  # conv_variance_threshold: 0.02 # var(z) gate for query()
+  conv_variance_threshold: 1.0 # var(z) gate for query()
   init_depth_var: 1.0
   sigma_pixel: 0.5              # pixel noise for obs tau^2 = z^4 * sigma^2 / drive^2
   uniform_z_max: 20.0           # outlier uniform density: 1/z_max
@@ -89,9 +90,21 @@ SparseVog:
   min_parallax: 1.0e-4
   min_cos_sim: 0.95
   min_depth: 0.1
-  max_depth: 100.0
+  max_depth: 150.0
   # PlaneDetector (separate instance, fed by sparse_vog pool)
   pd_max_tri_side_px: 200
-  pd_max_dist_between_z: 0.15
-  pd_max_norm_deg: 25
-  pd_min_plane_features: 4
+  pd_max_dist_between_z: 0.1
+  pd_max_norm_deg: 10
+  pd_min_plane_features: 15
+PatchDepth:
+  scale: 1.0
+  patch_size: 8
+  patch_stride: 4
+  cell_size: 8
+  seed_radius_px: 32
+  min_baseline_ratio: 0.005
+  max_baseline_ratio: 0.3
+  n_pyramid_levels: 1
+  max_depth: 150.0
+  vis_min_depth: 0.1
+  vis_max_depth: 5.0

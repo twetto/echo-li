@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::path::Path;
 
+use crate::depth::patch_depth::PatchDepthSettings;
 use crate::depth::sparse_gb::{DepthParametrization, SparseVogSettings};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -238,12 +239,144 @@ impl SparseVogConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PatchDepthConfig {
+    #[serde(default)]
+    pub scale: Option<f64>,
+    #[serde(default)]
+    pub patch_size: Option<usize>,
+    #[serde(default)]
+    pub patch_stride: Option<usize>,
+    #[serde(default)]
+    pub cell_size: Option<usize>,
+    #[serde(default)]
+    pub min_depth: Option<f64>,
+    #[serde(default)]
+    pub max_depth: Option<f64>,
+    #[serde(default)]
+    pub photo_huber_delta: Option<f64>,
+    #[serde(default)]
+    pub sigma_photo: Option<f64>,
+    #[serde(default)]
+    pub n_gn_iters: Option<usize>,
+    #[serde(default)]
+    pub fd_eps: Option<f64>,
+    #[serde(default)]
+    pub lambda_seed: Option<f64>,
+    #[serde(default)]
+    pub seed_radius_px: Option<f64>,
+    #[serde(default)]
+    pub sigma_seed_floor: Option<f64>,
+    #[serde(default)]
+    pub n_search_candidates: Option<usize>,
+    #[serde(default)]
+    pub search_half_range: Option<f64>,
+    #[serde(default)]
+    pub min_baseline_ratio: Option<f64>,
+    #[serde(default)]
+    pub max_baseline_ratio: Option<f64>,
+    #[serde(default)]
+    pub min_photo_curvature: Option<f64>,
+    #[serde(default)]
+    pub max_photo_residual: Option<f64>,
+    #[serde(default)]
+    pub n_pyramid_levels: Option<usize>,
+    #[serde(default)]
+    pub var_floor: Option<f64>,
+    #[serde(default)]
+    pub status_weight_photo: Option<f64>,
+    #[serde(default)]
+    pub status_weight_seed: Option<f64>,
+    #[serde(default)]
+    pub vis_min_depth: Option<f64>,
+    #[serde(default)]
+    pub vis_max_depth: Option<f64>,
+}
+
+impl PatchDepthConfig {
+    pub fn to_patch_depth_settings(&self) -> PatchDepthSettings {
+        let mut settings = PatchDepthSettings::default();
+        if let Some(v) = self.scale {
+            settings.scale = v;
+        }
+        if let Some(v) = self.patch_size {
+            settings.patch_size = v;
+        }
+        if let Some(v) = self.patch_stride {
+            settings.patch_stride = v;
+        }
+        if let Some(v) = self.cell_size {
+            settings.cell_size = v;
+        }
+        if let Some(v) = self.min_depth {
+            settings.min_depth = v;
+        }
+        if let Some(v) = self.max_depth {
+            settings.max_depth = v;
+        }
+        if let Some(v) = self.photo_huber_delta {
+            settings.photo_huber_delta = v;
+        }
+        if let Some(v) = self.sigma_photo {
+            settings.sigma_photo = v;
+        }
+        if let Some(v) = self.n_gn_iters {
+            settings.n_gn_iters = v;
+        }
+        if let Some(v) = self.fd_eps {
+            settings.fd_eps = v;
+        }
+        if let Some(v) = self.lambda_seed {
+            settings.lambda_seed = v;
+        }
+        if let Some(v) = self.seed_radius_px {
+            settings.seed_radius_px = v;
+        }
+        if let Some(v) = self.sigma_seed_floor {
+            settings.sigma_seed_floor = v;
+        }
+        if let Some(v) = self.n_search_candidates {
+            settings.n_search_candidates = v;
+        }
+        if let Some(v) = self.search_half_range {
+            settings.search_half_range = v;
+        }
+        if let Some(v) = self.min_baseline_ratio {
+            settings.min_baseline_ratio = v;
+        }
+        if let Some(v) = self.max_baseline_ratio {
+            settings.max_baseline_ratio = v;
+        }
+        if let Some(v) = self.min_photo_curvature {
+            settings.min_photo_curvature = v;
+        }
+        if let Some(v) = self.max_photo_residual {
+            settings.max_photo_residual = v;
+        }
+        if let Some(v) = self.n_pyramid_levels {
+            settings.n_pyramid_levels = v;
+        }
+        if let Some(v) = self.var_floor {
+            settings.var_floor = v;
+        }
+        if let Some(v) = self.status_weight_photo {
+            settings.status_weight_photo = v;
+        }
+        if let Some(v) = self.status_weight_seed {
+            settings.status_weight_seed = v;
+        }
+        settings
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VIOConfig {
     #[serde(rename = "RudolfV")]
     pub rudolf_v: RudolfVConfig,
     #[serde(rename = "SparseVog", default)]
     pub sparse_vog: Option<SparseVogConfig>,
+    #[serde(rename = "PatchDepth", default)]
+    pub patch_depth: Option<PatchDepthConfig>,
     pub eqf: EqfConfig,
     pub main: MainConfig,
 }
