@@ -7,8 +7,15 @@ use crate::depth::sparse_3d::Sparse3DFilter;
 use crate::mathematical::camera::CameraModel;
 use crate::mathematical::vision_measurement::VisionMeasurement;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchDepthCameraMode {
+    RawDistorted,
+    UndistortedPinhole,
+}
+
 #[derive(Debug, Clone)]
 pub struct PatchDepthSettings {
+    pub camera_mode: PatchDepthCameraMode,
     pub scale: f64,
     pub patch_size: usize,
     pub patch_stride: usize,
@@ -37,6 +44,7 @@ pub struct PatchDepthSettings {
 impl Default for PatchDepthSettings {
     fn default() -> Self {
         Self {
+            camera_mode: PatchDepthCameraMode::RawDistorted,
             scale: 1.0,
             patch_size: 8,
             patch_stride: 4,
@@ -135,11 +143,13 @@ struct PatchEstimate {
 
 pub struct PatchDepthMapper {
     camera: Arc<dyn CameraModel>,
+    camera_mode: PatchDepthCameraMode,
     intrinsics: CameraIntrinsics,
     width: usize,
     height: usize,
     settings: PatchDepthSettings,
     bearing_lut: Vec<Vector3<f64>>,
+    undistort_lut: Option<Vec<Option<Vector2<f64>>>>,
     keyframes: Vec<DepthKeyframe>,
 }
 
@@ -150,6 +160,41 @@ impl PatchDepthMapper {
         width: usize,
         height: usize,
         settings: PatchDepthSettings,
+    ) -> anyhow::Result<Self> {
+        let camera_mode = settings.camera_mode;
+        Self::new_with_mode(camera, intrinsics, width, height, settings, camera_mode)
+    }
+
+    pub fn new_undistorted_pinhole(
+        raw_camera: Arc<dyn CameraModel>,
+        intrinsics: CameraIntrinsics,
+        width: usize,
+        height: usize,
+        settings: PatchDepthSettings,
+    ) -> anyhow::Result<Self> {
+        let mut settings = settings;
+        settings.camera_mode = PatchDepthCameraMode::UndistortedPinhole;
+        Self::new_with_mode(
+            raw_camera,
+            intrinsics,
+            width,
+            height,
+            settings,
+            PatchDepthCameraMode::UndistortedPinhole,
+        )
+    }
+
+    pub fn camera_mode(&self) -> PatchDepthCameraMode {
+        self.camera_mode
+    }
+
+    fn new_with_mode(
+        camera: Arc<dyn CameraModel>,
+        intrinsics: CameraIntrinsics,
+        width: usize,
+        height: usize,
+        settings: PatchDepthSettings,
+        camera_mode: PatchDepthCameraMode,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(width > 0 && height > 0, "image size must be non-zero");
         anyhow::ensure!(
@@ -182,13 +227,25 @@ impl PatchDepthMapper {
             }
         }
 
+        let undistort_lut = match camera_mode {
+            PatchDepthCameraMode::RawDistorted => None,
+            PatchDepthCameraMode::UndistortedPinhole => Some(build_pinhole_to_raw_lut(
+                camera.as_ref(),
+                &intrinsics,
+                width,
+                height,
+            )),
+        };
+
         Ok(Self {
             camera,
+            camera_mode,
             intrinsics,
             width,
             height,
             settings,
             bearing_lut,
+            undistort_lut,
             keyframes: Vec::new(),
         })
     }
@@ -217,6 +274,7 @@ impl PatchDepthMapper {
             return None;
         }
 
+        let frame = self.frame_for_mode(frame)?;
         let median_depth = median_seed_depth(seeds).unwrap_or(self.settings.max_depth);
         let selected = self.select_keyframe(&frame.pose_t_wc, median_depth);
         self.manage_keyframes(Arc::new(frame.clone()), median_depth);
@@ -228,6 +286,31 @@ impl PatchDepthMapper {
 
     pub fn keyframe_count(&self) -> usize {
         self.keyframes.len()
+    }
+
+    fn frame_for_mode(&self, frame: FrameProducts) -> Option<FrameProducts> {
+        match self.camera_mode {
+            PatchDepthCameraMode::RawDistorted => Some(frame),
+            PatchDepthCameraMode::UndistortedPinhole => {
+                let lut = self.undistort_lut.as_ref()?;
+                let mut gray = vec![0u8; self.width * self.height];
+                for (idx, src_uv) in lut.iter().enumerate() {
+                    let value = src_uv
+                        .and_then(|uv| {
+                            sample_u8_bilinear_checked(
+                                &frame.gray,
+                                frame.width,
+                                frame.height,
+                                uv[0],
+                                uv[1],
+                            )
+                        })
+                        .unwrap_or(0.0);
+                    gray[idx] = value.round().clamp(0.0, 255.0) as u8;
+                }
+                Some(FrameProducts { gray, ..frame })
+            }
+        }
     }
 
     fn gather_seeds(
@@ -654,14 +737,12 @@ impl PatchDepthMapper {
                     continue;
                 };
 
-                let original_u = pu / intr.scale_from_original;
-                let original_v = pv / intr.scale_from_original;
-                let Some(bearing) = self.bearing_at_original(original_u, original_v) else {
+                let Some(bearing) = self.bearing_for_scaled_pixel(pu, pv, intr) else {
                     continue;
                 };
                 let r_ref_curr = t_ref_curr.fixed_view::<3, 3>(0, 0).into_owned();
                 let dx_ref_drho = r_ref_curr * (-bearing / (rho * rho));
-                let du_dxref = self.camera.projection_jacobian(&x_ref) * dx_ref_drho;
+                let du_dxref = self.projection_jacobian(&x_ref) * dx_ref_drho;
                 let du_drho = intr.scale_from_original * du_dxref[0];
                 let dv_drho = intr.scale_from_original * du_dxref[1];
                 let jac = level_jacobian_scale * (gx as f64 * du_drho + gy as f64 * dv_drho);
@@ -697,9 +778,7 @@ impl PatchDepthMapper {
         if rho <= 0.0 {
             return None;
         }
-        let original_u = u / intr.scale_from_original;
-        let original_v = v / intr.scale_from_original;
-        let bearing = self.bearing_at_original(original_u, original_v)?;
+        let bearing = self.bearing_for_scaled_pixel(u, v, intr)?;
         let x_curr = bearing / rho;
         let r = t_ref_curr.fixed_view::<3, 3>(0, 0).into_owned();
         let t = t_ref_curr.fixed_view::<3, 1>(0, 3).into_owned();
@@ -707,12 +786,67 @@ impl PatchDepthMapper {
         if x_ref[2] <= 1e-6 {
             return None;
         }
-        let uv_ref = self.camera.project(&x_ref);
+        let uv_ref = self.project(&x_ref);
         Some((
             uv_ref[0] * intr.scale_from_original,
             uv_ref[1] * intr.scale_from_original,
             x_ref,
         ))
+    }
+
+    fn bearing_for_scaled_pixel(
+        &self,
+        u: f64,
+        v: f64,
+        intr: &ScaledIntrinsics,
+    ) -> Option<Vector3<f64>> {
+        let original_u = u / intr.scale_from_original;
+        let original_v = v / intr.scale_from_original;
+        match self.camera_mode {
+            PatchDepthCameraMode::RawDistorted => self.bearing_at_original(original_u, original_v),
+            PatchDepthCameraMode::UndistortedPinhole => {
+                if original_u < 0.0
+                    || original_v < 0.0
+                    || original_u >= (self.width - 1) as f64
+                    || original_v >= (self.height - 1) as f64
+                {
+                    return None;
+                }
+                Some(Vector3::new(
+                    (original_u - self.intrinsics.cx) / self.intrinsics.fx,
+                    (original_v - self.intrinsics.cy) / self.intrinsics.fy,
+                    1.0,
+                ))
+            }
+        }
+    }
+
+    fn project(&self, p: &Vector3<f64>) -> Vector2<f64> {
+        match self.camera_mode {
+            PatchDepthCameraMode::RawDistorted => self.camera.project(p),
+            PatchDepthCameraMode::UndistortedPinhole => Vector2::new(
+                self.intrinsics.fx * p[0] / p[2] + self.intrinsics.cx,
+                self.intrinsics.fy * p[1] / p[2] + self.intrinsics.cy,
+            ),
+        }
+    }
+
+    fn projection_jacobian(&self, p: &Vector3<f64>) -> nalgebra::Matrix2x3<f64> {
+        match self.camera_mode {
+            PatchDepthCameraMode::RawDistorted => self.camera.projection_jacobian(p),
+            PatchDepthCameraMode::UndistortedPinhole => {
+                let z_inv = 1.0 / p[2];
+                let z_inv2 = z_inv * z_inv;
+                nalgebra::Matrix2x3::new(
+                    self.intrinsics.fx * z_inv,
+                    0.0,
+                    -self.intrinsics.fx * p[0] * z_inv2,
+                    0.0,
+                    self.intrinsics.fy * z_inv,
+                    -self.intrinsics.fy * p[1] * z_inv2,
+                )
+            }
+        }
     }
 
     fn bearing_at_original(&self, u: f64, v: f64) -> Option<Vector3<f64>> {
@@ -848,6 +982,41 @@ fn scaled_image_from_u8(gray: &[u8], width: usize, height: usize, scale: f64) ->
         }
     }
     ImageF32::new(out_w, out_h, data)
+}
+
+fn build_pinhole_to_raw_lut(
+    raw_camera: &dyn CameraModel,
+    intrinsics: &CameraIntrinsics,
+    width: usize,
+    height: usize,
+) -> Vec<Option<Vector2<f64>>> {
+    let mut lut = Vec::with_capacity(width * height);
+    for v in 0..height {
+        for u in 0..width {
+            let x = (u as f64 - intrinsics.cx) / intrinsics.fx;
+            let y = (v as f64 - intrinsics.cy) / intrinsics.fy;
+            let raw_uv = raw_camera.project(&Vector3::new(x, y, 1.0));
+            let valid = raw_uv[0] >= 0.0
+                && raw_uv[1] >= 0.0
+                && raw_uv[0] < (width - 1) as f64
+                && raw_uv[1] < (height - 1) as f64;
+            lut.push(valid.then_some(raw_uv));
+        }
+    }
+    lut
+}
+
+fn sample_u8_bilinear_checked(
+    gray: &[u8],
+    width: usize,
+    height: usize,
+    u: f64,
+    v: f64,
+) -> Option<f32> {
+    if u < 0.0 || v < 0.0 || u >= (width - 1) as f64 || v >= (height - 1) as f64 {
+        return None;
+    }
+    Some(sample_u8_bilinear(gray, width, height, u, v))
 }
 
 fn sample_u8_bilinear(gray: &[u8], width: usize, height: usize, u: f64, v: f64) -> f32 {

@@ -3,7 +3,8 @@ use echo_li_core::config::VIOConfig;
 use echo_li_core::core_types::CameraIntrinsics;
 use echo_li_core::dataserver::ASLDatasetReader;
 use echo_li_core::depth::patch_depth::{
-    FrameProducts, PatchDepthMapper, PatchDepthOutput, PatchDepthSettings, PatchStatus,
+    FrameProducts, PatchDepthCameraMode, PatchDepthMapper, PatchDepthOutput, PatchDepthSettings,
+    PatchStatus,
 };
 use echo_li_core::depth::sparse_3d::{Sparse3DChart, Sparse3DFilter};
 use echo_li_core::depth::sparse_gb::SparseVogSettings;
@@ -604,7 +605,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             patch_depth_settings.clone(),
         )?;
         println!(
-            "Patch depth: enabled scale={:.2}, patch={} stride={} cell={} levels={}",
+            "Patch depth: enabled mode={:?} scale={:.2}, patch={} stride={} cell={} levels={}",
+            patch_depth_settings.camera_mode,
             patch_depth_settings.scale,
             patch_depth_settings.patch_size,
             patch_depth_settings.patch_stride,
@@ -765,6 +767,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         sparse.update(&sparse_measurement, &t_wc, None);
                         if let Some(mapper) = &mut patch_depth_mapper {
                             if !patch_gray_data.is_empty() {
+                                let patch_measurement = match mapper.camera_mode() {
+                                    PatchDepthCameraMode::RawDistorted => &measurement,
+                                    PatchDepthCameraMode::UndistortedPinhole => &sparse_measurement,
+                                };
                                 let frame = FrameProducts {
                                     frame_id: vision_count as u64,
                                     stamp: img_data.stamp,
@@ -773,7 +779,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     height: img_h,
                                     pose_t_wc: t_wc,
                                 };
-                                let patch_output = mapper.update(sparse, &measurement, frame);
+                                let patch_output = mapper.update(sparse, patch_measurement, frame);
                                 last_patch_depth_counts =
                                     patch_output.as_ref().map(patch_depth_status_counts);
                                 #[cfg(feature = "rerun")]

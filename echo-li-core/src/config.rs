@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::path::Path;
 
-use crate::depth::patch_depth::PatchDepthSettings;
+use crate::depth::patch_depth::{PatchDepthCameraMode, PatchDepthSettings};
 use crate::depth::sparse_gb::{DepthParametrization, SparseVogSettings};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -242,6 +242,8 @@ impl SparseVogConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PatchDepthConfig {
     #[serde(default)]
+    pub camera_mode: Option<String>,
+    #[serde(default)]
     pub scale: Option<f64>,
     #[serde(default)]
     pub patch_size: Option<usize>,
@@ -296,6 +298,14 @@ pub struct PatchDepthConfig {
 impl PatchDepthConfig {
     pub fn to_patch_depth_settings(&self) -> PatchDepthSettings {
         let mut settings = PatchDepthSettings::default();
+        if let Some(v) = &self.camera_mode {
+            settings.camera_mode = match v.to_ascii_lowercase().as_str() {
+                "undistorted_pinhole" | "undistorted-pinhole" | "pinhole" => {
+                    PatchDepthCameraMode::UndistortedPinhole
+                }
+                _ => PatchDepthCameraMode::RawDistorted,
+            };
+        }
         if let Some(v) = self.scale {
             settings.scale = v;
         }
