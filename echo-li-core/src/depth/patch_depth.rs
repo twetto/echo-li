@@ -15,6 +15,12 @@ pub enum PatchDepthCameraMode {
     UndistortedPinhole,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchDepthSeedCoordinates {
+    RawDistorted,
+    UndistortedPinhole,
+}
+
 #[derive(Debug, Clone)]
 pub struct PatchDepthSettings {
     pub camera_mode: PatchDepthCameraMode,
@@ -111,8 +117,29 @@ pub struct SparseDepthPrior {
 struct DepthKeyframe {
     frame: Arc<FrameProducts>,
     ref_pyramid: Vec<Image<f32>>,
+    valid_pyramid: Option<Vec<Image<f32>>>,
     grad_x_pyramid: Vec<Image<f32>>,
     grad_y_pyramid: Vec<Image<f32>>,
+}
+
+struct ModeFrame {
+    frame: FrameProducts,
+    valid_mask: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone)]
+struct RelativePose {
+    r: Matrix3<f64>,
+    t: Vector3<f64>,
+}
+
+impl RelativePose {
+    fn from_matrix(t_ref_curr: &Matrix4<f64>) -> Self {
+        Self {
+            r: t_ref_curr.fixed_view::<3, 3>(0, 0).into_owned(),
+            t: t_ref_curr.fixed_view::<3, 1>(0, 3).into_owned(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -183,6 +210,15 @@ impl PatchDepthMapper {
         self.camera_mode
     }
 
+    pub fn expected_seed_coordinates(&self) -> PatchDepthSeedCoordinates {
+        match self.camera_mode {
+            PatchDepthCameraMode::RawDistorted => PatchDepthSeedCoordinates::RawDistorted,
+            PatchDepthCameraMode::UndistortedPinhole => {
+                PatchDepthSeedCoordinates::UndistortedPinhole
+            }
+        }
+    }
+
     fn new_with_mode(
         camera: Arc<dyn CameraModel>,
         intrinsics: CameraIntrinsics,
@@ -249,8 +285,12 @@ impl PatchDepthMapper {
         &mut self,
         sparse_filter: &Sparse3DFilter,
         measurement: &VisionMeasurement,
+        seed_coordinates: PatchDepthSeedCoordinates,
         frame: FrameProducts,
     ) -> Option<PatchDepthOutput> {
+        if seed_coordinates != self.expected_seed_coordinates() {
+            return None;
+        }
         let seeds = self.gather_seeds(sparse_filter, measurement);
         self.update_with_priors(frame, &seeds, None, 0.0)
     }
@@ -269,41 +309,57 @@ impl PatchDepthMapper {
             return None;
         }
 
-        let frame = self.frame_for_mode(frame)?;
+        let mode_frame = self.frame_for_mode(frame)?;
+        let frame = mode_frame.frame;
+        let valid_mask = mode_frame.valid_mask;
         let median_depth = median_seed_depth(seeds).unwrap_or(self.settings.max_depth);
         let selected = self.select_keyframe(&frame.pose_t_wc, median_depth);
-        self.manage_keyframes(Arc::new(frame.clone()), median_depth);
+        self.manage_keyframes(Arc::new(frame.clone()), valid_mask.clone(), median_depth);
         let (ref_keyframe, t_ref_curr) = selected?;
         let sigma_warp_sq =
             compute_sigma_warp_sq(&self.intrinsics, &t_ref_curr, p_vv, dt, median_depth);
-        Some(self.solve(&frame, &ref_keyframe, &t_ref_curr, seeds, sigma_warp_sq))
+        Some(self.solve(
+            &frame,
+            valid_mask.as_deref(),
+            &ref_keyframe,
+            &t_ref_curr,
+            seeds,
+            sigma_warp_sq,
+        ))
     }
 
     pub fn keyframe_count(&self) -> usize {
         self.keyframes.len()
     }
 
-    fn frame_for_mode(&self, frame: FrameProducts) -> Option<FrameProducts> {
+    fn frame_for_mode(&self, frame: FrameProducts) -> Option<ModeFrame> {
         match self.camera_mode {
-            PatchDepthCameraMode::RawDistorted => Some(frame),
+            PatchDepthCameraMode::RawDistorted => Some(ModeFrame {
+                frame,
+                valid_mask: None,
+            }),
             PatchDepthCameraMode::UndistortedPinhole => {
                 let lut = self.undistort_lut.as_ref()?;
                 let mut gray = vec![0u8; self.width * self.height];
+                let mut valid_mask = vec![0u8; self.width * self.height];
                 for (idx, src_uv) in lut.iter().enumerate() {
-                    let value = src_uv
-                        .and_then(|uv| {
-                            sample_u8_bilinear_checked(
-                                &frame.gray,
-                                frame.width,
-                                frame.height,
-                                uv[0],
-                                uv[1],
-                            )
-                        })
-                        .unwrap_or(0.0);
-                    gray[idx] = value.round().clamp(0.0, 255.0) as u8;
+                    if let Some(value) = src_uv.and_then(|uv| {
+                        sample_u8_bilinear_checked(
+                            &frame.gray,
+                            frame.width,
+                            frame.height,
+                            uv[0],
+                            uv[1],
+                        )
+                    }) {
+                        gray[idx] = value.round().clamp(0.0, 255.0) as u8;
+                        valid_mask[idx] = 1;
+                    }
                 }
-                Some(FrameProducts { gray, ..frame })
+                Some(ModeFrame {
+                    frame: FrameProducts { gray, ..frame },
+                    valid_mask: Some(valid_mask),
+                })
             }
         }
     }
@@ -364,9 +420,14 @@ impl PatchDepthMapper {
         best.map(|(kf, t, _)| (kf, t))
     }
 
-    fn manage_keyframes(&mut self, frame: Arc<FrameProducts>, median_depth: f64) {
+    fn manage_keyframes(
+        &mut self,
+        frame: Arc<FrameProducts>,
+        valid_mask: Option<Vec<u8>>,
+        median_depth: f64,
+    ) {
         if self.keyframes.len() < 2 {
-            self.keyframes.push(self.make_keyframe(frame));
+            self.keyframes.push(self.make_keyframe(frame, valid_mask));
             return;
         }
 
@@ -381,11 +442,15 @@ impl PatchDepthMapper {
         let baseline = t_new_curr.fixed_view::<3, 1>(0, 3).norm();
         if baseline >= min_bl {
             self.keyframes.remove(0);
-            self.keyframes.push(self.make_keyframe(frame));
+            self.keyframes.push(self.make_keyframe(frame, valid_mask));
         }
     }
 
-    fn make_keyframe(&self, frame: Arc<FrameProducts>) -> DepthKeyframe {
+    fn make_keyframe(
+        &self,
+        frame: Arc<FrameProducts>,
+        valid_mask: Option<Vec<u8>>,
+    ) -> DepthKeyframe {
         let ref_pyramid = build_pyramid_from_u8(
             &frame.gray,
             frame.width,
@@ -393,6 +458,15 @@ impl PatchDepthMapper {
             self.settings.scale,
             self.settings.n_pyramid_levels,
         );
+        let valid_pyramid = valid_mask.as_ref().map(|mask| {
+            build_mask_pyramid(
+                mask,
+                frame.width,
+                frame.height,
+                self.settings.scale,
+                self.settings.n_pyramid_levels,
+            )
+        });
         let mut grad_x_pyramid = Vec::with_capacity(self.settings.n_pyramid_levels);
         let mut grad_y_pyramid = Vec::with_capacity(self.settings.n_pyramid_levels);
         for img in &ref_pyramid {
@@ -403,6 +477,7 @@ impl PatchDepthMapper {
         DepthKeyframe {
             frame,
             ref_pyramid,
+            valid_pyramid,
             grad_x_pyramid,
             grad_y_pyramid,
         }
@@ -411,6 +486,7 @@ impl PatchDepthMapper {
     fn solve(
         &self,
         frame: &FrameProducts,
+        valid_mask: Option<&[u8]>,
         ref_keyframe: &DepthKeyframe,
         t_ref_curr: &Matrix4<f64>,
         seeds: &[SparseDepthPrior],
@@ -423,6 +499,15 @@ impl PatchDepthMapper {
             self.settings.scale,
             self.settings.n_pyramid_levels,
         );
+        let curr_valid_pyramid = valid_mask.map(|mask| {
+            build_mask_pyramid(
+                mask,
+                frame.width,
+                frame.height,
+                self.settings.scale,
+                self.settings.n_pyramid_levels,
+            )
+        });
         let width = curr_pyramid[0].width();
         let height = curr_pyramid[0].height();
         let scaled_intrinsics =
@@ -445,6 +530,7 @@ impl PatchDepthMapper {
                     &scaled_seeds,
                     &seed_grid,
                     &curr_pyramid,
+                    curr_valid_pyramid.as_deref(),
                     ref_keyframe,
                     &scaled_intrinsics,
                     t_ref_curr,
@@ -464,6 +550,7 @@ impl PatchDepthMapper {
         seeds: &[SparseDepthPrior],
         seed_grid: &SeedGrid,
         curr_pyramid: &[Image<f32>],
+        curr_valid_pyramid: Option<&[Image<f32>]>,
         ref_keyframe: &DepthKeyframe,
         intrinsics_by_level: &[ScaledIntrinsics],
         t_ref_curr: &Matrix4<f64>,
@@ -498,6 +585,7 @@ impl PatchDepthMapper {
             rho_min,
             rho_max,
             curr_pyramid,
+            curr_valid_pyramid,
             ref_keyframe,
             intrinsics_by_level,
             t_ref_curr,
@@ -511,6 +599,7 @@ impl PatchDepthMapper {
                 cv,
                 rho,
                 curr_pyramid,
+                curr_valid_pyramid,
                 ref_keyframe,
                 intrinsics_by_level,
                 t_ref_curr,
@@ -571,6 +660,7 @@ impl PatchDepthMapper {
         rho_min: f64,
         rho_max: f64,
         curr_pyramid: &[Image<f32>],
+        curr_valid_pyramid: Option<&[Image<f32>]>,
         ref_keyframe: &DepthKeyframe,
         intrinsics_by_level: &[ScaledIntrinsics],
         t_ref_curr: &Matrix4<f64>,
@@ -596,7 +686,9 @@ impl PatchDepthMapper {
                 cv,
                 rho,
                 &curr_pyramid[0],
+                curr_valid_pyramid.map(|p| &p[0]),
                 &ref_keyframe.ref_pyramid[0],
+                ref_keyframe.valid_pyramid.as_ref().map(|p| &p[0]),
                 &intrinsics_by_level[0],
                 t_ref_curr,
             );
@@ -614,10 +706,13 @@ impl PatchDepthMapper {
         cv: f64,
         rho: f64,
         curr_img: &Image<f32>,
+        curr_valid: Option<&Image<f32>>,
         ref_img: &Image<f32>,
+        ref_valid: Option<&Image<f32>>,
         intr: &ScaledIntrinsics,
         t_ref_curr: &Matrix4<f64>,
     ) -> (f64, usize) {
+        let rel_pose = RelativePose::from_matrix(t_ref_curr);
         let half = self.settings.patch_size / 2;
         let mut cost = 0.0;
         let mut valid = 0;
@@ -628,10 +723,16 @@ impl PatchDepthMapper {
                 let Some(i_curr) = sample_nearest(curr_img, pu, pv) else {
                     continue;
                 };
-                let Some((u_ref, v_ref, _)) = self.warp_scaled_pixel(pu, pv, rho, intr, t_ref_curr)
+                if !sample_valid_nearest(curr_valid, pu, pv) {
+                    continue;
+                }
+                let Some((u_ref, v_ref, _)) = self.warp_scaled_pixel(pu, pv, rho, intr, &rel_pose)
                 else {
                     continue;
                 };
+                if !sample_valid_bilinear(ref_valid, u_ref, v_ref) {
+                    continue;
+                }
                 let Some(i_ref) = sample_bilinear(ref_img, u_ref, v_ref) else {
                     continue;
                 };
@@ -654,11 +755,13 @@ impl PatchDepthMapper {
         cv: f64,
         rho: f64,
         curr_pyramid: &[Image<f32>],
+        curr_valid_pyramid: Option<&[Image<f32>]>,
         ref_keyframe: &DepthKeyframe,
         intrinsics_by_level: &[ScaledIntrinsics],
         t_ref_curr: &Matrix4<f64>,
         sigma_warp_sq: f64,
     ) -> (f64, f64, f64, usize) {
+        let rel_pose = RelativePose::from_matrix(t_ref_curr);
         let mut grad = 0.0;
         let mut hess = 0.0;
         let mut sum_abs_res = 0.0;
@@ -671,13 +774,14 @@ impl PatchDepthMapper {
                 cv * scale,
                 rho,
                 &curr_pyramid[level],
+                curr_valid_pyramid.map(|p| &p[level]),
                 &ref_keyframe.ref_pyramid[level],
+                ref_keyframe.valid_pyramid.as_ref().map(|p| &p[level]),
                 &ref_keyframe.grad_x_pyramid[level],
                 &ref_keyframe.grad_y_pyramid[level],
                 &intrinsics_by_level[level],
-                t_ref_curr,
+                &rel_pose,
                 sigma_warp_sq,
-                scale,
             );
             grad += g;
             hess += h;
@@ -694,13 +798,14 @@ impl PatchDepthMapper {
         cv: f64,
         rho: f64,
         curr_img: &Image<f32>,
+        curr_valid: Option<&Image<f32>>,
         ref_img: &Image<f32>,
+        ref_valid: Option<&Image<f32>>,
         ref_grad_x: &Image<f32>,
         ref_grad_y: &Image<f32>,
         intr: &ScaledIntrinsics,
-        t_ref_curr: &Matrix4<f64>,
+        rel_pose: &RelativePose,
         sigma_warp_sq: f64,
-        level_jacobian_scale: f64,
     ) -> (f64, f64, f64, usize) {
         let half = self.settings.patch_size / 2;
         let mut grad = 0.0;
@@ -716,11 +821,17 @@ impl PatchDepthMapper {
                 let Some(i_curr) = sample_nearest(curr_img, pu, pv) else {
                     continue;
                 };
+                if !sample_valid_nearest(curr_valid, pu, pv) {
+                    continue;
+                }
                 let Some((u_ref, v_ref, x_ref)) =
-                    self.warp_scaled_pixel(pu, pv, rho, intr, t_ref_curr)
+                    self.warp_scaled_pixel(pu, pv, rho, intr, rel_pose)
                 else {
                     continue;
                 };
+                if !sample_valid_bilinear(ref_valid, u_ref, v_ref) {
+                    continue;
+                }
                 let Some(i_ref) = sample_bilinear(ref_img, u_ref, v_ref) else {
                     continue;
                 };
@@ -734,12 +845,11 @@ impl PatchDepthMapper {
                 let Some(bearing) = self.bearing_for_scaled_pixel(pu, pv, intr) else {
                     continue;
                 };
-                let r_ref_curr = t_ref_curr.fixed_view::<3, 3>(0, 0).into_owned();
-                let dx_ref_drho = r_ref_curr * (-bearing / (rho * rho));
+                let dx_ref_drho = rel_pose.r * (-bearing / (rho * rho));
                 let du_dxref = self.projection_jacobian(&x_ref) * dx_ref_drho;
                 let du_drho = intr.scale_from_original * du_dxref[0];
                 let dv_drho = intr.scale_from_original * du_dxref[1];
-                let jac = level_jacobian_scale * (gx as f64 * du_drho + gy as f64 * dv_drho);
+                let jac = gx as f64 * du_drho + gy as f64 * dv_drho;
 
                 let residual = i_ref as f64 - i_curr as f64;
                 let ar = residual.abs();
@@ -767,16 +877,14 @@ impl PatchDepthMapper {
         v: f64,
         rho: f64,
         intr: &ScaledIntrinsics,
-        t_ref_curr: &Matrix4<f64>,
+        rel_pose: &RelativePose,
     ) -> Option<(f64, f64, Vector3<f64>)> {
         if rho <= 0.0 {
             return None;
         }
         let bearing = self.bearing_for_scaled_pixel(u, v, intr)?;
         let x_curr = bearing / rho;
-        let r = t_ref_curr.fixed_view::<3, 3>(0, 0).into_owned();
-        let t = t_ref_curr.fixed_view::<3, 1>(0, 3).into_owned();
-        let x_ref = r * x_curr + t;
+        let x_ref = rel_pose.r * x_curr + rel_pose.t;
         if x_ref[2] <= 1e-6 {
             return None;
         }
@@ -849,7 +957,18 @@ impl PatchDepthMapper {
         }
         let ix = u.floor() as usize;
         let iy = v.floor() as usize;
-        Some(self.bearing_lut[iy * self.width + ix])
+        let dx = u - ix as f64;
+        let dy = v - iy as f64;
+        let b00 = self.bearing_lut[iy * self.width + ix];
+        let b10 = self.bearing_lut[iy * self.width + ix + 1];
+        let b01 = self.bearing_lut[(iy + 1) * self.width + ix];
+        let b11 = self.bearing_lut[(iy + 1) * self.width + ix + 1];
+        Some(
+            b00 * ((1.0 - dx) * (1.0 - dy))
+                + b10 * (dx * (1.0 - dy))
+                + b01 * ((1.0 - dx) * dy)
+                + b11 * (dx * dy),
+        )
     }
 }
 
@@ -938,6 +1057,35 @@ fn sample_bilinear(img: &Image<f32>, u: f64, v: f64) -> Option<f32> {
     Some(interpolate_bilinear(img, u as f32, v as f32))
 }
 
+fn sample_valid_nearest(mask: Option<&Image<f32>>, u: f64, v: f64) -> bool {
+    let Some(mask) = mask else {
+        return true;
+    };
+    let x = u as isize;
+    let y = v as isize;
+    if x < 0 || y < 0 || x >= mask.width() as isize || y >= mask.height() as isize {
+        return false;
+    }
+    mask.get(x as usize, y as usize) > 0.5
+}
+
+fn sample_valid_bilinear(mask: Option<&Image<f32>>, u: f64, v: f64) -> bool {
+    let Some(mask) = mask else {
+        return true;
+    };
+    let ix = u.floor() as isize;
+    let iy = v.floor() as isize;
+    if ix < 0 || iy < 0 || ix >= mask.width() as isize - 1 || iy >= mask.height() as isize - 1 {
+        return false;
+    }
+    let x = ix as usize;
+    let y = iy as usize;
+    mask.get(x, y) > 0.5
+        && mask.get(x + 1, y) > 0.5
+        && mask.get(x, y + 1) > 0.5
+        && mask.get(x + 1, y + 1) > 0.5
+}
+
 fn scaled_image_from_u8(gray: &[u8], width: usize, height: usize, scale: f64) -> Image<f32> {
     if (scale - 1.0).abs() < f64::EPSILON {
         return Image::from_vec(width, height, gray.iter().map(|&v| v as f32).collect());
@@ -953,6 +1101,89 @@ fn scaled_image_from_u8(gray: &[u8], width: usize, height: usize, scale: f64) ->
         }
     }
     Image::from_vec(out_w, out_h, data)
+}
+
+fn scaled_mask_from_u8(mask: &[u8], width: usize, height: usize, scale: f64) -> Image<f32> {
+    if (scale - 1.0).abs() < f64::EPSILON {
+        return Image::from_vec(
+            width,
+            height,
+            mask.iter()
+                .map(|&v| if v != 0 { 1.0 } else { 0.0 })
+                .collect(),
+        );
+    }
+    let out_w = ((width as f64) * scale + 0.5).floor().max(1.0) as usize;
+    let out_h = ((height as f64) * scale + 0.5).floor().max(1.0) as usize;
+    let mut data = vec![0.0f32; out_w * out_h];
+    for y in 0..out_h {
+        for x in 0..out_w {
+            let src_x = ((x as f64 + 0.5) / scale - 0.5).clamp(0.0, (width - 1) as f64);
+            let src_y = ((y as f64 + 0.5) / scale - 0.5).clamp(0.0, (height - 1) as f64);
+            if mask_bilinear_footprint_valid(mask, width, height, src_x, src_y) {
+                data[y * out_w + x] = 1.0;
+            }
+        }
+    }
+    Image::from_vec(out_w, out_h, data)
+}
+
+fn mask_bilinear_footprint_valid(mask: &[u8], width: usize, height: usize, u: f64, v: f64) -> bool {
+    if u < 0.0 || v < 0.0 || u >= (width - 1) as f64 || v >= (height - 1) as f64 {
+        return false;
+    }
+    let ix = u.floor() as usize;
+    let iy = v.floor() as usize;
+    mask[iy * width + ix] != 0
+        && mask[iy * width + ix + 1] != 0
+        && mask[(iy + 1) * width + ix] != 0
+        && mask[(iy + 1) * width + ix + 1] != 0
+}
+
+fn build_mask_pyramid(
+    mask: &[u8],
+    width: usize,
+    height: usize,
+    scale: f64,
+    levels: usize,
+) -> Vec<Image<f32>> {
+    let mut out = Vec::with_capacity(levels);
+    out.push(scaled_mask_from_u8(mask, width, height, scale));
+    for level in 1..levels {
+        let prev = &out[level - 1];
+        let next_w = (prev.width() / 2).max(1);
+        let next_h = (prev.height() / 2).max(1);
+        let mut next = vec![0.0f32; next_w * next_h];
+        for y in 0..next_h {
+            for x in 0..next_w {
+                if mask_pyrdown_footprint_valid(prev, x * 2, y * 2) {
+                    next[y * next_w + x] = 1.0;
+                }
+            }
+        }
+        out.push(Image::from_vec(next_w, next_h, next));
+    }
+    out
+}
+
+fn mask_pyrdown_footprint_valid(mask: &Image<f32>, cx: usize, cy: usize) -> bool {
+    let cx = cx as isize;
+    let cy = cy as isize;
+    for dy in -2..=2 {
+        for dx in -2..=2 {
+            let x = cx + dx;
+            let y = cy + dy;
+            if x < 0
+                || y < 0
+                || x >= mask.width() as isize
+                || y >= mask.height() as isize
+                || mask.get(x as usize, y as usize) <= 0.5
+            {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn build_pinhole_to_raw_lut(
@@ -1272,5 +1503,17 @@ mod tests {
             .update_with_priors(frame(1, 0.02, img), &seeds, None, 0.0)
             .unwrap();
         assert!(out.status_cells.data.contains(&PatchStatus::PhotoRefined));
+    }
+
+    #[test]
+    fn raw_bearing_lut_interpolates_fractional_pixels() {
+        let (camera, intr) = camera();
+        let settings = PatchDepthSettings::default();
+        let mapper = PatchDepthMapper::new(camera, intr, 32, 32, settings).unwrap();
+
+        let bearing = mapper.bearing_at_original(16.5, 16.25).unwrap();
+        assert!((bearing[0] - 0.5 / 40.0).abs() < 1e-12);
+        assert!((bearing[1] - 0.25 / 40.0).abs() < 1e-12);
+        assert!((bearing[2] - 1.0).abs() < 1e-12);
     }
 }

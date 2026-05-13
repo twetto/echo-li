@@ -65,7 +65,11 @@ impl FeatureState3D {
 
     pub fn inlier_ratio(&self) -> f64 {
         let ab = self.a + self.b;
-        if ab <= 0.0 { 0.0 } else { self.a / ab }
+        if ab <= 0.0 {
+            0.0
+        } else {
+            self.a / ab
+        }
     }
 }
 
@@ -131,6 +135,7 @@ impl Sparse3DFilter {
         let r = t_curr_prev.fixed_view::<3, 3>(0, 0).into_owned();
         let t = t_curr_prev.fixed_view::<3, 1>(0, 3).into_owned();
 
+        let mut reset_features = Vec::new();
         for (&fid, &uv_curr) in &curr_uvs {
             let Some(&uv_prev) = self.prev_uvs.get(&fid) else {
                 continue;
@@ -138,7 +143,10 @@ impl Sparse3DFilter {
 
             if let Some(feat) = self.features.get_mut(&fid) {
                 predict_feature_3d(self.chart, &self.settings, feat, &r, &t, p_vv, dt);
-                bearing_update_3d(self.chart, &self.k, &self.settings, feat, &uv_curr);
+                if !bearing_update_3d(self.chart, &self.k, &self.settings, feat, &uv_curr) {
+                    reset_features.push(fid);
+                    continue;
+                }
                 feat.track_length += 1;
                 continue;
             }
@@ -202,6 +210,10 @@ impl Sparse3DFilter {
             self.pending.remove(&fid);
         }
 
+        for fid in reset_features {
+            self.features.remove(&fid);
+            self.pending.remove(&fid);
+        }
         self.features.retain(|id, _| curr_uvs.contains_key(id));
         self.pending.retain(|id, _| curr_uvs.contains_key(id));
         self.prev_t_wc = Some(*t_wc);
@@ -330,10 +342,10 @@ fn bearing_update_3d(
     settings: &SparseVogSettings,
     feat: &mut FeatureState3D,
     y_observed: &Vector2<f64>,
-) {
+) -> bool {
     let q = feat.position;
     if q[2].abs() < 1e-6 {
-        return;
+        return false;
     }
     let fx = k[(0, 0)];
     let fy = k[(1, 1)];
@@ -352,27 +364,33 @@ fn bearing_update_3d(
     let r = Matrix2::identity() * settings.sigma_pixel.powi(2);
     let s = h * feat.covariance * h.transpose() + r;
     let Some(s_inv) = (s + Matrix2::identity() * 1e-8).try_inverse() else {
-        return;
+        return true;
     };
     let gain = feat.covariance * h.transpose() * s_inv;
     let innovation = y_observed - y_pred;
     let maha_sq = (innovation.transpose() * s_inv * innovation)[(0, 0)];
     let det_s = s.determinant();
     if det_s < 1e-30 {
-        return;
+        return true;
+    }
+    if settings.mahalanobis_reset_chi2 > 0.0
+        && feat.inlier_ratio() < settings.min_inlier_ratio
+        && maha_sq > settings.mahalanobis_reset_chi2
+    {
+        return false;
     }
     let gauss_pdf = (-0.5 * maha_sq).exp() / ((2.0 * std::f64::consts::PI).powi(2) * det_s).sqrt();
     let uniform_prior = 1.0 / (fx * fy * 4.0);
     let ab = feat.a + feat.b;
     if ab <= 0.0 {
-        return;
+        return true;
     }
     let c1 = (feat.a / ab) * gauss_pdf;
     let c2 = (feat.b / ab) * uniform_prior;
     let z_norm = c1 + c2;
     if z_norm < 1e-30 {
         feat.b = (feat.b + 1.0).min(settings.ab_max);
-        return;
+        return true;
     }
     let w1 = c1 / z_norm;
     let w2 = c2 / z_norm;
@@ -388,11 +406,12 @@ fn bearing_update_3d(
         .iter()
         .any(|v| *v <= 0.0 || !v.is_finite())
     {
-        return;
+        return true;
     }
     feat.position = apply_chart_delta(chart, &feat.position, &delta);
     feat.covariance = 0.5 * (p_new + p_new.transpose());
     update_beta(settings, feat, w1, w2);
+    true
 }
 
 fn update_beta(settings: &SparseVogSettings, feat: &mut FeatureState3D, w1: f64, w2: f64) {
@@ -553,5 +572,33 @@ mod tests {
         let (depth, var) = filter.query(42);
         assert!(depth > 0.0, "depth should be queryable, got {depth}");
         assert!(var.is_finite());
+    }
+
+    #[test]
+    fn mahalanobis_reset_removes_bad_3d_feature() {
+        let mut settings = settings();
+        settings.mahalanobis_reset_chi2 = 1.0;
+        settings.min_inlier_ratio = 0.5;
+        let mut filter = Sparse3DFilter::invdepth3d(k(), settings);
+        let point = Vector3::new(1.0, 0.5, 3.0);
+        for i in 0..8 {
+            update_with_point(&mut filter, i, point);
+        }
+        let feat = filter
+            .features
+            .get_mut(&42)
+            .expect("feature should initialize before reset");
+        feat.a = 0.1;
+        feat.b = 10.0;
+
+        let t_wc = pose(8.0 * 0.05);
+        let mut coords = HashMap::new();
+        coords.insert(42, Vector2::new(10_000.0, 10_000.0));
+        filter.update(&VisionMeasurement::new(8.0 * 0.05, coords), &t_wc, None);
+
+        assert!(
+            !filter.features.contains_key(&42),
+            "low-inlier feature with large Mahalanobis innovation should be removed"
+        );
     }
 }

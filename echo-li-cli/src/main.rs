@@ -3,8 +3,8 @@ use echo_li_core::config::VIOConfig;
 use echo_li_core::core_types::CameraIntrinsics;
 use echo_li_core::dataserver::ASLDatasetReader;
 use echo_li_core::depth::patch_depth::{
-    FrameProducts, PatchDepthCameraMode, PatchDepthMapper, PatchDepthOutput, PatchDepthSettings,
-    PatchStatus,
+    FrameProducts, PatchDepthCameraMode, PatchDepthMapper, PatchDepthOutput,
+    PatchDepthSeedCoordinates, PatchDepthSettings, PatchStatus,
 };
 use echo_li_core::depth::sparse_3d::{Sparse3DChart, Sparse3DFilter};
 use echo_li_core::depth::sparse_gb::SparseVogSettings;
@@ -727,12 +727,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     vec![]
                 };
 
-                let patch_gray_data = if patch_depth_mapper.is_some() {
-                    gray_data.clone()
-                } else {
-                    Vec::new()
-                };
-
                 let rudolf_img = RudolfImage::from_vec(img_w, img_h, gray_data);
 
                 let (features, _stats) = frontend.process(&rudolf_img);
@@ -758,6 +752,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         cam_model.as_ref(),
                         &k_matrix,
                     );
+                    let patch_gray_data = if patch_depth_mapper.is_some() {
+                        frontend
+                            .preprocessed_image()
+                            .map(|img| img.as_slice()[..img_w * img_h].to_vec())
+                            .unwrap_or_else(|| rudolf_img.as_slice()[..img_w * img_h].to_vec())
+                    } else {
+                        Vec::new()
+                    };
                     f.process_vision(measurement.clone(), cam_model.as_ref());
                     vision_count += 1;
 
@@ -771,6 +773,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     PatchDepthCameraMode::RawDistorted => &measurement,
                                     PatchDepthCameraMode::UndistortedPinhole => &sparse_measurement,
                                 };
+                                let patch_seed_coordinates = match mapper.camera_mode() {
+                                    PatchDepthCameraMode::RawDistorted => {
+                                        PatchDepthSeedCoordinates::RawDistorted
+                                    }
+                                    PatchDepthCameraMode::UndistortedPinhole => {
+                                        PatchDepthSeedCoordinates::UndistortedPinhole
+                                    }
+                                };
                                 let frame = FrameProducts {
                                     frame_id: vision_count as u64,
                                     stamp: img_data.stamp,
@@ -779,7 +789,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     height: img_h,
                                     pose_t_wc: t_wc,
                                 };
-                                let patch_output = mapper.update(sparse, patch_measurement, frame);
+                                let patch_output = mapper.update(
+                                    sparse,
+                                    patch_measurement,
+                                    patch_seed_coordinates,
+                                    frame,
+                                );
                                 last_patch_depth_counts =
                                     patch_output.as_ref().map(patch_depth_status_counts);
                                 #[cfg(feature = "rerun")]
