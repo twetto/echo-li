@@ -18,6 +18,12 @@ pub enum PatchDepthCameraMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchDepthWarpMode {
+    Exact,
+    FastTranslation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PatchDepthSeedCoordinates {
     RawDistorted,
     UndistortedPinhole,
@@ -26,6 +32,7 @@ pub enum PatchDepthSeedCoordinates {
 #[derive(Debug, Clone)]
 pub struct PatchDepthSettings {
     pub camera_mode: PatchDepthCameraMode,
+    pub warp_mode: PatchDepthWarpMode,
     pub scale: f64,
     pub patch_size: usize,
     pub patch_stride: usize,
@@ -55,6 +62,7 @@ impl Default for PatchDepthSettings {
     fn default() -> Self {
         Self {
             camera_mode: PatchDepthCameraMode::RawDistorted,
+            warp_mode: PatchDepthWarpMode::Exact,
             scale: 1.0,
             patch_size: 8,
             patch_stride: 4,
@@ -118,15 +126,16 @@ pub struct SparseDepthPrior {
 #[derive(Debug, Clone)]
 struct DepthKeyframe {
     frame: Arc<FrameProducts>,
-    ref_pyramid: Vec<Image<f32>>,
-    bilinear_valid_pyramid: Option<Vec<Image<f32>>>,
+    ref_pyramid: Arc<Vec<Image<f32>>>,
+    bilinear_valid_pyramid: Option<Arc<Vec<Image<f32>>>>,
     grad_x_pyramid: Vec<Image<f32>>,
     grad_y_pyramid: Vec<Image<f32>>,
 }
 
-struct ModeFrame {
-    frame: FrameProducts,
-    valid_mask: Option<Vec<u8>>,
+struct DepthFrameProducts {
+    frame: Arc<FrameProducts>,
+    pyramid: Arc<Vec<Image<f32>>>,
+    valid_pyramid: Option<Arc<Vec<Image<f32>>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -163,6 +172,29 @@ struct PatchEstimate {
     rho: f64,
     var: f64,
     status: PatchStatus,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BilinearPatchFootprint {
+    x: usize,
+    y: usize,
+    weights: [f32; 4],
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TranslatedPatchFootprint {
+    ref_fp: BilinearPatchFootprint,
+    curr_x0: isize,
+    curr_y0: isize,
+    side: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PatchAccum {
+    grad: f64,
+    hess: f64,
+    sum_abs_res: f64,
+    n_valid: usize,
 }
 
 pub struct PatchDepthMapper {
@@ -311,18 +343,15 @@ impl PatchDepthMapper {
             return None;
         }
 
-        let mode_frame = self.frame_for_mode(frame)?;
-        let frame = mode_frame.frame;
-        let valid_mask = mode_frame.valid_mask;
+        let depth_frame = self.depth_frame_products(frame)?;
         let median_depth = median_seed_depth(seeds).unwrap_or(self.settings.max_depth);
-        let selected = self.select_keyframe(&frame.pose_t_wc, median_depth);
-        self.manage_keyframes(Arc::new(frame.clone()), valid_mask.clone(), median_depth);
+        let selected = self.select_keyframe(&depth_frame.frame.pose_t_wc, median_depth);
+        self.manage_keyframes(&depth_frame, median_depth);
         let (ref_keyframe, t_ref_curr) = selected?;
         let sigma_warp_sq =
             compute_sigma_warp_sq(&self.intrinsics, &t_ref_curr, p_vv, dt, median_depth);
         Some(self.solve(
-            &frame,
-            valid_mask.as_deref(),
+            &depth_frame,
             &ref_keyframe,
             &t_ref_curr,
             seeds,
@@ -334,12 +363,9 @@ impl PatchDepthMapper {
         self.keyframes.len()
     }
 
-    fn frame_for_mode(&self, frame: FrameProducts) -> Option<ModeFrame> {
-        match self.camera_mode {
-            PatchDepthCameraMode::RawDistorted => Some(ModeFrame {
-                frame,
-                valid_mask: None,
-            }),
+    fn depth_frame_products(&self, frame: FrameProducts) -> Option<DepthFrameProducts> {
+        let (frame, valid_mask) = match self.camera_mode {
+            PatchDepthCameraMode::RawDistorted => (frame, None),
             PatchDepthCameraMode::UndistortedPinhole => {
                 let lut = self.undistort_lut.as_ref()?;
                 let mut gray = vec![0u8; self.width * self.height];
@@ -358,12 +384,30 @@ impl PatchDepthMapper {
                         valid_mask[idx] = 1;
                     }
                 }
-                Some(ModeFrame {
-                    frame: FrameProducts { gray, ..frame },
-                    valid_mask: Some(valid_mask),
-                })
+                (FrameProducts { gray, ..frame }, Some(valid_mask))
             }
-        }
+        };
+        let pyramid = Arc::new(build_pyramid_from_u8(
+            &frame.gray,
+            frame.width,
+            frame.height,
+            self.settings.scale,
+            self.settings.n_pyramid_levels,
+        ));
+        let valid_pyramid = valid_mask.map(|mask| {
+            Arc::new(build_mask_pyramid(
+                &mask,
+                frame.width,
+                frame.height,
+                self.settings.scale,
+                self.settings.n_pyramid_levels,
+            ))
+        });
+        Some(DepthFrameProducts {
+            frame: Arc::new(frame),
+            pyramid,
+            valid_pyramid,
+        })
     }
 
     fn gather_seeds(
@@ -424,12 +468,11 @@ impl PatchDepthMapper {
 
     fn manage_keyframes(
         &mut self,
-        frame: Arc<FrameProducts>,
-        valid_mask: Option<Vec<u8>>,
+        depth_frame: &DepthFrameProducts,
         median_depth: f64,
     ) {
         if self.keyframes.len() < 2 {
-            self.keyframes.push(self.make_keyframe(frame, valid_mask));
+            self.keyframes.push(self.make_keyframe(depth_frame));
             return;
         }
 
@@ -440,49 +483,30 @@ impl PatchDepthMapper {
             .pose_t_wc
             .try_inverse()
             .unwrap_or_else(Matrix4::identity)
-            * frame.pose_t_wc;
+            * depth_frame.frame.pose_t_wc;
         let baseline = t_new_curr.fixed_view::<3, 1>(0, 3).norm();
         if baseline >= min_bl {
             self.keyframes.remove(0);
-            self.keyframes.push(self.make_keyframe(frame, valid_mask));
+            self.keyframes.push(self.make_keyframe(depth_frame));
         }
     }
 
-    fn make_keyframe(
-        &self,
-        frame: Arc<FrameProducts>,
-        valid_mask: Option<Vec<u8>>,
-    ) -> DepthKeyframe {
-        let ref_pyramid = build_pyramid_from_u8(
-            &frame.gray,
-            frame.width,
-            frame.height,
-            self.settings.scale,
-            self.settings.n_pyramid_levels,
-        );
-        let valid_pyramid = valid_mask.as_ref().map(|mask| {
-            build_mask_pyramid(
-                mask,
-                frame.width,
-                frame.height,
-                self.settings.scale,
-                self.settings.n_pyramid_levels,
-            )
-        });
-        let bilinear_valid_pyramid = valid_pyramid
+    fn make_keyframe(&self, depth_frame: &DepthFrameProducts) -> DepthKeyframe {
+        let bilinear_valid_pyramid = depth_frame
+            .valid_pyramid
             .as_ref()
             .map(|pyramid| build_bilinear_valid_pyramid(pyramid));
         let mut grad_x_pyramid = Vec::with_capacity(self.settings.n_pyramid_levels);
         let mut grad_y_pyramid = Vec::with_capacity(self.settings.n_pyramid_levels);
-        for img in &ref_pyramid {
+        for img in depth_frame.pyramid.iter() {
             let (gx, gy) = gradients(img);
             grad_x_pyramid.push(gx);
             grad_y_pyramid.push(gy);
         }
         DepthKeyframe {
-            frame,
-            ref_pyramid,
-            bilinear_valid_pyramid,
+            frame: Arc::clone(&depth_frame.frame),
+            ref_pyramid: Arc::clone(&depth_frame.pyramid),
+            bilinear_valid_pyramid: bilinear_valid_pyramid.map(Arc::new),
             grad_x_pyramid,
             grad_y_pyramid,
         }
@@ -490,29 +514,14 @@ impl PatchDepthMapper {
 
     fn solve(
         &self,
-        frame: &FrameProducts,
-        valid_mask: Option<&[u8]>,
+        depth_frame: &DepthFrameProducts,
         ref_keyframe: &DepthKeyframe,
         t_ref_curr: &Matrix4<f64>,
         seeds: &[SparseDepthPrior],
         sigma_warp_sq: f64,
     ) -> PatchDepthOutput {
-        let curr_pyramid = build_pyramid_from_u8(
-            &frame.gray,
-            frame.width,
-            frame.height,
-            self.settings.scale,
-            self.settings.n_pyramid_levels,
-        );
-        let curr_valid_pyramid = valid_mask.map(|mask| {
-            build_mask_pyramid(
-                mask,
-                frame.width,
-                frame.height,
-                self.settings.scale,
-                self.settings.n_pyramid_levels,
-            )
-        });
+        let curr_pyramid = depth_frame.pyramid.as_ref();
+        let curr_valid_pyramid = depth_frame.valid_pyramid.as_ref().map(|p| p.as_slice());
         let width = curr_pyramid[0].width();
         let height = curr_pyramid[0].height();
         let scaled_intrinsics =
@@ -542,7 +551,7 @@ impl PatchDepthMapper {
                     &scaled_seeds,
                     &seed_grid,
                     &curr_pyramid,
-                    curr_valid_pyramid.as_deref(),
+                    curr_valid_pyramid,
                     ref_keyframe,
                     &scaled_intrinsics,
                     t_ref_curr,
@@ -561,7 +570,7 @@ impl PatchDepthMapper {
                     &scaled_seeds,
                     &seed_grid,
                     &curr_pyramid,
-                    curr_valid_pyramid.as_deref(),
+                    curr_valid_pyramid,
                     ref_keyframe,
                     &scaled_intrinsics,
                     t_ref_curr,
@@ -623,19 +632,35 @@ impl PatchDepthMapper {
         );
         let mut final_residual = 1e10;
         let mut final_curvature = 0.0;
+        let use_fast_translation = self.settings.warp_mode == PatchDepthWarpMode::FastTranslation
+            && self.camera_mode == PatchDepthCameraMode::UndistortedPinhole;
 
         for _ in 0..self.settings.n_gn_iters {
-            let (grad_photo, hess_photo, mean_res, valid) = self.patch_residual_jacobian(
-                cu,
-                cv,
-                rho,
-                curr_pyramid,
-                curr_valid_pyramid,
-                ref_keyframe,
-                intrinsics_by_level,
-                t_ref_curr,
-                sigma_warp_sq,
-            );
+            let (grad_photo, hess_photo, mean_res, valid) = if use_fast_translation {
+                self.patch_residual_jacobian_fast_translation(
+                    cu,
+                    cv,
+                    rho,
+                    curr_pyramid,
+                    curr_valid_pyramid,
+                    ref_keyframe,
+                    intrinsics_by_level,
+                    t_ref_curr,
+                    sigma_warp_sq,
+                )
+            } else {
+                self.patch_residual_jacobian(
+                    cu,
+                    cv,
+                    rho,
+                    curr_pyramid,
+                    curr_valid_pyramid,
+                    ref_keyframe,
+                    intrinsics_by_level,
+                    t_ref_curr,
+                    sigma_warp_sq,
+                )
+            };
             if valid == 0 {
                 break;
             }
@@ -705,6 +730,8 @@ impl PatchDepthMapper {
         let hi = (rho_init * (1.0 + half_range)).clamp(rho_min, rho_max);
         let mut best_rho = rho_init;
         let mut best_cost = f64::INFINITY;
+        let use_fast_translation = self.settings.warp_mode == PatchDepthWarpMode::FastTranslation
+            && self.camera_mode == PatchDepthCameraMode::UndistortedPinhole;
         for i in 0..n {
             let a = if n > 1 {
                 i as f64 / (n - 1) as f64
@@ -712,17 +739,31 @@ impl PatchDepthMapper {
                 0.0
             };
             let rho = lo + (hi - lo) * a;
-            let (cost, valid) = self.patch_cost(
-                cu,
-                cv,
-                rho,
-                &curr_pyramid[0],
-                curr_valid_pyramid.map(|p| &p[0]),
-                &ref_keyframe.ref_pyramid[0],
-                ref_keyframe.bilinear_valid_pyramid.as_ref().map(|p| &p[0]),
-                &intrinsics_by_level[0],
-                t_ref_curr,
-            );
+            let (cost, valid) = if use_fast_translation {
+                self.patch_cost_fast_translation(
+                    cu,
+                    cv,
+                    rho,
+                    &curr_pyramid[0],
+                    curr_valid_pyramid.map(|p| &p[0]),
+                    &ref_keyframe.ref_pyramid[0],
+                    ref_keyframe.bilinear_valid_pyramid.as_ref().map(|p| &p[0]),
+                    &intrinsics_by_level[0],
+                    t_ref_curr,
+                )
+            } else {
+                self.patch_cost(
+                    cu,
+                    cv,
+                    rho,
+                    &curr_pyramid[0],
+                    curr_valid_pyramid.map(|p| &p[0]),
+                    &ref_keyframe.ref_pyramid[0],
+                    ref_keyframe.bilinear_valid_pyramid.as_ref().map(|p| &p[0]),
+                    &intrinsics_by_level[0],
+                    t_ref_curr,
+                )
+            };
             if valid > 0 && cost < best_cost {
                 best_cost = cost;
                 best_rho = rho;
@@ -778,6 +819,72 @@ impl PatchDepthMapper {
         (cost, valid)
     }
 
+    fn patch_cost_fast_translation(
+        &self,
+        cu: f64,
+        cv: f64,
+        rho: f64,
+        curr_img: &Image<f32>,
+        curr_valid: Option<&Image<f32>>,
+        ref_img: &Image<f32>,
+        ref_valid: Option<&Image<f32>>,
+        intr: &ScaledIntrinsics,
+        t_ref_curr: &Matrix4<f64>,
+    ) -> (f64, usize) {
+        let rel_pose = RelativePose::from_matrix(t_ref_curr);
+        let Some((u_ref_center, v_ref_center, _, _)) =
+            self.warp_scaled_pixel(cu, cv, rho, intr, &rel_pose)
+        else {
+            return (0.0, 0);
+        };
+
+        let Some(patch) =
+            self.translated_patch_footprint(cu, cv, ref_img, u_ref_center, v_ref_center)
+        else {
+            return (0.0, 0);
+        };
+        let mut cost = 0.0;
+        let mut valid = 0;
+
+        for ly in 0..patch.side {
+            let cy = patch.curr_y0 + ly as isize;
+            if cy < 0 || cy >= curr_img.height() as isize {
+                continue;
+            }
+            unsafe {
+                let curr_row = curr_img.row_ptr(cy as usize);
+                let curr_mask_row = curr_valid.map(|mask| mask.row_ptr(cy as usize));
+                let ref_row0 = ref_img.row_ptr(patch.ref_fp.y + ly);
+                let ref_row1 = ref_img.row_ptr(patch.ref_fp.y + ly + 1);
+                let ref_mask_row = ref_valid.map(|mask| mask.row_ptr(patch.ref_fp.y + ly));
+                for lx in 0..patch.side {
+                    let cx = patch.curr_x0 + lx as isize;
+                    if cx < 0 || cx >= curr_img.width() as isize {
+                        continue;
+                    }
+                    if !mask_row_valid(curr_mask_row, cx as usize) {
+                        continue;
+                    }
+                    if !mask_row_valid(ref_mask_row, patch.ref_fp.x + lx) {
+                        continue;
+                    }
+
+                    let i_curr = *curr_row.add(cx as usize);
+                    let i_ref = bilerp_ptr(
+                        ref_row0,
+                        ref_row1,
+                        patch.ref_fp.x + lx,
+                        patch.ref_fp.weights,
+                    );
+                    let r = i_ref as f64 - i_curr as f64;
+                    cost += huber_cost(r, self.settings.photo_huber_delta);
+                    valid += 1;
+                }
+            }
+        }
+        (cost, valid)
+    }
+
     fn patch_residual_jacobian(
         &self,
         cu: f64,
@@ -822,6 +929,188 @@ impl PatchDepthMapper {
         }
 
         (grad, hess, sum_abs_res / n_valid.max(1) as f64, n_valid)
+    }
+
+    fn patch_residual_jacobian_fast_translation(
+        &self,
+        cu: f64,
+        cv: f64,
+        rho: f64,
+        curr_pyramid: &[Image<f32>],
+        curr_valid_pyramid: Option<&[Image<f32>]>,
+        ref_keyframe: &DepthKeyframe,
+        intrinsics_by_level: &[ScaledIntrinsics],
+        t_ref_curr: &Matrix4<f64>,
+        sigma_warp_sq: f64,
+    ) -> (f64, f64, f64, usize) {
+        let rel_pose = RelativePose::from_matrix(t_ref_curr);
+        let mut grad = 0.0;
+        let mut hess = 0.0;
+        let mut sum_abs_res = 0.0;
+        let mut n_valid = 0;
+
+        for level in 0..curr_pyramid.len() {
+            let scale = 1.0 / (1usize << level) as f64;
+            let (g, h, sar, nv) = self.patch_residual_jacobian_fast_translation_level(
+                cu * scale,
+                cv * scale,
+                rho,
+                &curr_pyramid[level],
+                curr_valid_pyramid.map(|p| &p[level]),
+                &ref_keyframe.ref_pyramid[level],
+                ref_keyframe
+                    .bilinear_valid_pyramid
+                    .as_ref()
+                    .map(|p| &p[level]),
+                &ref_keyframe.grad_x_pyramid[level],
+                &ref_keyframe.grad_y_pyramid[level],
+                &intrinsics_by_level[level],
+                &rel_pose,
+                sigma_warp_sq,
+            );
+            grad += g;
+            hess += h;
+            sum_abs_res += sar;
+            n_valid += nv;
+        }
+
+        (grad, hess, sum_abs_res / n_valid.max(1) as f64, n_valid)
+    }
+
+    fn patch_residual_jacobian_fast_translation_level(
+        &self,
+        cu: f64,
+        cv: f64,
+        rho: f64,
+        curr_img: &Image<f32>,
+        curr_valid: Option<&Image<f32>>,
+        ref_img: &Image<f32>,
+        ref_valid: Option<&Image<f32>>,
+        ref_grad_x: &Image<f32>,
+        ref_grad_y: &Image<f32>,
+        intr: &ScaledIntrinsics,
+        rel_pose: &RelativePose,
+        sigma_warp_sq: f64,
+    ) -> (f64, f64, f64, usize) {
+        let Some((u_ref_center, v_ref_center, x_ref_center, bearing_center)) =
+            self.warp_scaled_pixel(cu, cv, rho, intr, rel_pose)
+        else {
+            return (0.0, 0.0, 0.0, 0);
+        };
+
+        let dx_ref_drho = rel_pose.r * (-bearing_center / (rho * rho));
+        let du_dxref = self.projection_jacobian(&x_ref_center) * dx_ref_drho;
+        let du_drho = intr.scale_from_original * du_dxref[0];
+        let dv_drho = intr.scale_from_original * du_dxref[1];
+
+        let Some(patch) =
+            self.translated_patch_footprint(cu, cv, ref_img, u_ref_center, v_ref_center)
+        else {
+            return (0.0, 0.0, 0.0, 0);
+        };
+        let mut grad = 0.0;
+        let mut hess = 0.0;
+        let mut sum_abs_res = 0.0;
+        let mut n_valid = 0;
+        let sigma_photo_sq = self.settings.sigma_photo * self.settings.sigma_photo;
+        let constant_inv_sigma_photo_sq =
+            (sigma_warp_sq <= 1e-18).then_some(1.0 / sigma_photo_sq.max(1e-12));
+
+        #[cfg(target_arch = "x86_64")]
+        if let Some(inv_sigma_photo_sq) = constant_inv_sigma_photo_sq {
+            if let Some(accum) = fast_translation_accum_avx2_if_available(
+                curr_img,
+                curr_valid,
+                ref_img,
+                ref_valid,
+                ref_grad_x,
+                ref_grad_y,
+                patch,
+                du_drho as f32,
+                dv_drho as f32,
+                inv_sigma_photo_sq as f32,
+                self.settings.photo_huber_delta as f32,
+            ) {
+                return (accum.grad, accum.hess, accum.sum_abs_res, accum.n_valid);
+            }
+        }
+
+        for ly in 0..patch.side {
+            let cy = patch.curr_y0 + ly as isize;
+            if cy < 0 || cy >= curr_img.height() as isize {
+                continue;
+            }
+            unsafe {
+                let curr_row = curr_img.row_ptr(cy as usize);
+                let curr_mask_row = curr_valid.map(|mask| mask.row_ptr(cy as usize));
+                let ref_row0 = ref_img.row_ptr(patch.ref_fp.y + ly);
+                let ref_row1 = ref_img.row_ptr(patch.ref_fp.y + ly + 1);
+                let gx_row0 = ref_grad_x.row_ptr(patch.ref_fp.y + ly);
+                let gx_row1 = ref_grad_x.row_ptr(patch.ref_fp.y + ly + 1);
+                let gy_row0 = ref_grad_y.row_ptr(patch.ref_fp.y + ly);
+                let gy_row1 = ref_grad_y.row_ptr(patch.ref_fp.y + ly + 1);
+                let ref_mask_row = ref_valid.map(|mask| mask.row_ptr(patch.ref_fp.y + ly));
+                for lx in 0..patch.side {
+                    let cx = patch.curr_x0 + lx as isize;
+                    if cx < 0 || cx >= curr_img.width() as isize {
+                        continue;
+                    }
+                    if !mask_row_valid(curr_mask_row, cx as usize) {
+                        continue;
+                    }
+                    if !mask_row_valid(ref_mask_row, patch.ref_fp.x + lx) {
+                        continue;
+                    }
+
+                    let ix = patch.ref_fp.x + lx;
+                    let i_curr = *curr_row.add(cx as usize);
+                    let i_ref = bilerp_ptr(ref_row0, ref_row1, ix, patch.ref_fp.weights);
+                    let gx = bilerp_ptr(gx_row0, gx_row1, ix, patch.ref_fp.weights);
+                    let gy = bilerp_ptr(gy_row0, gy_row1, ix, patch.ref_fp.weights);
+
+                    let jac = gx as f64 * du_drho + gy as f64 * dv_drho;
+                    let residual = i_ref as f64 - i_curr as f64;
+                    let ar = residual.abs();
+                    let inv_sigma_eff_sq = photo_inv_sigma_eff_sq(
+                        gx,
+                        gy,
+                        sigma_photo_sq,
+                        sigma_warp_sq,
+                        constant_inv_sigma_photo_sq,
+                    );
+                    let weight = huber_weight_from_abs_res(
+                        ar,
+                        self.settings.photo_huber_delta,
+                        inv_sigma_eff_sq,
+                    );
+                    grad += weight * jac * residual;
+                    hess += weight * jac * jac;
+                    sum_abs_res += ar;
+                    n_valid += 1;
+                }
+            }
+        }
+
+        (grad, hess, sum_abs_res, n_valid)
+    }
+
+    fn translated_patch_footprint(
+        &self,
+        cu: f64,
+        cv: f64,
+        ref_img: &Image<f32>,
+        u_ref_center: f64,
+        v_ref_center: f64,
+    ) -> Option<TranslatedPatchFootprint> {
+        let half = self.settings.patch_size / 2;
+        let side = half * 2;
+        let ref_fp = bilinear_patch_footprint(ref_img, u_ref_center, v_ref_center, half, side)?;
+        Some(TranslatedPatchFootprint {
+            ref_fp,
+            curr_x0: (cu - half as f64) as isize,
+            curr_y0: (cv - half as f64) as isize,
+            side,
+        })
     }
 
     fn patch_residual_jacobian_level(
@@ -1133,6 +1422,41 @@ fn bilinear_footprint(img: &Image<f32>, u: f64, v: f64) -> Option<(usize, usize,
     ))
 }
 
+fn bilinear_patch_footprint(
+    img: &Image<f32>,
+    u_center: f64,
+    v_center: f64,
+    half: usize,
+    patch_size: usize,
+) -> Option<BilinearPatchFootprint> {
+    let u0 = u_center - half as f64;
+    let v0 = v_center - half as f64;
+    if u0 < 0.0 || v0 < 0.0 {
+        return None;
+    }
+
+    let x = u0 as usize;
+    let y = v0 as usize;
+    if x + patch_size >= img.width() || y + patch_size >= img.height() {
+        return None;
+    }
+
+    let dx = (u0 - x as f64) as f32;
+    let dy = (v0 - y as f64) as f32;
+    let one_minus_dx = 1.0 - dx;
+    let one_minus_dy = 1.0 - dy;
+    Some(BilinearPatchFootprint {
+        x,
+        y,
+        weights: [
+            one_minus_dx * one_minus_dy,
+            dx * one_minus_dy,
+            one_minus_dx * dy,
+            dx * dy,
+        ],
+    })
+}
+
 fn valid_bilinear_footprint(mask: Option<&Image<f32>>, x: usize, y: usize) -> bool {
     let Some(mask) = mask else {
         return true;
@@ -1141,12 +1465,253 @@ fn valid_bilinear_footprint(mask: Option<&Image<f32>>, x: usize, y: usize) -> bo
     unsafe { mask.get_unchecked(x, y) > 0.5 }
 }
 
+#[inline(always)]
+unsafe fn mask_row_valid(row: Option<*const f32>, x: usize) -> bool {
+    match row {
+        Some(row) => unsafe { *row.add(x) > 0.5 },
+        None => true,
+    }
+}
+
+#[inline(always)]
+fn huber_cost(residual: f64, delta: f64) -> f64 {
+    let ar = residual.abs();
+    if ar <= delta {
+        0.5 * residual * residual
+    } else {
+        delta * (ar - 0.5 * delta)
+    }
+}
+
+#[inline(always)]
+fn huber_weight_from_abs_res(abs_residual: f64, delta: f64, inv_sigma_eff_sq: f64) -> f64 {
+    if abs_residual <= delta {
+        inv_sigma_eff_sq
+    } else {
+        inv_sigma_eff_sq * delta / abs_residual
+    }
+}
+
+#[inline(always)]
+fn photo_inv_sigma_eff_sq(
+    gx: f32,
+    gy: f32,
+    sigma_photo_sq: f64,
+    sigma_warp_sq: f64,
+    constant_inv_sigma_photo_sq: Option<f64>,
+) -> f64 {
+    if let Some(inv) = constant_inv_sigma_photo_sq {
+        inv
+    } else {
+        let grad_i_sq = gx as f64 * gx as f64 + gy as f64 * gy as f64;
+        let sigma_eff_sq = sigma_photo_sq + grad_i_sq * sigma_warp_sq;
+        1.0 / sigma_eff_sq.max(1e-12)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn fast_translation_accum_avx2_if_available(
+    curr_img: &Image<f32>,
+    curr_valid: Option<&Image<f32>>,
+    ref_img: &Image<f32>,
+    ref_valid: Option<&Image<f32>>,
+    ref_grad_x: &Image<f32>,
+    ref_grad_y: &Image<f32>,
+    patch: TranslatedPatchFootprint,
+    du_drho: f32,
+    dv_drho: f32,
+    inv_sigma_photo_sq: f32,
+    huber_delta: f32,
+) -> Option<PatchAccum> {
+    if patch.side != 8 && patch.side != 16 {
+        return None;
+    }
+    if patch.curr_x0 < 0
+        || patch.curr_y0 < 0
+        || patch.curr_x0 as usize + patch.side > curr_img.width()
+        || patch.curr_y0 as usize + patch.side > curr_img.height()
+    {
+        return None;
+    }
+    if !std::arch::is_x86_feature_detected!("avx2") || !std::arch::is_x86_feature_detected!("fma") {
+        return None;
+    }
+
+    // SAFETY: AVX2/FMA support is checked above. The translated footprint and
+    // current image bounds are validated before entering the SIMD routine.
+    unsafe {
+        fast_translation_accum_avx2(
+            curr_img,
+            curr_valid,
+            ref_img,
+            ref_valid,
+            ref_grad_x,
+            ref_grad_y,
+            patch,
+            du_drho,
+            dv_drho,
+            inv_sigma_photo_sq,
+            huber_delta,
+        )
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn fast_translation_accum_avx2(
+    curr_img: &Image<f32>,
+    curr_valid: Option<&Image<f32>>,
+    ref_img: &Image<f32>,
+    ref_valid: Option<&Image<f32>>,
+    ref_grad_x: &Image<f32>,
+    ref_grad_y: &Image<f32>,
+    patch: TranslatedPatchFootprint,
+    du_drho: f32,
+    dv_drho: f32,
+    inv_sigma_photo_sq: f32,
+    huber_delta: f32,
+) -> Option<PatchAccum> {
+    use std::arch::x86_64::{
+        _CMP_LE_OQ, _mm256_add_ps, _mm256_andnot_ps, _mm256_blendv_ps, _mm256_cmp_ps,
+        _mm256_div_ps, _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_mul_ps, _mm256_set1_ps,
+        _mm256_setzero_ps, _mm256_sub_ps,
+    };
+
+    let weights = patch.ref_fp.weights;
+    let vw00 = _mm256_set1_ps(weights[0]);
+    let vw10 = _mm256_set1_ps(weights[1]);
+    let vw01 = _mm256_set1_ps(weights[2]);
+    let vw11 = _mm256_set1_ps(weights[3]);
+    let v_du = _mm256_set1_ps(du_drho);
+    let v_dv = _mm256_set1_ps(dv_drho);
+    let v_inv_sigma = _mm256_set1_ps(inv_sigma_photo_sq);
+    let v_delta = _mm256_set1_ps(huber_delta);
+    let v_delta_inv_sigma = _mm256_set1_ps(huber_delta * inv_sigma_photo_sq);
+    let v_abs_mask = _mm256_set1_ps(-0.0);
+
+    let mut sum_grad = _mm256_setzero_ps();
+    let mut sum_hess = _mm256_setzero_ps();
+    let mut sum_abs = _mm256_setzero_ps();
+    let mut n_valid = 0usize;
+
+    unsafe {
+        for ly in 0..patch.side {
+            let cy = patch.curr_y0 as usize + ly;
+            let curr_row = curr_img.row_ptr(cy);
+            let curr_mask_row = curr_valid.map(|mask| mask.row_ptr(cy));
+            let ref_row0 = ref_img.row_ptr(patch.ref_fp.y + ly);
+            let ref_row1 = ref_img.row_ptr(patch.ref_fp.y + ly + 1);
+            let gx_row0 = ref_grad_x.row_ptr(patch.ref_fp.y + ly);
+            let gx_row1 = ref_grad_x.row_ptr(patch.ref_fp.y + ly + 1);
+            let gy_row0 = ref_grad_y.row_ptr(patch.ref_fp.y + ly);
+            let gy_row1 = ref_grad_y.row_ptr(patch.ref_fp.y + ly + 1);
+            let ref_mask_row = ref_valid.map(|mask| mask.row_ptr(patch.ref_fp.y + ly));
+
+            for lx in (0..patch.side).step_by(8) {
+                let cx = patch.curr_x0 as usize + lx;
+                let ix = patch.ref_fp.x + lx;
+                if !mask_chunk8_valid(curr_mask_row, cx) || !mask_chunk8_valid(ref_mask_row, ix) {
+                    return None;
+                }
+
+                let curr = _mm256_loadu_ps(curr_row.add(cx));
+                let i_ref = bilerp8_ptr(ref_row0, ref_row1, ix, vw00, vw10, vw01, vw11);
+                let gx = bilerp8_ptr(gx_row0, gx_row1, ix, vw00, vw10, vw01, vw11);
+                let gy = bilerp8_ptr(gy_row0, gy_row1, ix, vw00, vw10, vw01, vw11);
+
+                let jac = _mm256_fmadd_ps(gy, v_dv, _mm256_mul_ps(gx, v_du));
+                let residual = _mm256_sub_ps(i_ref, curr);
+                let abs_res = _mm256_andnot_ps(v_abs_mask, residual);
+                let huber_mask = _mm256_cmp_ps(abs_res, v_delta, _CMP_LE_OQ);
+                let robust = _mm256_blendv_ps(
+                    _mm256_div_ps(v_delta_inv_sigma, abs_res),
+                    v_inv_sigma,
+                    huber_mask,
+                );
+
+                sum_grad = _mm256_fmadd_ps(robust, _mm256_mul_ps(jac, residual), sum_grad);
+                sum_hess = _mm256_fmadd_ps(robust, _mm256_mul_ps(jac, jac), sum_hess);
+                sum_abs = _mm256_add_ps(sum_abs, abs_res);
+                n_valid += 8;
+            }
+        }
+
+        Some(PatchAccum {
+            grad: hsum256(sum_grad) as f64,
+            hess: hsum256(sum_hess) as f64,
+            sum_abs_res: hsum256(sum_abs) as f64,
+            n_valid,
+        })
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn bilerp8_ptr(
+    r0: *const f32,
+    r1: *const f32,
+    x: usize,
+    vw00: std::arch::x86_64::__m256,
+    vw10: std::arch::x86_64::__m256,
+    vw01: std::arch::x86_64::__m256,
+    vw11: std::arch::x86_64::__m256,
+) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::{_mm256_fmadd_ps, _mm256_loadu_ps, _mm256_mul_ps};
+    unsafe {
+        let p00 = _mm256_loadu_ps(r0.add(x));
+        let p10 = _mm256_loadu_ps(r0.add(x + 1));
+        let p01 = _mm256_loadu_ps(r1.add(x));
+        let p11 = _mm256_loadu_ps(r1.add(x + 1));
+        let acc = _mm256_mul_ps(vw00, p00);
+        let acc = _mm256_fmadd_ps(vw10, p10, acc);
+        let acc = _mm256_fmadd_ps(vw01, p01, acc);
+        _mm256_fmadd_ps(vw11, p11, acc)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn mask_chunk8_valid(row: Option<*const f32>, x: usize) -> bool {
+    let Some(row) = row else {
+        return true;
+    };
+    unsafe {
+        for i in 0..8 {
+            if *row.add(x + i) <= 0.5 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn hsum256(v: std::arch::x86_64::__m256) -> f32 {
+    let mut tmp = [0.0f32; 8];
+    unsafe {
+        std::arch::x86_64::_mm256_storeu_ps(tmp.as_mut_ptr(), v);
+    }
+    tmp.iter().sum()
+}
+
 unsafe fn bilinear_unchecked(img: &Image<f32>, x: usize, y: usize, weights: [f32; 4]) -> f32 {
     unsafe {
         let p00 = img.get_unchecked(x, y);
         let p10 = img.get_unchecked(x + 1, y);
         let p01 = img.get_unchecked(x, y + 1);
         let p11 = img.get_unchecked(x + 1, y + 1);
+        weights[0] * p00 + weights[1] * p10 + weights[2] * p01 + weights[3] * p11
+    }
+}
+
+#[inline(always)]
+unsafe fn bilerp_ptr(r0: *const f32, r1: *const f32, x: usize, weights: [f32; 4]) -> f32 {
+    unsafe {
+        let p00 = *r0.add(x);
+        let p10 = *r0.add(x + 1);
+        let p01 = *r1.add(x);
+        let p11 = *r1.add(x + 1);
         weights[0] * p00 + weights[1] * p10 + weights[2] * p01 + weights[3] * p11
     }
 }
@@ -1543,17 +2108,23 @@ mod tests {
         }];
 
         let img = textured_image();
-        assert!(mapper
-            .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
-            .is_none());
+        assert!(
+            mapper
+                .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
+                .is_none()
+        );
         assert_eq!(mapper.keyframe_count(), 1);
-        assert!(mapper
-            .update_with_priors(frame(1, 0.001, img.clone()), &seeds, None, 0.0)
-            .is_none());
+        assert!(
+            mapper
+                .update_with_priors(frame(1, 0.001, img.clone()), &seeds, None, 0.0)
+                .is_none()
+        );
         assert_eq!(mapper.keyframe_count(), 2);
-        assert!(mapper
-            .update_with_priors(frame(2, 0.02, img), &seeds, None, 0.0)
-            .is_some());
+        assert!(
+            mapper
+                .update_with_priors(frame(2, 0.02, img), &seeds, None, 0.0)
+                .is_some()
+        );
         assert_eq!(mapper.keyframe_count(), 2);
     }
 
@@ -1572,17 +2143,20 @@ mod tests {
         }];
         let img = vec![120u8; 32 * 32];
 
-        assert!(mapper
-            .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
-            .is_none());
+        assert!(
+            mapper
+                .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
+                .is_none()
+        );
         let out = mapper
             .update_with_priors(frame(1, 0.02, img), &seeds, None, 0.0)
             .unwrap();
-        assert!(out
-            .depth_cells
-            .data
-            .iter()
-            .any(|z| z.is_finite() && (*z - 2.0).abs() < 0.1));
+        assert!(
+            out.depth_cells
+                .data
+                .iter()
+                .any(|z| z.is_finite() && (*z - 2.0).abs() < 0.1)
+        );
         assert!(out.status_cells.data.contains(&PatchStatus::SeedOnly));
     }
 
@@ -1602,9 +2176,40 @@ mod tests {
         }];
         let img = textured_image();
 
-        assert!(mapper
-            .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
-            .is_none());
+        assert!(
+            mapper
+                .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
+                .is_none()
+        );
+        let out = mapper
+            .update_with_priors(frame(1, 0.02, img), &seeds, None, 0.0)
+            .unwrap();
+        assert!(out.status_cells.data.contains(&PatchStatus::PhotoRefined));
+    }
+
+    #[test]
+    fn fast_translation_refines_undistorted_pinhole_patches() {
+        let (camera, intr) = camera();
+        let settings = PatchDepthSettings {
+            camera_mode: PatchDepthCameraMode::UndistortedPinhole,
+            warp_mode: PatchDepthWarpMode::FastTranslation,
+            min_photo_curvature: 0.0,
+            max_photo_residual: 255.0,
+            ..PatchDepthSettings::default()
+        };
+        let mut mapper = PatchDepthMapper::new(camera, intr, 32, 32, settings).unwrap();
+        let seeds = vec![SparseDepthPrior {
+            uv: Vector2::new(16.0, 16.0),
+            rho: 0.5,
+            rho_var: 0.01,
+        }];
+        let img = textured_image();
+
+        assert!(
+            mapper
+                .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
+                .is_none()
+        );
         let out = mapper
             .update_with_priors(frame(1, 0.02, img), &seeds, None, 0.0)
             .unwrap();

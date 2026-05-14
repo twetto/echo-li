@@ -106,10 +106,11 @@ SparseVog:
   pd_min_plane_features: 15
 PatchDepth:
   camera_mode: undistorted_pinhole
-  scale: 0.5
-  patch_size: 4
-  patch_stride: 2
-  cell_size: 4
+  warp_mode: fast_translation
+  scale: 1.0
+  patch_size: 8
+  patch_stride: 4
+  cell_size: 8
   seed_radius_px: 32
   min_baseline_ratio: 0.005
   max_baseline_ratio: 0.3

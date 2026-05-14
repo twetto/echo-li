@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::path::Path;
 
-use crate::depth::patch_depth::{PatchDepthCameraMode, PatchDepthSettings};
+use crate::depth::patch_depth::{PatchDepthCameraMode, PatchDepthSettings, PatchDepthWarpMode};
 use crate::depth::sparse_gb::{DepthParametrization, SparseVogSettings};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -246,6 +246,8 @@ pub struct PatchDepthConfig {
     #[serde(default)]
     pub camera_mode: Option<String>,
     #[serde(default)]
+    pub warp_mode: Option<String>,
+    #[serde(default)]
     pub scale: Option<f64>,
     #[serde(default)]
     pub patch_size: Option<usize>,
@@ -306,6 +308,14 @@ impl PatchDepthConfig {
                     PatchDepthCameraMode::UndistortedPinhole
                 }
                 _ => PatchDepthCameraMode::RawDistorted,
+            };
+        }
+        if let Some(v) = &self.warp_mode {
+            settings.warp_mode = match v.to_ascii_lowercase().as_str() {
+                "fast_translation" | "fast-translation" | "fasttranslation" | "translation" => {
+                    PatchDepthWarpMode::FastTranslation
+                }
+                _ => PatchDepthWarpMode::Exact,
             };
         }
         if let Some(v) = self.scale {

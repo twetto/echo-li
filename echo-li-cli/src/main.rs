@@ -622,8 +622,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             patch_depth_settings.clone(),
         )?;
         println!(
-            "Patch depth: enabled mode={:?} scale={:.2}, patch={} stride={} cell={} levels={}",
+            "Patch depth: enabled mode={:?} warp={:?} scale={:.2}, patch={} stride={} cell={} levels={}",
             patch_depth_settings.camera_mode,
+            patch_depth_settings.warp_mode,
             patch_depth_settings.scale,
             patch_depth_settings.patch_size,
             patch_depth_settings.patch_stride,
