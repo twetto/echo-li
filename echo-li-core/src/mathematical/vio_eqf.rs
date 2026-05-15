@@ -1,12 +1,14 @@
+use echo_lie::SOT3;
 use nalgebra::{DMatrix, DVector, SMatrix, Vector2};
 use std::collections::HashMap;
-use echo_lie::SOT3;
 
-use crate::mathematical::vio_state::{VIOState, VIOSensorState, Landmark};
-use crate::mathematical::vio_group::{VIOGroup, state_group_action, lift_velocity, lift_velocity_discrete, vio_exp};
-use crate::mathematical::imu_velocity::IMUVelocity;
-use crate::mathematical::eqf_matrices::EqFCoordinateSuite;
 use crate::mathematical::camera::CameraModel;
+use crate::mathematical::eqf_matrices::{EqFCoordinateSuite, RiccatiPropagationBlocks};
+use crate::mathematical::imu_velocity::IMUVelocity;
+use crate::mathematical::vio_group::{
+    lift_velocity, lift_velocity_discrete, state_group_action, vio_exp, VIOGroup,
+};
+use crate::mathematical::vio_state::{Landmark, VIOSensorState, VIOState};
 
 pub struct VIOEqF {
     pub xi0: VIOState,
@@ -67,8 +69,7 @@ impl VIOEqF {
         input_gain: &SMatrix<f64, 12, 12>,
         state_gain: &DMatrix<f64>,
     ) {
-        let a0t = suite.state_matrix_a(&self.x, &self.xi0, imu);
-        let bt = suite.input_matrix_b(&self.x, &self.xi0);
+        let blocks = suite.propagation_blocks(&self.x, &self.xi0, imu);
         let n = self.xi0.dim();
         let s = VIOSensorState::CDIM;
         let n_lm = (n - s) / 3;
@@ -78,20 +79,19 @@ impl VIOEqF {
         // Sensor←landmark and cross-landmark blocks are exactly zero, so F·Σ·F^T
         // reduces to a few large gemm calls on the sensor band plus per-landmark
         // 3×N updates instead of two dense n×n multiplies.
-        let f_ss: SMatrix<f64, 21, 21> = SMatrix::<f64, 21, 21>::identity()
-            + a0t.fixed_view::<21, 21>(0, 0) * dt;
+        let f_ss: SMatrix<f64, 21, 21> = SMatrix::<f64, 21, 21>::identity() + blocks.a_ss * dt;
         let mut f_lm_s = DMatrix::<f64>::zeros(3 * n_lm, s);
         let mut f_li_li: Vec<SMatrix<f64, 3, 3>> = Vec::with_capacity(n_lm);
         for i in 0..n_lm {
-            let block = a0t.fixed_view::<3, 21>(s + 3 * i, 0).into_owned() * dt;
+            let block = blocks.a_lm_s.fixed_view::<3, 21>(3 * i, 0).into_owned() * dt;
             f_lm_s.fixed_view_mut::<3, 21>(3 * i, 0).copy_from(&block);
-            f_li_li.push(SMatrix::<f64, 3, 3>::identity()
-                + a0t.fixed_view::<3, 3>(s + 3 * i, s + 3 * i) * dt);
+            f_li_li.push(SMatrix::<f64, 3, 3>::identity() + blocks.a_lm_lm[i] * dt);
         }
         let f_ss_t = f_ss.transpose();
         let f_lm_s_t = f_lm_s.transpose();
 
         // Q_total = dt · (B · InputGain · B^T + StateGain)
+        let bt = dense_b_from_blocks(&blocks);
         let q_input = &bt * input_gain * bt.transpose();
         let state_gain_view = state_gain.view((0, 0), (n, n));
         let q_total = (q_input + state_gain_view) * dt;
@@ -207,7 +207,9 @@ impl VIOEqF {
         use_equivariance: bool,
         use_discrete_correction: bool,
     ) {
-        if y_ids.is_empty() { return; }
+        if y_ids.is_empty() {
+            return;
+        }
 
         let n_obs = y_ids.len();
         let xi_hat = self.state_estimate();
@@ -215,12 +217,19 @@ impl VIOEqF {
         // Innovation vector
         let mut y_tilde = DVector::<f64>::zeros(2 * n_obs);
         for (j, &id) in y_ids.iter().enumerate() {
-            let lm_idx = xi_hat.camera_landmarks.iter().position(|lm| lm.id == id)
+            let lm_idx = xi_hat
+                .camera_landmarks
+                .iter()
+                .position(|lm| lm.id == id)
                 .expect("Landmark ID must exist in state estimate");
             let q = &xi_hat.camera_landmarks[lm_idx].p;
             let y_pred = cam.project(q);
-            let y_obs = y_coords.get(&id).expect("Observed ID must exist in coordinates");
-            y_tilde.fixed_rows_mut::<2>(2 * j).copy_from(&(y_obs - y_pred));
+            let y_obs = y_coords
+                .get(&id)
+                .expect("Observed ID must exist in coordinates");
+            y_tilde
+                .fixed_rows_mut::<2>(2 * j)
+                .copy_from(&(y_obs - y_pred));
         }
 
         // Output matrix C*
@@ -246,7 +255,9 @@ impl VIOEqF {
         r_noise: &DMatrix<f64>,
         use_discrete_correction: bool,
     ) {
-        if residual.len() == 0 { return; }
+        if residual.len() == 0 {
+            return;
+        }
 
         let n = self.xi0.dim();
         let sigma_active = &self.sigma;
@@ -276,12 +287,12 @@ impl VIOEqF {
 
         // Lift to group correction
         if use_discrete_correction {
-            let delta = suite.lift_innovation_discrete(
-                &DVector::from_column_slice(gamma.as_slice()), &self.xi0);
+            let delta = suite
+                .lift_innovation_discrete(&DVector::from_column_slice(gamma.as_slice()), &self.xi0);
             self.x = delta.compose(&self.x);
         } else {
-            let delta_alg = suite.lift_innovation(
-                &DVector::from_column_slice(gamma.as_slice()), &self.xi0);
+            let delta_alg =
+                suite.lift_innovation(&DVector::from_column_slice(gamma.as_slice()), &self.xi0);
             let delta = vio_exp(&delta_alg);
             self.x = delta.compose(&self.x);
         }
@@ -312,16 +323,24 @@ impl VIOEqF {
         if n_added > 0 {
             // Augment sigma: grow from n_old×n_old to n_new×n_new
             let mut sigma_new = DMatrix::<f64>::zeros(n_new, n_new);
-            sigma_new.view_mut((0, 0), (n_old, n_old)).copy_from(&self.sigma);
+            sigma_new
+                .view_mut((0, 0), (n_old, n_old))
+                .copy_from(&self.sigma);
             let copy_size = n_added.min(new_cov.nrows());
-            sigma_new.view_mut((n_old, n_old), (copy_size, copy_size))
+            sigma_new
+                .view_mut((n_old, n_old), (copy_size, copy_size))
                 .copy_from(&new_cov.view((0, 0), (copy_size, copy_size)));
             self.sigma = sigma_new;
         }
     }
 
     pub fn remove_landmark_by_id(&mut self, lm_id: u64) {
-        if let Some(idx) = self.xi0.camera_landmarks.iter().position(|lm| lm.id == lm_id) {
+        if let Some(idx) = self
+            .xi0
+            .camera_landmarks
+            .iter()
+            .position(|lm| lm.id == lm_id)
+        {
             let s = VIOSensorState::CDIM;
             let start = s + 3 * idx;
 
@@ -337,23 +356,27 @@ impl VIOEqF {
 
             // Top-left block: [0..start, 0..start]
             if start > 0 {
-                sigma_new.view_mut((0, 0), (start, start))
+                sigma_new
+                    .view_mut((0, 0), (start, start))
                     .copy_from(&self.sigma.view((0, 0), (start, start)));
             }
             // Top-right block: [0..start, start..n_new]
             let after = n_new - start;
             if start > 0 && after > 0 {
-                sigma_new.view_mut((0, start), (start, after))
+                sigma_new
+                    .view_mut((0, start), (start, after))
                     .copy_from(&self.sigma.view((0, start + 3), (start, after)));
             }
             // Bottom-left block: [start..n_new, 0..start]
             if after > 0 && start > 0 {
-                sigma_new.view_mut((start, 0), (after, start))
+                sigma_new
+                    .view_mut((start, 0), (after, start))
                     .copy_from(&self.sigma.view((start + 3, 0), (after, start)));
             }
             // Bottom-right block: [start..n_new, start..n_new]
             if after > 0 {
-                sigma_new.view_mut((start, start), (after, after))
+                sigma_new
+                    .view_mut((start, start), (after, after))
                     .copy_from(&self.sigma.view((start + 3, start + 3), (after, after)));
             }
 
@@ -362,7 +385,11 @@ impl VIOEqF {
     }
 
     pub fn remove_invalid_landmarks(&mut self) {
-        let invalid_ids: Vec<u64> = self.x.id.iter().zip(self.x.q.iter())
+        let invalid_ids: Vec<u64> = self
+            .x
+            .id
+            .iter()
+            .zip(self.x.q.iter())
             .filter(|(_, q)| !q.scale.is_finite() || q.scale <= 1e-8 || q.scale > 1e8)
             .map(|(&id, _)| id)
             .collect();
@@ -376,8 +403,23 @@ impl VIOEqF {
     // ------------------------------------------------------------------
 
     pub fn get_landmark_cov_by_id(&self, lm_id: u64) -> Option<nalgebra::Matrix3<f64>> {
-        let idx = self.xi0.camera_landmarks.iter().position(|lm| lm.id == lm_id)?;
+        let idx = self
+            .xi0
+            .camera_landmarks
+            .iter()
+            .position(|lm| lm.id == lm_id)?;
         let start = VIOSensorState::CDIM + 3 * idx;
         Some(self.sigma.fixed_view::<3, 3>(start, start).into_owned())
     }
+}
+
+fn dense_b_from_blocks(blocks: &RiccatiPropagationBlocks) -> DMatrix<f64> {
+    let s = VIOSensorState::CDIM;
+    let n_lm = blocks.b_lm.nrows() / 3;
+    let mut b = DMatrix::<f64>::zeros(s + 3 * n_lm, 12);
+    b.fixed_view_mut::<21, 12>(0, 0).copy_from(&blocks.b_s);
+    if n_lm > 0 {
+        b.view_mut((s, 0), (3 * n_lm, 12)).copy_from(&blocks.b_lm);
+    }
+    b
 }

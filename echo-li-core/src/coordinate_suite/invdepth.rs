@@ -1,17 +1,16 @@
-use nalgebra::{DMatrix, DVector, Matrix3, Vector2, Vector3, Matrix2x3, Matrix3x2};
-use echo_lie::{SO3, SE3, SOT3};
+use echo_lie::{SE3, SO3, SOT3};
+use nalgebra::{DMatrix, DVector, Matrix2x3, Matrix3, Matrix3x2, Vector2, Vector3};
 
-use crate::mathematical::vio_state::{VIOState, VIOSensorState, Landmark};
-use crate::mathematical::vio_group::{VIOGroup, VIOAlgebra, state_group_action};
-use crate::mathematical::imu_velocity::IMUVelocity;
-use crate::mathematical::eqf_matrices::EqFCoordinateSuite;
-use crate::mathematical::camera::CameraModel;
-use crate::coordinate_suite::{
-    base_skew,
-    e3_project_sphere, e3_project_sphere_inv,
-    e3_project_sphere_diff, e3_project_sphere_inv_diff,
-};
 use crate::coordinate_suite::euclid::EuclideanSuite;
+use crate::coordinate_suite::{
+    base_skew, e3_project_sphere, e3_project_sphere_diff, e3_project_sphere_inv,
+    e3_project_sphere_inv_diff,
+};
+use crate::mathematical::camera::CameraModel;
+use crate::mathematical::eqf_matrices::{EqFCoordinateSuite, RiccatiPropagationBlocks};
+use crate::mathematical::imu_velocity::IMUVelocity;
+use crate::mathematical::vio_group::{state_group_action, VIOAlgebra, VIOGroup};
+use crate::mathematical::vio_state::{Landmark, VIOSensorState, VIOState};
 
 // ===========================================================================
 // Stereographic sphere chart
@@ -76,7 +75,8 @@ pub fn conv_ind2euc(q0: &Vector3<f64>) -> Matrix3<f64> {
     let mut m = Matrix3::zeros();
     // dp/d(bearing) = (1/rho0) * sphere_chart_stereo_inv_diff0(y0)
     let inv_diff0 = sphere_chart_stereo_inv_diff0(&y0);
-    m.fixed_view_mut::<3, 2>(0, 0).copy_from(&(inv_diff0 / rho0));
+    m.fixed_view_mut::<3, 2>(0, 0)
+        .copy_from(&(inv_diff0 / rho0));
     // dp/d(inv_depth) = -y0 / rho0^2
     m.column_mut(2).copy_from(&(-y0 / (rho0 * rho0)));
     m
@@ -113,7 +113,9 @@ pub fn point_chart_invdepth_inv(eps: &Vector3<f64>, q0: &Vector3<f64>) -> Vector
 pub struct InvDepthSuite;
 
 impl InvDepthSuite {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 impl EqFCoordinateSuite for InvDepthSuite {
@@ -123,16 +125,23 @@ impl EqFCoordinateSuite for InvDepthSuite {
         let mut eps = DVector::<f64>::zeros(s + 3 * n);
 
         // Sensor state (identical to Euclidean)
-        eps.fixed_rows_mut::<6>(0).copy_from(&(xi.sensor.input_bias - xi0.sensor.input_bias));
+        eps.fixed_rows_mut::<6>(0)
+            .copy_from(&(xi.sensor.input_bias - xi0.sensor.input_bias));
         let pose_diff = xi0.sensor.pose.inverse().compose(&xi.sensor.pose);
         eps.fixed_rows_mut::<6>(6).copy_from(&pose_diff.log());
-        eps.fixed_rows_mut::<3>(12).copy_from(&(xi.sensor.velocity - xi0.sensor.velocity));
-        let offset_diff = xi0.sensor.camera_offset.inverse().compose(&xi.sensor.camera_offset);
+        eps.fixed_rows_mut::<3>(12)
+            .copy_from(&(xi.sensor.velocity - xi0.sensor.velocity));
+        let offset_diff = xi0
+            .sensor
+            .camera_offset
+            .inverse()
+            .compose(&xi.sensor.camera_offset);
         eps.fixed_rows_mut::<6>(15).copy_from(&offset_diff.log());
 
         // Landmarks (inverse-depth)
         for i in 0..n {
-            let pt_eps = point_chart_invdepth(&xi.camera_landmarks[i].p, &xi0.camera_landmarks[i].p);
+            let pt_eps =
+                point_chart_invdepth(&xi.camera_landmarks[i].p, &xi0.camera_landmarks[i].p);
             eps.fixed_rows_mut::<3>(s + 3 * i).copy_from(&pt_eps);
         }
         eps
@@ -145,9 +154,15 @@ impl EqFCoordinateSuite for InvDepthSuite {
         // Sensor state (identical to Euclidean)
         let mut xi = xi0.clone();
         xi.sensor.input_bias = xi0.sensor.input_bias + eps.fixed_rows::<6>(0);
-        xi.sensor.pose = xi0.sensor.pose.compose(&SE3::exp(&eps.fixed_rows::<6>(6).into_owned()));
+        xi.sensor.pose = xi0
+            .sensor
+            .pose
+            .compose(&SE3::exp(&eps.fixed_rows::<6>(6).into_owned()));
         xi.sensor.velocity = xi0.sensor.velocity + eps.fixed_rows::<3>(12);
-        xi.sensor.camera_offset = xi0.sensor.camera_offset.compose(&SE3::exp(&eps.fixed_rows::<6>(15).into_owned()));
+        xi.sensor.camera_offset = xi0
+            .sensor
+            .camera_offset
+            .compose(&SE3::exp(&eps.fixed_rows::<6>(15).into_owned()));
 
         // Landmarks (inverse-depth)
         xi.camera_landmarks = Vec::with_capacity(n);
@@ -174,7 +189,8 @@ impl EqFCoordinateSuite for InvDepthSuite {
         let v_est = imu_vel.gyr - xi_hat.sensor.gyro_bias();
         let mut u_i = nalgebra::SVector::<f64, 6>::zeros();
         u_i.fixed_rows_mut::<3>(0).copy_from(&v_est);
-        u_i.fixed_rows_mut::<3>(3).copy_from(&xi_hat.sensor.velocity);
+        u_i.fixed_rows_mut::<3>(3)
+            .copy_from(&xi_hat.sensor.velocity);
 
         let r_ic = xi_hat.sensor.camera_offset.rotation.as_matrix();
         let r_ahat = x.a.rotation.as_matrix();
@@ -198,7 +214,11 @@ impl EqFCoordinateSuite for InvDepthSuite {
             let m_i2e = conv_ind2euc(&q0);
             let qhat_p = xi_hat.camera_landmarks[i].p;
 
-            if q0.norm() < 1e-10 || qhat_p.norm() < 1e-10 || !qi.scale.is_finite() || qi.scale.abs() < 1e-12 {
+            if q0.norm() < 1e-10
+                || qhat_p.norm() < 1e-10
+                || !qi.scale.is_finite()
+                || qi.scale.abs() < 1e-12
+            {
                 continue; // degenerate landmark, leave as zero block
             }
 
@@ -207,30 +227,34 @@ impl EqFCoordinateSuite for InvDepthSuite {
             let inner_b = base_skew(&qhat_p) * r_ic.transpose() + term_x_ic;
             let block_b_euc = qhat_i * inner_b;
             let block_b_ind = m_e2i * block_b_euc;
-            a0t.fixed_view_mut::<3, 3>(s + 3 * i, 0).copy_from(&(-block_b_ind));
+            a0t.fixed_view_mut::<3, 3>(s + 3 * i, 0)
+                .copy_from(&(-block_b_ind));
             // cols 3:6 are zero for landmarks in B, so A[lm, 3:6] = 0
             a0t.fixed_view_mut::<3, 3>(s + 3 * i, 3).fill(0.0);
 
             // Velocity -> Landmarks: M_e2i @ (-Qhat @ R_IC^T @ R_A^T)
             let block_vel = m_e2i * (-qhat_i * r_ic.transpose() * r_ahat.transpose());
-            a0t.fixed_view_mut::<3, 3>(s + 3 * i, 12).copy_from(&block_vel);
+            a0t.fixed_view_mut::<3, 3>(s + 3 * i, 12)
+                .copy_from(&block_vel);
 
             // Camera Offset -> Landmarks: M_e2i @ temp @ common_term
             let mut temp = nalgebra::SMatrix::<f64, 3, 6>::zeros();
-            temp.fixed_view_mut::<3, 3>(0, 0).copy_from(&(base_skew(&q0) * qi.rotation.as_matrix()));
+            temp.fixed_view_mut::<3, 3>(0, 0)
+                .copy_from(&(base_skew(&q0) * qi.rotation.as_matrix()));
             temp.fixed_view_mut::<3, 3>(0, 3).copy_from(&(-qhat_i));
             let block_offset = m_e2i * temp * common_term;
-            a0t.fixed_view_mut::<3, 6>(s + 3 * i, 15).copy_from(&block_offset);
+            a0t.fixed_view_mut::<3, 6>(s + 3 * i, 15)
+                .copy_from(&block_offset);
 
             // Landmark -> Landmark: M_e2i @ A_qi_euc @ M_i2e
             let qq = qhat_p.norm_squared();
-            let inner = base_skew(&qhat_p) * base_skew(&v_c)
-                - (v_c * qhat_p.transpose() * 2.0)
+            let inner = base_skew(&qhat_p) * base_skew(&v_c) - (v_c * qhat_p.transpose() * 2.0)
                 + qhat_p * v_c.transpose();
             let qhat_inv = qi.rotation.as_matrix().transpose() / qi.scale;
             let a_qi_euc = -(qhat_i * inner * qhat_inv) / qq;
             let block_lm = m_e2i * a_qi_euc * m_i2e;
-            a0t.fixed_view_mut::<3, 3>(s + 3 * i, s + 3 * i).copy_from(&block_lm);
+            a0t.fixed_view_mut::<3, 3>(s + 3 * i, s + 3 * i)
+                .copy_from(&block_lm);
         }
 
         a0t
@@ -267,7 +291,106 @@ impl EqFCoordinateSuite for InvDepthSuite {
         bt
     }
 
-    fn output_matrix_ci_star(&self, q0: &Vector3<f64>, q_hat: &SOT3, cam: &dyn CameraModel, y: &Vector2<f64>) -> Matrix2x3<f64> {
+    fn propagation_blocks(
+        &self,
+        x: &VIOGroup,
+        xi0: &VIOState,
+        imu_vel: &IMUVelocity,
+    ) -> RiccatiPropagationBlocks {
+        let RiccatiPropagationBlocks {
+            a_ss,
+            mut a_lm_s,
+            mut a_lm_lm,
+            b_s,
+            mut b_lm,
+        } = EuclideanSuite.propagation_blocks(x, xi0, imu_vel);
+
+        let n = xi0.camera_landmarks.len();
+        let xi_hat = state_group_action(x, xi0);
+        let v_est = imu_vel.gyr - xi_hat.sensor.gyro_bias();
+        let mut u_i = nalgebra::SVector::<f64, 6>::zeros();
+        u_i.fixed_rows_mut::<3>(0).copy_from(&v_est);
+        u_i.fixed_rows_mut::<3>(3)
+            .copy_from(&xi_hat.sensor.velocity);
+
+        let r_ic = xi_hat.sensor.camera_offset.rotation.as_matrix();
+        let r_ahat = x.a.rotation.as_matrix();
+
+        let ad_tc_inv = xi0.sensor.camera_offset.inverse().adjoint();
+        let ad_a = x.a.adjoint();
+        let transformed = ad_tc_inv * ad_a * u_i;
+        let common_term = x.b.inverse().adjoint() * SE3::adjoint_algebra(&transformed);
+
+        let u_c_full = xi_hat.sensor.camera_offset.inverse().adjoint() * u_i;
+        let v_c = u_c_full.fixed_rows::<3>(3).into_owned();
+
+        let x_ic = xi_hat.sensor.camera_offset.translation;
+        let term_x_ic = r_ic.transpose() * base_skew(&x_ic);
+
+        for i in 0..n {
+            let row = 3 * i;
+            let q0 = xi0.camera_landmarks[i].p;
+            let qi = &x.q[i];
+
+            if q0.norm() < 1e-10 || !qi.scale.is_finite() || qi.scale.abs() < 1e-12 {
+                continue;
+            }
+
+            let qhat_i = qi.rotation.as_matrix() * qi.scale;
+            let qhat_p = xi_hat.camera_landmarks[i].p;
+            let m_e2i = conv_euc2ind(&q0);
+
+            let inner_b = base_skew(&qhat_p) * r_ic.transpose() + term_x_ic;
+            let block_b_ind = m_e2i * qhat_i * inner_b;
+            b_lm.fixed_view_mut::<3, 3>(row, 0).copy_from(&block_b_ind);
+
+            if qhat_p.norm() < 1e-10 {
+                continue;
+            }
+
+            let m_i2e = conv_ind2euc(&q0);
+
+            a_lm_s
+                .fixed_view_mut::<3, 3>(row, 0)
+                .copy_from(&(-block_b_ind));
+            a_lm_s.fixed_view_mut::<3, 3>(row, 3).fill(0.0);
+
+            let block_vel = m_e2i * (-qhat_i * r_ic.transpose() * r_ahat.transpose());
+            a_lm_s.fixed_view_mut::<3, 3>(row, 12).copy_from(&block_vel);
+
+            let mut temp = nalgebra::SMatrix::<f64, 3, 6>::zeros();
+            temp.fixed_view_mut::<3, 3>(0, 0)
+                .copy_from(&(base_skew(&q0) * qi.rotation.as_matrix()));
+            temp.fixed_view_mut::<3, 3>(0, 3).copy_from(&(-qhat_i));
+            let block_offset = m_e2i * temp * common_term;
+            a_lm_s
+                .fixed_view_mut::<3, 6>(row, 15)
+                .copy_from(&block_offset);
+
+            let qq = qhat_p.norm_squared();
+            let inner = base_skew(&qhat_p) * base_skew(&v_c) - (v_c * qhat_p.transpose() * 2.0)
+                + qhat_p * v_c.transpose();
+            let qhat_inv = qi.rotation.as_matrix().transpose() / qi.scale;
+            let a_qi_euc = -(qhat_i * inner * qhat_inv) / qq;
+            a_lm_lm[i] = m_e2i * a_qi_euc * m_i2e;
+        }
+
+        RiccatiPropagationBlocks {
+            a_ss,
+            a_lm_s,
+            a_lm_lm,
+            b_s,
+            b_lm,
+        }
+    }
+
+    fn output_matrix_ci_star(
+        &self,
+        q0: &Vector3<f64>,
+        q_hat: &SOT3,
+        cam: &dyn CameraModel,
+        y: &Vector2<f64>,
+    ) -> Matrix2x3<f64> {
         // C*_invdepth = C*_euclid @ ind2euc
         let m_i2e = conv_ind2euc(q0);
         EuclideanSuite.output_matrix_ci_star(q0, q_hat, cam, y) * m_i2e
@@ -305,7 +428,8 @@ impl EqFCoordinateSuite for InvDepthSuite {
 
             let qq = qi0.norm_squared();
             let mut wi = nalgebra::Vector4::zeros();
-            wi.fixed_rows_mut::<3>(0).copy_from(&(-qi0.cross(&gamma_qi_euclid) / qq));
+            wi.fixed_rows_mut::<3>(0)
+                .copy_from(&(-qi0.cross(&gamma_qi_euclid) / qq));
             wi[3] = -(qi0.dot(&gamma_qi_euclid)) / qq;
 
             delta.w.push(wi);
@@ -315,7 +439,11 @@ impl EqFCoordinateSuite for InvDepthSuite {
         delta
     }
 
-    fn lift_innovation_discrete(&self, total_innovation: &DVector<f64>, xi0: &VIOState) -> VIOGroup {
+    fn lift_innovation_discrete(
+        &self,
+        total_innovation: &DVector<f64>,
+        xi0: &VIOState,
+    ) -> VIOGroup {
         // Sensor part identical to Euclidean.
         // Landmark part uses InvDepth chart inverse to get perturbed position.
         let s = VIOSensorState::CDIM;
@@ -328,10 +456,15 @@ impl EqFCoordinateSuite for InvDepthSuite {
         let v0 = xi0.sensor.velocity;
         let w = v0 - a.rotation.act(&(v0 + gamma_v));
 
-        let b = xi0.sensor.camera_offset.inverse()
+        let b = xi0
+            .sensor
+            .camera_offset
+            .inverse()
             .compose(&a)
             .compose(&xi0.sensor.camera_offset)
-            .compose(&SE3::exp(&total_innovation.fixed_rows::<6>(15).into_owned()));
+            .compose(&SE3::exp(
+                &total_innovation.fixed_rows::<6>(15).into_owned(),
+            ));
 
         let mut q_vec = Vec::with_capacity(n);
         let mut id_vec = Vec::with_capacity(n);
@@ -346,6 +479,13 @@ impl EqFCoordinateSuite for InvDepthSuite {
             id_vec.push(xi0.camera_landmarks[i].id);
         }
 
-        VIOGroup { beta, a, w, b, q: q_vec, id: id_vec }
+        VIOGroup {
+            beta,
+            a,
+            w,
+            b,
+            q: q_vec,
+            id: id_vec,
+        }
     }
 }
