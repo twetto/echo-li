@@ -15,18 +15,23 @@ pub struct VIOEqF {
     pub x: VIOGroup,
     pub sigma: DMatrix<f64>,
     pub current_time: f64,
+    scratch_m: DMatrix<f64>,
+    scratch_sigma: DMatrix<f64>,
 }
 
 impl VIOEqF {
     pub fn new(xi0: VIOState, initial_covariance: &DMatrix<f64>) -> Self {
         let sigma = initial_covariance.clone();
         let x = VIOGroup::identity(&xi0.get_ids());
+        let n = xi0.dim();
 
         Self {
             xi0,
             x,
             sigma,
             current_time: -1.0,
+            scratch_m: DMatrix::<f64>::zeros(n, n),
+            scratch_sigma: DMatrix::<f64>::zeros(n, n),
         }
     }
 
@@ -97,14 +102,13 @@ impl VIOEqF {
         let q_total = (q_input + state_gain_view) * dt;
 
         // ---- Step 1: M = F · Σ ----
-        let mut m_buf = DMatrix::<f64>::zeros(n, n);
         {
             let sigma_active = &self.sigma;
 
             // M[0:s, :] = F_ss · Σ[0:s, :]
             {
                 let sigma_s = sigma_active.view((0, 0), (s, n));
-                let mut m_top = m_buf.view_mut((0, 0), (s, n));
+                let mut m_top = self.scratch_m.view_mut((0, 0), (s, n));
                 m_top.gemm(1.0, &f_ss, &sigma_s, 0.0);
             }
 
@@ -112,71 +116,70 @@ impl VIOEqF {
                 // M[s:n, :] = F_lm_s · Σ[0:s, :]  (one big gemm for all landmarks)
                 {
                     let sigma_s = sigma_active.view((0, 0), (s, n));
-                    let mut m_lm = m_buf.view_mut((s, 0), (3 * n_lm, n));
+                    let mut m_lm = self.scratch_m.view_mut((s, 0), (3 * n_lm, n));
                     m_lm.gemm(1.0, &f_lm_s, &sigma_s, 0.0);
                 }
                 // M[s+3i:s+3i+3, :] += F_li_li · Σ[s+3i:s+3i+3, :]
                 for i in 0..n_lm {
                     let row_band = s + 3 * i;
                     let sigma_li = sigma_active.view((row_band, 0), (3, n));
-                    let mut m_li = m_buf.view_mut((row_band, 0), (3, n));
+                    let mut m_li = self.scratch_m.view_mut((row_band, 0), (3, n));
                     m_li.gemm(1.0, &f_li_li[i], &sigma_li, 1.0);
                 }
             }
         }
 
         // ---- Step 2: Σ_new = M · F^T ----
-        let mut sigma_new = DMatrix::<f64>::zeros(n, n);
 
         // Σ_new[0:s, 0:s] = M[0:s, 0:s] · F_ss^T
         {
-            let m_ss = m_buf.view((0, 0), (s, s));
-            let mut sn_ss = sigma_new.view_mut((0, 0), (s, s));
+            let m_ss = self.scratch_m.view((0, 0), (s, s));
+            let mut sn_ss = self.scratch_sigma.view_mut((0, 0), (s, s));
             sn_ss.gemm(1.0, &m_ss, &f_ss_t, 0.0);
         }
 
         if n_lm > 0 {
             // Σ_new[0:s, s:n] = M[0:s, 0:s] · F_lm_s^T
             {
-                let m_ss = m_buf.view((0, 0), (s, s));
-                let mut sn_top_lm = sigma_new.view_mut((0, s), (s, 3 * n_lm));
+                let m_ss = self.scratch_m.view((0, 0), (s, s));
+                let mut sn_top_lm = self.scratch_sigma.view_mut((0, s), (s, 3 * n_lm));
                 sn_top_lm.gemm(1.0, &m_ss, &f_lm_s_t, 0.0);
             }
             // Σ_new[0:s, s+3j:s+3j+3] += M[0:s, s+3j:s+3j+3] · F_lj_lj^T
             for j in 0..n_lm {
                 let col_band = s + 3 * j;
-                let m_s_lj = m_buf.view((0, col_band), (s, 3));
+                let m_s_lj = self.scratch_m.view((0, col_band), (s, 3));
                 let f_t = f_li_li[j].transpose();
-                let mut sn_view = sigma_new.view_mut((0, col_band), (s, 3));
+                let mut sn_view = self.scratch_sigma.view_mut((0, col_band), (s, 3));
                 sn_view.gemm(1.0, &m_s_lj, &f_t, 1.0);
             }
 
             // Σ_new[s:n, 0:s] = M[s:n, 0:s] · F_ss^T
             {
-                let m_lm_s = m_buf.view((s, 0), (3 * n_lm, s));
-                let mut sn_lm_s = sigma_new.view_mut((s, 0), (3 * n_lm, s));
+                let m_lm_s = self.scratch_m.view((s, 0), (3 * n_lm, s));
+                let mut sn_lm_s = self.scratch_sigma.view_mut((s, 0), (3 * n_lm, s));
                 sn_lm_s.gemm(1.0, &m_lm_s, &f_ss_t, 0.0);
             }
 
             // Σ_new[s:n, s:n] = M[s:n, 0:s] · F_lm_s^T
             {
-                let m_lm_s = m_buf.view((s, 0), (3 * n_lm, s));
-                let mut sn_lm_lm = sigma_new.view_mut((s, s), (3 * n_lm, 3 * n_lm));
+                let m_lm_s = self.scratch_m.view((s, 0), (3 * n_lm, s));
+                let mut sn_lm_lm = self.scratch_sigma.view_mut((s, s), (3 * n_lm, 3 * n_lm));
                 sn_lm_lm.gemm(1.0, &m_lm_s, &f_lm_s_t, 0.0);
             }
             // Σ_new[s:n, s+3j:s+3j+3] += M[s:n, s+3j:s+3j+3] · F_lj_lj^T
             for j in 0..n_lm {
                 let col_band = s + 3 * j;
-                let m_lm_lj = m_buf.view((s, col_band), (3 * n_lm, 3));
+                let m_lm_lj = self.scratch_m.view((s, col_band), (3 * n_lm, 3));
                 let f_t = f_li_li[j].transpose();
-                let mut sn_view = sigma_new.view_mut((s, col_band), (3 * n_lm, 3));
+                let mut sn_view = self.scratch_sigma.view_mut((s, col_band), (3 * n_lm, 3));
                 sn_view.gemm(1.0, &m_lm_lj, &f_t, 1.0);
             }
         }
 
-        sigma_new += q_total;
+        self.scratch_sigma += q_total;
 
-        self.sigma = sigma_new;
+        std::mem::swap(&mut self.sigma, &mut self.scratch_sigma);
         self.enforce_spd();
     }
 
@@ -190,6 +193,14 @@ impl VIOEqF {
             }
             // Clamp minimum diagonal (matches Python: diagonal + 1e-12)
             self.sigma[(i, i)] += 1e-12;
+        }
+    }
+
+    fn resize_scratch(&mut self) {
+        let n = self.xi0.dim();
+        if self.scratch_m.nrows() != n {
+            self.scratch_m = DMatrix::<f64>::zeros(n, n);
+            self.scratch_sigma = DMatrix::<f64>::zeros(n, n);
         }
     }
 
@@ -244,7 +255,7 @@ impl VIOEqF {
     }
 
     // ------------------------------------------------------------------
-    // Stacked update (Joseph form)
+    // Sequential scalar update (sparse C, symmetric rank-1 downdate)
     // ------------------------------------------------------------------
 
     pub fn perform_stacked_update<S: EqFCoordinateSuite + ?Sized>(
@@ -255,32 +266,47 @@ impl VIOEqF {
         r_noise: &DMatrix<f64>,
         use_discrete_correction: bool,
     ) {
-        if residual.len() == 0 {
+        let m = residual.len();
+        if m == 0 {
             return;
         }
 
         let n = self.xi0.dim();
-        let sigma_active = &self.sigma;
+        let mut gamma = DVector::<f64>::zeros(n);
 
-        // S = C * Sigma * C^T + R
-        let s = c_star * sigma_active * c_star.transpose() + r_noise;
+        for j in 0..m {
+            let r_j = r_noise[(j, j)];
 
-        // Skip if S is degenerate
-        if !s.iter().all(|v| v.is_finite()) {
-            return;
+            // v = Σ · c_j, exploiting sparsity of c_j (only 3 nonzero entries per row)
+            let mut v = DVector::<f64>::zeros(n);
+            for col in 0..n {
+                let c_jc = c_star[(j, col)];
+                if c_jc != 0.0 {
+                    v.axpy(c_jc, &self.sigma.column(col), 1.0);
+                }
+            }
+
+            // α = c_j^T v + r_j
+            let mut alpha = r_j;
+            for col in 0..n {
+                let c_jc = c_star[(j, col)];
+                if c_jc != 0.0 {
+                    alpha += c_jc * v[col];
+                }
+            }
+
+            if !alpha.is_finite() || alpha.abs() < 1e-30 {
+                continue;
+            }
+
+            // Σ -= v vᵀ / α (symmetric rank-1 downdate)
+            let inv_alpha = 1.0 / alpha;
+            self.sigma.ger(-inv_alpha, &v, &v, 1.0);
+
+            // k = v / α, accumulate gamma
+            gamma.axpy(residual[j] * inv_alpha, &v, 1.0);
         }
 
-        // K = Sigma * C^T * S^{-1}
-        let s_inv = match s.try_inverse() {
-            Some(inv) => inv,
-            None => return,
-        };
-        let k = sigma_active * c_star.transpose() * s_inv;
-
-        // Gamma = K * residual
-        let gamma = &k * residual;
-
-        // Skip if gain is degenerate
         if !gamma.iter().all(|v| v.is_finite()) {
             return;
         }
@@ -297,11 +323,6 @@ impl VIOEqF {
             self.x = delta.compose(&self.x);
         }
 
-        // Joseph form: Σ = (I - KC) Σ (I - KC)^T + K R K^T
-        let i_kc = DMatrix::<f64>::identity(n, n) - &k * c_star;
-        let sigma_new = &i_kc * sigma_active * i_kc.transpose() + &k * r_noise * k.transpose();
-
-        self.sigma = sigma_new;
         self.enforce_spd();
     }
 
@@ -331,6 +352,7 @@ impl VIOEqF {
                 .view_mut((n_old, n_old), (copy_size, copy_size))
                 .copy_from(&new_cov.view((0, 0), (copy_size, copy_size)));
             self.sigma = sigma_new;
+            self.resize_scratch();
         }
     }
 
@@ -381,6 +403,7 @@ impl VIOEqF {
             }
 
             self.sigma = sigma_new;
+            self.resize_scratch();
         }
     }
 
