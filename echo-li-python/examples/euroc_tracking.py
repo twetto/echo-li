@@ -132,7 +132,7 @@ def main():
     vio = None
     cam = None
     if args.config:
-        if dist_model and "radtan" in dist_model.lower():
+        if dist_model and "radial" in dist_model.lower():
             cam = echo_li.RadTanCamera(fx, fy, cx, cy, *dist_coeffs[:4])
         else:
             cam = echo_li.PinholeCamera(fx, fy, cx, cy)

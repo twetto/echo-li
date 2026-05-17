@@ -86,14 +86,15 @@ impl FrontendConfig {
             .as_deref()
             .unwrap_or("soft")
             .to_string();
+        let defaults = frontend::FrontendConfig::default();
         Ok(Self {
             max_features: rv.max_features,
-            fast_threshold: 20,
+            fast_threshold: defaults.fast_threshold,
             pyramid_levels: rv.max_level,
             cell_size: rv.feature_dist as usize,
-            klt_window: 21,
-            klt_max_iter: 30,
-            lbp_verification: true,
+            klt_window: defaults.klt_window,
+            klt_max_iter: defaults.klt_max_iter,
+            lbp_verification: defaults.lbp_verification_enabled,
             lbp_policy,
             histeq,
             intrinsics: None,
