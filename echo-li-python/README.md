@@ -2,14 +2,22 @@
 
 Python bindings for ECHO-LI via PyO3/maturin.
 
-## Build
+## Install
 
 ```bash
 cd echo-li-python
-python -m venv .venv
-source .venv/bin/activate
-pip install maturin numpy opencv-python pyyaml
+pip install .
+```
+
+For development (faster rebuilds, no wheel packaging):
+```bash
+pip install maturin
 maturin develop --release
+```
+
+Runtime dependencies (`numpy`) are pulled automatically. For the EuRoC demo:
+```bash
+pip install opencv-python pyyaml
 ```
 
 For the trajectory visualizer (optional):
