@@ -461,7 +461,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let reader = ASLDatasetReader::new(&args.dataset, cam_lag);
-    let mut imu_it = reader.imu_iter().peekable();
+    let mut raw_imu_it = reader.imu_iter();
     let mut image_it = reader.image_iter().peekable();
 
     let settings = if let Some(conf) = &vio_config {
@@ -612,7 +612,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Warning: --vis requires building with --features rerun");
     }
 
-    let mut filter: Option<VIOFilter> = None;
+    // ------------------------------------------------------------------
+    // Pose initialization — mirrors run_euroc.py / initialization.py.
+    // Eager-init: build filter once with gravity-aligned xi0, then process
+    // every event (IMU + image) through it in time order. No batch IMU
+    // replay; no dropping of early images.
+    // ------------------------------------------------------------------
+    let initial_imu: Vec<IMUVelocity> = (&mut raw_imu_it).take(100).collect();
+    let init_pose = if check_stationary(&initial_imu, 100, 0.1, 0.5) {
+        let pose = estimate_initial_pose(&initial_imu, 100);
+        let r = pose.rotation.as_matrix();
+        let pitch_deg = (-r[(2, 0)]).clamp(-1.0, 1.0).asin().to_degrees();
+        let roll_deg = r[(2, 1)].atan2(r[(2, 2)]).to_degrees();
+        let t0 = initial_imu.first().map(|imu| imu.stamp).unwrap_or(0.0);
+        println!(
+            "Static IMU initialization at t={:.3}: roll={:.1}° pitch={:.1}°",
+            t0, roll_deg, pitch_deg
+        );
+        pose
+    } else {
+        println!("WARNING: Platform not stationary at start, using identity pose");
+        echo_lie::SE3::identity()
+    };
+
+    let mut xi0 = VIOState::new(VIOSensorState::identity(), Vec::new());
+    xi0.sensor.pose = init_pose;
+    if let Some(ext) = &reader.camera_extrinsics {
+        xi0.sensor.camera_offset = ext.clone();
+    }
+    let mut filter: Option<VIOFilter> = Some(VIOFilter::new(settings.clone(), xi0));
+
+    // Re-attach the buffered IMU samples to the front of the stream so they
+    // pass through the filter at their original timestamps, interleaved with
+    // images, just like every other IMU sample.
+    let mut imu_it = initial_imu.into_iter().chain(raw_imu_it).peekable();
+
     let mut patch_depth_mapper = if patch_depth_enabled {
         let mapper = PatchDepthMapper::new(
             Arc::clone(&cam_model),
@@ -679,8 +713,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
-    let mut initial_imu = Vec::new();
-    let mut initialized = false;
     let mut states_out: Vec<(f64, VIOState)> = Vec::new();
     let mut imu_count: usize = 0;
     let mut vision_count: usize = 0;
@@ -704,29 +736,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 let imu = imu_it.next().unwrap();
                 imu_count += 1;
-
-                if !initialized {
-                    initial_imu.push(imu);
-                    if initial_imu.len() >= 100 {
-                        if check_stationary(&initial_imu, 100, 0.1, 0.5) {
-                            let mut xi0 = VIOState::new(VIOSensorState::identity(), Vec::new());
-                            xi0.sensor.pose = estimate_initial_pose(&initial_imu, 100);
-                            if let Some(ext) = &reader.camera_extrinsics {
-                                xi0.sensor.camera_offset = ext.clone();
-                            }
-                            println!("Initialized at t={:.3}", imu.stamp);
-                            filter = Some(VIOFilter::new(settings.clone(), xi0));
-                            // Warm up the covariance by replaying initial IMU
-                            let f = filter.as_mut().unwrap();
-                            for past_imu in &initial_imu {
-                                f.process_imu(*past_imu);
-                            }
-                            initialized = true;
-                        } else {
-                            initial_imu.remove(0);
-                        }
-                    }
-                } else if let Some(f) = &mut filter {
+                if let Some(f) = &mut filter {
                     f.process_imu(imu);
                 }
             }

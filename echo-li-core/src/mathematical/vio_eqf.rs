@@ -299,12 +299,30 @@ impl VIOEqF {
                 continue;
             }
 
+            // Sequential KF re-prediction: subtract the projection of the
+            // already-accumulated γ along c_j before applying this scalar
+            // update. Without this term, γ = Σ_j K_j · residual_j (an
+            // un-adjusted sum) differs from the batch γ = K_batch · y_tilde
+            // whenever c_j rows share state columns — which they always do
+            // in VIO (u/v of the same landmark, plus the sensor-state
+            // band). The error compounds across the m scalar updates and
+            // is most pronounced for the Euclidean chart (R³ landmarks,
+            // strongest u↔v cross-coupling on the landmark columns).
+            let mut c_dot_gamma = 0.0;
+            for col in 0..n {
+                let c_jc = c_star[(j, col)];
+                if c_jc != 0.0 {
+                    c_dot_gamma += c_jc * gamma[col];
+                }
+            }
+            let adjusted_residual = residual[j] - c_dot_gamma;
+
             // Σ -= v vᵀ / α (symmetric rank-1 downdate)
             let inv_alpha = 1.0 / alpha;
             self.sigma.ger(-inv_alpha, &v, &v, 1.0);
 
-            // k = v / α, accumulate gamma
-            gamma.axpy(residual[j] * inv_alpha, &v, 1.0);
+            // γ += (adjusted_residual / α) · v
+            gamma.axpy(adjusted_residual * inv_alpha, &v, 1.0);
         }
 
         if !gamma.iter().all(|v| v.is_finite()) {

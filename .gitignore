@@ -16,3 +16,4 @@ docs/
 eqvio_output*/
 profile*
 run.sh
+cross_compile.sh
