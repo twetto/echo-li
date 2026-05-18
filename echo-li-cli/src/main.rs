@@ -138,7 +138,7 @@ fn patch_depth_status_counts(output: &PatchDepthOutput) -> (usize, usize, usize,
     let mut seed_only = 0;
     let mut photo_refined = 0;
     let mut rejected = 0;
-    for status in &output.status_cells.data {
+    for status in &output.status.data {
         match status {
             PatchStatus::Unknown => unknown += 1,
             PatchStatus::SeedOnly => seed_only += 1,
@@ -161,40 +161,21 @@ fn patch_depth_rgb_for_vis(
     if vis_min_depth <= 0.0 || vis_max_depth <= vis_min_depth {
         return rgb;
     }
-    let cell_w = (img_w / output.depth_cells.width.max(1)).max(1);
-    let cell_h = (img_h / output.depth_cells.height.max(1)).max(1);
-
-    for cy in 0..output.depth_cells.height {
-        for cx in 0..output.depth_cells.width {
-            let idx = cy * output.depth_cells.width + cx;
-            let depth = output.depth_cells.data[idx];
+    let dw = output.depth.width;
+    let dh = output.depth.height;
+    for y in 0..img_h {
+        let dy = y * dh / img_h;
+        for x in 0..img_w {
+            let dx = x * dw / img_w;
+            let depth = output.depth.data[dy * dw + dx];
             if !depth.is_finite() || depth <= 0.0 {
                 continue;
             }
             let color = color_for_depth(depth as f64, vis_min_depth, vis_max_depth);
-            let r = ((color >> 24) & 0xFF) as u8;
-            let g = ((color >> 16) & 0xFF) as u8;
-            let b = ((color >> 8) & 0xFF) as u8;
-            let x0 = cx * cell_w;
-            let y0 = cy * cell_h;
-            let x1 = if cx + 1 == output.depth_cells.width {
-                img_w
-            } else {
-                ((cx + 1) * cell_w).min(img_w)
-            };
-            let y1 = if cy + 1 == output.depth_cells.height {
-                img_h
-            } else {
-                ((cy + 1) * cell_h).min(img_h)
-            };
-            for y in y0..y1 {
-                for x in x0..x1 {
-                    let out = (y * img_w + x) * 3;
-                    rgb[out] = r;
-                    rgb[out + 1] = g;
-                    rgb[out + 2] = b;
-                }
-            }
+            let out = (y * img_w + x) * 3;
+            rgb[out] = ((color >> 24) & 0xFF) as u8;
+            rgb[out + 1] = ((color >> 16) & 0xFF) as u8;
+            rgb[out + 2] = ((color >> 8) & 0xFF) as u8;
         }
     }
 
@@ -656,13 +637,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             patch_depth_settings.clone(),
         )?;
         println!(
-            "Patch depth: enabled mode={:?} warp={:?} scale={:.2}, patch={} stride={} cell={} levels={}",
+            "Patch depth: enabled mode={:?} warp={:?} scale={:.2}, patch={} stride={} levels={}",
             patch_depth_settings.camera_mode,
             patch_depth_settings.warp_mode,
             patch_depth_settings.scale,
             patch_depth_settings.patch_size,
             patch_depth_settings.patch_stride,
-            patch_depth_settings.cell_size,
             patch_depth_settings.n_pyramid_levels
         );
         #[cfg(feature = "rerun")]

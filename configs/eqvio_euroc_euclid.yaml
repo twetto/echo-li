@@ -1,12 +1,12 @@
 RudolfV:
   equaliseImageHistogram: true
   # useFastFeatures: false
-  featureDist: 64.0
-  # featureDist: 16.0
+  # featureDist: 64.0
+  featureDist: 16.0
   featureSearchThreshold: 0.8
   # maxError: 50.0
-  maxFeatures: 40  # LK tracker pool (feeds sparse_vog). EqF cap is --max-features.
-  # maxFeatures: 1410
+  # maxFeatures: 40  # LK tracker pool (feeds sparse_vog). EqF cap is --max-features.
+  maxFeatures: 1410
   # maxFeatures: 500
   maxLevel: 3
   lbpPolicy: HardReject
@@ -17,8 +17,8 @@ RudolfV:
     maxIterations: 200
     minDataPoints: 5
     minInliers: 15
-  # trackedFeatureDist: 16.0
-  trackedFeatureDist: 64.0
+  trackedFeatureDist: 16.0
+  # trackedFeatureDist: 64.0
   # winSize: 21
 eqf:
   maxFeatures: 40           # core EqF landmark cap
@@ -76,8 +76,8 @@ SparseVog:
   # parametrization: euclidean, invdepth, polar (1D scalar)
   #                  invdepth3d, polar3d (3D Local IEKF on Normal chart)
   parametrization: invdepth3d
-  # max_pool_size: 1410
-  max_pool_size: 40
+  max_pool_size: 1410
+  # max_pool_size: 40
   # max_pool_size: 500
   min_track_length: 5
   # conv_variance_threshold: 0.02 # var(z) gate for query()
@@ -106,18 +106,18 @@ SparseVog:
   pd_max_dist_between_z: 0.1
   pd_max_norm_deg: 10
   pd_min_plane_features: 15
-# PatchDepth:
-#   camera_mode: undistorted_pinhole
-#   warp_mode: fast_translation
-#   scale: 0.5
-#   patch_size: 4
-#   patch_stride: 2
-#   cell_size: 4
-#   seed_radius_px: 32
-#   min_baseline_ratio: 0.005
-#   max_baseline_ratio: 0.3
-#   n_pyramid_levels: 1
-#   max_depth: 150.0
-#   vis_min_depth: 0.5
-#   vis_max_depth: 5.0
-#   n_search_candidates: 1
+PatchDepth:
+  camera_mode: undistorted_pinhole
+  warp_mode: fast_translation
+  scale: 0.25
+  patch_size: 8
+  patch_stride: 4
+  cell_size: 8
+  seed_radius_px: 64
+  min_baseline_ratio: 0.005
+  max_baseline_ratio: 0.3
+  n_pyramid_levels: 1
+  max_depth: 150.0
+  vis_min_depth: 0.5
+  vis_max_depth: 5.0
+  n_search_candidates: 1

@@ -17,10 +17,9 @@ mod seeds;
 #[cfg(target_arch = "x86_64")]
 mod simd;
 
-#[cfg(not(feature = "parallel"))]
-use fuse::FuseAccumulator;
+use fuse::{densify_pixels, PatchGrid};
 #[cfg(feature = "parallel")]
-use fuse::{fuse_cells, patch_centers};
+use fuse::{densify_pixels_parallel, patch_centers};
 use image_ops::{
     bilerp_ptr, bilinear_patch_footprint, build_bilinear_valid_pyramid, build_mask_pyramid,
     build_pinhole_to_raw_lut, build_pyramid_from_u8, dyadic_scale_offset, empty_pyramid, gradients,
@@ -56,7 +55,6 @@ pub struct PatchDepthSettings {
     pub scale: f64,
     pub patch_size: usize,
     pub patch_stride: usize,
-    pub cell_size: usize,
     pub min_depth: f64,
     pub max_depth: f64,
     pub photo_huber_delta: f64,
@@ -86,7 +84,6 @@ impl Default for PatchDepthSettings {
             scale: 1.0,
             patch_size: 8,
             patch_stride: 4,
-            cell_size: 8,
             max_depth: 20.0,
             min_depth: 0.1,
             photo_huber_delta: 5.0,
@@ -121,9 +118,9 @@ pub enum PatchStatus {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PatchDepthOutput {
-    pub depth_cells: DepthMap<f32>,
-    pub variance_cells: DepthMap<f32>,
-    pub status_cells: DepthMap<PatchStatus>,
+    pub depth: DepthMap<f32>,
+    pub variance: DepthMap<f32>,
+    pub status: DepthMap<PatchStatus>,
 }
 
 #[derive(Debug, Clone)]
@@ -159,9 +156,9 @@ struct DepthFrameProducts {
 }
 
 #[derive(Debug, Clone)]
-struct RelativePose {
-    r: Matrix3<f64>,
-    t: Vector3<f64>,
+pub(super) struct RelativePose {
+    pub(super) r: Matrix3<f64>,
+    pub(super) t: Vector3<f64>,
 }
 
 impl RelativePose {
@@ -174,15 +171,15 @@ impl RelativePose {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct ScaledIntrinsics {
-    scale_from_original: f64,
+pub(super) struct ScaledIntrinsics {
+    pub(super) scale_from_original: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
-struct PatchEstimate {
-    rho: f64,
-    var: f64,
-    status: PatchStatus,
+pub(super) struct PatchEstimate {
+    pub(super) rho: f64,
+    pub(super) var: f64,
+    pub(super) status: PatchStatus,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -299,14 +296,6 @@ impl PatchDepthMapper {
         camera_mode: PatchDepthCameraMode,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(width > 0 && height > 0, "image size must be non-zero");
-        anyhow::ensure!(
-            settings.patch_stride == settings.cell_size / 2,
-            "patch_stride must equal cell_size / 2"
-        );
-        anyhow::ensure!(
-            settings.patch_size >= settings.cell_size,
-            "patch_size must be >= cell_size"
-        );
         anyhow::ensure!(
             settings.scale > 0.0 && settings.scale <= 1.0,
             "scale must be in (0, 1]"
@@ -579,10 +568,19 @@ impl PatchDepthMapper {
             height,
         );
 
+        let rel_pose = RelativePose::from_matrix(t_ref_curr);
+        let ref_img = &ref_keyframe.ref_pyramid[0];
+        let ref_valid: Option<&Image<f32>> =
+            ref_keyframe.bilinear_valid_pyramid.as_ref().map(|p| &p[0]);
+
+        let curr_img = &curr_pyramid[0];
+        let curr_valid = curr_valid_pyramid.map(|p| &p[0]);
+
         #[cfg(feature = "parallel")]
         {
-            let patch_centers = patch_centers(width, height, &self.settings);
-            let patches: Vec<_> = patch_centers
+            let patch_centers_list = patch_centers(width, height, &self.settings);
+            let mut grid = PatchGrid::new(width, height, &self.settings);
+            let estimates: Vec<_> = patch_centers_list
                 .par_iter()
                 .map(|&(u, v)| {
                     let estimate = self.solve_one_patch(
@@ -597,14 +595,29 @@ impl PatchDepthMapper {
                         t_ref_curr,
                         sigma_warp_sq,
                     );
-                    (u as f64, v as f64, estimate)
+                    (u, v, estimate)
                 })
                 .collect();
-            fuse_cells(&patches, width, height, &self.settings)
+            for (u, v, estimate) in estimates {
+                grid.set(u, v, estimate);
+            }
+            densify_pixels_parallel(
+                &grid,
+                width,
+                height,
+                curr_img,
+                curr_valid,
+                ref_img,
+                ref_valid,
+                self,
+                &scaled_intrinsics[0],
+                &rel_pose,
+                &self.settings,
+            )
         }
         #[cfg(not(feature = "parallel"))]
         {
-            let mut fuse = FuseAccumulator::new(width, height, &self.settings);
+            let mut grid = PatchGrid::new(width, height, &self.settings);
             let half = self.settings.patch_size / 2;
             for v in (half..height.saturating_sub(half)).step_by(self.settings.patch_stride) {
                 for u in (half..width.saturating_sub(half)).step_by(self.settings.patch_stride) {
@@ -620,10 +633,22 @@ impl PatchDepthMapper {
                         t_ref_curr,
                         sigma_warp_sq,
                     );
-                    fuse.add(u as f64, v as f64, estimate, &self.settings);
+                    grid.set(u, v, estimate);
                 }
             }
-            fuse.finish()
+            densify_pixels(
+                &grid,
+                width,
+                height,
+                curr_img,
+                curr_valid,
+                ref_img,
+                ref_valid,
+                self,
+                &scaled_intrinsics[0],
+                &rel_pose,
+                &self.settings,
+            )
         }
     }
 
@@ -1228,7 +1253,7 @@ impl PatchDepthMapper {
         (grad, hess, sum_abs_res, n_valid)
     }
 
-    fn warp_scaled_pixel(
+    pub(super) fn warp_scaled_pixel(
         &self,
         u: f64,
         v: f64,
@@ -1249,7 +1274,7 @@ impl PatchDepthMapper {
         Some((u_ref, v_ref, x_ref, bearing))
     }
 
-    fn bearing_for_scaled_pixel(
+    pub(super) fn bearing_for_scaled_pixel(
         &self,
         u: f64,
         v: f64,
@@ -1276,7 +1301,7 @@ impl PatchDepthMapper {
         }
     }
 
-    fn project_scaled(&self, p: &Vector3<f64>, scale_from_original: f64) -> (f64, f64) {
+    pub(super) fn project_scaled(&self, p: &Vector3<f64>, scale_from_original: f64) -> (f64, f64) {
         match self.camera_mode {
             PatchDepthCameraMode::RawDistorted => {
                 let uv = self.camera.project(p);

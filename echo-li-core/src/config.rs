@@ -327,9 +327,7 @@ impl PatchDepthConfig {
         if let Some(v) = self.patch_stride {
             settings.patch_stride = v;
         }
-        if let Some(v) = self.cell_size {
-            settings.cell_size = v;
-        }
+        // cell_size is ignored — output is now per-pixel
         if let Some(v) = self.min_depth {
             settings.min_depth = v;
         }

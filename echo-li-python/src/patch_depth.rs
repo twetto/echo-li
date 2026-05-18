@@ -79,23 +79,18 @@ impl PyPatchDepthMapper {
         match result {
             Some(output) => {
                 let dict = pyo3::types::PyDict::new(py);
-                let dw = output.depth_cells.width;
-                let dh = output.depth_cells.height;
+                let dw = output.depth.width;
+                let dh = output.depth.height;
 
-                let depth = Array2::from_shape_vec((dh, dw), output.depth_cells.data)
+                let depth = Array2::from_shape_vec((dh, dw), output.depth.data)
                     .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
                 dict.set_item("depth", PyArray2::from_owned_array(py, depth))?;
 
-                let var = Array2::from_shape_vec((dh, dw), output.variance_cells.data)
+                let var = Array2::from_shape_vec((dh, dw), output.variance.data)
                     .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
                 dict.set_item("variance", PyArray2::from_owned_array(py, var))?;
 
-                let status_u8: Vec<u8> = output
-                    .status_cells
-                    .data
-                    .iter()
-                    .map(|s| *s as u8)
-                    .collect();
+                let status_u8: Vec<u8> = output.status.data.iter().map(|s| *s as u8).collect();
                 let status = Array2::from_shape_vec((dh, dw), status_u8)
                     .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
                 dict.set_item("status", PyArray2::from_owned_array(py, status))?;
@@ -121,7 +116,7 @@ impl PyPatchDepthMapper {
 
 fn array_to_matrix4(a: &[[f64; 4]; 4]) -> Matrix4<f64> {
     Matrix4::new(
-        a[0][0], a[0][1], a[0][2], a[0][3], a[1][0], a[1][1], a[1][2], a[1][3], a[2][0],
-        a[2][1], a[2][2], a[2][3], a[3][0], a[3][1], a[3][2], a[3][3],
+        a[0][0], a[0][1], a[0][2], a[0][3], a[1][0], a[1][1], a[1][2], a[1][3], a[2][0], a[2][1],
+        a[2][2], a[2][3], a[3][0], a[3][1], a[3][2], a[3][3],
     )
 }

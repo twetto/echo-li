@@ -90,11 +90,11 @@ fn seed_priors_produce_cell_depths() {
         .update_with_priors(frame(1, 0.02, img), &seeds, None, 0.0)
         .unwrap();
     assert!(out
-        .depth_cells
+        .depth
         .data
         .iter()
         .any(|z| z.is_finite() && (*z - 2.0).abs() < 0.1));
-    assert!(out.status_cells.data.contains(&PatchStatus::SeedOnly));
+    assert!(out.status.data.contains(&PatchStatus::SeedOnly));
 }
 
 #[test]
@@ -119,7 +119,7 @@ fn bearing_lut_handles_distorted_path_for_photometric_solve() {
     let out = mapper
         .update_with_priors(frame(1, 0.02, img), &seeds, None, 0.0)
         .unwrap();
-    assert!(out.status_cells.data.contains(&PatchStatus::PhotoRefined));
+    assert!(out.status.data.contains(&PatchStatus::PhotoRefined));
 }
 
 #[test]
@@ -146,7 +146,7 @@ fn fast_translation_refines_undistorted_pinhole_patches() {
     let out = mapper
         .update_with_priors(frame(1, 0.02, img), &seeds, None, 0.0)
         .unwrap();
-    assert!(out.status_cells.data.contains(&PatchStatus::PhotoRefined));
+    assert!(out.status.data.contains(&PatchStatus::PhotoRefined));
 }
 
 #[test]
@@ -157,7 +157,6 @@ fn fast_translation_refines_undistorted_pinhole_4x4_patches() {
         warp_mode: PatchDepthWarpMode::FastTranslation,
         patch_size: 4,
         patch_stride: 2,
-        cell_size: 4,
         min_photo_curvature: 0.0,
         max_photo_residual: 255.0,
         ..PatchDepthSettings::default()
@@ -176,7 +175,7 @@ fn fast_translation_refines_undistorted_pinhole_4x4_patches() {
     let out = mapper
         .update_with_priors(frame(1, 0.02, img), &seeds, None, 0.0)
         .unwrap();
-    assert!(out.status_cells.data.contains(&PatchStatus::PhotoRefined));
+    assert!(out.status.data.contains(&PatchStatus::PhotoRefined));
 }
 
 #[test]
