@@ -238,16 +238,8 @@ pub(super) fn build_mask_pyramid(
     out.push(scaled_mask_from_u8(mask, width, height, scale));
     for level in 1..levels {
         let prev = &out[level - 1];
-        let next_w = (prev.width() / 2).max(1);
-        let next_h = (prev.height() / 2).max(1);
-        let mut next = vec![0.0f32; next_w * next_h];
-        for y in 0..next_h {
-            for x in 0..next_w {
-                if mask_pyrdown_footprint_valid(prev, x * 2, y * 2) {
-                    next[y * next_w + x] = 1.0;
-                }
-            }
-        }
+        let eroded = mask_pyrdown_erode(prev);
+        let (next, next_w, next_h) = mask_pyrdown_from_eroded(&eroded, prev.width(), prev.height());
         out.push(Image::from_vec(next_w, next_h, next));
     }
     out
@@ -271,16 +263,8 @@ fn build_dyadic_mask_pyramid(
     ));
     for level in 1..total_levels {
         let prev = &full[level - 1];
-        let next_w = (prev.width() / 2).max(1);
-        let next_h = (prev.height() / 2).max(1);
-        let mut next = vec![0.0f32; next_w * next_h];
-        for y in 0..next_h {
-            for x in 0..next_w {
-                if mask_pyrdown_footprint_valid(prev, x * 2, y * 2) {
-                    next[y * next_w + x] = 1.0;
-                }
-            }
-        }
+        let eroded = mask_pyrdown_erode(prev);
+        let (next, next_w, next_h) = mask_pyrdown_from_eroded(&eroded, prev.width(), prev.height());
         full.push(Image::from_vec(next_w, next_h, next));
     }
     full.into_iter().skip(offset).collect()
@@ -314,24 +298,181 @@ fn bilinear_valid_image(mask: &Image<f32>) -> Image<f32> {
     Image::from_vec(width, height, data)
 }
 
-fn mask_pyrdown_footprint_valid(mask: &Image<f32>, cx: usize, cy: usize) -> bool {
-    let cx = cx as isize;
-    let cy = cy as isize;
-    for dy in -2..=2 {
-        for dx in -2..=2 {
-            let x = cx + dx;
-            let y = cy + dy;
-            if x < 0
-                || y < 0
-                || x >= mask.width() as isize
-                || y >= mask.height() as isize
-                || mask.get(x as usize, y as usize) <= 0.5
-            {
-                return false;
+fn mask_pyrdown_erode(mask: &Image<f32>) -> Vec<u8> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            return unsafe { mask_pyrdown_erode_avx2(mask) };
+        }
+    }
+    mask_pyrdown_erode_scalar(mask)
+}
+
+fn mask_pyrdown_erode_scalar(mask: &Image<f32>) -> Vec<u8> {
+    let w = mask.width();
+    let h = mask.height();
+    let src = mask.as_slice();
+
+    let mut bin = vec![0u8; w * h];
+    for (i, &v) in src.iter().enumerate() {
+        bin[i] = (v > 0.5) as u8;
+    }
+
+    let mut h_eroded = vec![0u8; w * h];
+    if w >= 5 {
+        for y in 0..h {
+            let row = &bin[y * w..(y + 1) * w];
+            let out_row = &mut h_eroded[y * w..(y + 1) * w];
+            for x in 2..w - 2 {
+                out_row[x] = row[x - 2] & row[x - 1] & row[x] & row[x + 1] & row[x + 2];
             }
         }
     }
-    true
+
+    let mut eroded = vec![0u8; w * h];
+    if h >= 5 {
+        for y in 2..h - 2 {
+            let r0 = &h_eroded[(y - 2) * w..(y - 1) * w];
+            let r1 = &h_eroded[(y - 1) * w..y * w];
+            let r2 = &h_eroded[y * w..(y + 1) * w];
+            let r3 = &h_eroded[(y + 1) * w..(y + 2) * w];
+            let r4 = &h_eroded[(y + 2) * w..(y + 3) * w];
+            let out_row = &mut eroded[y * w..(y + 1) * w];
+            for x in 0..w {
+                out_row[x] = r0[x] & r1[x] & r2[x] & r3[x] & r4[x];
+            }
+        }
+    }
+
+    eroded
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn mask_pyrdown_erode_avx2(mask: &Image<f32>) -> Vec<u8> {
+    unsafe {
+        use std::arch::x86_64::*;
+
+        let w = mask.width();
+        let h = mask.height();
+        let src = mask.as_slice();
+
+        let mut bin = vec![0u8; w * h];
+        let threshold = _mm256_set1_ps(0.5);
+        let n = w * h;
+        let mut i = 0;
+        while i + 32 <= n {
+            let m0 = _mm256_cmp_ps::<_CMP_GT_OQ>(_mm256_loadu_ps(src.as_ptr().add(i)), threshold);
+            let m1 =
+                _mm256_cmp_ps::<_CMP_GT_OQ>(_mm256_loadu_ps(src.as_ptr().add(i + 8)), threshold);
+            let m2 =
+                _mm256_cmp_ps::<_CMP_GT_OQ>(_mm256_loadu_ps(src.as_ptr().add(i + 16)), threshold);
+            let m3 =
+                _mm256_cmp_ps::<_CMP_GT_OQ>(_mm256_loadu_ps(src.as_ptr().add(i + 24)), threshold);
+            let b0 = _mm256_movemask_ps(m0) as u32;
+            let b1 = _mm256_movemask_ps(m1) as u32;
+            let b2 = _mm256_movemask_ps(m2) as u32;
+            let b3 = _mm256_movemask_ps(m3) as u32;
+            for bit in 0..8u32 {
+                *bin.get_unchecked_mut(i + bit as usize) = ((b0 >> bit) & 1) as u8;
+                *bin.get_unchecked_mut(i + 8 + bit as usize) = ((b1 >> bit) & 1) as u8;
+                *bin.get_unchecked_mut(i + 16 + bit as usize) = ((b2 >> bit) & 1) as u8;
+                *bin.get_unchecked_mut(i + 24 + bit as usize) = ((b3 >> bit) & 1) as u8;
+            }
+            i += 32;
+        }
+        for j in i..n {
+            bin[j] = (*src.get_unchecked(j) > 0.5) as u8;
+        }
+
+        let mut h_eroded = vec![0u8; w * h];
+        if w >= 5 {
+            for y in 0..h {
+                let row_ptr = bin.as_ptr().add(y * w);
+                let out_ptr = h_eroded.as_mut_ptr().add(y * w);
+                let interior = w - 4;
+                let mut x = 0usize;
+                while x + 32 <= interior {
+                    let a0 = _mm256_loadu_si256(row_ptr.add(x) as *const __m256i);
+                    let a1 = _mm256_loadu_si256(row_ptr.add(x + 1) as *const __m256i);
+                    let a2 = _mm256_loadu_si256(row_ptr.add(x + 2) as *const __m256i);
+                    let a3 = _mm256_loadu_si256(row_ptr.add(x + 3) as *const __m256i);
+                    let a4 = _mm256_loadu_si256(row_ptr.add(x + 4) as *const __m256i);
+                    let result = _mm256_and_si256(
+                        _mm256_and_si256(a0, a1),
+                        _mm256_and_si256(_mm256_and_si256(a2, a3), a4),
+                    );
+                    _mm256_storeu_si256(out_ptr.add(x + 2) as *mut __m256i, result);
+                    x += 32;
+                }
+                for xx in x..interior {
+                    *out_ptr.add(xx + 2) = *row_ptr.add(xx)
+                        & *row_ptr.add(xx + 1)
+                        & *row_ptr.add(xx + 2)
+                        & *row_ptr.add(xx + 3)
+                        & *row_ptr.add(xx + 4);
+                }
+            }
+        }
+
+        let mut eroded = vec![0u8; w * h];
+        if h >= 5 {
+            for y in 2..h - 2 {
+                let r0 = h_eroded.as_ptr().add((y - 2) * w);
+                let r1 = h_eroded.as_ptr().add((y - 1) * w);
+                let r2 = h_eroded.as_ptr().add(y * w);
+                let r3 = h_eroded.as_ptr().add((y + 1) * w);
+                let r4 = h_eroded.as_ptr().add((y + 2) * w);
+                let out = eroded.as_mut_ptr().add(y * w);
+                let mut x = 0usize;
+                while x + 32 <= w {
+                    let v0 = _mm256_loadu_si256(r0.add(x) as *const __m256i);
+                    let v1 = _mm256_loadu_si256(r1.add(x) as *const __m256i);
+                    let v2 = _mm256_loadu_si256(r2.add(x) as *const __m256i);
+                    let v3 = _mm256_loadu_si256(r3.add(x) as *const __m256i);
+                    let v4 = _mm256_loadu_si256(r4.add(x) as *const __m256i);
+                    let result = _mm256_and_si256(
+                        _mm256_and_si256(v0, v1),
+                        _mm256_and_si256(_mm256_and_si256(v2, v3), v4),
+                    );
+                    _mm256_storeu_si256(out.add(x) as *mut __m256i, result);
+                    x += 32;
+                }
+                for xx in x..w {
+                    *out.add(xx) =
+                        *r0.add(xx) & *r1.add(xx) & *r2.add(xx) & *r3.add(xx) & *r4.add(xx);
+                }
+            }
+        }
+
+        eroded
+    }
+}
+
+fn mask_pyrdown_from_eroded(
+    eroded: &[u8],
+    width: usize,
+    height: usize,
+) -> (Vec<f32>, usize, usize) {
+    let next_w = (width / 2).max(1);
+    let next_h = (height / 2).max(1);
+    let mut out = vec![0.0f32; next_w * next_h];
+    for y in 0..next_h {
+        let sy = y * 2;
+        if sy >= height {
+            break;
+        }
+        for x in 0..next_w {
+            let sx = x * 2;
+            if sx >= width {
+                break;
+            }
+            if eroded[sy * width + sx] != 0 {
+                out[y * next_w + x] = 1.0;
+            }
+        }
+    }
+    (out, next_w, next_h)
 }
 
 pub(super) fn build_pinhole_to_raw_lut(

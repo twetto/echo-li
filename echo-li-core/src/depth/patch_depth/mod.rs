@@ -17,7 +17,9 @@ mod seeds;
 #[cfg(target_arch = "x86_64")]
 mod simd;
 
-use fuse::{densify_pixels, PatchGrid};
+#[cfg(not(feature = "parallel"))]
+use fuse::densify_pixels;
+use fuse::PatchGrid;
 #[cfg(feature = "parallel")]
 use fuse::{densify_pixels_parallel, patch_centers};
 use image_ops::{
@@ -178,8 +180,53 @@ pub(super) struct ScaledIntrinsics {
 #[derive(Debug, Clone, Copy)]
 pub(super) struct PatchEstimate {
     pub(super) rho: f64,
+    #[allow(dead_code)]
     pub(super) var: f64,
     pub(super) status: PatchStatus,
+    pub(super) inv_var_w: f64,
+}
+
+impl PatchEstimate {
+    pub(super) fn unknown() -> Self {
+        Self {
+            rho: 0.0,
+            var: 1e10,
+            status: PatchStatus::Unknown,
+            inv_var_w: 0.0,
+        }
+    }
+
+    fn rejected(rho: f64) -> Self {
+        Self {
+            rho,
+            var: 1e10,
+            status: PatchStatus::Rejected,
+            inv_var_w: 0.0,
+        }
+    }
+
+    fn photo_refined(rho: f64, var: f64, settings: &PatchDepthSettings) -> Self {
+        Self {
+            rho,
+            var,
+            status: PatchStatus::PhotoRefined,
+            inv_var_w: settings.status_weight_photo / var.max(settings.var_floor),
+        }
+    }
+
+    fn seed_only(rho: f64, var: f64, settings: &PatchDepthSettings) -> Self {
+        Self {
+            rho,
+            var,
+            status: PatchStatus::SeedOnly,
+            inv_var_w: settings.status_weight_seed / var.max(settings.var_floor),
+        }
+    }
+
+    #[inline(always)]
+    pub(super) fn inv_var_weight_f32(self) -> Option<f32> {
+        (self.inv_var_w > 0.0).then_some(self.inv_var_w as f32)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -214,30 +261,202 @@ struct UndistortSample {
     weights: [f32; 4],
 }
 
-impl UndistortSample {
+struct UndistortLut {
+    idx00: Vec<u32>,
+    idx10: Vec<u32>,
+    idx01: Vec<u32>,
+    idx11: Vec<u32>,
+    w00: Vec<f32>,
+    w10: Vec<f32>,
+    w01: Vec<f32>,
+    w11: Vec<f32>,
+    valid: Vec<u8>,
+}
+
+impl UndistortLut {
+    fn from_options(lut: Vec<Option<UndistortSample>>) -> Self {
+        let n = lut.len();
+        let mut out = Self {
+            idx00: vec![0; n],
+            idx10: vec![0; n],
+            idx01: vec![0; n],
+            idx11: vec![0; n],
+            w00: vec![0.0; n],
+            w10: vec![0.0; n],
+            w01: vec![0.0; n],
+            w11: vec![0.0; n],
+            valid: vec![0; n],
+        };
+        for (i, sample) in lut.into_iter().enumerate() {
+            if let Some(s) = sample {
+                out.idx00[i] = s.idx00 as u32;
+                out.idx10[i] = s.idx10 as u32;
+                out.idx01[i] = s.idx01 as u32;
+                out.idx11[i] = s.idx11 as u32;
+                out.w00[i] = s.weights[0];
+                out.w10[i] = s.weights[1];
+                out.w01[i] = s.weights[2];
+                out.w11[i] = s.weights[3];
+                out.valid[i] = 1;
+            }
+        }
+        out
+    }
+
+    fn undistort_image(&self, src: &[u8], dst: &mut [u8], valid_mask: &mut [u8]) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::arch::is_x86_feature_detected!("avx2") {
+                // SAFETY: AVX2 support is checked above. The SIMD routine
+                // falls back to scalar code for chunks whose u8 gathers could
+                // read past the end of the source image.
+                unsafe { self.undistort_image_avx2(src, dst, valid_mask) };
+                return;
+            }
+        }
+        self.undistort_image_scalar(src, dst, valid_mask);
+    }
+
+    fn undistort_image_scalar(&self, src: &[u8], dst: &mut [u8], valid_mask: &mut [u8]) {
+        let n = self.valid.len();
+        for i in 0..n {
+            self.undistort_one_scalar(src, dst, valid_mask, i);
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn undistort_image_avx2(&self, src: &[u8], dst: &mut [u8], valid_mask: &mut [u8]) {
+        unsafe {
+            use std::arch::x86_64::*;
+
+            let n = self.valid.len();
+            let half = _mm256_set1_ps(0.5);
+            let mut i = 0;
+
+            while i + 8 <= n {
+                let valid_chunk = &self.valid[i..i + 8];
+                let any_valid = valid_chunk.iter().any(|&v| v != 0);
+                if !any_valid {
+                    i += 8;
+                    continue;
+                }
+                if !self.chunk_can_gather_u8_as_i32(src.len(), i) {
+                    self.undistort_chunk_scalar(src, dst, valid_mask, i, i + 8);
+                    i += 8;
+                    continue;
+                }
+
+                let gi00 = _mm256_loadu_si256(self.idx00.as_ptr().add(i) as *const __m256i);
+                let gi10 = _mm256_loadu_si256(self.idx10.as_ptr().add(i) as *const __m256i);
+                let gi01 = _mm256_loadu_si256(self.idx01.as_ptr().add(i) as *const __m256i);
+                let gi11 = _mm256_loadu_si256(self.idx11.as_ptr().add(i) as *const __m256i);
+
+                let v00 = _mm256_i32gather_epi32(src.as_ptr() as *const i32, gi00, 1);
+                let v10 = _mm256_i32gather_epi32(src.as_ptr() as *const i32, gi10, 1);
+                let v01 = _mm256_i32gather_epi32(src.as_ptr() as *const i32, gi01, 1);
+                let v11 = _mm256_i32gather_epi32(src.as_ptr() as *const i32, gi11, 1);
+
+                let mask_byte = _mm256_set1_epi32(0xFF);
+                let f00 = _mm256_cvtepi32_ps(_mm256_and_si256(v00, mask_byte));
+                let f10 = _mm256_cvtepi32_ps(_mm256_and_si256(v10, mask_byte));
+                let f01 = _mm256_cvtepi32_ps(_mm256_and_si256(v01, mask_byte));
+                let f11 = _mm256_cvtepi32_ps(_mm256_and_si256(v11, mask_byte));
+
+                let w00 = _mm256_loadu_ps(self.w00.as_ptr().add(i));
+                let w10 = _mm256_loadu_ps(self.w10.as_ptr().add(i));
+                let w01 = _mm256_loadu_ps(self.w01.as_ptr().add(i));
+                let w11 = _mm256_loadu_ps(self.w11.as_ptr().add(i));
+
+                let mut acc = _mm256_mul_ps(w00, f00);
+                acc = _mm256_fmadd_ps(w10, f10, acc);
+                acc = _mm256_fmadd_ps(w01, f01, acc);
+                acc = _mm256_fmadd_ps(w11, f11, acc);
+                acc = _mm256_add_ps(acc, half);
+
+                let result_i32 = _mm256_cvttps_epi32(acc);
+                let packed_16 = _mm256_packus_epi32(result_i32, _mm256_setzero_si256());
+                let packed_8 = _mm256_packus_epi16(packed_16, _mm256_setzero_si256());
+                let shuffled = _mm256_permutevar8x32_epi32(
+                    packed_8,
+                    _mm256_setr_epi32(0, 4, 0, 0, 0, 0, 0, 0),
+                );
+                let low_64 = _mm256_extract_epi64(shuffled, 0);
+
+                for k in 0..8 {
+                    if *valid_chunk.get_unchecked(k) != 0 {
+                        *dst.get_unchecked_mut(i + k) = ((low_64 >> (k * 8)) & 0xFF) as u8;
+                        *valid_mask.get_unchecked_mut(i + k) = 1;
+                    }
+                }
+
+                i += 8;
+            }
+
+            for j in i..n {
+                self.undistort_one_scalar(src, dst, valid_mask, j);
+            }
+        }
+    }
+
     #[inline(always)]
-    fn sample_u8(self, gray: &[u8]) -> u8 {
-        let i00 = gray[self.idx00] as f32;
-        let i10 = gray[self.idx10] as f32;
-        let i01 = gray[self.idx01] as f32;
-        let i11 = gray[self.idx11] as f32;
-        (self.weights[0] * i00
-            + self.weights[1] * i10
-            + self.weights[2] * i01
-            + self.weights[3] * i11)
-            .round() as u8
+    fn chunk_can_gather_u8_as_i32(&self, src_len: usize, start: usize) -> bool {
+        let Some(max_idx) = src_len.checked_sub(4).map(|idx| idx as u32) else {
+            return false;
+        };
+        self.idx00[start..start + 8]
+            .iter()
+            .all(|&idx| idx <= max_idx)
+            && self.idx10[start..start + 8]
+                .iter()
+                .all(|&idx| idx <= max_idx)
+            && self.idx01[start..start + 8]
+                .iter()
+                .all(|&idx| idx <= max_idx)
+            && self.idx11[start..start + 8]
+                .iter()
+                .all(|&idx| idx <= max_idx)
+    }
+
+    #[inline(always)]
+    fn undistort_chunk_scalar(
+        &self,
+        src: &[u8],
+        dst: &mut [u8],
+        valid_mask: &mut [u8],
+        start: usize,
+        end: usize,
+    ) {
+        for i in start..end {
+            self.undistort_one_scalar(src, dst, valid_mask, i);
+        }
+    }
+
+    #[inline(always)]
+    fn undistort_one_scalar(&self, src: &[u8], dst: &mut [u8], valid_mask: &mut [u8], i: usize) {
+        if self.valid[i] == 0 {
+            return;
+        }
+        let i00 = src[self.idx00[i] as usize] as f32;
+        let i10 = src[self.idx10[i] as usize] as f32;
+        let i01 = src[self.idx01[i] as usize] as f32;
+        let i11 = src[self.idx11[i] as usize] as f32;
+        dst[i] =
+            (self.w00[i] * i00 + self.w10[i] * i10 + self.w01[i] * i01 + self.w11[i] * i11 + 0.5)
+                as u8;
+        valid_mask[i] = 1;
     }
 }
 
 pub struct PatchDepthMapper {
     camera: Arc<dyn CameraModel>,
-    camera_mode: PatchDepthCameraMode,
-    intrinsics: CameraIntrinsics,
+    pub(super) camera_mode: PatchDepthCameraMode,
+    pub(super) intrinsics: CameraIntrinsics,
     width: usize,
     height: usize,
     settings: PatchDepthSettings,
     bearing_lut: Vec<Vector3<f64>>,
-    undistort_lut: Option<Vec<Option<UndistortSample>>>,
+    undistort_lut: Option<UndistortLut>,
     keyframes: Vec<DepthKeyframe>,
     pyramid_work: Pyramid,
     pyramid_scratch: PyramidScratch,
@@ -320,11 +539,8 @@ impl PatchDepthMapper {
 
         let undistort_lut = match camera_mode {
             PatchDepthCameraMode::RawDistorted => None,
-            PatchDepthCameraMode::UndistortedPinhole => Some(build_pinhole_to_raw_lut(
-                camera.as_ref(),
-                &intrinsics,
-                width,
-                height,
+            PatchDepthCameraMode::UndistortedPinhole => Some(UndistortLut::from_options(
+                build_pinhole_to_raw_lut(camera.as_ref(), &intrinsics, width, height),
             )),
         };
 
@@ -396,14 +612,10 @@ impl PatchDepthMapper {
             PatchDepthCameraMode::RawDistorted => (frame, None),
             PatchDepthCameraMode::UndistortedPinhole => {
                 let lut = self.undistort_lut.as_ref()?;
-                let mut gray = vec![0u8; self.width * self.height];
-                let mut valid_mask = vec![0u8; self.width * self.height];
-                for (idx, sample) in lut.iter().enumerate() {
-                    if let Some(sample) = sample {
-                        gray[idx] = sample.sample_u8(&frame.gray);
-                        valid_mask[idx] = 1;
-                    }
-                }
+                let n = self.width * self.height;
+                let mut gray = vec![0u8; n];
+                let mut valid_mask = vec![0u8; n];
+                lut.undistort_image(&frame.gray, &mut gray, &mut valid_mask);
                 (FrameProducts { gray, ..frame }, Some(valid_mask))
             }
         };
@@ -612,7 +824,6 @@ impl PatchDepthMapper {
                 self,
                 &scaled_intrinsics[0],
                 &rel_pose,
-                &self.settings,
             )
         }
         #[cfg(not(feature = "parallel"))]
@@ -647,7 +858,6 @@ impl PatchDepthMapper {
                 self,
                 &scaled_intrinsics[0],
                 &rel_pose,
-                &self.settings,
             )
         }
     }
@@ -667,11 +877,7 @@ impl PatchDepthMapper {
     ) -> PatchEstimate {
         let nearby = nearby_seed_weights(cu, cv, seeds, seed_grid, &self.settings);
         if nearby.is_empty() {
-            return PatchEstimate {
-                rho: 0.0,
-                var: 1e10,
-                status: PatchStatus::Unknown,
-            };
+            return PatchEstimate::unknown();
         }
 
         let mut seed_rho_init = 0.0;
@@ -755,25 +961,15 @@ impl PatchDepthMapper {
             * (self.settings.patch_size * self.settings.patch_size) as f64;
         if final_curvature >= min_curvature && final_residual <= self.settings.max_photo_residual {
             let hess_total = final_curvature + seed_precision_sum * self.settings.lambda_seed;
-            PatchEstimate {
-                rho,
-                var: 1.0 / hess_total.max(1e-12),
-                status: PatchStatus::PhotoRefined,
-            }
+            let var = 1.0 / hess_total.max(1e-12);
+            PatchEstimate::photo_refined(rho, var, &self.settings)
         } else if final_residual > self.settings.max_photo_residual
             && final_curvature >= min_curvature
         {
-            PatchEstimate {
-                rho,
-                var: 1e10,
-                status: PatchStatus::Rejected,
-            }
+            PatchEstimate::rejected(rho)
         } else {
-            PatchEstimate {
-                rho: rho_init,
-                var: 1.0 / (seed_precision_sum * self.settings.lambda_seed).max(1e-12),
-                status: PatchStatus::SeedOnly,
-            }
+            let var = 1.0 / (seed_precision_sum * self.settings.lambda_seed).max(1e-12);
+            PatchEstimate::seed_only(rho_init, var, &self.settings)
         }
     }
 
