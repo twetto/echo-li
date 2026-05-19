@@ -1,5 +1,4 @@
 use super::image_ops::sample_bilinear_valid;
-#[cfg(not(feature = "parallel"))]
 use super::PatchDepthCameraMode;
 use super::{
     PatchDepthMapper, PatchDepthOutput, PatchDepthSettings, PatchEstimate, PatchStatus,
@@ -197,7 +196,6 @@ fn densify_pixels_generic(
     }
 }
 
-#[cfg(not(feature = "parallel"))]
 struct RowWarpCoeffs {
     // x_ref[i] = a[i] * px + b[i], for i in 0..3
     a: [f32; 3],
@@ -209,7 +207,6 @@ struct RowWarpCoeffs {
     cy_s: f32,
 }
 
-#[cfg(not(feature = "parallel"))]
 impl RowWarpCoeffs {
     fn new(
         py: usize,
@@ -351,6 +348,29 @@ fn densify_pixels_pinhole(
                         }
                     }
 
+                    #[cfg(target_arch = "aarch64")]
+                    while px + 4 <= px_end {
+                        unsafe {
+                            densify_row_neon(
+                                &coeffs,
+                                px,
+                                curr_row,
+                                valid_row,
+                                ref_img,
+                                ref_valid,
+                                ref_w,
+                                ref_h,
+                                inv_var_w,
+                                patch_rho_f32,
+                                &mut rho_buf[row_off..],
+                                &mut w_buf[row_off..],
+                                &mut status_buf[row_off..],
+                                PatchStatus::PhotoRefined,
+                            );
+                        }
+                        px += 4;
+                    }
+
                     // Scalar tail
                     for px in px..px_end {
                         let (u_ref, v_ref, z_ref) = coeffs.warp(px as f32);
@@ -428,7 +448,6 @@ fn densify_pixels_pinhole(
 }
 
 #[inline(always)]
-#[cfg(not(feature = "parallel"))]
 fn photo_weight_inline(
     i_curr: f32,
     ref_img: &Image<f32>,
@@ -443,7 +462,7 @@ fn photo_weight_inline(
     1.0 / residual.max(1.0)
 }
 
-#[cfg(all(not(feature = "parallel"), target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn densify_row_avx2(
     coeffs: &RowWarpCoeffs,
@@ -593,8 +612,185 @@ unsafe fn densify_row_avx2(
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn densify_row_neon(
+    coeffs: &RowWarpCoeffs,
+    px_start: usize,
+    curr_row: &[f32],
+    valid_row: Option<&[f32]>,
+    ref_img: &Image<f32>,
+    ref_valid: Option<&Image<f32>>,
+    ref_w: usize,
+    ref_h: usize,
+    inv_var_w: f32,
+    patch_rho: f32,
+    rho_buf: &mut [f32],
+    w_buf: &mut [f32],
+    status_buf: &mut [PatchStatus],
+    patch_status: PatchStatus,
+) {
+    use std::arch::aarch64::*;
+
+    unsafe {
+        let ref_slice = ref_img.as_slice();
+        let ref_valid_slice = ref_valid.map(|v| v.as_slice());
+
+        let px_offsets: [f32; 4] = [0.0, 1.0, 2.0, 3.0];
+        let px_vec = vaddq_f32(vdupq_n_f32(px_start as f32), vld1q_f32(px_offsets.as_ptr()));
+
+        let xr0 = vfmaq_f32(vdupq_n_f32(coeffs.b[0]), vdupq_n_f32(coeffs.a[0]), px_vec);
+        let xr1 = vfmaq_f32(vdupq_n_f32(coeffs.b[1]), vdupq_n_f32(coeffs.a[1]), px_vec);
+        let xr2 = vfmaq_f32(vdupq_n_f32(coeffs.b[2]), vdupq_n_f32(coeffs.a[2]), px_vec);
+
+        // 1/xr2 via reciprocal estimate + one Newton step (matches AVX2 path).
+        let rcp = vrecpeq_f32(xr2);
+        let z_inv = vmulq_f32(rcp, vrecpsq_f32(xr2, rcp));
+
+        let fx_s = vdupq_n_f32(coeffs.fx_s);
+        let fy_s = vdupq_n_f32(coeffs.fy_s);
+        let cx_s = vdupq_n_f32(coeffs.cx_s);
+        let cy_s = vdupq_n_f32(coeffs.cy_s);
+        let u_ref = vfmaq_f32(cx_s, fx_s, vmulq_f32(xr0, z_inv));
+        let v_ref = vfmaq_f32(cy_s, fy_s, vmulq_f32(xr1, z_inv));
+
+        let eps = vdupq_n_f32(1e-6);
+        let zero = vdupq_n_f32(0.0);
+        let max_u = vdupq_n_f32((ref_w - 1) as f32);
+        let max_v = vdupq_n_f32((ref_h - 1) as f32);
+
+        let valid_mask = vandq_u32(
+            vandq_u32(vcgtq_f32(xr2, eps), vcgeq_f32(u_ref, zero)),
+            vandq_u32(
+                vcltq_f32(u_ref, max_u),
+                vandq_u32(vcgeq_f32(v_ref, zero), vcltq_f32(v_ref, max_v)),
+            ),
+        );
+
+        let valid_mask = if let Some(vr) = valid_row {
+            let curr_valid_vec = vld1q_f32(vr.as_ptr().add(px_start));
+            vandq_u32(valid_mask, vcgeq_f32(curr_valid_vec, vdupq_n_f32(0.5)))
+        } else {
+            valid_mask
+        };
+
+        let ix = vrndmq_f32(u_ref); // round toward -inf
+        let iy = vrndmq_f32(v_ref);
+        let dx = vsubq_f32(u_ref, ix);
+        let dy = vsubq_f32(v_ref, iy);
+        let one = vdupq_n_f32(1.0);
+        let one_minus_dx = vsubq_f32(one, dx);
+        let one_minus_dy = vsubq_f32(one, dy);
+
+        let ix_i32 = vcvtq_s32_f32(ix);
+        let iy_i32 = vcvtq_s32_f32(iy);
+        let ref_w_vec = vdupq_n_s32(ref_w as i32);
+        let idx00_v = vaddq_s32(vmulq_s32(iy_i32, ref_w_vec), ix_i32);
+        let idx10_v = vaddq_s32(idx00_v, vdupq_n_s32(1));
+        let idx01_v = vaddq_s32(idx00_v, ref_w_vec);
+        let idx11_v = vaddq_s32(idx01_v, vdupq_n_s32(1));
+
+        // NEON has no masked gather, so substitute index 0 on invalid lanes to keep
+        // the unconditional gather in-bounds; their photo_w gets selected back to 1.0 below.
+        let zero_i32 = vdupq_n_s32(0);
+        let idx00_s = vbslq_s32(valid_mask, idx00_v, zero_i32);
+        let idx10_s = vbslq_s32(valid_mask, idx10_v, zero_i32);
+        let idx01_s = vbslq_s32(valid_mask, idx01_v, zero_i32);
+        let idx11_s = vbslq_s32(valid_mask, idx11_v, zero_i32);
+
+        let p00 = gather4_f32(ref_slice, idx00_s);
+        let p10 = gather4_f32(ref_slice, idx10_s);
+        let p01 = gather4_f32(ref_slice, idx01_s);
+        let p11 = gather4_f32(ref_slice, idx11_s);
+
+        let valid_mask = if let Some(rv) = ref_valid_slice {
+            let rv00 = gather4_f32(rv, idx00_s);
+            vandq_u32(valid_mask, vcgtq_f32(rv00, vdupq_n_f32(0.5)))
+        } else {
+            valid_mask
+        };
+
+        let w00v = vmulq_f32(one_minus_dx, one_minus_dy);
+        let w10v = vmulq_f32(dx, one_minus_dy);
+        let w01v = vmulq_f32(one_minus_dx, dy);
+        let w11v = vmulq_f32(dx, dy);
+        let mut i_ref = vmulq_f32(w00v, p00);
+        i_ref = vfmaq_f32(i_ref, w10v, p10);
+        i_ref = vfmaq_f32(i_ref, w01v, p01);
+        i_ref = vfmaq_f32(i_ref, w11v, p11);
+
+        let i_curr = vld1q_f32(curr_row.as_ptr().add(px_start));
+        let residual = vabsq_f32(vsubq_f32(i_ref, i_curr));
+        let residual_clamped = vmaxq_f32(residual, one);
+        let photo_w_valid = vrecpeq_f32(residual_clamped); // ~12-bit, matches AVX2 `_mm256_rcp_ps`
+
+        let photo_w = vbslq_f32(valid_mask, photo_w_valid, one);
+
+        let w = vmulq_f32(vdupq_n_f32(inv_var_w), photo_w);
+        let w_rho = vmulq_f32(w, vdupq_n_f32(patch_rho));
+
+        let rho_ptr = rho_buf.as_mut_ptr().add(px_start);
+        let w_ptr = w_buf.as_mut_ptr().add(px_start);
+        let rho_old = vld1q_f32(rho_ptr);
+        let w_old = vld1q_f32(w_ptr);
+        vst1q_f32(rho_ptr, vaddq_f32(rho_old, w_rho));
+        vst1q_f32(w_ptr, vaddq_f32(w_old, w));
+
+        let status_ptr = &mut status_buf[px_start..px_start + 4];
+        for s in status_ptr.iter_mut() {
+            if (patch_status as u8) > (*s as u8) {
+                *s = patch_status;
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn gather4_f32(
+    slice: &[f32],
+    idx: std::arch::aarch64::int32x4_t,
+) -> std::arch::aarch64::float32x4_t {
+    use std::arch::aarch64::*;
+    unsafe {
+        let base = slice.as_ptr();
+        let i0 = vgetq_lane_s32::<0>(idx) as usize;
+        let i1 = vgetq_lane_s32::<1>(idx) as usize;
+        let i2 = vgetq_lane_s32::<2>(idx) as usize;
+        let i3 = vgetq_lane_s32::<3>(idx) as usize;
+        let v = vdupq_n_f32(0.0);
+        let v = vld1q_lane_f32::<0>(base.add(i0), v);
+        let v = vld1q_lane_f32::<1>(base.add(i1), v);
+        let v = vld1q_lane_f32::<2>(base.add(i2), v);
+        vld1q_lane_f32::<3>(base.add(i3), v)
+    }
+}
+
 #[cfg(feature = "parallel")]
 pub(super) fn densify_pixels_parallel(
+    grid: &PatchGrid,
+    width: usize,
+    height: usize,
+    curr_img: &Image<f32>,
+    curr_valid: Option<&Image<f32>>,
+    ref_img: &Image<f32>,
+    ref_valid: Option<&Image<f32>>,
+    mapper: &PatchDepthMapper,
+    intr: &ScaledIntrinsics,
+    rel_pose: &RelativePose,
+) -> PatchDepthOutput {
+    if mapper.camera_mode == PatchDepthCameraMode::UndistortedPinhole {
+        return densify_pixels_pinhole_parallel(
+            grid, width, height, curr_img, curr_valid, ref_img, ref_valid, mapper, intr, rel_pose,
+        );
+    }
+    densify_pixels_generic_parallel(
+        grid, width, height, curr_img, curr_valid, ref_img, ref_valid, mapper, intr, rel_pose,
+    )
+}
+
+#[cfg(feature = "parallel")]
+fn densify_pixels_pinhole_parallel(
     grid: &PatchGrid,
     width: usize,
     height: usize,
@@ -613,69 +809,242 @@ pub(super) fn densify_pixels_parallel(
     let mut variance = vec![f32::INFINITY; n];
     let mut status = vec![PatchStatus::Unknown; n];
 
-    let row_chunks: Vec<_> = (0..height).collect();
-    let depth_chunks: Vec<&mut [f32]> = depth.chunks_mut(width).collect();
-    let var_chunks: Vec<&mut [f32]> = variance.chunks_mut(width).collect();
-    let status_chunks: Vec<&mut [PatchStatus]> = status.chunks_mut(width).collect();
+    let ref_w = ref_img.width();
+    let ref_h = ref_img.height();
+    let curr_w = curr_img.width();
+    let curr_valid_w = curr_valid.map(|v| v.width());
 
-    // Combine into tuples for parallel iteration
-    let mut rows: Vec<(usize, &mut [f32], &mut [f32], &mut [PatchStatus])> = row_chunks
-        .into_iter()
-        .zip(depth_chunks)
-        .zip(var_chunks)
-        .zip(status_chunks)
-        .map(|(((py, d), v), s)| (py, d, v, s))
-        .collect();
+    #[cfg(target_arch = "x86_64")]
+    let use_avx2 =
+        std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma");
+    #[cfg(not(target_arch = "x86_64"))]
+    let use_avx2 = false;
 
-    rows.par_iter_mut().for_each(|(py, d_row, v_row, s_row)| {
-        let (iv_start, iv_end) = grid.overlap_v(*py);
-        if iv_start > iv_end {
-            return;
-        }
+    let patch_size = 2 * grid.half;
+    let min_len = (height / (rayon::current_num_threads() * 8)).max(1);
 
-        for px in 0..width {
-            let (iu_start, iu_end) = grid.overlap_u(px);
-            if iu_start > iu_end {
-                continue;
+    depth
+        .par_chunks_mut(width)
+        .zip(variance.par_chunks_mut(width))
+        .zip(status.par_chunks_mut(width))
+        .enumerate()
+        .with_min_len(min_len)
+        .for_each(|(py, ((d_row, v_row), s_row))| {
+            let (iv_start, iv_end) = grid.overlap_v(py);
+            if iv_start > iv_end {
+                return;
             }
 
-            let mut rho_acc = 0.0_f32;
-            let mut w_acc = 0.0_f32;
-            let mut best_status = PatchStatus::Unknown;
+            let mut rho_row = vec![0.0_f32; width];
+            let mut w_row = vec![0.0_f32; width];
+            let mut status_row = vec![PatchStatus::Unknown; width];
+
+            let curr_row = &curr_img.as_slice()[py * curr_w..py * curr_w + width];
+            let valid_row = curr_valid.map(|v| {
+                let vw = curr_valid_w.unwrap();
+                &v.as_slice()[py * vw..py * vw + width]
+            });
 
             for iv in iv_start..=iv_end {
-                for iu in iu_start..=iu_end {
+                for iu in 0..grid.n_u {
                     let patch = grid.get(iu, iv);
                     let Some(inv_var_w) = patch.inv_var_weight_f32() else {
                         continue;
                     };
 
-                    let photo_w = if patch.status == PatchStatus::PhotoRefined {
-                        compute_photo_weight(
-                            px, *py, patch.rho, curr_img, curr_valid, ref_img, ref_valid, mapper,
-                            intr, rel_pose,
-                        )
+                    let patch_rho_f32 = patch.rho as f32;
+                    let weighted_rho = inv_var_w * patch_rho_f32;
+
+                    let px_start = iu * grid.stride;
+                    let px_end = (px_start + patch_size).min(width);
+
+                    if patch.status == PatchStatus::PhotoRefined {
+                        let coeffs = RowWarpCoeffs::new(py, patch.rho, mapper, intr, rel_pose);
+                        let mut px = px_start;
+
+                        #[cfg(target_arch = "x86_64")]
+                        if use_avx2 {
+                            while px + 8 <= px_end {
+                                unsafe {
+                                    densify_row_avx2(
+                                        &coeffs,
+                                        px,
+                                        curr_row,
+                                        valid_row,
+                                        ref_img,
+                                        ref_valid,
+                                        ref_w,
+                                        ref_h,
+                                        inv_var_w,
+                                        patch_rho_f32,
+                                        &mut rho_row,
+                                        &mut w_row,
+                                        &mut status_row,
+                                        PatchStatus::PhotoRefined,
+                                    );
+                                }
+                                px += 8;
+                            }
+                        }
+
+                        #[cfg(target_arch = "aarch64")]
+                        while px + 4 <= px_end {
+                            unsafe {
+                                densify_row_neon(
+                                    &coeffs,
+                                    px,
+                                    curr_row,
+                                    valid_row,
+                                    ref_img,
+                                    ref_valid,
+                                    ref_w,
+                                    ref_h,
+                                    inv_var_w,
+                                    patch_rho_f32,
+                                    &mut rho_row,
+                                    &mut w_row,
+                                    &mut status_row,
+                                    PatchStatus::PhotoRefined,
+                                );
+                            }
+                            px += 4;
+                        }
+
+                        for px in px..px_end {
+                            let (u_ref, v_ref, z_ref) = coeffs.warp(px as f32);
+                            let photo_w = if z_ref > 1e-6
+                                && u_ref >= 0.0
+                                && v_ref >= 0.0
+                                && u_ref < (ref_w - 1) as f32
+                                && v_ref < (ref_h - 1) as f32
+                            {
+                                let i_curr = curr_row[px];
+                                let vr_block = valid_row.map(|vr| vr[px] < 0.5).unwrap_or(false);
+                                if vr_block {
+                                    1.0_f32
+                                } else {
+                                    photo_weight_inline(
+                                        i_curr,
+                                        ref_img,
+                                        ref_valid,
+                                        u_ref as f64,
+                                        v_ref as f64,
+                                    )
+                                }
+                            } else {
+                                1.0_f32
+                            };
+                            let w = inv_var_w * photo_w;
+                            rho_row[px] += w * patch_rho_f32;
+                            w_row[px] += w;
+                            if (patch.status as u8) > (status_row[px] as u8) {
+                                status_row[px] = patch.status;
+                            }
+                        }
                     } else {
-                        1.0_f32
-                    };
-
-                    let w = inv_var_w * photo_w;
-                    rho_acc += w * patch.rho as f32;
-                    w_acc += w;
-
-                    if (patch.status as u8) > (best_status as u8) {
-                        best_status = patch.status;
+                        for px in px_start..px_end {
+                            rho_row[px] += weighted_rho;
+                            w_row[px] += inv_var_w;
+                            if (patch.status as u8) > (status_row[px] as u8) {
+                                status_row[px] = patch.status;
+                            }
+                        }
                     }
                 }
             }
 
-            if w_acc > 0.0 {
-                d_row[px] = w_acc / rho_acc;
-                v_row[px] = 1.0 / w_acc;
-                s_row[px] = best_status;
+            for px in 0..width {
+                if w_row[px] > 0.0 {
+                    d_row[px] = w_row[px] / rho_row[px];
+                    v_row[px] = 1.0 / w_row[px];
+                    s_row[px] = status_row[px];
+                }
             }
-        }
-    });
+        });
+
+    PatchDepthOutput {
+        depth: DepthMap::from_vec(width, height, depth).expect("depth size"),
+        variance: DepthMap::from_vec(width, height, variance).expect("variance size"),
+        status: DepthMap::from_vec(width, height, status).expect("status size"),
+    }
+}
+
+#[cfg(feature = "parallel")]
+fn densify_pixels_generic_parallel(
+    grid: &PatchGrid,
+    width: usize,
+    height: usize,
+    curr_img: &Image<f32>,
+    curr_valid: Option<&Image<f32>>,
+    ref_img: &Image<f32>,
+    ref_valid: Option<&Image<f32>>,
+    mapper: &PatchDepthMapper,
+    intr: &ScaledIntrinsics,
+    rel_pose: &RelativePose,
+) -> PatchDepthOutput {
+    use rayon::prelude::*;
+
+    let n = width * height;
+    let mut depth = vec![f32::NAN; n];
+    let mut variance = vec![f32::INFINITY; n];
+    let mut status = vec![PatchStatus::Unknown; n];
+
+    let min_len = (height / (rayon::current_num_threads() * 8)).max(1);
+    depth
+        .par_chunks_mut(width)
+        .zip(variance.par_chunks_mut(width))
+        .zip(status.par_chunks_mut(width))
+        .enumerate()
+        .with_min_len(min_len)
+        .for_each(|(py, ((d_row, v_row), s_row))| {
+            let (iv_start, iv_end) = grid.overlap_v(py);
+            if iv_start > iv_end {
+                return;
+            }
+
+            for px in 0..width {
+                let (iu_start, iu_end) = grid.overlap_u(px);
+                if iu_start > iu_end {
+                    continue;
+                }
+
+                let mut rho_acc = 0.0_f32;
+                let mut w_acc = 0.0_f32;
+                let mut best_status = PatchStatus::Unknown;
+
+                for iv in iv_start..=iv_end {
+                    for iu in iu_start..=iu_end {
+                        let patch = grid.get(iu, iv);
+                        let Some(inv_var_w) = patch.inv_var_weight_f32() else {
+                            continue;
+                        };
+
+                        let photo_w = if patch.status == PatchStatus::PhotoRefined {
+                            compute_photo_weight(
+                                px, py, patch.rho, curr_img, curr_valid, ref_img, ref_valid,
+                                mapper, intr, rel_pose,
+                            )
+                        } else {
+                            1.0_f32
+                        };
+
+                        let w = inv_var_w * photo_w;
+                        rho_acc += w * patch.rho as f32;
+                        w_acc += w;
+
+                        if (patch.status as u8) > (best_status as u8) {
+                            best_status = patch.status;
+                        }
+                    }
+                }
+
+                if w_acc > 0.0 {
+                    d_row[px] = w_acc / rho_acc;
+                    v_row[px] = 1.0 / w_acc;
+                    s_row[px] = best_status;
+                }
+            }
+        });
 
     PatchDepthOutput {
         depth: DepthMap::from_vec(width, height, depth).expect("depth size"),

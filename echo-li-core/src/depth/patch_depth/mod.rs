@@ -16,6 +16,8 @@ mod image_ops;
 mod seeds;
 #[cfg(target_arch = "x86_64")]
 mod simd;
+#[cfg(target_arch = "aarch64")]
+mod simd_neon;
 
 #[cfg(not(feature = "parallel"))]
 use fuse::densify_pixels;
@@ -31,6 +33,8 @@ use image_ops::{
 use seeds::{median_seed_depth, nearby_seed_weights, scale_seeds, SeedGrid};
 #[cfg(target_arch = "x86_64")]
 use simd::fast_translation_accum_avx2_if_available;
+#[cfg(target_arch = "aarch64")]
+use simd_neon::fast_translation_accum_neon_if_available;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PatchDepthCameraMode {
@@ -314,6 +318,15 @@ impl UndistortLut {
                 return;
             }
         }
+        #[cfg(target_arch = "aarch64")]
+        {
+            let processed = simd_neon::undistort_image_neon(self, src, dst, valid_mask);
+            for i in processed..self.valid.len() {
+                self.undistort_one_scalar(src, dst, valid_mask, i);
+            }
+            return;
+        }
+        #[cfg_attr(target_arch = "aarch64", allow(unreachable_code))]
         self.undistort_image_scalar(src, dst, valid_mask);
     }
 
@@ -792,8 +805,11 @@ impl PatchDepthMapper {
         {
             let patch_centers_list = patch_centers(width, height, &self.settings);
             let mut grid = PatchGrid::new(width, height, &self.settings);
+            // Target ~8 chunks per thread; degrades gracefully when patches < threads.
+            let min_len = (patch_centers_list.len() / (rayon::current_num_threads() * 8)).max(1);
             let estimates: Vec<_> = patch_centers_list
                 .par_iter()
+                .with_min_len(min_len)
                 .map(|&(u, v)| {
                     let estimate = self.solve_one_patch(
                         u as f64,
@@ -1284,6 +1300,25 @@ impl PatchDepthMapper {
         #[cfg(target_arch = "x86_64")]
         if let Some(inv_sigma_photo_sq) = constant_inv_sigma_photo_sq {
             if let Some(accum) = fast_translation_accum_avx2_if_available(
+                curr_img,
+                curr_valid,
+                ref_img,
+                ref_valid,
+                ref_grad_x,
+                ref_grad_y,
+                patch,
+                du_drho as f32,
+                dv_drho as f32,
+                inv_sigma_photo_sq as f32,
+                self.settings.photo_huber_delta as f32,
+            ) {
+                return (accum.grad, accum.hess, accum.sum_abs_res, accum.n_valid);
+            }
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        if let Some(inv_sigma_photo_sq) = constant_inv_sigma_photo_sq {
+            if let Some(accum) = fast_translation_accum_neon_if_available(
                 curr_img,
                 curr_valid,
                 ref_img,
