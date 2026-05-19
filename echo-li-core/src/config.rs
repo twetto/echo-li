@@ -150,6 +150,10 @@ pub struct SparseVogConfig {
     pub max_depth: Option<f64>,
     #[serde(default)]
     pub reanchor_flow_px: Option<f64>,
+    #[serde(default)]
+    pub vis_min_depth: Option<f64>,
+    #[serde(default)]
+    pub vis_max_depth: Option<f64>,
 }
 
 fn default_true() -> bool {

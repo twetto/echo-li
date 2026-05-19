@@ -188,11 +188,6 @@ fn clip_image_point(x: f64, y: f64, img_w: usize, img_h: usize) -> Option<(f32, 
 }
 
 #[cfg(feature = "rerun")]
-fn color_for_inverse_depth(invdepth: f64, min_invdepth: f64, max_invdepth: f64) -> u32 {
-    color_for_scalar(invdepth, min_invdepth, max_invdepth)
-}
-
-#[cfg(feature = "rerun")]
 fn color_for_depth(depth: f64, min_depth: f64, max_depth: f64) -> u32 {
     let flipped_depth = max_depth + min_depth - depth;
     color_for_scalar(flipped_depth, min_depth, max_depth)
@@ -239,11 +234,13 @@ fn sparse_points_for_vis(
     r_cam: &echo_lie::SO3,
     img_w: usize,
     img_h: usize,
+    vis_min_depth: f64,
+    vis_max_depth: f64,
 ) -> (Vec<(f32, f32)>, Vec<u32>, Vec<(f32, f32, f32)>, Vec<u32>) {
     struct SparseVisPoint {
         image_point: Option<(f32, f32)>,
         world_point: (f32, f32, f32),
-        invdepth: f64,
+        depth: f64,
     }
 
     let mut points = Vec::new();
@@ -260,7 +257,7 @@ fn sparse_points_for_vis(
         points.push(SparseVisPoint {
             image_point,
             world_point: (p_world[0] as f32, p_world[1] as f32, p_world[2] as f32),
-            invdepth: 1.0 / q[2],
+            depth: q[2],
         });
     }
 
@@ -269,17 +266,8 @@ fn sparse_points_for_vis(
     let mut world_points = Vec::new();
     let mut world_colors = Vec::new();
 
-    let min_invdepth = points
-        .iter()
-        .map(|point| point.invdepth)
-        .fold(f64::INFINITY, f64::min);
-    let max_invdepth = points
-        .iter()
-        .map(|point| point.invdepth)
-        .fold(f64::NEG_INFINITY, f64::max);
-
     for point in points {
-        let color = color_for_inverse_depth(point.invdepth, min_invdepth, max_invdepth);
+        let color = color_for_depth(point.depth, vis_min_depth, vis_max_depth);
         if let Some(image_point) = point.image_point {
             image_points.push(image_point);
             image_colors.push(color);
@@ -529,6 +517,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (patch_depth_vis_min_depth, patch_depth_vis_max_depth) = vio_config
         .as_ref()
         .and_then(|conf| conf.patch_depth.as_ref())
+        .map(|conf| {
+            (
+                conf.vis_min_depth.unwrap_or(0.1),
+                conf.vis_max_depth.unwrap_or(5.0),
+            )
+        })
+        .unwrap_or((0.1, 5.0));
+    #[cfg(feature = "rerun")]
+    let (sparse_vis_min_depth, sparse_vis_max_depth) = vio_config
+        .as_ref()
+        .and_then(|conf| conf.sparse_vog.as_ref())
         .map(|conf| {
             (
                 conf.vis_min_depth.unwrap_or(0.1),
@@ -875,6 +874,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 &r_cam,
                                 img_w,
                                 img_h,
+                                sparse_vis_min_depth,
+                                sparse_vis_max_depth,
                             )
                         } else {
                             (Vec::new(), Vec::new(), Vec::new(), Vec::new())

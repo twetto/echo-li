@@ -106,6 +106,8 @@ SparseVog:
   pd_max_dist_between_z: 0.1
   pd_max_norm_deg: 10
   pd_min_plane_features: 15
+  vis_min_depth: 0.5
+  vis_max_depth: 5.0
 PatchDepth:
   camera_mode: undistorted_pinhole
   warp_mode: fast_translation
