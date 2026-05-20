@@ -186,90 +186,6 @@ fn scaled_image_from_u8(gray: &[u8], width: usize, height: usize, scale: f64) ->
     Image::from_vec(out_w, out_h, data)
 }
 
-fn scaled_mask_from_u8(mask: &[u8], width: usize, height: usize, scale: f64) -> Image<f32> {
-    if (scale - 1.0).abs() < f64::EPSILON {
-        return Image::from_vec(
-            width,
-            height,
-            mask.iter()
-                .map(|&v| if v != 0 { 1.0 } else { 0.0 })
-                .collect(),
-        );
-    }
-    let out_w = ((width as f64) * scale + 0.5).floor().max(1.0) as usize;
-    let out_h = ((height as f64) * scale + 0.5).floor().max(1.0) as usize;
-    let mut data = vec![0.0f32; out_w * out_h];
-    for y in 0..out_h {
-        for x in 0..out_w {
-            let src_x = ((x as f64 + 0.5) / scale - 0.5).clamp(0.0, (width - 1) as f64);
-            let src_y = ((y as f64 + 0.5) / scale - 0.5).clamp(0.0, (height - 1) as f64);
-            if mask_bilinear_footprint_valid(mask, width, height, src_x, src_y) {
-                data[y * out_w + x] = 1.0;
-            }
-        }
-    }
-    Image::from_vec(out_w, out_h, data)
-}
-
-fn mask_bilinear_footprint_valid(mask: &[u8], width: usize, height: usize, u: f64, v: f64) -> bool {
-    if u < 0.0 || v < 0.0 || u >= (width - 1) as f64 || v >= (height - 1) as f64 {
-        return false;
-    }
-    let ix = u.floor() as usize;
-    let iy = v.floor() as usize;
-    mask[iy * width + ix] != 0
-        && mask[iy * width + ix + 1] != 0
-        && mask[(iy + 1) * width + ix] != 0
-        && mask[(iy + 1) * width + ix + 1] != 0
-}
-
-pub(super) fn build_mask_pyramid(
-    mask: &[u8],
-    width: usize,
-    height: usize,
-    scale: f64,
-    levels: usize,
-) -> Vec<Image<f32>> {
-    if let Some(offset) = dyadic_scale_offset(scale) {
-        return build_dyadic_mask_pyramid(mask, width, height, offset, levels);
-    }
-
-    let mut out = Vec::with_capacity(levels);
-    out.push(scaled_mask_from_u8(mask, width, height, scale));
-    for level in 1..levels {
-        let prev = &out[level - 1];
-        let eroded = mask_pyrdown_erode(prev);
-        let (next, next_w, next_h) = mask_pyrdown_from_eroded(&eroded, prev.width(), prev.height());
-        out.push(Image::from_vec(next_w, next_h, next));
-    }
-    out
-}
-
-fn build_dyadic_mask_pyramid(
-    mask: &[u8],
-    width: usize,
-    height: usize,
-    offset: usize,
-    levels: usize,
-) -> Vec<Image<f32>> {
-    let total_levels = offset + levels;
-    let mut full = Vec::with_capacity(total_levels);
-    full.push(Image::from_vec(
-        width,
-        height,
-        mask.iter()
-            .map(|&v| if v != 0 { 1.0 } else { 0.0 })
-            .collect(),
-    ));
-    for level in 1..total_levels {
-        let prev = &full[level - 1];
-        let eroded = mask_pyrdown_erode(prev);
-        let (next, next_w, next_h) = mask_pyrdown_from_eroded(&eroded, prev.width(), prev.height());
-        full.push(Image::from_vec(next_w, next_h, next));
-    }
-    full.into_iter().skip(offset).collect()
-}
-
 pub(super) fn build_bilinear_valid_pyramid(valid_pyramid: &[Image<f32>]) -> Vec<Image<f32>> {
     valid_pyramid.iter().map(bilinear_valid_image).collect()
 }
@@ -298,196 +214,80 @@ fn bilinear_valid_image(mask: &Image<f32>) -> Image<f32> {
     Image::from_vec(width, height, data)
 }
 
-fn mask_pyrdown_erode(mask: &Image<f32>) -> Vec<u8> {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if std::arch::is_x86_feature_detected!("avx2") {
-            return unsafe { mask_pyrdown_erode_avx2(mask) };
-        }
-    }
-    mask_pyrdown_erode_scalar(mask)
+/// Geometry of one undistort LUT level: the pinhole (output) dimensions and
+/// the affine map from full-resolution raw coordinates into this level's raw
+/// grid (`raw_level = raw_full * level_scale + raw_offset`).
+pub(super) struct UndistortLevelSpec {
+    pub(super) lw: usize,
+    pub(super) lh: usize,
+    /// Pinhole scale of this level relative to the full-resolution image.
+    pub(super) level_scale: f64,
+    /// Additive offset applied after scaling raw coords into the level grid.
+    pub(super) raw_offset: f64,
 }
 
-fn mask_pyrdown_erode_scalar(mask: &Image<f32>) -> Vec<u8> {
-    let w = mask.width();
-    let h = mask.height();
-    let src = mask.as_slice();
-
-    let mut bin = vec![0u8; w * h];
-    for (i, &v) in src.iter().enumerate() {
-        bin[i] = (v > 0.5) as u8;
-    }
-
-    let mut h_eroded = vec![0u8; w * h];
-    if w >= 5 {
-        for y in 0..h {
-            let row = &bin[y * w..(y + 1) * w];
-            let out_row = &mut h_eroded[y * w..(y + 1) * w];
-            for x in 2..w - 2 {
-                out_row[x] = row[x - 2] & row[x - 1] & row[x] & row[x + 1] & row[x + 2];
-            }
-        }
-    }
-
-    let mut eroded = vec![0u8; w * h];
-    if h >= 5 {
-        for y in 2..h - 2 {
-            let r0 = &h_eroded[(y - 2) * w..(y - 1) * w];
-            let r1 = &h_eroded[(y - 1) * w..y * w];
-            let r2 = &h_eroded[y * w..(y + 1) * w];
-            let r3 = &h_eroded[(y + 1) * w..(y + 2) * w];
-            let r4 = &h_eroded[(y + 2) * w..(y + 3) * w];
-            let out_row = &mut eroded[y * w..(y + 1) * w];
-            for x in 0..w {
-                out_row[x] = r0[x] & r1[x] & r2[x] & r3[x] & r4[x];
-            }
-        }
-    }
-
-    eroded
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn mask_pyrdown_erode_avx2(mask: &Image<f32>) -> Vec<u8> {
-    unsafe {
-        use std::arch::x86_64::*;
-
-        let w = mask.width();
-        let h = mask.height();
-        let src = mask.as_slice();
-
-        let mut bin = vec![0u8; w * h];
-        let threshold = _mm256_set1_ps(0.5);
-        let n = w * h;
-        let mut i = 0;
-        while i + 32 <= n {
-            let m0 = _mm256_cmp_ps::<_CMP_GT_OQ>(_mm256_loadu_ps(src.as_ptr().add(i)), threshold);
-            let m1 =
-                _mm256_cmp_ps::<_CMP_GT_OQ>(_mm256_loadu_ps(src.as_ptr().add(i + 8)), threshold);
-            let m2 =
-                _mm256_cmp_ps::<_CMP_GT_OQ>(_mm256_loadu_ps(src.as_ptr().add(i + 16)), threshold);
-            let m3 =
-                _mm256_cmp_ps::<_CMP_GT_OQ>(_mm256_loadu_ps(src.as_ptr().add(i + 24)), threshold);
-            let b0 = _mm256_movemask_ps(m0) as u32;
-            let b1 = _mm256_movemask_ps(m1) as u32;
-            let b2 = _mm256_movemask_ps(m2) as u32;
-            let b3 = _mm256_movemask_ps(m3) as u32;
-            for bit in 0..8u32 {
-                *bin.get_unchecked_mut(i + bit as usize) = ((b0 >> bit) & 1) as u8;
-                *bin.get_unchecked_mut(i + 8 + bit as usize) = ((b1 >> bit) & 1) as u8;
-                *bin.get_unchecked_mut(i + 16 + bit as usize) = ((b2 >> bit) & 1) as u8;
-                *bin.get_unchecked_mut(i + 24 + bit as usize) = ((b3 >> bit) & 1) as u8;
-            }
-            i += 32;
-        }
-        for j in i..n {
-            bin[j] = (*src.get_unchecked(j) > 0.5) as u8;
-        }
-
-        let mut h_eroded = vec![0u8; w * h];
-        if w >= 5 {
-            for y in 0..h {
-                let row_ptr = bin.as_ptr().add(y * w);
-                let out_ptr = h_eroded.as_mut_ptr().add(y * w);
-                let interior = w - 4;
-                let mut x = 0usize;
-                while x + 32 <= interior {
-                    let a0 = _mm256_loadu_si256(row_ptr.add(x) as *const __m256i);
-                    let a1 = _mm256_loadu_si256(row_ptr.add(x + 1) as *const __m256i);
-                    let a2 = _mm256_loadu_si256(row_ptr.add(x + 2) as *const __m256i);
-                    let a3 = _mm256_loadu_si256(row_ptr.add(x + 3) as *const __m256i);
-                    let a4 = _mm256_loadu_si256(row_ptr.add(x + 4) as *const __m256i);
-                    let result = _mm256_and_si256(
-                        _mm256_and_si256(a0, a1),
-                        _mm256_and_si256(_mm256_and_si256(a2, a3), a4),
-                    );
-                    _mm256_storeu_si256(out_ptr.add(x + 2) as *mut __m256i, result);
-                    x += 32;
-                }
-                for xx in x..interior {
-                    *out_ptr.add(xx + 2) = *row_ptr.add(xx)
-                        & *row_ptr.add(xx + 1)
-                        & *row_ptr.add(xx + 2)
-                        & *row_ptr.add(xx + 3)
-                        & *row_ptr.add(xx + 4);
-                }
-            }
-        }
-
-        let mut eroded = vec![0u8; w * h];
-        if h >= 5 {
-            for y in 2..h - 2 {
-                let r0 = h_eroded.as_ptr().add((y - 2) * w);
-                let r1 = h_eroded.as_ptr().add((y - 1) * w);
-                let r2 = h_eroded.as_ptr().add(y * w);
-                let r3 = h_eroded.as_ptr().add((y + 1) * w);
-                let r4 = h_eroded.as_ptr().add((y + 2) * w);
-                let out = eroded.as_mut_ptr().add(y * w);
-                let mut x = 0usize;
-                while x + 32 <= w {
-                    let v0 = _mm256_loadu_si256(r0.add(x) as *const __m256i);
-                    let v1 = _mm256_loadu_si256(r1.add(x) as *const __m256i);
-                    let v2 = _mm256_loadu_si256(r2.add(x) as *const __m256i);
-                    let v3 = _mm256_loadu_si256(r3.add(x) as *const __m256i);
-                    let v4 = _mm256_loadu_si256(r4.add(x) as *const __m256i);
-                    let result = _mm256_and_si256(
-                        _mm256_and_si256(v0, v1),
-                        _mm256_and_si256(_mm256_and_si256(v2, v3), v4),
-                    );
-                    _mm256_storeu_si256(out.add(x) as *mut __m256i, result);
-                    x += 32;
-                }
-                for xx in x..w {
-                    *out.add(xx) =
-                        *r0.add(xx) & *r1.add(xx) & *r2.add(xx) & *r3.add(xx) & *r4.add(xx);
-                }
-            }
-        }
-
-        eroded
-    }
-}
-
-fn mask_pyrdown_from_eroded(
-    eroded: &[u8],
+/// Per-level geometry for the undistort LUTs, mirroring how the depth pyramid
+/// derives each kept level from the raw image.
+pub(super) fn undistort_level_specs(
     width: usize,
     height: usize,
-) -> (Vec<f32>, usize, usize) {
-    let next_w = (width / 2).max(1);
-    let next_h = (height / 2).max(1);
-    let mut out = vec![0.0f32; next_w * next_h];
-    for y in 0..next_h {
-        let sy = y * 2;
-        if sy >= height {
-            break;
+    scale: f64,
+    levels: usize,
+) -> Vec<UndistortLevelSpec> {
+    let mut specs = Vec::with_capacity(levels);
+    if let Some(offset) = dyadic_scale_offset(scale) {
+        // Dyadic: each level is the raw image floor-halved `offset + l` times.
+        // The [1,4,6,4,1] pyrdown is centered, so raw_full * level_scale maps
+        // exactly with no half-pixel offset.
+        for l in 0..levels {
+            let shift = offset + l;
+            specs.push(UndistortLevelSpec {
+                lw: (width >> shift).max(1),
+                lh: (height >> shift).max(1),
+                level_scale: scale / (1usize << l) as f64,
+                raw_offset: 0.0,
+            });
         }
-        for x in 0..next_w {
-            let sx = x * 2;
-            if sx >= width {
-                break;
-            }
-            if eroded[sy * width + sx] != 0 {
-                out[y * next_w + x] = 1.0;
-            }
+    } else {
+        // Non-dyadic: the base is a pixel-center-aligned resample
+        // (src = (dst + 0.5) / scale - 0.5), then centered halving above it.
+        let bw = ((width as f64) * scale + 0.5).floor().max(1.0) as usize;
+        let bh = ((height as f64) * scale + 0.5).floor().max(1.0) as usize;
+        for l in 0..levels {
+            let div = (1usize << l) as f64;
+            specs.push(UndistortLevelSpec {
+                lw: (bw >> l).max(1),
+                lh: (bh >> l).max(1),
+                level_scale: scale / div,
+                raw_offset: (0.5 * scale - 0.5) / div,
+            });
         }
     }
-    (out, next_w, next_h)
+    specs
 }
 
+/// Build the undistort LUT for one pyramid level: each pinhole pixel maps to a
+/// bilinear footprint in that level's raw (distorted) image.
 pub(super) fn build_pinhole_to_raw_lut(
     raw_camera: &dyn CameraModel,
     intrinsics: &CameraIntrinsics,
-    width: usize,
-    height: usize,
+    spec: &UndistortLevelSpec,
 ) -> Vec<Option<UndistortSample>> {
-    let mut lut = Vec::with_capacity(width * height);
-    for v in 0..height {
-        for u in 0..width {
-            let x = (u as f64 - intrinsics.cx) / intrinsics.fx;
-            let y = (v as f64 - intrinsics.cy) / intrinsics.fy;
+    // Pinhole intrinsics scaled to this level.
+    let cx = intrinsics.cx * spec.level_scale;
+    let cy = intrinsics.cy * spec.level_scale;
+    let fx = intrinsics.fx * spec.level_scale;
+    let fy = intrinsics.fy * spec.level_scale;
+    let mut lut = Vec::with_capacity(spec.lw * spec.lh);
+    for v in 0..spec.lh {
+        for u in 0..spec.lw {
+            let x = (u as f64 - cx) / fx;
+            let y = (v as f64 - cy) / fy;
             let raw_uv = raw_camera.project(&Vector3::new(x, y, 1.0));
-            lut.push(undistort_sample(raw_uv[0], raw_uv[1], width, height));
+            // `raw_uv` is full-resolution raw coords; map into this level.
+            let raw_u = raw_uv[0] * spec.level_scale + spec.raw_offset;
+            let raw_v = raw_uv[1] * spec.level_scale + spec.raw_offset;
+            lut.push(undistort_sample(raw_u, raw_v, spec.lw, spec.lh));
         }
     }
     lut

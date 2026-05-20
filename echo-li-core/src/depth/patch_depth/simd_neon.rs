@@ -1,9 +1,8 @@
-use super::{PatchAccum, TranslatedPatchFootprint, UndistortLut};
+use super::{PatchAccum, TranslatedPatchFootprint};
 use rudolf_v::image::Image;
 use std::arch::aarch64::{
-    float32x4_t, vabsq_f32, vaddq_f32, vaddvq_f32, vbslq_f32, vcleq_f32, vcvtq_f32_u32,
-    vcvtq_u32_f32, vdivq_f32, vdupq_n_f32, vdupq_n_u8, vfmaq_f32, vgetq_lane_u32, vld1q_f32,
-    vld1q_lane_u8, vmulq_f32, vreinterpretq_u32_u8, vsubq_f32,
+    float32x4_t, vabsq_f32, vaddq_f32, vaddvq_f32, vbslq_f32, vcleq_f32, vdivq_f32, vdupq_n_f32,
+    vfmaq_f32, vld1q_f32, vmulq_f32, vsubq_f32,
 };
 
 pub(super) fn fast_translation_accum_neon_if_available(
@@ -166,110 +165,4 @@ unsafe fn mask_chunk4_valid(row: Option<*const f32>, x: usize) -> bool {
         }
     }
     true
-}
-
-/// NEON-accelerated bilinear undistort. Processes 4 pixels per iter; the caller
-/// is expected to handle the tail with the scalar path. Returns the index of
-/// the first unprocessed pixel.
-pub(super) fn undistort_image_neon(
-    lut: &UndistortLut,
-    src: &[u8],
-    dst: &mut [u8],
-    valid_mask: &mut [u8],
-) -> usize {
-    // SAFETY: NEON is part of aarch64 base ISA. Indices come from `lut`, which
-    // validates them during construction (invalid entries have `valid[i] == 0`
-    // and their indices are 0). Within each chunk, we only write `dst`/`valid_mask`
-    // at indices for which `lut.valid` is non-zero, matching the scalar behavior.
-    unsafe { undistort_image_neon_inner(lut, src, dst, valid_mask) }
-}
-
-#[target_feature(enable = "neon")]
-unsafe fn undistort_image_neon_inner(
-    lut: &UndistortLut,
-    src: &[u8],
-    dst: &mut [u8],
-    valid_mask: &mut [u8],
-) -> usize {
-    let n = lut.valid.len();
-    let half = vdupq_n_f32(0.5);
-    let mut i = 0;
-    let src_ptr = src.as_ptr();
-
-    unsafe {
-        while i + 4 <= n {
-            let v0 = *lut.valid.get_unchecked(i);
-            let v1 = *lut.valid.get_unchecked(i + 1);
-            let v2 = *lut.valid.get_unchecked(i + 2);
-            let v3 = *lut.valid.get_unchecked(i + 3);
-            if (v0 | v1 | v2 | v3) == 0 {
-                i += 4;
-                continue;
-            }
-
-            let f00 = gather4_as_f32(src_ptr, &lut.idx00, i);
-            let f10 = gather4_as_f32(src_ptr, &lut.idx10, i);
-            let f01 = gather4_as_f32(src_ptr, &lut.idx01, i);
-            let f11 = gather4_as_f32(src_ptr, &lut.idx11, i);
-
-            let w00 = vld1q_f32(lut.w00.as_ptr().add(i));
-            let w10 = vld1q_f32(lut.w10.as_ptr().add(i));
-            let w01 = vld1q_f32(lut.w01.as_ptr().add(i));
-            let w11 = vld1q_f32(lut.w11.as_ptr().add(i));
-
-            let mut acc = vmulq_f32(w00, f00);
-            acc = vfmaq_f32(acc, w10, f10);
-            acc = vfmaq_f32(acc, w01, f01);
-            acc = vfmaq_f32(acc, w11, f11);
-            acc = vaddq_f32(acc, half);
-
-            // Truncate to u32 (NEON saturates negatives to 0). Final byte clamp
-            // matches the scalar `min(255)`.
-            let acc_u32 = vcvtq_u32_f32(acc);
-            let r0 = vgetq_lane_u32::<0>(acc_u32).min(255) as u8;
-            let r1 = vgetq_lane_u32::<1>(acc_u32).min(255) as u8;
-            let r2 = vgetq_lane_u32::<2>(acc_u32).min(255) as u8;
-            let r3 = vgetq_lane_u32::<3>(acc_u32).min(255) as u8;
-
-            if v0 != 0 {
-                *dst.get_unchecked_mut(i) = r0;
-                *valid_mask.get_unchecked_mut(i) = 1;
-            }
-            if v1 != 0 {
-                *dst.get_unchecked_mut(i + 1) = r1;
-                *valid_mask.get_unchecked_mut(i + 1) = 1;
-            }
-            if v2 != 0 {
-                *dst.get_unchecked_mut(i + 2) = r2;
-                *valid_mask.get_unchecked_mut(i + 2) = 1;
-            }
-            if v3 != 0 {
-                *dst.get_unchecked_mut(i + 3) = r3;
-                *valid_mask.get_unchecked_mut(i + 3) = 1;
-            }
-
-            i += 4;
-        }
-    }
-
-    i
-}
-
-#[target_feature(enable = "neon")]
-unsafe fn gather4_as_f32(src_ptr: *const u8, idx: &[u32], i: usize) -> float32x4_t {
-    unsafe {
-        let i0 = *idx.get_unchecked(i) as usize;
-        let i1 = *idx.get_unchecked(i + 1) as usize;
-        let i2 = *idx.get_unchecked(i + 2) as usize;
-        let i3 = *idx.get_unchecked(i + 3) as usize;
-        // Insert 4 bytes at byte-lanes 0, 4, 8, 12 of a zeroed uint8x16_t.
-        // Reinterpreted as uint32x4_t (little-endian), each lane holds the byte
-        // in its low byte; the other 3 bytes of each lane are zero.
-        let v = vdupq_n_u8(0);
-        let v = vld1q_lane_u8::<0>(src_ptr.add(i0), v);
-        let v = vld1q_lane_u8::<4>(src_ptr.add(i1), v);
-        let v = vld1q_lane_u8::<8>(src_ptr.add(i2), v);
-        let v = vld1q_lane_u8::<12>(src_ptr.add(i3), v);
-        vcvtq_f32_u32(vreinterpretq_u32_u8(v))
-    }
 }

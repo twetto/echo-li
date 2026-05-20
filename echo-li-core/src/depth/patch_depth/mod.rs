@@ -25,10 +25,10 @@ use fuse::PatchGrid;
 #[cfg(feature = "parallel")]
 use fuse::{densify_pixels_parallel, patch_centers};
 use image_ops::{
-    bilerp_ptr, bilinear_patch_footprint, build_bilinear_valid_pyramid, build_mask_pyramid,
-    build_pinhole_to_raw_lut, build_pyramid_from_u8, dyadic_scale_offset, empty_pyramid, gradients,
-    mask_row_valid, sample_bilinear_valid, sample_bilinear_valid_with_grad, sample_nearest,
-    sample_valid_nearest, scaled_intrinsics,
+    bilerp_ptr, bilinear_patch_footprint, build_bilinear_valid_pyramid, build_pinhole_to_raw_lut,
+    build_pyramid_from_u8, dyadic_scale_offset, empty_pyramid, gradients, mask_row_valid,
+    sample_bilinear_valid, sample_bilinear_valid_with_grad, sample_nearest, sample_valid_nearest,
+    scaled_intrinsics, undistort_level_specs,
 };
 use seeds::{median_seed_depth, nearby_seed_weights, scale_seeds, SeedGrid};
 #[cfg(target_arch = "x86_64")]
@@ -265,7 +265,11 @@ struct UndistortSample {
     weights: [f32; 4],
 }
 
+/// Undistort LUT for one pyramid level: maps each undistorted-pinhole pixel to
+/// a bilinear footprint in that level's raw (distorted) image.
 struct UndistortLut {
+    width: usize,
+    height: usize,
     idx00: Vec<u32>,
     idx10: Vec<u32>,
     idx01: Vec<u32>,
@@ -278,9 +282,12 @@ struct UndistortLut {
 }
 
 impl UndistortLut {
-    fn from_options(lut: Vec<Option<UndistortSample>>) -> Self {
+    fn from_options(lut: Vec<Option<UndistortSample>>, width: usize, height: usize) -> Self {
         let n = lut.len();
+        debug_assert_eq!(n, width * height);
         let mut out = Self {
+            width,
+            height,
             idx00: vec![0; n],
             idx10: vec![0; n],
             idx01: vec![0; n],
@@ -307,157 +314,38 @@ impl UndistortLut {
         out
     }
 
-    fn undistort_image(&self, src: &[u8], dst: &mut [u8], valid_mask: &mut [u8]) {
-        #[cfg(target_arch = "x86_64")]
-        {
-            if std::arch::is_x86_feature_detected!("avx2") {
-                // SAFETY: AVX2 support is checked above. The SIMD routine
-                // falls back to scalar code for chunks whose u8 gathers could
-                // read past the end of the source image.
-                unsafe { self.undistort_image_avx2(src, dst, valid_mask) };
-                return;
-            }
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            let processed = simd_neon::undistort_image_neon(self, src, dst, valid_mask);
-            for i in processed..self.valid.len() {
-                self.undistort_one_scalar(src, dst, valid_mask, i);
-            }
-            return;
-        }
-        #[cfg_attr(target_arch = "aarch64", allow(unreachable_code))]
-        self.undistort_image_scalar(src, dst, valid_mask);
-    }
-
-    fn undistort_image_scalar(&self, src: &[u8], dst: &mut [u8], valid_mask: &mut [u8]) {
-        let n = self.valid.len();
+    /// Undistort one raw pyramid level into a pinhole `Image<f32>`. Invalid
+    /// pixels (raw footprint out of bounds) are left at zero.
+    fn undistort_level(&self, raw: &Image<f32>) -> Image<f32> {
+        debug_assert_eq!(raw.width(), self.width);
+        debug_assert_eq!(raw.height(), self.height);
+        debug_assert_eq!(raw.stride(), raw.width());
+        let src = raw.as_slice();
+        let n = self.width * self.height;
+        let mut dst = vec![0.0f32; n];
         for i in 0..n {
-            self.undistort_one_scalar(src, dst, valid_mask, i);
+            if self.valid[i] == 0 {
+                continue;
+            }
+            let i00 = src[self.idx00[i] as usize];
+            let i10 = src[self.idx10[i] as usize];
+            let i01 = src[self.idx01[i] as usize];
+            let i11 = src[self.idx11[i] as usize];
+            dst[i] = self.w00[i] * i00 + self.w10[i] * i10 + self.w01[i] * i01 + self.w11[i] * i11;
         }
+        Image::from_vec(self.width, self.height, dst)
     }
 
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2")]
-    unsafe fn undistort_image_avx2(&self, src: &[u8], dst: &mut [u8], valid_mask: &mut [u8]) {
-        unsafe {
-            use std::arch::x86_64::*;
-
-            let n = self.valid.len();
-            let half = _mm256_set1_ps(0.5);
-            let mut i = 0;
-
-            while i + 8 <= n {
-                let valid_chunk = &self.valid[i..i + 8];
-                let any_valid = valid_chunk.iter().any(|&v| v != 0);
-                if !any_valid {
-                    i += 8;
-                    continue;
-                }
-                if !self.chunk_can_gather_u8_as_i32(src.len(), i) {
-                    self.undistort_chunk_scalar(src, dst, valid_mask, i, i + 8);
-                    i += 8;
-                    continue;
-                }
-
-                let gi00 = _mm256_loadu_si256(self.idx00.as_ptr().add(i) as *const __m256i);
-                let gi10 = _mm256_loadu_si256(self.idx10.as_ptr().add(i) as *const __m256i);
-                let gi01 = _mm256_loadu_si256(self.idx01.as_ptr().add(i) as *const __m256i);
-                let gi11 = _mm256_loadu_si256(self.idx11.as_ptr().add(i) as *const __m256i);
-
-                let v00 = _mm256_i32gather_epi32(src.as_ptr() as *const i32, gi00, 1);
-                let v10 = _mm256_i32gather_epi32(src.as_ptr() as *const i32, gi10, 1);
-                let v01 = _mm256_i32gather_epi32(src.as_ptr() as *const i32, gi01, 1);
-                let v11 = _mm256_i32gather_epi32(src.as_ptr() as *const i32, gi11, 1);
-
-                let mask_byte = _mm256_set1_epi32(0xFF);
-                let f00 = _mm256_cvtepi32_ps(_mm256_and_si256(v00, mask_byte));
-                let f10 = _mm256_cvtepi32_ps(_mm256_and_si256(v10, mask_byte));
-                let f01 = _mm256_cvtepi32_ps(_mm256_and_si256(v01, mask_byte));
-                let f11 = _mm256_cvtepi32_ps(_mm256_and_si256(v11, mask_byte));
-
-                let w00 = _mm256_loadu_ps(self.w00.as_ptr().add(i));
-                let w10 = _mm256_loadu_ps(self.w10.as_ptr().add(i));
-                let w01 = _mm256_loadu_ps(self.w01.as_ptr().add(i));
-                let w11 = _mm256_loadu_ps(self.w11.as_ptr().add(i));
-
-                let mut acc = _mm256_mul_ps(w00, f00);
-                acc = _mm256_fmadd_ps(w10, f10, acc);
-                acc = _mm256_fmadd_ps(w01, f01, acc);
-                acc = _mm256_fmadd_ps(w11, f11, acc);
-                acc = _mm256_add_ps(acc, half);
-
-                let result_i32 = _mm256_cvttps_epi32(acc);
-                let packed_16 = _mm256_packus_epi32(result_i32, _mm256_setzero_si256());
-                let packed_8 = _mm256_packus_epi16(packed_16, _mm256_setzero_si256());
-                let shuffled = _mm256_permutevar8x32_epi32(
-                    packed_8,
-                    _mm256_setr_epi32(0, 4, 0, 0, 0, 0, 0, 0),
-                );
-                let low_64 = _mm256_extract_epi64(shuffled, 0);
-
-                for k in 0..8 {
-                    if *valid_chunk.get_unchecked(k) != 0 {
-                        *dst.get_unchecked_mut(i + k) = ((low_64 >> (k * 8)) & 0xFF) as u8;
-                        *valid_mask.get_unchecked_mut(i + k) = 1;
-                    }
-                }
-
-                i += 8;
-            }
-
-            for j in i..n {
-                self.undistort_one_scalar(src, dst, valid_mask, j);
-            }
-        }
-    }
-
-    #[inline(always)]
-    fn chunk_can_gather_u8_as_i32(&self, src_len: usize, start: usize) -> bool {
-        let Some(max_idx) = src_len.checked_sub(4).map(|idx| idx as u32) else {
-            return false;
-        };
-        self.idx00[start..start + 8]
+    /// Static validity mask for this level (1.0 where the pinhole pixel has a
+    /// fully in-bounds raw footprint). Frame-invariant — the raw image has no
+    /// holes and the undistort geometry is fixed.
+    fn valid_image(&self) -> Image<f32> {
+        let data = self
+            .valid
             .iter()
-            .all(|&idx| idx <= max_idx)
-            && self.idx10[start..start + 8]
-                .iter()
-                .all(|&idx| idx <= max_idx)
-            && self.idx01[start..start + 8]
-                .iter()
-                .all(|&idx| idx <= max_idx)
-            && self.idx11[start..start + 8]
-                .iter()
-                .all(|&idx| idx <= max_idx)
-    }
-
-    #[inline(always)]
-    fn undistort_chunk_scalar(
-        &self,
-        src: &[u8],
-        dst: &mut [u8],
-        valid_mask: &mut [u8],
-        start: usize,
-        end: usize,
-    ) {
-        for i in start..end {
-            self.undistort_one_scalar(src, dst, valid_mask, i);
-        }
-    }
-
-    #[inline(always)]
-    fn undistort_one_scalar(&self, src: &[u8], dst: &mut [u8], valid_mask: &mut [u8], i: usize) {
-        if self.valid[i] == 0 {
-            return;
-        }
-        let i00 = src[self.idx00[i] as usize] as f32;
-        let i10 = src[self.idx10[i] as usize] as f32;
-        let i01 = src[self.idx01[i] as usize] as f32;
-        let i11 = src[self.idx11[i] as usize] as f32;
-        dst[i] =
-            (self.w00[i] * i00 + self.w10[i] * i10 + self.w01[i] * i01 + self.w11[i] * i11 + 0.5)
-                as u8;
-        valid_mask[i] = 1;
+            .map(|&v| if v != 0 { 1.0 } else { 0.0 })
+            .collect();
+        Image::from_vec(self.width, self.height, data)
     }
 }
 
@@ -469,7 +357,10 @@ pub struct PatchDepthMapper {
     height: usize,
     settings: PatchDepthSettings,
     bearing_lut: Vec<Vector3<f64>>,
-    undistort_lut: Option<UndistortLut>,
+    /// One undistort LUT per pyramid level (`UndistortedPinhole` mode only).
+    undistort_luts: Option<Vec<UndistortLut>>,
+    /// Frame-invariant per-level validity mask, derived from `undistort_luts`.
+    valid_pyramid: Option<Arc<Vec<Image<f32>>>>,
     keyframes: Vec<DepthKeyframe>,
     pyramid_work: Pyramid,
     pyramid_scratch: PyramidScratch,
@@ -550,12 +441,33 @@ impl PatchDepthMapper {
             }
         }
 
-        let undistort_lut = match camera_mode {
+        let undistort_luts = match camera_mode {
             PatchDepthCameraMode::RawDistorted => None,
-            PatchDepthCameraMode::UndistortedPinhole => Some(UndistortLut::from_options(
-                build_pinhole_to_raw_lut(camera.as_ref(), &intrinsics, width, height),
-            )),
+            PatchDepthCameraMode::UndistortedPinhole => {
+                let specs =
+                    undistort_level_specs(width, height, settings.scale, settings.n_pyramid_levels);
+                let luts = specs
+                    .iter()
+                    .map(|spec| {
+                        UndistortLut::from_options(
+                            build_pinhole_to_raw_lut(camera.as_ref(), &intrinsics, spec),
+                            spec.lw,
+                            spec.lh,
+                        )
+                    })
+                    .collect();
+                Some(luts)
+            }
         };
+        // The raw image has no holes and the undistort geometry is fixed, so
+        // each level's validity mask is the same every frame — build it once.
+        let valid_pyramid = undistort_luts.as_ref().map(|luts: &Vec<UndistortLut>| {
+            Arc::new(
+                luts.iter()
+                    .map(UndistortLut::valid_image)
+                    .collect::<Vec<_>>(),
+            )
+        });
 
         Ok(Self {
             camera,
@@ -565,7 +477,8 @@ impl PatchDepthMapper {
             height,
             settings,
             bearing_lut,
-            undistort_lut,
+            undistort_luts,
+            valid_pyramid,
             keyframes: Vec::new(),
             pyramid_work: empty_pyramid(),
             pyramid_scratch: PyramidScratch::new(width, height, 1.0),
@@ -621,36 +534,31 @@ impl PatchDepthMapper {
     }
 
     fn depth_frame_products(&mut self, frame: FrameProducts) -> Option<DepthFrameProducts> {
-        let (frame, valid_mask) = match self.camera_mode {
-            PatchDepthCameraMode::RawDistorted => (frame, None),
-            PatchDepthCameraMode::UndistortedPinhole => {
-                let lut = self.undistort_lut.as_ref()?;
-                let n = self.width * self.height;
-                let mut gray = vec![0u8; n];
-                let mut valid_mask = vec![0u8; n];
-                lut.undistort_image(&frame.gray, &mut gray, &mut valid_mask);
-                (FrameProducts { gray, ..frame }, Some(valid_mask))
-            }
-        };
-        let pyramid = Arc::new(self.build_depth_pyramid_from_u8(
+        // Build the pyramid on the raw image, then undistort each kept level.
+        // Undistorting the small downsampled levels instead of the full-res
+        // frame is ~16x less work; the anti-alias blur happens in raw space.
+        let raw_pyramid = self.build_depth_pyramid_from_u8(
             &frame.gray,
             frame.width,
             frame.height,
             self.settings.scale,
             self.settings.n_pyramid_levels,
-        ));
-        let valid_pyramid = valid_mask.map(|mask| {
-            Arc::new(build_mask_pyramid(
-                &mask,
-                frame.width,
-                frame.height,
-                self.settings.scale,
-                self.settings.n_pyramid_levels,
-            ))
-        });
+        );
+        let (pyramid, valid_pyramid) = match self.camera_mode {
+            PatchDepthCameraMode::RawDistorted => (raw_pyramid, None),
+            PatchDepthCameraMode::UndistortedPinhole => {
+                let luts = self.undistort_luts.as_ref()?;
+                let undistorted: Vec<Image<f32>> = raw_pyramid
+                    .iter()
+                    .zip(luts)
+                    .map(|(raw, lut)| lut.undistort_level(raw))
+                    .collect();
+                (undistorted, self.valid_pyramid.clone())
+            }
+        };
         Some(DepthFrameProducts {
             frame: Arc::new(frame),
-            pyramid,
+            pyramid: Arc::new(pyramid),
             valid_pyramid,
         })
     }
