@@ -182,6 +182,46 @@ fn patch_depth_rgb_for_vis(
     rgb
 }
 
+/// Render the patch-depth covariance as a depth standard-deviation image
+/// (metres). `output.variance` is the variance of inverse depth (rho), so the
+/// depth standard deviation is `sqrt(var(rho)) * z^2`. Low std-dev (confident)
+/// maps to blue, high std-dev (uncertain) to red.
+#[cfg(feature = "rerun")]
+fn patch_depth_cov_rgb_for_vis(
+    output: &PatchDepthOutput,
+    img_w: usize,
+    img_h: usize,
+    cov_vis_min: f64,
+    cov_vis_max: f64,
+) -> Vec<u8> {
+    let mut rgb = vec![0u8; img_w * img_h * 3];
+    if cov_vis_max <= cov_vis_min {
+        return rgb;
+    }
+    let dw = output.depth.width;
+    let dh = output.depth.height;
+    for y in 0..img_h {
+        let dy = y * dh / img_h;
+        for x in 0..img_w {
+            let dx = x * dw / img_w;
+            let idx = dy * dw + dx;
+            let depth = output.depth.data[idx];
+            let rho_var = output.variance.data[idx];
+            if !depth.is_finite() || depth <= 0.0 || !rho_var.is_finite() || rho_var <= 0.0 {
+                continue;
+            }
+            let std_depth = (rho_var as f64).sqrt() * (depth as f64) * (depth as f64);
+            let color = color_for_scalar(std_depth, cov_vis_min, cov_vis_max);
+            let out = (y * img_w + x) * 3;
+            rgb[out] = ((color >> 24) & 0xFF) as u8;
+            rgb[out + 1] = ((color >> 16) & 0xFF) as u8;
+            rgb[out + 2] = ((color >> 8) & 0xFF) as u8;
+        }
+    }
+
+    rgb
+}
+
 #[cfg(feature = "rerun")]
 fn clip_image_point(x: f64, y: f64, img_w: usize, img_h: usize) -> Option<(f32, f32)> {
     (x >= 0.0 && x < img_w as f64 && y >= 0.0 && y < img_h as f64).then_some((x as f32, y as f32))
@@ -308,11 +348,13 @@ fn send_rerun_blueprint(
 
     let camera_view_id = Uuid::random();
     let patch_depth_view_id = Uuid::random();
+    let patch_depth_cov_view_id = Uuid::random();
     let world_view_id = Uuid::random();
     let left_container_id = Uuid::random();
     let root_container_id = Uuid::random();
     let camera_view_path = format!("view/{camera_view_id}");
     let patch_depth_view_path = format!("view/{patch_depth_view_id}");
+    let patch_depth_cov_view_path = format!("view/{patch_depth_cov_view_id}");
     let world_view_path = format!("view/{world_view_id}");
     let left_container_path = format!("container/{left_container_id}");
     let root_container_path = format!("container/{root_container_id}");
@@ -356,6 +398,25 @@ fn send_rerun_blueprint(
     )?;
 
     bp.log(
+        patch_depth_cov_view_path.as_str(),
+        &ViewBlueprint::new("2D")
+            .with_display_name(Name("Patch Depth Covariance".into()))
+            .with_space_origin(ViewOrigin("patch_depth_cov".into()))
+            .with_visible(Visible(Bool(true))),
+    )?;
+    bp.log(
+        format!("{patch_depth_cov_view_path}/ViewContents"),
+        &ViewContents::new(["patch_depth_cov/**"]),
+    )?;
+    bp.log(
+        format!("{patch_depth_cov_view_path}/VisualBounds2D"),
+        &VisualBounds2D::new(Range2D {
+            x_range: [0.0, img_w as f64].into(),
+            y_range: [0.0, img_h as f64].into(),
+        }),
+    )?;
+
+    bp.log(
         world_view_path.as_str(),
         &ViewBlueprint::new("3D")
             .with_display_name(Name("World".into()))
@@ -372,6 +433,7 @@ fn send_rerun_blueprint(
         &ContainerBlueprint::new(ContainerKind::Vertical).with_contents([
             IncludedContent(EntityPath(camera_view_path.into())),
             IncludedContent(EntityPath(patch_depth_view_path.into())),
+            IncludedContent(EntityPath(patch_depth_cov_view_path.into())),
         ]),
     )?;
     bp.log(
@@ -525,6 +587,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .unwrap_or((0.1, 5.0));
     #[cfg(feature = "rerun")]
+    let (patch_depth_cov_vis_min, patch_depth_cov_vis_max) = vio_config
+        .as_ref()
+        .and_then(|conf| conf.patch_depth.as_ref())
+        .map(|conf| {
+            (
+                conf.cov_vis_min.unwrap_or(0.0),
+                conf.cov_vis_max.unwrap_or(0.5),
+            )
+        })
+        .unwrap_or((0.0, 0.5));
+    #[cfg(feature = "rerun")]
     let (sparse_vis_min_depth, sparse_vis_max_depth) = vio_config
         .as_ref()
         .and_then(|conf| conf.sparse_vog.as_ref())
@@ -646,8 +719,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         #[cfg(feature = "rerun")]
         println!(
-            "Patch depth visualization: fixed depth range [{:.2}, {:.2}] m",
-            patch_depth_vis_min_depth, patch_depth_vis_max_depth
+            "Patch depth visualization: fixed depth range [{:.2}, {:.2}] m, \
+             covariance std-dev range [{:.2}, {:.2}] m",
+            patch_depth_vis_min_depth,
+            patch_depth_vis_max_depth,
+            patch_depth_cov_vis_min,
+            patch_depth_cov_vis_max
         );
         Some(mapper)
     } else {
@@ -704,6 +781,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(feature = "rerun")]
     let mut trajectory_vis: Vec<nalgebra::Vector3<f64>> = Vec::new();
+    // Ground-truth trajectory + its rolling alignment to the estimate (Rerun).
+    #[cfg(feature = "rerun")]
+    let gt_poses_vis = reader.groundtruth();
+    #[cfg(feature = "rerun")]
+    let mut gt_align: Option<echo_lie::SE3> = None;
 
     println!("\nRunning filter...");
 
@@ -844,8 +926,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 &rerun::Image::from_rgb24(rgb, [img_w as u32, img_h as u32]),
                             )
                             .ok();
+                            let cov_rgb = patch_depth_cov_rgb_for_vis(
+                                output,
+                                img_w,
+                                img_h,
+                                patch_depth_cov_vis_min,
+                                patch_depth_cov_vis_max,
+                            );
+                            rec.log(
+                                "patch_depth_cov/image",
+                                &rerun::Image::from_rgb24(cov_rgb, [img_w as u32, img_h as u32]),
+                            )
+                            .ok();
                             if !patch_depth_vis_announced {
-                                println!("Patch depth Rerun entity: patch_depth/image");
+                                println!(
+                                    "Patch depth Rerun entities: patch_depth/image, \
+                                     patch_depth_cov/image"
+                                );
                                 patch_depth_vis_announced = true;
                             }
                         }
@@ -904,6 +1001,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 &rerun::LineStrips3D::new([strip]).with_colors([0x00FFFFFFu32]),
                             )
                             .ok();
+                        }
+
+                        // Ground truth, aligned to the estimate in real time —
+                        // like eqvio's visualiser.py: a Umeyama fit over the
+                        // matched estimate↔GT poses so far, recomputed every
+                        // few frames once enough have accumulated. GT is shown
+                        // in the estimate frame (inverse transform), subsampled
+                        // and time-masked to "now" so it grows with the run.
+                        let now = states_out.last().map(|(t, _)| *t).unwrap_or(0.0);
+                        if states_out.len() >= 100
+                            && states_out.len() % 5 == 0
+                            && !gt_poses_vis.is_empty()
+                        {
+                            let est_poses: Vec<(f64, echo_lie::SE3)> = states_out
+                                .iter()
+                                .map(|(t, s)| (*t, s.sensor.pose.clone()))
+                                .collect();
+                            gt_align = Some(echo_li_core::alignment::align_trajectories(
+                                &est_poses,
+                                &gt_poses_vis,
+                            ));
+                        }
+                        if let Some(align) = &gt_align {
+                            let inv = align.inverse();
+                            let gt_strip: Vec<[f32; 3]> = gt_poses_vis
+                                .iter()
+                                .filter(|sp| sp.stamp <= now)
+                                .step_by(10)
+                                .map(|sp| {
+                                    let p = inv.compose(&sp.pose).translation;
+                                    [p[0] as f32, p[1] as f32, p[2] as f32]
+                                })
+                                .collect();
+                            if gt_strip.len() >= 2 {
+                                rec.log(
+                                    "world/groundtruth",
+                                    &rerun::LineStrips3D::new([gt_strip])
+                                        .with_colors([0xFFFFFFFFu32])
+                                        .with_radii([0.02f32]),
+                                )
+                                .ok();
+                            }
                         }
 
                         // 3D landmarks

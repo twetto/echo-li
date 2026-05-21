@@ -63,6 +63,8 @@ eqf:
     # useFeaturePredictions: false
     # useMedianDepth: false
     useMedianDepth: true
+    # Riccati variant: fast = per-sample; faster = batched per image sub-frame.
+    riccatiVariant: faster
   velocityNoise:
     acc: 0.012438843268295521
     accBias: 0.004462289865453429
@@ -123,3 +125,5 @@ PatchDepth:
   vis_min_depth: 0.5
   vis_max_depth: 5.0
   n_search_candidates: 1
+  cov_vis_min: 0.0
+  cov_vis_max: 1.0

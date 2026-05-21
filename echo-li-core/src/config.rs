@@ -68,6 +68,11 @@ pub struct EqfSettings {
     pub use_equivariant_output: bool,
     pub use_feature_predictions: bool,
     pub use_median_depth: bool,
+    /// Riccati propagation variant: "fast" (default) = per-sample transport;
+    /// "faster" = covariance transport batched across each IMU sub-frame
+    /// (flushed when the next image frame arrives).
+    #[serde(default)]
+    pub riccati_variant: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -301,6 +306,10 @@ pub struct PatchDepthConfig {
     pub vis_min_depth: Option<f64>,
     #[serde(default)]
     pub vis_max_depth: Option<f64>,
+    #[serde(default)]
+    pub cov_vis_min: Option<f64>,
+    #[serde(default)]
+    pub cov_vis_max: Option<f64>,
 }
 
 impl PatchDepthConfig {
@@ -448,6 +457,13 @@ impl VIOConfig {
         settings.use_equivariant_output = self.eqf.settings.use_equivariant_output;
         settings.use_discrete_correction = self.eqf.settings.use_discrete_innovation_lift;
         settings.use_discrete_velocity_lift = self.eqf.settings.use_discrete_velocity_lift;
+        settings.use_faster_riccati = self
+            .eqf
+            .settings
+            .riccati_variant
+            .as_deref()
+            .map(|v| v.eq_ignore_ascii_case("faster"))
+            .unwrap_or(false);
         settings.initial_scene_depth = self.eqf.initial_value.scene_depth;
 
         settings

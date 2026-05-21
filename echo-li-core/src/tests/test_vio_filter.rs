@@ -1,16 +1,16 @@
 use approx::assert_abs_diff_eq;
+use echo_lie::{SE3, SO3};
 use nalgebra::{DMatrix, Vector2, Vector3, Vector6};
-use echo_lie::{SO3, SE3};
 use std::collections::HashMap;
 
-use crate::mathematical::vio_state::{VIOState, VIOSensorState, Landmark, GRAVITY_CONSTANT};
-use crate::mathematical::vio_eqf::VIOEqF;
-use crate::mathematical::camera::{PinholeModel, CameraModel};
-use crate::mathematical::imu_velocity::IMUVelocity;
-use crate::mathematical::vision_measurement::VisionMeasurement;
 use crate::coordinate_suite::euclid::EuclideanSuite;
-use crate::{VIOFilterSettings, VIOFilter};
+use crate::mathematical::camera::{CameraModel, PinholeModel};
+use crate::mathematical::imu_velocity::IMUVelocity;
+use crate::mathematical::vio_eqf::VIOEqF;
+use crate::mathematical::vio_state::{Landmark, VIOSensorState, VIOState, GRAVITY_CONSTANT};
+use crate::mathematical::vision_measurement::VisionMeasurement;
 use crate::tests::testing_utilities::*;
+use crate::{VIOFilter, VIOFilterSettings};
 
 fn make_xi0_with_landmarks(n: usize) -> VIOState {
     let mut landmarks = Vec::new();
@@ -36,11 +36,20 @@ fn make_xi0_with_landmarks(n: usize) -> VIOState {
 }
 
 fn make_pinhole() -> PinholeModel {
-    PinholeModel { fx: 458.0, fy: 458.0, cx: 376.0, cy: 240.0 }
+    PinholeModel {
+        fx: 458.0,
+        fy: 458.0,
+        cx: 376.0,
+        cy: 240.0,
+    }
 }
 
 fn stationary_imu(stamp: f64) -> IMUVelocity {
-    IMUVelocity::new(stamp, Vector3::zeros(), Vector3::new(0.0, 0.0, GRAVITY_CONSTANT))
+    IMUVelocity::new(
+        stamp,
+        Vector3::zeros(),
+        Vector3::new(0.0, 0.0, GRAVITY_CONSTANT),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -55,7 +64,11 @@ fn test_eqf_new_identity_state() {
 
     // State estimate should equal xi0 when X = identity
     let est = eqf.state_estimate();
-    assert_abs_diff_eq!(est.sensor.pose.translation, xi0.sensor.pose.translation, epsilon = 1e-12);
+    assert_abs_diff_eq!(
+        est.sensor.pose.translation,
+        xi0.sensor.pose.translation,
+        epsilon = 1e-12
+    );
     assert_abs_diff_eq!(est.sensor.velocity, xi0.sensor.velocity, epsilon = 1e-12);
     for (e, o) in est.camera_landmarks.iter().zip(xi0.camera_landmarks.iter()) {
         assert_abs_diff_eq!(e.p, o.p, epsilon = 1e-12);
@@ -91,10 +104,16 @@ fn test_observer_integration_stationary() {
 
     let est = eqf.state_estimate();
     // Position should stay near zero (no velocity, no net acceleration)
-    assert!(est.sensor.pose.translation.norm() < 1e-6,
-        "Position drifted: {:?}", est.sensor.pose.translation);
-    assert!(est.sensor.velocity.norm() < 1e-6,
-        "Velocity drifted: {:?}", est.sensor.velocity);
+    assert!(
+        est.sensor.pose.translation.norm() < 1e-6,
+        "Position drifted: {:?}",
+        est.sensor.pose.translation
+    );
+    assert!(
+        est.sensor.velocity.norm() < 1e-6,
+        "Velocity drifted: {:?}",
+        est.sensor.velocity
+    );
 }
 
 #[test]
@@ -115,9 +134,11 @@ fn test_observer_integration_matches_kinematics() {
     let gt = crate::mathematical::vio_state::integrate_system_function(&xi0, &imu, dt);
 
     // They should match since X starts at identity, so xi_hat = xi0
-    assert!(state_distance(&est, &gt) < 1e-10,
+    assert!(
+        state_distance(&est, &gt) < 1e-10,
         "Observer integration diverged from kinematics: dist={}",
-        state_distance(&est, &gt));
+        state_distance(&est, &gt)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -144,11 +165,17 @@ fn test_riccati_covariance_grows() {
 
     // Covariance diagonal should generally grow (process noise adds uncertainty)
     let diag_after: Vec<f64> = (0..n).map(|i| eqf.sigma[(i, i)]).collect();
-    let grew_count = diag_before.iter().zip(diag_after.iter())
+    let grew_count = diag_before
+        .iter()
+        .zip(diag_after.iter())
         .filter(|(b, a)| *a > *b)
         .count();
-    assert!(grew_count > n / 2,
-        "Expected majority of diag entries to grow, but only {}/{} did", grew_count, n);
+    assert!(
+        grew_count > n / 2,
+        "Expected majority of diag entries to grow, but only {}/{} did",
+        grew_count,
+        n
+    );
 }
 
 #[test]
@@ -195,8 +222,13 @@ fn test_riccati_positive_diagonal() {
 
         let n = xi0.dim();
         for i in 0..n {
-            assert!(eqf.sigma[(i, i)] > 0.0,
-                "Negative diagonal at step={}, index={}: {}", step, i, eqf.sigma[(i, i)]);
+            assert!(
+                eqf.sigma[(i, i)] > 0.0,
+                "Negative diagonal at step={}, index={}: {}",
+                step,
+                i,
+                eqf.sigma[(i, i)]
+            );
         }
     }
 }
@@ -243,8 +275,13 @@ fn test_vision_update_reduces_uncertainty() {
     let diag_after: Vec<f64> = (0..n).map(|i| eqf.sigma[(i, i)]).collect();
     let s = VIOSensorState::CDIM;
     for i in s..n {
-        assert!(diag_after[i] <= diag_before[i] + 1e-12,
-            "Landmark cov increased at idx {}: {} -> {}", i, diag_before[i], diag_after[i]);
+        assert!(
+            diag_after[i] <= diag_before[i] + 1e-12,
+            "Landmark cov increased at idx {}: {} -> {}",
+            i,
+            diag_before[i],
+            diag_after[i]
+        );
     }
 }
 
@@ -270,8 +307,11 @@ fn test_vision_update_with_perfect_obs_no_state_jump() {
     eqf.perform_vision_update(&suite, &y_ids, &y_coords, &cam, &output_gain, true, false);
 
     let est_after = eqf.state_estimate();
-    assert!(state_distance(&est, &est_after) < 1e-6,
-        "State jumped on perfect observation: dist={}", state_distance(&est, &est_after));
+    assert!(
+        state_distance(&est, &est_after) < 1e-6,
+        "State jumped on perfect observation: dist={}",
+        state_distance(&est, &est_after)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -288,8 +328,14 @@ fn test_add_landmarks() {
     assert_eq!(eqf.xi0.dim(), 21 + 6);
 
     let new_lms = vec![
-        Landmark { p: Vector3::new(1.0, 2.0, 5.0), id: 100 },
-        Landmark { p: Vector3::new(-1.0, 0.5, 3.0), id: 101 },
+        Landmark {
+            p: Vector3::new(1.0, 2.0, 5.0),
+            id: 100,
+        },
+        Landmark {
+            p: Vector3::new(-1.0, 0.5, 3.0),
+            id: 101,
+        },
     ];
     let new_cov = DMatrix::<f64>::identity(6, 6) * 0.5;
     eqf.add_new_landmarks(new_lms, &new_cov);
@@ -420,10 +466,16 @@ fn test_filter_imu_stationary_stable() {
     }
 
     let est = filter.state_estimate();
-    assert!(est.sensor.pose.translation.norm() < 1e-4,
-        "Stationary IMU caused position drift: {:?}", est.sensor.pose.translation);
-    assert!(est.sensor.velocity.norm() < 1e-4,
-        "Stationary IMU caused velocity drift: {:?}", est.sensor.velocity);
+    assert!(
+        est.sensor.pose.translation.norm() < 1e-4,
+        "Stationary IMU caused position drift: {:?}",
+        est.sensor.pose.translation
+    );
+    assert!(
+        est.sensor.velocity.norm() < 1e-4,
+        "Stationary IMU caused velocity drift: {:?}",
+        est.sensor.velocity
+    );
 }
 
 #[test]
@@ -438,8 +490,11 @@ fn test_filter_pending_imu_buffer_bounded() {
 
     // Buffer drains when > 200 entries, keeping last 100
     // With 300 samples: first drain at 201 → 101, then grows to 200 (not > 200)
-    assert!(filter.pending_imu.len() <= 200,
-        "IMU buffer not bounded: len={}", filter.pending_imu.len());
+    assert!(
+        filter.pending_imu.len() <= 200,
+        "IMU buffer not bounded: len={}",
+        filter.pending_imu.len()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -522,8 +577,11 @@ fn test_filter_max_landmarks_respected() {
     let meas = VisionMeasurement::new(0.005, coords);
     filter.process_vision(meas, &cam);
 
-    assert!(filter.eqf.xi0.camera_landmarks.len() <= 5,
-        "Exceeded max landmarks: {}", filter.eqf.xi0.camera_landmarks.len());
+    assert!(
+        filter.eqf.xi0.camera_landmarks.len() <= 5,
+        "Exceeded max landmarks: {}",
+        filter.eqf.xi0.camera_landmarks.len()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -540,13 +598,18 @@ fn test_filter_imu_then_vision_convergence() {
     let mut filter = VIOFilter::new(settings, xi0.clone());
 
     // Ground truth landmarks in camera frame (used for generating observations)
-    let gt_landmarks: Vec<(u64, Vector3<f64>)> = (0..5).map(|i| {
-        (i as u64, Vector3::new(
-            (i as f64 - 2.0) * 0.5,
-            ((i * 7 + 3) % 5) as f64 * 0.3,
-            3.0 + (i as f64) * 0.2,
-        ))
-    }).collect();
+    let gt_landmarks: Vec<(u64, Vector3<f64>)> = (0..5)
+        .map(|i| {
+            (
+                i as u64,
+                Vector3::new(
+                    (i as f64 - 2.0) * 0.5,
+                    ((i * 7 + 3) % 5) as f64 * 0.3,
+                    3.0 + (i as f64) * 0.2,
+                ),
+            )
+        })
+        .collect();
 
     let dt_imu = 0.005;
     let mut t = 0.0;
@@ -570,11 +633,17 @@ fn test_filter_imu_then_vision_convergence() {
 
     let final_est = filter.state_estimate();
     // Position should stay near zero (stationary)
-    assert!(final_est.sensor.pose.translation.norm() < 1.0,
-        "Position diverged: {:?}", final_est.sensor.pose.translation);
+    assert!(
+        final_est.sensor.pose.translation.norm() < 1.0,
+        "Position diverged: {:?}",
+        final_est.sensor.pose.translation
+    );
     // Velocity should stay near zero
-    assert!(final_est.sensor.velocity.norm() < 1.0,
-        "Velocity diverged: {:?}", final_est.sensor.velocity);
+    assert!(
+        final_est.sensor.velocity.norm() < 1.0,
+        "Velocity diverged: {:?}",
+        final_est.sensor.velocity
+    );
 }
 
 #[test]
@@ -637,13 +706,29 @@ fn test_vision_update_discrete_vs_continuous() {
         }
 
         let output_gain = settings.output_gain_matrix(y_ids.len());
-        eqf.perform_vision_update(&suite, &y_ids, &y_coords, &cam, &output_gain, true, use_discrete);
+        eqf.perform_vision_update(
+            &suite,
+            &y_ids,
+            &y_coords,
+            &cam,
+            &output_gain,
+            true,
+            use_discrete,
+        );
 
         let est_after = eqf.state_estimate();
-        assert!(est_after.sensor.pose.translation.norm() < 100.0,
-            "Diverged with use_discrete={}: pos={:?}", use_discrete, est_after.sensor.pose.translation);
-        assert!(est_after.sensor.velocity.norm() < 100.0,
-            "Diverged with use_discrete={}: vel={:?}", use_discrete, est_after.sensor.velocity);
+        assert!(
+            est_after.sensor.pose.translation.norm() < 100.0,
+            "Diverged with use_discrete={}: pos={:?}",
+            use_discrete,
+            est_after.sensor.pose.translation
+        );
+        assert!(
+            est_after.sensor.velocity.norm() < 100.0,
+            "Diverged with use_discrete={}: vel={:?}",
+            use_discrete,
+            est_after.sensor.velocity
+        );
     }
 }
 
@@ -659,7 +744,15 @@ fn test_empty_vision_update_is_noop() {
     let est_before = eqf.state_estimate();
 
     let output_gain = settings.output_gain_matrix(0);
-    eqf.perform_vision_update(&suite, &[], &HashMap::new(), &cam, &output_gain, true, false);
+    eqf.perform_vision_update(
+        &suite,
+        &[],
+        &HashMap::new(),
+        &cam,
+        &output_gain,
+        true,
+        false,
+    );
 
     let est_after = eqf.state_estimate();
     assert!(state_distance(&est_before, &est_after) < 1e-15);
@@ -695,7 +788,11 @@ fn test_settings_state_gain_grows_with_landmarks() {
     for i in 0..5 {
         let start = 21 + 3 * i;
         for k in 0..3 {
-            assert_abs_diff_eq!(q5[(start + k, start + k)], settings.process_point, epsilon = 1e-15);
+            assert_abs_diff_eq!(
+                q5[(start + k, start + k)],
+                settings.process_point,
+                epsilon = 1e-15
+            );
         }
     }
 }
@@ -709,37 +806,69 @@ fn test_settings_initial_covariance_structure() {
 
     // Bias gyro block
     for k in 0..3 {
-        assert_abs_diff_eq!(cov[(k, k)], settings.initial_bias_omega_variance, epsilon = 1e-15);
+        assert_abs_diff_eq!(
+            cov[(k, k)],
+            settings.initial_bias_omega_variance,
+            epsilon = 1e-15
+        );
     }
     // Bias accel block
     for k in 3..6 {
-        assert_abs_diff_eq!(cov[(k, k)], settings.initial_bias_accel_variance, epsilon = 1e-15);
+        assert_abs_diff_eq!(
+            cov[(k, k)],
+            settings.initial_bias_accel_variance,
+            epsilon = 1e-15
+        );
     }
     // Attitude block
     for k in 6..9 {
-        assert_abs_diff_eq!(cov[(k, k)], settings.initial_attitude_variance, epsilon = 1e-15);
+        assert_abs_diff_eq!(
+            cov[(k, k)],
+            settings.initial_attitude_variance,
+            epsilon = 1e-15
+        );
     }
     // Position block
     for k in 9..12 {
-        assert_abs_diff_eq!(cov[(k, k)], settings.initial_position_variance, epsilon = 1e-15);
+        assert_abs_diff_eq!(
+            cov[(k, k)],
+            settings.initial_position_variance,
+            epsilon = 1e-15
+        );
     }
     // Velocity block
     for k in 12..15 {
-        assert_abs_diff_eq!(cov[(k, k)], settings.initial_velocity_variance, epsilon = 1e-15);
+        assert_abs_diff_eq!(
+            cov[(k, k)],
+            settings.initial_velocity_variance,
+            epsilon = 1e-15
+        );
     }
     // Camera attitude block
     for k in 15..18 {
-        assert_abs_diff_eq!(cov[(k, k)], settings.initial_camera_attitude_variance, epsilon = 1e-15);
+        assert_abs_diff_eq!(
+            cov[(k, k)],
+            settings.initial_camera_attitude_variance,
+            epsilon = 1e-15
+        );
     }
     // Camera position block
     for k in 18..21 {
-        assert_abs_diff_eq!(cov[(k, k)], settings.initial_camera_position_variance, epsilon = 1e-15);
+        assert_abs_diff_eq!(
+            cov[(k, k)],
+            settings.initial_camera_position_variance,
+            epsilon = 1e-15
+        );
     }
     // Landmark blocks
     for i in 0..3 {
         let start = 21 + 3 * i;
         for k in 0..3 {
-            assert_abs_diff_eq!(cov[(start + k, start + k)], settings.initial_point_variance, epsilon = 1e-15);
+            assert_abs_diff_eq!(
+                cov[(start + k, start + k)],
+                settings.initial_point_variance,
+                epsilon = 1e-15
+            );
         }
     }
 }
@@ -752,4 +881,114 @@ fn test_settings_output_gain_diagonal() {
     for i in 0..8 {
         assert_abs_diff_eq!(r[(i, i)], settings.sigma_bearing.powi(2), epsilon = 1e-15);
     }
+}
+
+// ---------------------------------------------------------------------------
+// `Faster` Riccati variant (Phase 6)
+// ---------------------------------------------------------------------------
+
+/// A single-sample `Faster` flush must reproduce one `Fast` step bit-for-bit:
+/// with one accumulated sample Φ = F and Q is built from that sample's B, so
+/// `accumulate_transition` + `flush_riccati` == `integrate_riccati_fast`.
+/// This is the regression guard for the accumulate/flush machinery.
+#[test]
+fn test_faster_single_sample_matches_fast() {
+    let xi0 = make_xi0_with_landmarks(5);
+    let settings = VIOFilterSettings::default();
+    let n = xi0.dim();
+    let init_cov = DMatrix::<f64>::identity(n, n) * 0.3;
+    let suite = EuclideanSuite;
+    let input_gain = settings.input_gain_matrix();
+    let state_gain = settings.state_gain_matrix(xi0.camera_landmarks.len());
+    let imu = IMUVelocity::new(
+        0.0,
+        Vector3::new(0.13, -0.07, 0.21),
+        Vector3::new(0.4, -0.25, GRAVITY_CONSTANT + 0.15),
+    );
+    let dt = 0.005;
+
+    let mut eqf_fast = VIOEqF::new(xi0.clone(), &init_cov);
+    eqf_fast.integrate_riccati_fast(&suite, &imu, dt, &input_gain, &state_gain);
+
+    let mut eqf_faster = VIOEqF::new(xi0.clone(), &init_cov);
+    eqf_faster.accumulate_transition(&suite, &imu, dt);
+    eqf_faster.flush_riccati(&input_gain, &state_gain);
+
+    assert_eq!(eqf_fast.sigma.nrows(), eqf_faster.sigma.nrows());
+    for i in 0..n {
+        for j in 0..n {
+            assert_eq!(
+                eqf_fast.sigma[(i, j)],
+                eqf_faster.sigma[(i, j)],
+                "Fast vs Faster mismatch at ({i}, {j})"
+            );
+        }
+    }
+}
+
+/// `flush_riccati` with nothing accumulated is a no-op (safe to call under the
+/// `Fast` variant, where `process_vision` flushes unconditionally).
+#[test]
+fn test_faster_flush_empty_is_noop() {
+    let xi0 = make_xi0_with_landmarks(4);
+    let settings = VIOFilterSettings::default();
+    let n = xi0.dim();
+    let init_cov = DMatrix::<f64>::identity(n, n) * 0.2;
+    let input_gain = settings.input_gain_matrix();
+    let state_gain = settings.state_gain_matrix(xi0.camera_landmarks.len());
+
+    let mut eqf = VIOEqF::new(xi0.clone(), &init_cov);
+    eqf.flush_riccati(&input_gain, &state_gain);
+    for i in 0..n {
+        for j in 0..n {
+            assert_eq!(eqf.sigma[(i, j)], init_cov[(i, j)]);
+        }
+    }
+}
+
+/// A multi-sample `Faster` flush composes the transitions across the sub-frame:
+/// it stays symmetric, finite, and positive on the diagonal — and differs from
+/// the per-sample `Fast` path (the bounded process-noise approximation).
+#[test]
+fn test_faster_multi_sample_well_formed() {
+    let xi0 = make_xi0_with_landmarks(5);
+    let settings = VIOFilterSettings::default();
+    let n = xi0.dim();
+    let init_cov = DMatrix::<f64>::identity(n, n) * 0.3;
+    let suite = EuclideanSuite;
+    let input_gain = settings.input_gain_matrix();
+    let state_gain = settings.state_gain_matrix(xi0.camera_landmarks.len());
+    let imu = IMUVelocity::new(
+        0.0,
+        Vector3::new(0.13, -0.07, 0.21),
+        Vector3::new(0.4, -0.25, GRAVITY_CONSTANT + 0.15),
+    );
+    let dt = 0.005;
+
+    let mut eqf_fast = VIOEqF::new(xi0.clone(), &init_cov);
+    let mut eqf_faster = VIOEqF::new(xi0.clone(), &init_cov);
+    for _ in 0..10 {
+        eqf_fast.integrate_riccati_fast(&suite, &imu, dt, &input_gain, &state_gain);
+        eqf_faster.accumulate_transition(&suite, &imu, dt);
+    }
+    eqf_faster.flush_riccati(&input_gain, &state_gain);
+
+    let mut max_dev = 0.0_f64;
+    for i in 0..n {
+        for j in 0..n {
+            let v = eqf_faster.sigma[(i, j)];
+            assert!(v.is_finite(), "non-finite at ({i}, {j})");
+            assert_abs_diff_eq!(v, eqf_faster.sigma[(j, i)], epsilon = 1e-12);
+            max_dev = max_dev.max((v - eqf_fast.sigma[(i, j)]).abs());
+        }
+        assert!(
+            eqf_faster.sigma[(i, i)] > 0.0,
+            "non-positive diagonal at {i}"
+        );
+    }
+    // Faster is a distinct, more-approximate variant — it must differ from Fast.
+    assert!(
+        max_dev > 0.0,
+        "Faster should not be identical to Fast over 10 samples"
+    );
 }

@@ -3,7 +3,7 @@ use nalgebra::{DMatrix, DVector, SMatrix, Vector2};
 use std::collections::HashMap;
 
 use crate::mathematical::camera::CameraModel;
-use crate::mathematical::eqf_matrices::{EqFCoordinateSuite, RiccatiPropagationBlocks};
+use crate::mathematical::eqf_matrices::EqFCoordinateSuite;
 use crate::mathematical::imu_velocity::IMUVelocity;
 use crate::mathematical::vio_group::{
     lift_velocity, lift_velocity_discrete, state_group_action, vio_exp, VIOGroup,
@@ -17,6 +17,16 @@ pub struct VIOEqF {
     pub current_time: f64,
     scratch_m: DMatrix<f64>,
     scratch_sigma: DMatrix<f64>,
+    // `Faster` variant accumulator — the sub-frame transition Φ in block form
+    // (Phase 6, see docs/imu_optimization_plan.md). Identity when empty.
+    phi_ss: SMatrix<f64, 21, 21>,
+    phi_lm_s: DMatrix<f64>,
+    phi_lm_s_scratch: DMatrix<f64>,
+    phi_li_li: Vec<SMatrix<f64, 3, 3>>,
+    accum_dt: f64,
+    accum_count: usize,
+    last_b_s: SMatrix<f64, 21, 12>,
+    last_b_lm: DMatrix<f64>,
 }
 
 impl VIOEqF {
@@ -24,6 +34,7 @@ impl VIOEqF {
         let sigma = initial_covariance.clone();
         let x = VIOGroup::identity(&xi0.get_ids());
         let n = xi0.dim();
+        let n_lm = (n - VIOSensorState::CDIM) / 3;
 
         Self {
             xi0,
@@ -32,6 +43,14 @@ impl VIOEqF {
             current_time: -1.0,
             scratch_m: DMatrix::<f64>::zeros(n, n),
             scratch_sigma: DMatrix::<f64>::zeros(n, n),
+            phi_ss: SMatrix::<f64, 21, 21>::identity(),
+            phi_lm_s: DMatrix::<f64>::zeros(3 * n_lm, 21),
+            phi_lm_s_scratch: DMatrix::<f64>::zeros(3 * n_lm, 21),
+            phi_li_li: vec![SMatrix::<f64, 3, 3>::identity(); n_lm],
+            accum_dt: 0.0,
+            accum_count: 0,
+            last_b_s: SMatrix::<f64, 21, 12>::zeros(),
+            last_b_lm: DMatrix::<f64>::zeros(3 * n_lm, 12),
         }
     }
 
@@ -66,6 +85,7 @@ impl VIOEqF {
     // Riccati propagation (Euler)
     // ------------------------------------------------------------------
 
+    /// `Fast` variant — per-sample Euler Riccati: Σ ← F·Σ·Fᵀ + Q, F = I + A·dt.
     pub fn integrate_riccati_fast<S: EqFCoordinateSuite + ?Sized>(
         &mut self,
         suite: &S,
@@ -79,11 +99,9 @@ impl VIOEqF {
         let s = VIOSensorState::CDIM;
         let n_lm = (n - s) / 3;
 
-        // F = I + A·dt has the same block-sparsity as A across all coordinate suites:
-        //   F_ss (21×21), F_li_s (3×21) per landmark, F_li_li (3×3) per landmark.
-        // Sensor←landmark and cross-landmark blocks are exactly zero, so F·Σ·F^T
-        // reduces to a few large gemm calls on the sensor band plus per-landmark
-        // 3×N updates instead of two dense n×n multiplies.
+        // F = I + A·dt has the same block-sparsity as A across all coordinate
+        // suites: F_ss (21×21), F_li_s (3×21) per landmark, F_li_li (3×3) per
+        // landmark; sensor←landmark and cross-landmark blocks are exactly zero.
         let f_ss: SMatrix<f64, 21, 21> = SMatrix::<f64, 21, 21>::identity() + blocks.a_ss * dt;
         let mut f_lm_s = DMatrix::<f64>::zeros(3 * n_lm, s);
         let mut f_li_li: Vec<SMatrix<f64, 3, 3>> = Vec::with_capacity(n_lm);
@@ -92,14 +110,35 @@ impl VIOEqF {
             f_lm_s.fixed_view_mut::<3, 21>(3 * i, 0).copy_from(&block);
             f_li_li.push(SMatrix::<f64, 3, 3>::identity() + blocks.a_lm_lm[i] * dt);
         }
-        let f_ss_t = f_ss.transpose();
-        let f_lm_s_t = f_lm_s.transpose();
 
         // Q_total = dt · (B · InputGain · B^T + StateGain)
-        let bt = dense_b_from_blocks(&blocks);
+        let bt = dense_b(&blocks.b_s, &blocks.b_lm);
         let q_input = &bt * input_gain * bt.transpose();
         let state_gain_view = state_gain.view((0, 0), (n, n));
         let q_total = (q_input + state_gain_view) * dt;
+
+        self.apply_transport(&f_ss, &f_lm_s, &f_li_li, &q_total);
+    }
+
+    /// Σ ← F·Σ·F^T + q_total for the block-sparse transition `F`.
+    ///
+    /// `F` is block lower-triangular — `F_ss` (21×21), `F_lm_s` (3·n_lm×21),
+    /// per-landmark diagonal `F_li_li` (3×3) — so the transport reduces to a few
+    /// large gemm calls on the sensor band plus per-landmark 3×N updates instead
+    /// of two dense n×n multiplies. Shared by `integrate_riccati_fast` (`Fast`)
+    /// and `flush_riccati` (`Faster`, where `F` is the composed sub-frame Φ).
+    fn apply_transport(
+        &mut self,
+        f_ss: &SMatrix<f64, 21, 21>,
+        f_lm_s: &DMatrix<f64>,
+        f_li_li: &[SMatrix<f64, 3, 3>],
+        q_total: &DMatrix<f64>,
+    ) {
+        let n = self.xi0.dim();
+        let s = VIOSensorState::CDIM;
+        let n_lm = (n - s) / 3;
+        let f_ss_t = f_ss.transpose();
+        let f_lm_s_t = f_lm_s.transpose();
 
         // ---- Step 1: M = F · Σ ----
         {
@@ -109,7 +148,7 @@ impl VIOEqF {
             {
                 let sigma_s = sigma_active.view((0, 0), (s, n));
                 let mut m_top = self.scratch_m.view_mut((0, 0), (s, n));
-                m_top.gemm(1.0, &f_ss, &sigma_s, 0.0);
+                m_top.gemm(1.0, f_ss, &sigma_s, 0.0);
             }
 
             if n_lm > 0 {
@@ -117,7 +156,7 @@ impl VIOEqF {
                 {
                     let sigma_s = sigma_active.view((0, 0), (s, n));
                     let mut m_lm = self.scratch_m.view_mut((s, 0), (3 * n_lm, n));
-                    m_lm.gemm(1.0, &f_lm_s, &sigma_s, 0.0);
+                    m_lm.gemm(1.0, f_lm_s, &sigma_s, 0.0);
                 }
                 // M[s+3i:s+3i+3, :] += F_li_li · Σ[s+3i:s+3i+3, :]
                 for i in 0..n_lm {
@@ -183,6 +222,100 @@ impl VIOEqF {
         self.enforce_spd();
     }
 
+    /// `Faster` variant — compose this IMU sample's transition `F = I + A·dt`
+    /// into the sub-frame accumulator Φ. Cheap block products only, no O(n²)
+    /// transport; `flush_riccati` applies `Φ·Σ·Φ^T` once per sub-frame.
+    pub fn accumulate_transition<S: EqFCoordinateSuite + ?Sized>(
+        &mut self,
+        suite: &S,
+        imu: &IMUVelocity,
+        dt: f64,
+    ) {
+        let blocks = suite.propagation_blocks(&self.x, &self.xi0, imu);
+        let n_lm = (self.xi0.dim() - VIOSensorState::CDIM) / 3;
+
+        let f_ss: SMatrix<f64, 21, 21> = SMatrix::<f64, 21, 21>::identity() + blocks.a_ss * dt;
+
+        // Φ ← F · Φ. Both are block lower-triangular and the product keeps that
+        // structure, so the composition is exact and stays block-sparse:
+        //   Φ_lm_s[i] ← F_lm_s[i]·Φ_ss + F_li_li[i]·Φ_lm_s[i]   (uses old Φ_ss)
+        //   Φ_li_li[i] ← F_li_li[i]·Φ_li_li[i]
+        //   Φ_ss      ← F_ss·Φ_ss
+        for i in 0..n_lm {
+            let f_lm_s_i: SMatrix<f64, 3, 21> =
+                blocks.a_lm_s.fixed_view::<3, 21>(3 * i, 0).into_owned() * dt;
+            let f_li_li_i: SMatrix<f64, 3, 3> =
+                SMatrix::<f64, 3, 3>::identity() + blocks.a_lm_lm[i] * dt;
+            let phi_lm_s_old: SMatrix<f64, 3, 21> =
+                self.phi_lm_s.fixed_view::<3, 21>(3 * i, 0).into_owned();
+            let new_row = f_lm_s_i * self.phi_ss + f_li_li_i * phi_lm_s_old;
+            self.phi_lm_s_scratch
+                .fixed_view_mut::<3, 21>(3 * i, 0)
+                .copy_from(&new_row);
+            self.phi_li_li[i] = f_li_li_i * self.phi_li_li[i];
+        }
+        self.phi_ss = f_ss * self.phi_ss;
+        std::mem::swap(&mut self.phi_lm_s, &mut self.phi_lm_s_scratch);
+
+        self.accum_dt += dt;
+        self.accum_count += 1;
+        self.last_b_s = blocks.b_s;
+        self.last_b_lm = blocks.b_lm;
+    }
+
+    /// `Faster` variant — apply the batched sub-frame transition:
+    /// Σ ← Φ·Σ·Φ^T + (Σ dt)·(B_last·InputGain·B_last^T + StateGain), then reset
+    /// the accumulator. `B` is held at the sub-frame's last sample (the Phase 6
+    /// process-noise approximation — see docs/imu_optimization_plan.md). No-op
+    /// when nothing is accumulated, so it is safe to call unconditionally.
+    pub fn flush_riccati(&mut self, input_gain: &SMatrix<f64, 12, 12>, state_gain: &DMatrix<f64>) {
+        if self.accum_count == 0 {
+            return;
+        }
+        let n = self.xi0.dim();
+
+        // Q ≈ accum_dt · (B_last · InputGain · B_last^T + StateGain)
+        let bt = dense_b(&self.last_b_s, &self.last_b_lm);
+        let q_input = &bt * input_gain * bt.transpose();
+        let state_gain_view = state_gain.view((0, 0), (n, n));
+        let q_total = (q_input + state_gain_view) * self.accum_dt;
+
+        let phi_ss = self.phi_ss;
+        let phi_lm_s = self.phi_lm_s.clone();
+        let phi_li_li = self.phi_li_li.clone();
+        self.apply_transport(&phi_ss, &phi_lm_s, &phi_li_li, &q_total);
+        self.reset_riccati_accumulator();
+    }
+
+    /// Reset the `Faster` accumulator to the identity transition at the current
+    /// state dimension.
+    fn reset_riccati_accumulator(&mut self) {
+        let n_lm = (self.xi0.dim() - VIOSensorState::CDIM) / 3;
+        self.phi_ss = SMatrix::<f64, 21, 21>::identity();
+        if self.phi_lm_s.nrows() != 3 * n_lm {
+            self.phi_lm_s = DMatrix::<f64>::zeros(3 * n_lm, 21);
+            self.phi_lm_s_scratch = DMatrix::<f64>::zeros(3 * n_lm, 21);
+            self.last_b_lm = DMatrix::<f64>::zeros(3 * n_lm, 12);
+        } else {
+            self.phi_lm_s.fill(0.0);
+        }
+        self.phi_li_li.clear();
+        self.phi_li_li
+            .resize(n_lm, SMatrix::<f64, 3, 3>::identity());
+        self.accum_dt = 0.0;
+        self.accum_count = 0;
+    }
+
+    /// True if any landmark group element has a degenerate scale — the same
+    /// predicate `remove_invalid_landmarks` uses. Lets the batched IMU path
+    /// flush before a structural change to the covariance.
+    pub fn has_degenerate_landmarks(&self) -> bool {
+        self.x
+            .q
+            .iter()
+            .any(|q| !q.scale.is_finite() || q.scale <= 1e-8 || q.scale > 1e8)
+    }
+
     fn enforce_spd(&mut self) {
         let n = self.sigma.nrows();
         for i in 0..n {
@@ -202,6 +335,9 @@ impl VIOEqF {
             self.scratch_m = DMatrix::<f64>::zeros(n, n);
             self.scratch_sigma = DMatrix::<f64>::zeros(n, n);
         }
+        // Landmark add/remove is always flush-preceded, so the `Faster`
+        // accumulator is empty here — resize/reset it to identity at the new n.
+        self.reset_riccati_accumulator();
     }
 
     // ------------------------------------------------------------------
@@ -454,13 +590,13 @@ impl VIOEqF {
     }
 }
 
-fn dense_b_from_blocks(blocks: &RiccatiPropagationBlocks) -> DMatrix<f64> {
+fn dense_b(b_s: &SMatrix<f64, 21, 12>, b_lm: &DMatrix<f64>) -> DMatrix<f64> {
     let s = VIOSensorState::CDIM;
-    let n_lm = blocks.b_lm.nrows() / 3;
+    let n_lm = b_lm.nrows() / 3;
     let mut b = DMatrix::<f64>::zeros(s + 3 * n_lm, 12);
-    b.fixed_view_mut::<21, 12>(0, 0).copy_from(&blocks.b_s);
+    b.fixed_view_mut::<21, 12>(0, 0).copy_from(b_s);
     if n_lm > 0 {
-        b.view_mut((s, 0), (3 * n_lm, 12)).copy_from(&blocks.b_lm);
+        b.view_mut((s, 0), (3 * n_lm, 12)).copy_from(b_lm);
     }
     b
 }

@@ -71,6 +71,10 @@ pub struct VIOFilterSettings {
     // Feature management
     pub max_landmarks: usize,
     pub outlier_threshold: f64,
+
+    // Riccati propagation variant (Phase 6). false = `Fast` per-sample;
+    // true = `Faster` (covariance transport batched per IMU sub-frame).
+    pub use_faster_riccati: bool,
 }
 
 impl Default for VIOFilterSettings {
@@ -104,6 +108,7 @@ impl Default for VIOFilterSettings {
             use_discrete_velocity_lift: true,
             max_landmarks: 40,
             outlier_threshold: 5.0,
+            use_faster_riccati: false,
         }
     }
 }
@@ -258,21 +263,35 @@ impl VIOFilter {
         self.eqf
             .integrate_observer_state(&imu, dt, self.settings.use_discrete_velocity_lift);
 
-        // Remove landmarks that became degenerate during propagation
-        let n_before = self.eqf.x.id.len();
-        self.eqf.remove_invalid_landmarks();
-        if self.eqf.x.id.len() != n_before {
-            self.invalidate_gain_cache();
+        // 2. Propagate covariance.
+        if self.settings.use_faster_riccati {
+            // `Faster` variant — accumulate this sample's transition into Φ;
+            // the O(n²) transport runs once, at the next vision frame. A
+            // landmark going degenerate mid-sub-frame forces an early flush so
+            // the structural change lands on an up-to-date covariance.
+            if self.eqf.has_degenerate_landmarks() {
+                self.eqf.flush_riccati(&self.input_gain, &self.state_gain);
+                self.eqf.remove_invalid_landmarks();
+                self.invalidate_gain_cache();
+            }
+            self.eqf
+                .accumulate_transition(self.suite.as_ref(), &imu, dt);
+        } else {
+            // `Fast` variant — per-sample transport. Remove landmarks that
+            // became degenerate during propagation, then propagate Riccati.
+            let n_before = self.eqf.x.id.len();
+            self.eqf.remove_invalid_landmarks();
+            if self.eqf.x.id.len() != n_before {
+                self.invalidate_gain_cache();
+            }
+            self.eqf.integrate_riccati_fast(
+                self.suite.as_ref(),
+                &imu,
+                dt,
+                &self.input_gain,
+                &self.state_gain,
+            );
         }
-
-        // 2. Propagate Riccati (uses updated X)
-        self.eqf.integrate_riccati_fast(
-            self.suite.as_ref(),
-            &imu,
-            dt,
-            &self.input_gain,
-            &self.state_gain,
-        );
 
         self.eqf.current_time = imu.stamp;
         self.pending_imu.push(imu);
@@ -296,6 +315,11 @@ impl VIOFilter {
         if self.eqf.current_time < 0.0 {
             return;
         }
+
+        // `Faster` variant: apply the covariance accumulated since the last
+        // frame before the measurement update reads or restructures Σ — the
+        // image frame is the sub-frame boundary. No-op under `Fast`.
+        self.eqf.flush_riccati(&self.input_gain, &self.state_gain);
 
         let current_ids: HashSet<u64> = self.eqf.x.id.iter().cloned().collect();
         let observed_ids: HashSet<u64> = measurement.cam_coordinates.keys().cloned().collect();
