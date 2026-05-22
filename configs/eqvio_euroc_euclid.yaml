@@ -123,6 +123,8 @@ PatchDepth:
   max_baseline_ratio: 0.3
   n_pyramid_levels: 1
   max_depth: 150.0
+  min_structure_eigen: 1.0
+  max_structure_condition: 0.0
   vis_min_depth: 0.5
   vis_max_depth: 5.0
   n_search_candidates: 1

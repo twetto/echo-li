@@ -297,6 +297,10 @@ pub struct PatchDepthConfig {
     #[serde(default)]
     pub max_photo_residual: Option<f64>,
     #[serde(default)]
+    pub min_structure_eigen: Option<f64>,
+    #[serde(default)]
+    pub max_structure_condition: Option<f64>,
+    #[serde(default)]
     pub n_pyramid_levels: Option<usize>,
     #[serde(default)]
     pub var_floor: Option<f64>,
@@ -387,6 +391,12 @@ impl PatchDepthConfig {
         }
         if let Some(v) = self.max_photo_residual {
             settings.max_photo_residual = v;
+        }
+        if let Some(v) = self.min_structure_eigen {
+            settings.min_structure_eigen = v;
+        }
+        if let Some(v) = self.max_structure_condition {
+            settings.max_structure_condition = v;
         }
         if let Some(v) = self.n_pyramid_levels {
             settings.n_pyramid_levels = v;

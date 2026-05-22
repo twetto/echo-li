@@ -76,6 +76,8 @@ pub struct PatchDepthSettings {
     pub max_baseline_ratio: f64,
     pub min_photo_curvature: f64,
     pub max_photo_residual: f64,
+    pub min_structure_eigen: f64,
+    pub max_structure_condition: f64,
     pub n_pyramid_levels: usize,
     pub var_floor: f64,
     pub status_weight_photo: f64,
@@ -105,6 +107,8 @@ impl Default for PatchDepthSettings {
             max_baseline_ratio: 0.3,
             min_photo_curvature: 1e-6,
             max_photo_residual: 20.0,
+            min_structure_eigen: 0.0,
+            max_structure_condition: 0.0,
             n_pyramid_levels: 1,
             var_floor: 1e-6,
             status_weight_photo: 1.0,
@@ -817,6 +821,16 @@ impl PatchDepthMapper {
         let rho_min = 1.0 / self.settings.max_depth;
         let rho_max = 1.0 / self.settings.min_depth;
         let rho_init = (seed_rho_init / seed_weight_total).clamp(rho_min, rho_max);
+        if !self.patch_has_enough_structure(
+            cu,
+            cv,
+            rho_init,
+            ref_keyframe,
+            &intrinsics_by_level[0],
+            &RelativePose::from_matrix(t_ref_curr),
+        ) {
+            return PatchEstimate::rejected(rho_init);
+        }
         let mut rho = self.search_initial_rho(
             cu,
             cv,
@@ -895,6 +909,86 @@ impl PatchDepthMapper {
             let var = 1.0 / (seed_precision_sum * self.settings.lambda_seed).max(1e-12);
             PatchEstimate::seed_only(rho_init, var, &self.settings)
         }
+    }
+
+    fn patch_has_enough_structure(
+        &self,
+        cu: f64,
+        cv: f64,
+        rho: f64,
+        ref_keyframe: &DepthKeyframe,
+        intr: &ScaledIntrinsics,
+        rel_pose: &RelativePose,
+    ) -> bool {
+        if self.settings.min_structure_eigen <= 0.0 && self.settings.max_structure_condition <= 0.0
+        {
+            return true;
+        }
+
+        let Some((u_ref_center, v_ref_center, _, _)) =
+            self.warp_scaled_pixel(cu, cv, rho, intr, rel_pose)
+        else {
+            return false;
+        };
+        let half = self.settings.patch_size / 2;
+        let side = half * 2;
+        let Some(fp) = bilinear_patch_footprint(
+            &ref_keyframe.grad_x_pyramid[0],
+            u_ref_center,
+            v_ref_center,
+            half,
+            side,
+        ) else {
+            return false;
+        };
+
+        let mut gxx = 0.0;
+        let mut gxy = 0.0;
+        let mut gyy = 0.0;
+        let mut n = 0usize;
+        unsafe {
+            for ly in 0..side {
+                let gx_row0 = ref_keyframe.grad_x_pyramid[0].row_ptr(fp.y + ly);
+                let gx_row1 = ref_keyframe.grad_x_pyramid[0].row_ptr(fp.y + ly + 1);
+                let gy_row0 = ref_keyframe.grad_y_pyramid[0].row_ptr(fp.y + ly);
+                let gy_row1 = ref_keyframe.grad_y_pyramid[0].row_ptr(fp.y + ly + 1);
+                for lx in 0..side {
+                    let ix = fp.x + lx;
+                    let gx = bilerp_ptr(gx_row0, gx_row1, ix, fp.weights) as f64;
+                    let gy = bilerp_ptr(gy_row0, gy_row1, ix, fp.weights) as f64;
+                    gxx += gx * gx;
+                    gxy += gx * gy;
+                    gyy += gy * gy;
+                    n += 1;
+                }
+            }
+        }
+        if n == 0 {
+            return false;
+        }
+        let inv_n = 1.0 / n as f64;
+        gxx *= inv_n;
+        gxy *= inv_n;
+        gyy *= inv_n;
+
+        let trace = gxx + gyy;
+        let discr = ((gxx - gyy) * (gxx - gyy) + 4.0 * gxy * gxy).sqrt();
+        let lambda_min = 0.5 * (trace - discr);
+        let lambda_max = 0.5 * (trace + discr);
+
+        if self.settings.min_structure_eigen > 0.0 && lambda_min < self.settings.min_structure_eigen
+        {
+            return false;
+        }
+        if self.settings.max_structure_condition > 0.0 {
+            if lambda_min <= 1e-12 {
+                return false;
+            }
+            if lambda_max / lambda_min > self.settings.max_structure_condition {
+                return false;
+            }
+        }
+        true
     }
 
     fn search_initial_rho(
