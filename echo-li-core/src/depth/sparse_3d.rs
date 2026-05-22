@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use nalgebra::{Matrix2, Matrix2x3, Matrix3, Matrix4, Vector2, Vector3};
 
@@ -78,7 +78,8 @@ pub struct Sparse3DFilter {
     chart: Sparse3DChart,
     settings: SparseVogSettings,
     sigma_norm_sq: f64,
-    features: HashMap<u64, FeatureState3D>,
+    features: Vec<FeatureState3D>,
+    feature_slots: HashMap<u64, usize>,
     pending: HashMap<u64, PendingFeature>,
     prev_uvs: HashMap<u64, Vector2<f64>>,
     prev_t_wc: Option<Matrix4<f64>>,
@@ -93,7 +94,8 @@ impl Sparse3DFilter {
             chart,
             settings,
             sigma_norm_sq,
-            features: HashMap::new(),
+            features: Vec::new(),
+            feature_slots: HashMap::new(),
             pending: HashMap::new(),
             prev_uvs: HashMap::new(),
             prev_t_wc: None,
@@ -135,24 +137,70 @@ impl Sparse3DFilter {
         let r = t_curr_prev.fixed_view::<3, 3>(0, 0).into_owned();
         let t = t_curr_prev.fixed_view::<3, 1>(0, 3).into_owned();
 
-        let mut reset_features = Vec::new();
+        #[cfg(feature = "parallel")]
+        let reset_features: Vec<_> = {
+            use rayon::prelude::*;
+
+            let chart = self.chart;
+            let settings = self.settings.clone();
+            let k = self.k;
+            self.features
+                .par_iter_mut()
+                .filter_map(|feat| {
+                    let fid = feat.feat_id;
+                    if !self.prev_uvs.contains_key(&fid) {
+                        return None;
+                    }
+                    let uv_curr = curr_uvs.get(&fid)?;
+                    (!update_existing_feature_3d(
+                        chart, &k, &settings, feat, uv_curr, &r, &t, p_vv, dt,
+                    ))
+                    .then_some(fid)
+                })
+                .collect()
+        };
+
+        #[cfg(not(feature = "parallel"))]
+        let reset_features = {
+            let mut reset_features = Vec::new();
+            for feat in &mut self.features {
+                let fid = feat.feat_id;
+                if !self.prev_uvs.contains_key(&fid) {
+                    continue;
+                }
+
+                let Some(uv_curr) = curr_uvs.get(&fid) else {
+                    continue;
+                };
+
+                if !update_existing_feature_3d(
+                    self.chart,
+                    &self.k,
+                    &self.settings,
+                    feat,
+                    uv_curr,
+                    &r,
+                    &t,
+                    p_vv,
+                    dt,
+                ) {
+                    reset_features.push(fid);
+                }
+            }
+            reset_features
+        };
+
+        let reset_set: HashSet<_> = reset_features.iter().copied().collect();
         for (&fid, &uv_curr) in &curr_uvs {
             let Some(&uv_prev) = self.prev_uvs.get(&fid) else {
                 continue;
             };
-
-            if let Some(feat) = self.features.get_mut(&fid) {
-                predict_feature_3d(self.chart, &self.settings, feat, &r, &t, p_vv, dt);
-                if !bearing_update_3d(self.chart, &self.k, &self.settings, feat, &uv_curr) {
-                    reset_features.push(fid);
-                    continue;
-                }
-                feat.track_length += 1;
+            if self.feature_slots.contains_key(&fid) || reset_set.contains(&fid) {
                 continue;
             }
 
             if !self.pending.contains_key(&fid)
-                && self.features.len() + self.pending.len() >= self.settings.max_pool_size
+                && self.feature_slots.len() + self.pending.len() >= self.settings.max_pool_size
             {
                 continue;
             }
@@ -206,15 +254,17 @@ impl Sparse3DFilter {
                 ref_stamp: stamp,
             };
             bearing_update_3d(self.chart, &self.k, &self.settings, &mut feat, &uv_curr);
-            self.features.insert(fid, feat);
+            self.insert_feature(feat);
             self.pending.remove(&fid);
         }
 
-        for fid in reset_features {
-            self.features.remove(&fid);
+        for &fid in &reset_features {
             self.pending.remove(&fid);
         }
-        self.features.retain(|id, _| curr_uvs.contains_key(id));
+
+        self.remove_features(|feat| {
+            reset_set.contains(&feat.feat_id) || !curr_uvs.contains_key(&feat.feat_id)
+        });
         self.pending.retain(|id, _| curr_uvs.contains_key(id));
         self.prev_t_wc = Some(*t_wc);
         self.prev_stamp = stamp;
@@ -222,7 +272,7 @@ impl Sparse3DFilter {
     }
 
     pub fn query(&self, fid: u64) -> (f64, f64) {
-        let Some(feat) = self.features.get(&fid) else {
+        let Some(feat) = self.feature(fid) else {
             return (-1.0, f64::INFINITY);
         };
         let depth = feat.depth_for_chart(self.chart);
@@ -238,8 +288,39 @@ impl Sparse3DFilter {
         (depth, depth_var)
     }
 
-    pub fn features(&self) -> &HashMap<u64, FeatureState3D> {
-        &self.features
+    pub fn feature(&self, fid: u64) -> Option<&FeatureState3D> {
+        let &slot = self.feature_slots.get(&fid)?;
+        self.features.get(slot)
+    }
+
+    pub fn features_iter(&self) -> impl Iterator<Item = &FeatureState3D> {
+        self.features.iter()
+    }
+
+    pub fn feature_count(&self) -> usize {
+        self.features.len()
+    }
+
+    fn insert_feature(&mut self, feat: FeatureState3D) {
+        let slot = self.features.len();
+        self.feature_slots.insert(feat.feat_id, slot);
+        self.features.push(feat);
+    }
+
+    fn remove_features(&mut self, mut should_remove: impl FnMut(&FeatureState3D) -> bool) {
+        let mut i = 0;
+        while i < self.features.len() {
+            if should_remove(&self.features[i]) {
+                let removed_id = self.features[i].feat_id;
+                self.feature_slots.remove(&removed_id);
+                self.features.swap_remove(i);
+                if let Some(moved) = self.features.get(i) {
+                    self.feature_slots.insert(moved.feat_id, i);
+                }
+            } else {
+                i += 1;
+            }
+        }
     }
 }
 
@@ -268,6 +349,25 @@ fn apply_chart_delta(chart: Sparse3DChart, q: &Vector3<f64>, delta: &Vector3<f64
         Sparse3DChart::Polar => point_chart_normal_inv(delta, q),
         Sparse3DChart::InvDepth => point_chart_invdepth_inv(delta, q),
     }
+}
+
+fn update_existing_feature_3d(
+    chart: Sparse3DChart,
+    k: &Matrix3<f64>,
+    settings: &SparseVogSettings,
+    feat: &mut FeatureState3D,
+    uv_curr: &Vector2<f64>,
+    r: &Matrix3<f64>,
+    t: &Vector3<f64>,
+    p_vv: Option<&Matrix3<f64>>,
+    dt: f64,
+) -> bool {
+    predict_feature_3d(chart, settings, feat, r, t, p_vv, dt);
+    if !bearing_update_3d(chart, k, settings, feat, uv_curr) {
+        return false;
+    }
+    feat.track_length += 1;
+    true
 }
 
 fn init_cov_3d(
@@ -526,15 +626,75 @@ mod tests {
     }
 
     fn update_with_point(filter: &mut Sparse3DFilter, i: usize, point_w: Vector3<f64>) {
+        update_with_points(filter, i, &[(42, point_w)]);
+    }
+
+    fn update_with_points(filter: &mut Sparse3DFilter, i: usize, points: &[(u64, Vector3<f64>)]) {
         let t_wc = pose(i as f64 * 0.05);
-        let p_c = point_w - Vector3::new(t_wc[(0, 3)], 0.0, 0.0);
         let mut coords = HashMap::new();
-        coords.insert(42, project(&k(), p_c));
+        for &(fid, point_w) in points {
+            let p_c = point_w - Vector3::new(t_wc[(0, 3)], 0.0, 0.0);
+            coords.insert(fid, project(&k(), p_c));
+        }
         filter.update(
             &VisionMeasurement::new(i as f64 * 0.05, coords),
             &t_wc,
             None,
         );
+    }
+
+    fn feature(fid: u64) -> FeatureState3D {
+        FeatureState3D {
+            feat_id: fid,
+            position: Vector3::new(0.0, 0.0, 3.0),
+            covariance: Matrix3::identity(),
+            a: 1.0,
+            b: 1.0,
+            track_length: 3,
+            ref_t_wc: Matrix4::identity(),
+            ref_uv: Vector2::new(0.0, 0.0),
+            ref_stamp: 0.0,
+        }
+    }
+
+    #[test]
+    fn dense_storage_updates_lookup_after_swap_remove() {
+        let mut filter = Sparse3DFilter::polar3d(k(), settings());
+        filter.insert_feature(feature(1));
+        filter.insert_feature(feature(2));
+        filter.insert_feature(feature(3));
+
+        filter.remove_features(|feat| feat.feat_id == 1);
+
+        assert_eq!(filter.feature_count(), 2);
+        assert!(filter.feature(1).is_none());
+        assert_eq!(
+            filter.feature(2).expect("feature 2 should remain").feat_id,
+            2
+        );
+        assert_eq!(
+            filter.feature(3).expect("feature 3 should remain").feat_id,
+            3
+        );
+    }
+
+    #[test]
+    fn lost_track_removal_updates_dense_lookup() {
+        let mut filter = Sparse3DFilter::polar3d(k(), settings());
+        let points = [
+            (1, Vector3::new(1.0, 0.5, 3.0)),
+            (2, Vector3::new(1.5, 0.5, 4.0)),
+        ];
+        for i in 0..8 {
+            update_with_points(&mut filter, i, &points);
+        }
+        assert_eq!(filter.feature_count(), 2);
+
+        update_with_points(&mut filter, 8, &points[1..]);
+
+        assert_eq!(filter.feature_count(), 1);
+        assert!(filter.feature(1).is_none());
+        assert!(filter.feature(2).is_some());
     }
 
     #[test]
@@ -544,10 +704,7 @@ mod tests {
         for i in 0..8 {
             update_with_point(&mut filter, i, point);
         }
-        let feat = filter
-            .features()
-            .get(&42)
-            .expect("feature should initialize");
+        let feat = filter.feature(42).expect("feature should initialize");
         assert!(feat.position[2] > 2.5 && feat.position[2] < 3.5);
         let (depth, var) = filter.query(42);
         assert!(depth > 0.0, "depth should be queryable, got {depth}");
@@ -561,10 +718,7 @@ mod tests {
         for i in 0..8 {
             update_with_point(&mut filter, i, point);
         }
-        let feat = filter
-            .features()
-            .get(&42)
-            .expect("feature should initialize");
+        let feat = filter.feature(42).expect("feature should initialize");
         assert!(feat.position[2] > 2.5 && feat.position[2] < 3.5);
         let (depth, var) = filter.query(42);
         assert!(depth > 0.0, "depth should be queryable, got {depth}");
@@ -582,8 +736,7 @@ mod tests {
         }
         assert!(
             filter
-                .features
-                .get(&42)
+                .feature(42)
                 .expect("feature should initialize before reset")
                 .inlier_ratio()
                 > 0.5,
@@ -596,7 +749,7 @@ mod tests {
         filter.update(&VisionMeasurement::new(8.0 * 0.05, coords), &t_wc, None);
 
         assert!(
-            !filter.features.contains_key(&42),
+            filter.feature(42).is_none(),
             "large Mahalanobis bearing innovation should immediately remove the feature"
         );
     }

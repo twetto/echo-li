@@ -47,12 +47,7 @@ impl PySparse3DFilter {
         })
     }
 
-    fn update(
-        &mut self,
-        stamp: f64,
-        feature_uvs: HashMap<u64, [f32; 2]>,
-        t_wc: [[f64; 4]; 4],
-    ) {
+    fn update(&mut self, stamp: f64, feature_uvs: HashMap<u64, [f32; 2]>, t_wc: [[f64; 4]; 4]) {
         let cam_coords: HashMap<u64, Vector2<f32>> = feature_uvs
             .into_iter()
             .map(|(id, uv)| (id, Vector2::new(uv[0], uv[1])))
@@ -68,28 +63,24 @@ impl PySparse3DFilter {
 
     fn get_features<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
         let dict = pyo3::types::PyDict::new(py);
-        for (id, feat) in self.inner.features() {
+        for feat in self.inner.features_iter() {
             let feat_dict = pyo3::types::PyDict::new(py);
             feat_dict.set_item(
                 "position",
                 PyArray1::from_owned_array(
                     py,
-                    Array1::from_vec(vec![
-                        feat.position[0],
-                        feat.position[1],
-                        feat.position[2],
-                    ]),
+                    Array1::from_vec(vec![feat.position[0], feat.position[1], feat.position[2]]),
                 ),
             )?;
             feat_dict.set_item("track_length", feat.track_length)?;
             feat_dict.set_item("inlier_ratio", feat.inlier_ratio())?;
-            dict.set_item(id, feat_dict)?;
+            dict.set_item(feat.feat_id, feat_dict)?;
         }
         Ok(dict)
     }
 
     fn __repr__(&self) -> String {
-        format!("Sparse3DFilter({} features)", self.inner.features().len())
+        format!("Sparse3DFilter({} features)", self.inner.feature_count())
     }
 }
 
@@ -99,10 +90,8 @@ fn intrinsics_matrix(fx: f64, fy: f64, cx: f64, cy: f64) -> Matrix3<f64> {
 
 fn array_to_matrix4(a: &[[f64; 4]; 4]) -> Matrix4<f64> {
     Matrix4::new(
-        a[0][0], a[0][1], a[0][2], a[0][3],
-        a[1][0], a[1][1], a[1][2], a[1][3],
-        a[2][0], a[2][1], a[2][2], a[2][3],
-        a[3][0], a[3][1], a[3][2], a[3][3],
+        a[0][0], a[0][1], a[0][2], a[0][3], a[1][0], a[1][1], a[1][2], a[1][3], a[2][0], a[2][1],
+        a[2][2], a[2][3], a[3][0], a[3][1], a[3][2], a[3][3],
     )
 }
 

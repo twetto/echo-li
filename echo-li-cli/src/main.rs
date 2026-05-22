@@ -285,7 +285,7 @@ fn sparse_points_for_vis(
 
     let mut points = Vec::new();
 
-    for feat in sparse_filter.features().values() {
+    for feat in sparse_filter.features_iter() {
         let q = feat.position;
         if q[2] <= 1e-6 {
             continue;
