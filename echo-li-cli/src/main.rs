@@ -614,6 +614,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(conf) = &vio_config {
         frontend_config.max_features = conf.rudolf_v.max_features;
         frontend_config.pyramid_levels = conf.rudolf_v.max_level;
+        if let Some(fast_threshold) = conf.rudolf_v.fast_threshold {
+            frontend_config.fast_threshold = fast_threshold;
+        }
         if conf.rudolf_v.equalise_image_histogram {
             frontend_config.histeq = rudolf_v::histeq::HistEqMethod::Global;
         }
