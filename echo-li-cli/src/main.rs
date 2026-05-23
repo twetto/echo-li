@@ -11,6 +11,7 @@ use echo_li_core::depth::sparse_gb::SparseVogSettings;
 use echo_li_core::initialization::{check_stationary, estimate_initial_pose};
 use echo_li_core::mathematical::camera::{CameraModel, PinholeModel, RadTanModel};
 use echo_li_core::mathematical::*;
+use echo_li_core::trajectory_metrics::TrajectoryMetrics;
 use echo_li_core::{VIOFilter, VIOFilterSettings};
 use nalgebra::{Matrix3, Matrix4, Vector2};
 use rudolf_v::frontend::{Frontend, FrontendConfig, LbpPolicy};
@@ -89,6 +90,47 @@ fn write_groundtruth(path: &std::path::Path, poses: &[StampedPose]) -> std::io::
             sp.stamp, pos[0], pos[1], pos[2], q[0], q[1], q[2], q[3]
         )?;
     }
+    Ok(())
+}
+
+fn write_trajectory_metrics(
+    path: &std::path::Path,
+    metrics: &TrajectoryMetrics,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut f = std::fs::File::create(path)?;
+    writeln!(f, "matched_poses {}", metrics.matched_poses)?;
+    writeln!(f, "ate_position_rmse_m {:.9}", metrics.ate_position_m.rmse)?;
+    writeln!(f, "ate_position_mean_m {:.9}", metrics.ate_position_m.mean)?;
+    writeln!(
+        f,
+        "ate_position_median_m {:.9}",
+        metrics.ate_position_m.median
+    )?;
+    writeln!(f, "ate_position_max_m {:.9}", metrics.ate_position_m.max)?;
+    writeln!(
+        f,
+        "ate_attitude_rmse_deg {:.9}",
+        metrics.ate_attitude_deg.rmse
+    )?;
+    writeln!(
+        f,
+        "ate_attitude_mean_deg {:.9}",
+        metrics.ate_attitude_deg.mean
+    )?;
+    writeln!(
+        f,
+        "ate_attitude_median_deg {:.9}",
+        metrics.ate_attitude_deg.median
+    )?;
+    writeln!(
+        f,
+        "ate_attitude_max_deg {:.9}",
+        metrics.ate_attitude_deg.max
+    )?;
     Ok(())
 }
 
@@ -1195,6 +1237,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let aligned_file = output_dir.join("aligned_trajectory.txt");
             write_trajectory(&aligned_file, &aligned)?;
             println!("Aligned trajectory written to {}", aligned_file.display());
+
+            if let Some(metrics) = echo_li_core::trajectory_metrics::compute_ate_metrics(
+                &est_poses, &gt_poses, &alignment,
+            ) {
+                println!(
+                    "ATE position: rmse={:.4} m mean={:.4} m median={:.4} m max={:.4} m",
+                    metrics.ate_position_m.rmse,
+                    metrics.ate_position_m.mean,
+                    metrics.ate_position_m.median,
+                    metrics.ate_position_m.max
+                );
+                println!(
+                    "ATE attitude: rmse={:.4} deg mean={:.4} deg median={:.4} deg max={:.4} deg",
+                    metrics.ate_attitude_deg.rmse,
+                    metrics.ate_attitude_deg.mean,
+                    metrics.ate_attitude_deg.median,
+                    metrics.ate_attitude_deg.max
+                );
+                let metrics_file = output_dir.join("trajectory_metrics.txt");
+                write_trajectory_metrics(&metrics_file, &metrics)?;
+                println!("Trajectory metrics written to {}", metrics_file.display());
+            }
         }
     }
 

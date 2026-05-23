@@ -6,6 +6,7 @@ pub mod dataserver;
 pub mod depth;
 pub mod initialization;
 pub mod mathematical;
+pub mod trajectory_metrics;
 
 #[cfg(test)]
 pub mod tests;
