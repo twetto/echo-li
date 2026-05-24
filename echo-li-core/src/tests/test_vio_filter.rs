@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use crate::coordinate_suite::euclid::EuclideanSuite;
 use crate::mathematical::bias_group_ops::BiasGroupOps;
 use crate::mathematical::camera::{CameraModel, PinholeModel};
+use crate::mathematical::eqf_matrices::EqFCoordinateSuite;
 use crate::mathematical::imu_velocity::IMUVelocity;
 use crate::mathematical::vio_eqf::VIOEqF;
 use crate::mathematical::vio_group::VIOGroup;
@@ -216,6 +217,40 @@ fn test_semi_direct_beta_for_physical_bias_update() {
     let after = ops.act_bias(&delta.compose(&current), &bias_origin);
 
     assert_abs_diff_eq!(after, before + physical_delta, epsilon = 1e-12);
+}
+
+#[test]
+fn test_semi_direct_bias_process_noise_uses_action_matrix() {
+    let suite = EuclideanSuite;
+    let xi0 = make_xi0_with_landmarks(0);
+    let imu = IMUVelocity::new(
+        0.0,
+        Vector3::new(0.1, -0.2, 0.3),
+        Vector3::new(0.4, -0.1, 9.7),
+    );
+
+    let mut additive = VIOGroup::identity_with_bias_group(&[], ImuBiasGroup::Additive);
+    additive.a = SE3::new(
+        SO3::exp(&Vector3::new(0.12, -0.05, 0.03)),
+        Vector3::new(0.2, -0.1, 0.05),
+    );
+    additive.w = Vector3::new(0.08, -0.03, 0.1);
+    let additive_blocks = suite.propagation_blocks(&additive, &xi0, &imu);
+    assert_abs_diff_eq!(
+        additive_blocks.b_s.fixed_view::<6, 6>(0, 6).into_owned(),
+        SMatrix::<f64, 6, 6>::identity(),
+        epsilon = 1e-12
+    );
+
+    let mut semi_direct = additive.with_bias_group(ImuBiasGroup::SemiDirect);
+    semi_direct.beta = Vector6::new(0.1, -0.2, 0.05, 0.3, -0.1, 0.2);
+    let semi_direct_blocks = suite.propagation_blocks(&semi_direct, &xi0, &imu);
+    let expected = BiasGroupOps::bias_action_matrix(&semi_direct).adjoint();
+    assert_abs_diff_eq!(
+        semi_direct_blocks.b_s.fixed_view::<6, 6>(0, 6).into_owned(),
+        expected,
+        epsilon = 1e-12
+    );
 }
 
 #[test]

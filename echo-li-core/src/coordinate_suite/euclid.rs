@@ -2,6 +2,7 @@ use echo_lie::{SE3, SO3, SOT3};
 use nalgebra::{DMatrix, DVector, Matrix2x3, Matrix3, SMatrix, Vector2, Vector3};
 
 use crate::coordinate_suite::base_skew;
+use crate::mathematical::bias_group_ops::BiasGroupOps;
 use crate::mathematical::camera::CameraModel;
 use crate::mathematical::eqf_matrices::{EqFCoordinateSuite, RiccatiPropagationBlocks};
 use crate::mathematical::imu_velocity::IMUVelocity;
@@ -154,8 +155,8 @@ impl EqFCoordinateSuite for EuclideanSuite {
         let xi_hat = state_group_action(x, xi0);
         let r_a = x.a.rotation.as_matrix();
 
-        bt.fixed_view_mut::<6, 6>(0, 6)
-            .copy_from(&nalgebra::SMatrix::<f64, 6, 6>::identity());
+        let bias_noise = BiasGroupOps::new(x.imu_bias_group).physical_bias_noise_matrix(x);
+        bt.fixed_view_mut::<6, 6>(0, 6).copy_from(&bias_noise);
         bt.fixed_view_mut::<3, 3>(6, 0).copy_from(&r_a);
         bt.fixed_view_mut::<3, 3>(9, 0)
             .copy_from(&(base_skew(&x.a.translation) * r_a));
@@ -194,8 +195,8 @@ impl EqFCoordinateSuite for EuclideanSuite {
         let r_a = x.a.rotation.as_matrix();
 
         let mut b_s = SMatrix::<f64, 21, 12>::zeros();
-        b_s.fixed_view_mut::<6, 6>(0, 6)
-            .copy_from(&SMatrix::<f64, 6, 6>::identity());
+        let bias_noise = BiasGroupOps::new(x.imu_bias_group).physical_bias_noise_matrix(x);
+        b_s.fixed_view_mut::<6, 6>(0, 6).copy_from(&bias_noise);
         b_s.fixed_view_mut::<3, 3>(6, 0).copy_from(&r_a);
         b_s.fixed_view_mut::<3, 3>(9, 0)
             .copy_from(&(base_skew(&x.a.translation) * r_a));

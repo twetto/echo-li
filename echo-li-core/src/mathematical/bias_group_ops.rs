@@ -1,5 +1,5 @@
 use echo_lie::SE3;
-use nalgebra::Vector6;
+use nalgebra::{SMatrix, Vector6};
 
 use crate::mathematical::vio_group::{VIOAlgebra, VIOGroup};
 use crate::ImuBiasGroup;
@@ -45,6 +45,13 @@ impl BiasGroupOps {
         }
     }
 
+    pub fn physical_bias_noise_matrix(self, x: &VIOGroup) -> SMatrix<f64, 6, 6> {
+        match self.kind {
+            ImuBiasGroup::Additive => SMatrix::<f64, 6, 6>::identity(),
+            ImuBiasGroup::SemiDirect => Self::bias_action_matrix(x).adjoint(),
+        }
+    }
+
     pub fn beta_for_physical_bias_update(
         self,
         current: &VIOGroup,
@@ -57,7 +64,7 @@ impl BiasGroupOps {
             ImuBiasGroup::SemiDirect => {
                 let ad_delta = Self::bias_action_matrix(delta_geometry).adjoint();
                 let ad_current = Self::bias_action_matrix(current).adjoint();
-                (ad_delta - nalgebra::SMatrix::<f64, 6, 6>::identity()) * bias_origin
+                (ad_delta - SMatrix::<f64, 6, 6>::identity()) * bias_origin
                     + ad_delta * ad_current * physical_bias_delta
             }
         }
