@@ -1,7 +1,8 @@
 use echo_lie::SE3;
-use nalgebra::{SMatrix, Vector6};
+use nalgebra::{DMatrix, DVector, SMatrix, Vector6};
 
 use crate::mathematical::vio_group::{VIOAlgebra, VIOGroup};
+use crate::mathematical::vio_state::VIOState;
 use crate::ImuBiasGroup;
 
 #[derive(Debug, Clone, Copy)]
@@ -50,6 +51,41 @@ impl BiasGroupOps {
             ImuBiasGroup::Additive => SMatrix::<f64, 6, 6>::identity(),
             ImuBiasGroup::SemiDirect => Self::bias_action_matrix(x).adjoint(),
         }
+    }
+
+    pub fn numerical_state_matrix<F>(
+        self,
+        x: &VIOGroup,
+        xi0: &VIOState,
+        mut eval: F,
+    ) -> DMatrix<f64>
+    where
+        F: FnMut(&DVector<f64>) -> DVector<f64>,
+    {
+        assert_eq!(
+            self.kind,
+            ImuBiasGroup::SemiDirect,
+            "numerical state matrix is only used by semi-direct bias mode"
+        );
+        assert_eq!(
+            x.imu_bias_group,
+            ImuBiasGroup::SemiDirect,
+            "state matrix group element must use semi-direct bias mode"
+        );
+
+        let eps = 1e-6;
+        let dim = xi0.dim();
+        let mut a = DMatrix::<f64>::zeros(dim, dim);
+
+        for col in 0..dim {
+            let mut plus = DVector::<f64>::zeros(dim);
+            let mut minus = DVector::<f64>::zeros(dim);
+            plus[col] = eps;
+            minus[col] = -eps;
+            a.set_column(col, &((eval(&plus) - eval(&minus)) / (2.0 * eps)));
+        }
+
+        a
     }
 
     pub fn beta_for_physical_bias_update(

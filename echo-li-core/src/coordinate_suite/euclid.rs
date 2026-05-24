@@ -25,11 +25,8 @@ fn semi_direct_state_matrix_numerical(
     // derived from the EqVIO (A, w) group coordinates.
     let xi_hat = state_group_action(x, xi0);
     let x_inv = x.inverse();
-    let eps = 1e-6;
-    let dim = xi0.dim();
-    let mut a = DMatrix::<f64>::zeros(dim, dim);
 
-    let eval = |eps_vec: &DVector<f64>| {
+    BiasGroupOps::new(x.imu_bias_group).numerical_state_matrix(x, xi0, |eps_vec| {
         let xi_e = suite.state_chart_inv(eps_vec, xi0);
         let xi = state_group_action(x, &xi_e);
         let lambda_tilde = &lift_velocity(&xi, imu_vel) - &lift_velocity(&xi_hat, imu_vel);
@@ -38,17 +35,7 @@ fn semi_direct_state_matrix_numerical(
         let xi_e_next = state_group_action(&x_inv, &xi_hat_next);
 
         suite.state_chart(&xi_e_next, xi0)
-    };
-
-    for col in 0..dim {
-        let mut plus = DVector::<f64>::zeros(dim);
-        let mut minus = DVector::<f64>::zeros(dim);
-        plus[col] = eps;
-        minus[col] = -eps;
-        a.set_column(col, &((eval(&plus) - eval(&minus)) / (2.0 * eps)));
-    }
-
-    a
+    })
 }
 
 impl EqFCoordinateSuite for EuclideanSuite {

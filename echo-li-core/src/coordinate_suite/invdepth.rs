@@ -6,11 +6,15 @@ use crate::coordinate_suite::{
     base_skew, e3_project_sphere, e3_project_sphere_diff, e3_project_sphere_inv,
     e3_project_sphere_inv_diff,
 };
+use crate::mathematical::bias_group_ops::BiasGroupOps;
 use crate::mathematical::camera::CameraModel;
 use crate::mathematical::eqf_matrices::{EqFCoordinateSuite, RiccatiPropagationBlocks};
 use crate::mathematical::imu_velocity::IMUVelocity;
-use crate::mathematical::vio_group::{state_group_action, VIOAlgebra, VIOGroup};
+use crate::mathematical::vio_group::{
+    lift_velocity, state_group_action, vio_exp_with_bias_group, VIOAlgebra, VIOGroup,
+};
 use crate::mathematical::vio_state::{Landmark, VIOSensorState, VIOState};
+use crate::ImuBiasGroup;
 
 // ===========================================================================
 // Stereographic sphere chart
@@ -178,6 +182,21 @@ impl EqFCoordinateSuite for InvDepthSuite {
     }
 
     fn state_matrix_a(&self, x: &VIOGroup, xi0: &VIOState, imu_vel: &IMUVelocity) -> DMatrix<f64> {
+        if x.imu_bias_group == ImuBiasGroup::SemiDirect {
+            let xi_hat = state_group_action(x, xi0);
+            let x_inv = x.inverse();
+            return BiasGroupOps::new(x.imu_bias_group).numerical_state_matrix(x, xi0, |eps| {
+                let xi_e = self.state_chart_inv(eps, xi0);
+                let xi = state_group_action(x, &xi_e);
+                let lambda_tilde = &lift_velocity(&xi, imu_vel) - &lift_velocity(&xi_hat, imu_vel);
+                let delta = vio_exp_with_bias_group(&lambda_tilde, ImuBiasGroup::SemiDirect);
+                let xi_hat_next = state_group_action(&delta, &xi_hat);
+                let xi_e_next = state_group_action(&x_inv, &xi_hat_next);
+
+                self.state_chart(&xi_e_next, xi0)
+            });
+        }
+
         let n = xi0.camera_landmarks.len();
         let s = VIOSensorState::CDIM;
 

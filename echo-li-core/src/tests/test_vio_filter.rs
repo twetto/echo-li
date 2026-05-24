@@ -4,6 +4,8 @@ use nalgebra::{DMatrix, DVector, SMatrix, Vector2, Vector3, Vector6};
 use std::collections::HashMap;
 
 use crate::coordinate_suite::euclid::EuclideanSuite;
+use crate::coordinate_suite::invdepth::InvDepthSuite;
+use crate::coordinate_suite::normal::NormalSuite;
 use crate::mathematical::bias_group_ops::BiasGroupOps;
 use crate::mathematical::camera::{CameraModel, PinholeModel};
 use crate::mathematical::eqf_matrices::EqFCoordinateSuite;
@@ -255,9 +257,10 @@ fn test_semi_direct_bias_process_noise_uses_action_matrix() {
     );
 }
 
-#[test]
-fn test_semi_direct_a0t_matches_finite_difference() {
-    let suite = EuclideanSuite;
+fn assert_semi_direct_a0t_matches_finite_difference<S: EqFCoordinateSuite>(
+    suite: &S,
+    name: &str,
+) {
     let xi0 = make_xi0_with_landmarks(2);
     let mut x_hat = VIOGroup::identity_with_bias_group(&xi0.get_ids(), ImuBiasGroup::SemiDirect);
     x_hat.beta = Vector6::new(0.1, -0.2, 0.05, 0.3, -0.1, 0.2);
@@ -294,9 +297,24 @@ fn test_semi_direct_a0t_matches_finite_difference() {
     let diff = (&a_analytical - &a_numerical).norm();
     assert!(
         diff < 1e-4 * (xi0.dim() as f64),
-        "semi-direct A0t Jacobian mismatch: ||A - A_num|| = {:.2e}",
+        "{name} semi-direct A0t Jacobian mismatch: ||A - A_num|| = {:.2e}",
         diff
     );
+}
+
+#[test]
+fn test_semi_direct_a0t_matches_finite_difference() {
+    assert_semi_direct_a0t_matches_finite_difference(&EuclideanSuite, "euclidean");
+}
+
+#[test]
+fn test_semi_direct_a0t_matches_finite_difference_normal() {
+    assert_semi_direct_a0t_matches_finite_difference(&NormalSuite::new(), "normal");
+}
+
+#[test]
+fn test_semi_direct_a0t_matches_finite_difference_invdepth() {
+    assert_semi_direct_a0t_matches_finite_difference(&InvDepthSuite::new(), "invdepth");
 }
 
 #[test]
