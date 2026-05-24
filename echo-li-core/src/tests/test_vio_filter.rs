@@ -10,7 +10,7 @@ use crate::mathematical::vio_eqf::VIOEqF;
 use crate::mathematical::vio_state::{Landmark, VIOSensorState, VIOState, GRAVITY_CONSTANT};
 use crate::mathematical::vision_measurement::VisionMeasurement;
 use crate::tests::testing_utilities::*;
-use crate::{VIOFilter, VIOFilterSettings};
+use crate::{LandmarkDepthPrior, VIOFilter, VIOFilterSettings};
 
 fn make_xi0_with_landmarks(n: usize) -> VIOState {
     let mut landmarks = Vec::new();
@@ -532,6 +532,42 @@ fn test_filter_vision_adds_landmarks() {
 
     assert_eq!(filter.eqf.xi0.camera_landmarks.len(), 2);
     assert_eq!(filter.vision_count, 1);
+}
+
+#[test]
+fn test_filter_vision_initializes_new_landmark_from_range_prior() {
+    let mut settings = VIOFilterSettings::default();
+    settings.initial_scene_depth = 3.0;
+    let xi0 = make_xi0_with_landmarks(0);
+    let mut filter = VIOFilter::new(settings, xi0);
+
+    let cam = make_pinhole();
+    filter.process_imu(stationary_imu(0.0));
+    filter.process_imu(stationary_imu(0.005));
+
+    let mut coords = HashMap::new();
+    coords.insert(42u64, Vector2::new(400.0f32, 250.0f32));
+    let meas = VisionMeasurement::new(0.005, coords);
+
+    let mut priors = HashMap::new();
+    priors.insert(
+        42u64,
+        LandmarkDepthPrior {
+            range: 7.0,
+            range_var: 0.1,
+        },
+    );
+
+    filter.process_vision_with_depth_priors(meas, &cam, &priors);
+
+    let landmark = filter
+        .eqf
+        .xi0
+        .camera_landmarks
+        .iter()
+        .find(|landmark| landmark.id == 42)
+        .unwrap();
+    assert_abs_diff_eq!(landmark.p.norm(), 7.0, epsilon = 1e-9);
 }
 
 #[test]

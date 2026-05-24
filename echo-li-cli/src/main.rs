@@ -12,7 +12,7 @@ use echo_li_core::initialization::{check_stationary, estimate_initial_pose};
 use echo_li_core::mathematical::camera::{CameraModel, PinholeModel, RadTanModel};
 use echo_li_core::mathematical::*;
 use echo_li_core::trajectory_metrics::TrajectoryMetrics;
-use echo_li_core::{VIOFilter, VIOFilterSettings};
+use echo_li_core::{LandmarkDepthPrior, VIOFilter, VIOFilterSettings};
 use nalgebra::{Matrix3, Matrix4, Vector2};
 use rudolf_v::frontend::{Frontend, FrontendConfig, LbpPolicy};
 use rudolf_v::image::Image as RudolfImage;
@@ -894,7 +894,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                         Vec::new()
                     };
-                    f.process_vision(measurement.clone(), cam_model.as_ref());
+                    let depth_priors = if let Some(sparse) = &sparse_filter {
+                        measurement
+                            .cam_coordinates
+                            .keys()
+                            .filter_map(|&fid| {
+                                let (range, range_var) = sparse.query_range(fid);
+                                (range > 0.0 && range_var.is_finite())
+                                    .then_some((fid, LandmarkDepthPrior { range, range_var }))
+                            })
+                            .collect()
+                    } else {
+                        HashMap::new()
+                    };
+                    f.process_vision_with_depth_priors(
+                        measurement.clone(),
+                        cam_model.as_ref(),
+                        &depth_priors,
+                    );
                     vision_count += 1;
 
                     let state = f.eqf.state_estimate();

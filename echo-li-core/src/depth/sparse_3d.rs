@@ -63,6 +63,15 @@ impl FeatureState3D {
         }
     }
 
+    pub fn range_variance_for_chart(&self, chart: Sparse3DChart) -> f64 {
+        let range = self.position.norm();
+        if range < 1e-6 {
+            return f64::INFINITY;
+        }
+        let h_range = (self.position / range).transpose() * chart_to_euc_jac(chart, &self.position);
+        (h_range * self.covariance * h_range.transpose())[(0, 0)]
+    }
+
     pub fn inlier_ratio(&self) -> f64 {
         let ab = self.a + self.b;
         if ab <= 0.0 {
@@ -286,6 +295,23 @@ impl Sparse3DFilter {
             return (-1.0, f64::INFINITY);
         }
         (depth, depth_var)
+    }
+
+    pub fn query_range(&self, fid: u64) -> (f64, f64) {
+        let Some(feat) = self.feature(fid) else {
+            return (-1.0, f64::INFINITY);
+        };
+        let range = feat.position.norm();
+        let range_var = feat.range_variance_for_chart(self.chart);
+        if range <= 0.0 || feat.track_length < self.settings.min_track_length {
+            return (-1.0, f64::INFINITY);
+        }
+        if feat.inlier_ratio() < self.settings.conv_inlier_ratio
+            || range_var > self.settings.conv_variance_threshold
+        {
+            return (-1.0, f64::INFINITY);
+        }
+        (range, range_var)
     }
 
     pub fn feature(&self, fid: u64) -> Option<&FeatureState3D> {

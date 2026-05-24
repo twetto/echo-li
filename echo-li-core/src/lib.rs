@@ -25,6 +25,12 @@ use crate::mathematical::vio_eqf::VIOEqF;
 use crate::mathematical::vio_state::{Landmark, VIOSensorState, VIOState};
 use crate::mathematical::vision_measurement::VisionMeasurement;
 
+#[derive(Debug, Clone, Copy)]
+pub struct LandmarkDepthPrior {
+    pub range: f64,
+    pub range_var: f64,
+}
+
 // ---------------------------------------------------------------------------
 // Settings (matches Python VIOFilterSettings)
 // ---------------------------------------------------------------------------
@@ -313,6 +319,15 @@ impl VIOFilter {
     // ------------------------------------------------------------------
 
     pub fn process_vision(&mut self, measurement: VisionMeasurement, cam: &dyn CameraModel) {
+        self.process_vision_with_depth_priors(measurement, cam, &HashMap::new());
+    }
+
+    pub fn process_vision_with_depth_priors(
+        &mut self,
+        measurement: VisionMeasurement,
+        cam: &dyn CameraModel,
+        depth_priors: &HashMap<u64, LandmarkDepthPrior>,
+    ) {
         if self.eqf.current_time < 0.0 {
             return;
         }
@@ -352,7 +367,40 @@ impl VIOFilter {
             }
             let uv = measurement.cam_coordinates.get(&id).unwrap();
             let bearing = cam.undistort(&Vector2::new(uv[0] as f64, uv[1] as f64));
-            let p = bearing * self.settings.initial_scene_depth;
+            let fallback_range = if bearing[2] > 1e-9 {
+                self.settings.initial_scene_depth / bearing[2]
+            } else {
+                self.settings.initial_scene_depth
+            };
+            let prior = depth_priors.get(&id).filter(|prior| {
+                prior.range.is_finite() && prior.range > 0.0 && prior.range_var.is_finite()
+            });
+            let range = prior.map(|prior| prior.range).unwrap_or(fallback_range);
+            let p = bearing * range;
+            if std::env::var_os("ECHO_LI_DEBUG_LANDMARK_INIT").is_some() {
+                let source = if prior.is_some() {
+                    "sparse_range"
+                } else {
+                    "fallback_scene_depth"
+                };
+                let range_var = prior.map(|prior| prior.range_var).unwrap_or(f64::INFINITY);
+                eprintln!(
+                    "eqf landmark init id={} source={} uv=({:.2},{:.2}) bearing=({:.6},{:.6},{:.6}) range={:.6} range_var={:.6e} p=({:.6},{:.6},{:.6}) fallback_range={:.6}",
+                    id,
+                    source,
+                    uv[0],
+                    uv[1],
+                    bearing[0],
+                    bearing[1],
+                    bearing[2],
+                    range,
+                    range_var,
+                    p[0],
+                    p[1],
+                    p[2],
+                    fallback_range,
+                );
+            }
             new_landmarks.push(Landmark { p, id });
         }
 
