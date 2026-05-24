@@ -9,7 +9,9 @@ use crate::mathematical::camera::{CameraModel, PinholeModel};
 use crate::mathematical::eqf_matrices::EqFCoordinateSuite;
 use crate::mathematical::imu_velocity::IMUVelocity;
 use crate::mathematical::vio_eqf::VIOEqF;
-use crate::mathematical::vio_group::VIOGroup;
+use crate::mathematical::vio_group::{
+    lift_velocity, state_group_action, vio_exp_with_bias_group, VIOGroup,
+};
 use crate::mathematical::vio_state::{Landmark, VIOSensorState, VIOState, GRAVITY_CONSTANT};
 use crate::mathematical::vision_measurement::VisionMeasurement;
 use crate::tests::testing_utilities::*;
@@ -250,6 +252,50 @@ fn test_semi_direct_bias_process_noise_uses_action_matrix() {
         semi_direct_blocks.b_s.fixed_view::<6, 6>(0, 6).into_owned(),
         expected,
         epsilon = 1e-12
+    );
+}
+
+#[test]
+fn test_semi_direct_a0t_matches_finite_difference() {
+    let suite = EuclideanSuite;
+    let xi0 = make_xi0_with_landmarks(2);
+    let mut x_hat = VIOGroup::identity_with_bias_group(&xi0.get_ids(), ImuBiasGroup::SemiDirect);
+    x_hat.beta = Vector6::new(0.1, -0.2, 0.05, 0.3, -0.1, 0.2);
+    x_hat.a = SE3::new(
+        SO3::exp(&Vector3::new(0.12, -0.05, 0.03)),
+        Vector3::new(0.2, -0.1, 0.05),
+    );
+    x_hat.w = Vector3::new(0.08, -0.03, 0.1);
+
+    let imu = IMUVelocity::new(
+        0.0,
+        Vector3::new(0.1, -0.2, 0.3),
+        Vector3::new(0.4, -0.1, 9.7),
+    );
+    let a_analytical = suite.state_matrix_a(&x_hat, &xi0, &imu);
+
+    let a0 = |eps: &DVector<f64>| {
+        let xi_hat = state_group_action(&x_hat, &xi0);
+        let xi_e = suite.state_chart_inv(eps, &xi0);
+        let xi = state_group_action(&x_hat, &xi_e);
+
+        let lambda_tilde = &lift_velocity(&xi, &imu) - &lift_velocity(&xi_hat, &imu);
+        let delta = vio_exp_with_bias_group(&lambda_tilde, ImuBiasGroup::SemiDirect);
+        let xi_hat_next = state_group_action(&delta, &xi_hat);
+        let xi_e_next = state_group_action(&x_hat.inverse(), &xi_hat_next);
+
+        suite.state_chart(&xi_e_next, &xi0)
+    };
+
+    let zero = DVector::zeros(xi0.dim());
+    assert!(a0(&zero).norm() < 1e-8, "a0(0) should be zero");
+
+    let a_numerical = numerical_jacobian(a0, &zero, 1e-6);
+    let diff = (&a_analytical - &a_numerical).norm();
+    assert!(
+        diff < 1e-4 * (xi0.dim() as f64),
+        "semi-direct A0t Jacobian mismatch: ||A - A_num|| = {:.2e}",
+        diff
     );
 }
 

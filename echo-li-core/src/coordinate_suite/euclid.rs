@@ -6,11 +6,50 @@ use crate::mathematical::bias_group_ops::BiasGroupOps;
 use crate::mathematical::camera::CameraModel;
 use crate::mathematical::eqf_matrices::{EqFCoordinateSuite, RiccatiPropagationBlocks};
 use crate::mathematical::imu_velocity::IMUVelocity;
+use crate::mathematical::vio_group::{lift_velocity, vio_exp_with_bias_group};
 use crate::mathematical::vio_group::{state_group_action, VIOAlgebra, VIOGroup};
 use crate::mathematical::vio_state::{VIOSensorState, VIOState, GRAVITY_CONSTANT};
 use crate::ImuBiasGroup;
 
 pub struct EuclideanSuite;
+
+fn semi_direct_state_matrix_numerical(
+    suite: &EuclideanSuite,
+    x: &VIOGroup,
+    xi0: &VIOState,
+    imu_vel: &IMUVelocity,
+) -> DMatrix<f64> {
+    // Reference implementation for the experimental semi-direct bias mode.
+    // The additive closed-form A matrix is not valid under the coupled bias
+    // action; keep this isolated until the corresponding closed form is
+    // derived from the EqVIO (A, w) group coordinates.
+    let xi_hat = state_group_action(x, xi0);
+    let x_inv = x.inverse();
+    let eps = 1e-6;
+    let dim = xi0.dim();
+    let mut a = DMatrix::<f64>::zeros(dim, dim);
+
+    let eval = |eps_vec: &DVector<f64>| {
+        let xi_e = suite.state_chart_inv(eps_vec, xi0);
+        let xi = state_group_action(x, &xi_e);
+        let lambda_tilde = &lift_velocity(&xi, imu_vel) - &lift_velocity(&xi_hat, imu_vel);
+        let delta = vio_exp_with_bias_group(&lambda_tilde, ImuBiasGroup::SemiDirect);
+        let xi_hat_next = state_group_action(&delta, &xi_hat);
+        let xi_e_next = state_group_action(&x_inv, &xi_hat_next);
+
+        suite.state_chart(&xi_e_next, xi0)
+    };
+
+    for col in 0..dim {
+        let mut plus = DVector::<f64>::zeros(dim);
+        let mut minus = DVector::<f64>::zeros(dim);
+        plus[col] = eps;
+        minus[col] = -eps;
+        a.set_column(col, &((eval(&plus) - eval(&minus)) / (2.0 * eps)));
+    }
+
+    a
+}
 
 impl EqFCoordinateSuite for EuclideanSuite {
     fn state_chart(&self, xi: &VIOState, xi0: &VIOState) -> DVector<f64> {
@@ -63,6 +102,10 @@ impl EqFCoordinateSuite for EuclideanSuite {
     }
 
     fn state_matrix_a(&self, x: &VIOGroup, xi0: &VIOState, imu_vel: &IMUVelocity) -> DMatrix<f64> {
+        if x.imu_bias_group == ImuBiasGroup::SemiDirect {
+            return semi_direct_state_matrix_numerical(self, x, xi0, imu_vel);
+        }
+
         let n = xi0.camera_landmarks.len();
         let dim = xi0.dim();
         let mut a0t = DMatrix::<f64>::zeros(dim, dim);
@@ -239,6 +282,12 @@ impl EqFCoordinateSuite for EuclideanSuite {
         let mut a_lm_lm = Vec::with_capacity(n);
         let mut b_lm = DMatrix::<f64>::zeros(3 * n, 12);
 
+        let semi_direct_a = if x.imu_bias_group == ImuBiasGroup::SemiDirect {
+            Some(semi_direct_state_matrix_numerical(self, x, xi0, imu_vel))
+        } else {
+            None
+        };
+
         for i in 0..n {
             let qi = &x.q[i];
             let row = 3 * i;
@@ -275,6 +324,18 @@ impl EqFCoordinateSuite for EuclideanSuite {
             let qhat_inv = qi.rotation.as_matrix().transpose() / qi.scale;
             let a_qi = -(qhat_i * inner * qhat_inv) / qq;
             a_lm_lm.push(a_qi);
+        }
+
+        if let Some(a) = semi_direct_a {
+            a_ss.copy_from(&a.fixed_view::<21, 21>(0, 0));
+            for i in 0..n {
+                let state_row = s + 3 * i;
+                let compact_row = 3 * i;
+                a_lm_s
+                    .fixed_view_mut::<3, 21>(compact_row, 0)
+                    .copy_from(&a.fixed_view::<3, 21>(state_row, 0));
+                a_lm_lm[i].copy_from(&a.fixed_view::<3, 3>(state_row, state_row));
+            }
         }
 
         RiccatiPropagationBlocks {
