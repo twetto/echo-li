@@ -4,6 +4,7 @@ use std::path::Path;
 
 use crate::depth::patch_depth::{PatchDepthCameraMode, PatchDepthSettings, PatchDepthWarpMode};
 use crate::depth::sparse_gb::{DepthParametrization, SparseVogSettings};
+use crate::ImuBiasGroup;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -65,6 +66,8 @@ pub struct EqfProcessVariance {
 pub struct EqfSettings {
     pub coordinate_choice: String,
     pub fast_riccati: bool,
+    #[serde(default)]
+    pub imu_bias_group: Option<String>,
     pub use_discrete_innovation_lift: bool,
     pub use_discrete_velocity_lift: bool,
     pub use_equivariant_output: bool,
@@ -467,6 +470,13 @@ impl VIOConfig {
 
         // settings
         settings.use_equivariant_output = self.eqf.settings.use_equivariant_output;
+        settings.imu_bias_group = self
+            .eqf
+            .settings
+            .imu_bias_group
+            .as_deref()
+            .map(ImuBiasGroup::from_config)
+            .unwrap_or_default();
         settings.use_discrete_correction = self.eqf.settings.use_discrete_innovation_lift;
         settings.use_discrete_velocity_lift = self.eqf.settings.use_discrete_velocity_lift;
         settings.use_faster_riccati = self

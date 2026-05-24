@@ -546,8 +546,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     println!(
-        "Filter: chart={}, max_landmarks={}",
-        settings.coordinate_choice, settings.max_landmarks
+        "Filter: chart={}, imu_bias_group={}, max_landmarks={}",
+        settings.coordinate_choice,
+        settings.imu_bias_group.as_str(),
+        settings.max_landmarks
     );
 
     let (cam_model, k_matrix, img_w, img_h): (Arc<dyn CameraModel>, Matrix3<f64>, usize, usize) =

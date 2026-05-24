@@ -31,6 +31,34 @@ pub struct LandmarkDepthPrior {
     pub range_var: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImuBiasGroup {
+    Additive,
+    SemiDirect,
+}
+
+impl Default for ImuBiasGroup {
+    fn default() -> Self {
+        Self::Additive
+    }
+}
+
+impl ImuBiasGroup {
+    pub fn from_config(value: &str) -> Self {
+        match value.to_ascii_lowercase().replace(['-', '_'], "").as_str() {
+            "semidirect" | "sdb" => Self::SemiDirect,
+            _ => Self::Additive,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Additive => "additive",
+            Self::SemiDirect => "semi-direct",
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Settings (matches Python VIOFilterSettings)
 // ---------------------------------------------------------------------------
@@ -71,6 +99,7 @@ pub struct VIOFilterSettings {
 
     // settings
     pub coordinate_choice: String,
+    pub imu_bias_group: ImuBiasGroup,
     pub use_equivariant_output: bool,
     pub use_discrete_correction: bool,
     pub use_discrete_velocity_lift: bool,
@@ -110,6 +139,7 @@ impl Default for VIOFilterSettings {
             process_camera_position: 1.2188313140115635e-05,
             process_point: 0.00029845436136043135,
             coordinate_choice: "Euclidean".to_string(),
+            imu_bias_group: ImuBiasGroup::Additive,
             use_equivariant_output: true,
             use_discrete_correction: false,
             use_discrete_velocity_lift: true,
