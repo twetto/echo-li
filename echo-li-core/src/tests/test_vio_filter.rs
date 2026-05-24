@@ -1,9 +1,10 @@
 use approx::assert_abs_diff_eq;
 use echo_lie::{SE3, SO3};
-use nalgebra::{DMatrix, Vector2, Vector3, Vector6};
+use nalgebra::{DMatrix, SMatrix, Vector2, Vector3, Vector6};
 use std::collections::HashMap;
 
 use crate::coordinate_suite::euclid::EuclideanSuite;
+use crate::mathematical::bias_group_ops::BiasGroupOps;
 use crate::mathematical::camera::{CameraModel, PinholeModel};
 use crate::mathematical::imu_velocity::IMUVelocity;
 use crate::mathematical::vio_eqf::VIOEqF;
@@ -125,11 +126,96 @@ fn test_vio_group_semi_direct_bias_composition() {
         x.a.compose(&y.a).translation,
         epsilon = 1e-12
     );
+    assert_abs_diff_eq!(composed.w, x.w + x.a.rotation.act(&y.w), epsilon = 1e-12);
+}
+
+#[test]
+fn test_semi_direct_bias_action_matches_group_composition() {
+    let ops = BiasGroupOps::new(ImuBiasGroup::SemiDirect);
+    let mut x = VIOGroup::identity_with_bias_group(&[], ImuBiasGroup::SemiDirect);
+    x.beta = Vector6::new(0.1, -0.2, 0.05, 0.3, -0.1, 0.2);
+    x.a = SE3::new(
+        SO3::exp(&Vector3::new(0.2, -0.1, 0.05)),
+        Vector3::new(0.4, -0.2, 0.1),
+    );
+    x.w = Vector3::new(0.2, -0.1, 0.3);
+
+    let mut y = VIOGroup::identity_with_bias_group(&[], ImuBiasGroup::SemiDirect);
+    y.beta = Vector6::new(-0.05, 0.04, 0.02, -0.2, 0.15, -0.03);
+    y.a = SE3::new(
+        SO3::exp(&Vector3::new(-0.08, 0.12, 0.04)),
+        Vector3::new(-0.3, 0.1, 0.2),
+    );
+    y.w = Vector3::new(-0.1, 0.05, 0.2);
+
+    let bias_origin = Vector6::new(0.02, -0.01, 0.03, 0.1, -0.05, 0.04);
+    let sequential = ops.act_bias(&y, &ops.act_bias(&x, &bias_origin));
+    let composed = ops.act_bias(&x.compose(&y), &bias_origin);
+    assert_abs_diff_eq!(composed, sequential, epsilon = 1e-12);
+
+    let identity = x.compose(&x.inverse());
+    assert_abs_diff_eq!(identity.beta, Vector6::zeros(), epsilon = 1e-12);
     assert_abs_diff_eq!(
-        composed.w,
-        x.w + x.a.rotation.act(&y.w),
+        identity.a.log(),
+        nalgebra::Vector6::zeros(),
         epsilon = 1e-12
     );
+    assert_abs_diff_eq!(identity.w, Vector3::zeros(), epsilon = 1e-12);
+}
+
+#[test]
+fn test_semi_direct_physical_bias_beta_jacobian() {
+    let ops = BiasGroupOps::new(ImuBiasGroup::SemiDirect);
+    let mut x = VIOGroup::identity_with_bias_group(&[], ImuBiasGroup::SemiDirect);
+    x.beta = Vector6::new(0.1, -0.2, 0.05, 0.3, -0.1, 0.2);
+    x.a = SE3::new(
+        SO3::exp(&Vector3::new(0.25, -0.15, 0.08)),
+        Vector3::new(0.4, -0.2, 0.1),
+    );
+    x.w = Vector3::new(0.2, -0.1, 0.3);
+    let bias_origin = Vector6::new(0.02, -0.01, 0.03, 0.1, -0.05, 0.04);
+
+    let eps = 1e-7;
+    let mut numerical = SMatrix::<f64, 6, 6>::zeros();
+    for col in 0..6 {
+        let mut xp = x.clone();
+        let mut xm = x.clone();
+        xp.beta[col] += eps;
+        xm.beta[col] -= eps;
+        let fp = ops.act_bias(&xp, &bias_origin);
+        let fm = ops.act_bias(&xm, &bias_origin);
+        numerical.set_column(col, &((fp - fm) / (2.0 * eps)));
+    }
+
+    let expected = BiasGroupOps::bias_action_matrix(&x).inverse().adjoint();
+    assert_abs_diff_eq!(numerical, expected, epsilon = 1e-8);
+}
+
+#[test]
+fn test_semi_direct_beta_for_physical_bias_update() {
+    let ops = BiasGroupOps::new(ImuBiasGroup::SemiDirect);
+    let mut current = VIOGroup::identity_with_bias_group(&[], ImuBiasGroup::SemiDirect);
+    current.beta = Vector6::new(0.1, -0.2, 0.05, 0.3, -0.1, 0.2);
+    current.a = SE3::new(
+        SO3::exp(&Vector3::new(0.12, -0.05, 0.03)),
+        Vector3::new(0.2, -0.1, 0.05),
+    );
+    current.w = Vector3::new(0.08, -0.03, 0.1);
+
+    let mut delta = VIOGroup::identity_with_bias_group(&[], ImuBiasGroup::SemiDirect);
+    delta.a = SE3::new(
+        SO3::exp(&Vector3::new(-0.02, 0.04, 0.01)),
+        Vector3::new(-0.03, 0.02, 0.01),
+    );
+    delta.w = Vector3::new(0.01, -0.02, 0.03);
+
+    let bias_origin = Vector6::new(0.02, -0.01, 0.03, 0.1, -0.05, 0.04);
+    let physical_delta = Vector6::new(0.004, -0.002, 0.003, -0.01, 0.005, -0.006);
+    let before = ops.act_bias(&current, &bias_origin);
+    delta.beta = ops.beta_for_physical_bias_update(&current, &delta, &bias_origin, &physical_delta);
+    let after = ops.act_bias(&delta.compose(&current), &bias_origin);
+
+    assert_abs_diff_eq!(after, before + physical_delta, epsilon = 1e-12);
 }
 
 #[test]

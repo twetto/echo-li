@@ -45,6 +45,24 @@ impl BiasGroupOps {
         }
     }
 
+    pub fn beta_for_physical_bias_update(
+        self,
+        current: &VIOGroup,
+        delta_geometry: &VIOGroup,
+        bias_origin: &Vector6<f64>,
+        physical_bias_delta: &Vector6<f64>,
+    ) -> Vector6<f64> {
+        match self.kind {
+            ImuBiasGroup::Additive => *physical_bias_delta,
+            ImuBiasGroup::SemiDirect => {
+                let ad_delta = Self::bias_action_matrix(delta_geometry).adjoint();
+                let ad_current = Self::bias_action_matrix(current).adjoint();
+                (ad_delta - nalgebra::SMatrix::<f64, 6, 6>::identity()) * bias_origin
+                    + ad_delta * ad_current * physical_bias_delta
+            }
+        }
+    }
+
     pub fn exp_beta(self, lam: &VIOAlgebra) -> Vector6<f64> {
         match self.kind {
             ImuBiasGroup::Additive => lam.u_beta,
