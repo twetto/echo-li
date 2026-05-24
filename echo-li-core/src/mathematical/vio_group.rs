@@ -1,7 +1,8 @@
-use nalgebra::{Vector3, Vector6, Vector4};
-use echo_lie::{SO3, SE3, SOT3, SE23, base::LieGroup};
+use echo_lie::{base::LieGroup, SE3, SE23, SO3, SOT3};
+use nalgebra::{Vector3, Vector4, Vector6};
 
-use crate::mathematical::vio_state::{VIOState, VIOSensorState, Landmark, GRAVITY_CONSTANT};
+use crate::mathematical::vio_state::{Landmark, VIOSensorState, VIOState, GRAVITY_CONSTANT};
+use crate::ImuBiasGroup;
 
 /// Symmetry group element for EqVIO.
 #[derive(Debug, Clone)]
@@ -12,10 +13,15 @@ pub struct VIOGroup {
     pub b: SE3,
     pub q: Vec<SOT3>,
     pub id: Vec<u64>,
+    pub imu_bias_group: ImuBiasGroup,
 }
 
 impl VIOGroup {
     pub fn identity(ids: &[u64]) -> Self {
+        Self::identity_with_bias_group(ids, ImuBiasGroup::Additive)
+    }
+
+    pub fn identity_with_bias_group(ids: &[u64], imu_bias_group: ImuBiasGroup) -> Self {
         Self {
             beta: Vector6::zeros(),
             a: SE3::identity(),
@@ -23,29 +29,52 @@ impl VIOGroup {
             b: SE3::identity(),
             q: vec![SOT3::identity(); ids.len()],
             id: ids.to_vec(),
+            imu_bias_group,
         }
     }
 
     pub fn inverse(&self) -> Self {
+        let beta = match self.imu_bias_group {
+            ImuBiasGroup::Additive => -self.beta,
+            ImuBiasGroup::SemiDirect => {
+                -(self.bias_action_matrix().inverse().adjoint() * self.beta)
+            }
+        };
         Self {
-            beta: -self.beta,
+            beta,
             a: self.a.inverse(),
             w: -(self.a.rotation.inverse().act(&self.w)),
             b: self.b.inverse(),
             q: self.q.iter().map(|qi| qi.inverse()).collect(),
             id: self.id.clone(),
+            imu_bias_group: self.imu_bias_group,
         }
     }
 
     pub fn compose(&self, other: &Self) -> Self {
+        let imu_bias_group = self.imu_bias_group;
+        let beta = match imu_bias_group {
+            ImuBiasGroup::Additive => self.beta + other.beta,
+            ImuBiasGroup::SemiDirect => self.beta + self.bias_action_matrix().adjoint() * other.beta,
+        };
         Self {
-            beta: self.beta + other.beta,
+            beta,
             a: self.a.compose(&other.a),
             w: self.w + self.a.rotation.act(&other.w),
             b: self.b.compose(&other.b),
             q: self.q.iter().zip(other.q.iter()).map(|(q1, q2)| q1.compose(q2)).collect(),
             id: self.id.clone(),
+            imu_bias_group,
         }
+    }
+
+    pub fn with_bias_group(mut self, imu_bias_group: ImuBiasGroup) -> Self {
+        self.imu_bias_group = imu_bias_group;
+        self
+    }
+
+    fn bias_action_matrix(&self) -> SE3 {
+        SE3::new(self.a.rotation.clone(), self.w)
     }
 }
 
@@ -88,8 +117,14 @@ impl std::ops::Sub for &VIOAlgebra {
 }
 
 pub fn sensor_state_group_action(x: &VIOGroup, sensor: &VIOSensorState) -> VIOSensorState {
+    let input_bias = match x.imu_bias_group {
+        ImuBiasGroup::Additive => sensor.input_bias + x.beta,
+        ImuBiasGroup::SemiDirect => {
+            x.bias_action_matrix().inverse().adjoint() * (sensor.input_bias + x.beta)
+        }
+    };
     VIOSensorState {
-        input_bias: sensor.input_bias + x.beta,
+        input_bias,
         pose: sensor.pose.compose(&x.a),
         velocity: x.a.rotation.inverse().act(&(sensor.velocity - x.w)),
         camera_offset: x.a.inverse().compose(&sensor.camera_offset).compose(&x.b),
@@ -161,18 +196,32 @@ pub fn lift_velocity(state: &VIOState, velocity: &crate::mathematical::imu_veloc
 }
 
 pub fn vio_exp(lam: &VIOAlgebra) -> VIOGroup {
+    vio_exp_with_bias_group(lam, ImuBiasGroup::Additive)
+}
+
+pub fn vio_exp_with_bias_group(lam: &VIOAlgebra, imu_bias_group: ImuBiasGroup) -> VIOGroup {
     let mut ext_vel = nalgebra::SVector::<f64, 9>::zeros();
     ext_vel.fixed_rows_mut::<6>(0).copy_from(&lam.u_a);
     ext_vel.fixed_rows_mut::<3>(6).copy_from(&lam.u_w);
     let ext_pose = SE23::exp(&ext_vel);
+    let beta = match imu_bias_group {
+        ImuBiasGroup::Additive => lam.u_beta,
+        ImuBiasGroup::SemiDirect => {
+            let mut b_tangent = Vector6::zeros();
+            b_tangent.fixed_rows_mut::<3>(0).copy_from(&lam.u_a.fixed_rows::<3>(0));
+            b_tangent.fixed_rows_mut::<3>(3).copy_from(&lam.u_w);
+            SE3::left_jacobian(&b_tangent) * lam.u_beta
+        }
+    };
 
     VIOGroup {
-        beta: lam.u_beta,
+        beta,
         a: SE3::new(ext_pose.rotation, ext_pose.position),
         w: ext_pose.velocity,
         b: SE3::exp(&lam.u_b),
         q: lam.w.iter().map(|wi| SOT3::exp(wi)).collect(),
         id: lam.id.clone(),
+        imu_bias_group,
     }
 }
 
@@ -223,5 +272,13 @@ pub fn lift_velocity_discrete(state: &VIOState, velocity: &crate::mathematical::
         id_vec.push(lm.id);
     }
 
-    VIOGroup { beta, a, w, b, q: q_vec, id: id_vec }
+    VIOGroup {
+        beta,
+        a,
+        w,
+        b,
+        q: q_vec,
+        id: id_vec,
+        imu_bias_group: ImuBiasGroup::Additive,
+    }
 }

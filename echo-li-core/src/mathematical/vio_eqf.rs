@@ -6,15 +6,18 @@ use crate::mathematical::camera::CameraModel;
 use crate::mathematical::eqf_matrices::EqFCoordinateSuite;
 use crate::mathematical::imu_velocity::IMUVelocity;
 use crate::mathematical::vio_group::{
-    lift_velocity, lift_velocity_discrete, state_group_action, vio_exp, VIOGroup,
+    lift_velocity, lift_velocity_discrete, state_group_action, vio_exp_with_bias_group, VIOGroup,
 };
 use crate::mathematical::vio_state::{Landmark, VIOSensorState, VIOState};
+use echo_lie::SE3;
+use crate::ImuBiasGroup;
 
 pub struct VIOEqF {
     pub xi0: VIOState,
     pub x: VIOGroup,
     pub sigma: DMatrix<f64>,
     pub current_time: f64,
+    imu_bias_group: ImuBiasGroup,
     scratch_m: DMatrix<f64>,
     scratch_sigma: DMatrix<f64>,
     // `Faster` variant accumulator — the sub-frame transition Φ in block form
@@ -31,8 +34,16 @@ pub struct VIOEqF {
 
 impl VIOEqF {
     pub fn new(xi0: VIOState, initial_covariance: &DMatrix<f64>) -> Self {
+        Self::new_with_bias_group(xi0, initial_covariance, ImuBiasGroup::Additive)
+    }
+
+    pub fn new_with_bias_group(
+        xi0: VIOState,
+        initial_covariance: &DMatrix<f64>,
+        imu_bias_group: ImuBiasGroup,
+    ) -> Self {
         let sigma = initial_covariance.clone();
-        let x = VIOGroup::identity(&xi0.get_ids());
+        let x = VIOGroup::identity_with_bias_group(&xi0.get_ids(), imu_bias_group);
         let n = xi0.dim();
         let n_lm = (n - VIOSensorState::CDIM) / 3;
 
@@ -41,6 +52,7 @@ impl VIOEqF {
             x,
             sigma,
             current_time: -1.0,
+            imu_bias_group,
             scratch_m: DMatrix::<f64>::zeros(n, n),
             scratch_sigma: DMatrix::<f64>::zeros(n, n),
             phi_ss: SMatrix::<f64, 21, 21>::identity(),
@@ -63,10 +75,19 @@ impl VIOEqF {
     // ------------------------------------------------------------------
 
     pub fn integrate_observer_state(&mut self, imu: &IMUVelocity, dt: f64, discrete_lift: bool) {
+        let state = self.state_estimate();
+        let mut additive_bias_delta = nalgebra::Vector6::zeros();
+        additive_bias_delta
+            .fixed_rows_mut::<3>(0)
+            .copy_from(&(dt * imu.gyr_bias_vel));
+        additive_bias_delta
+            .fixed_rows_mut::<3>(3)
+            .copy_from(&(dt * imu.acc_bias_vel));
+
         let lifted = if discrete_lift {
-            lift_velocity_discrete(&self.state_estimate(), imu, dt)
+            lift_velocity_discrete(&state, imu, dt)
         } else {
-            let lifted_alg = lift_velocity(&self.state_estimate(), imu);
+            let lifted_alg = lift_velocity(&state, imu);
             // Scale algebra by dt, then exponentiate
             let scaled = crate::mathematical::vio_group::VIOAlgebra {
                 u_beta: lifted_alg.u_beta * dt,
@@ -76,9 +97,25 @@ impl VIOEqF {
                 w: lifted_alg.w.iter().map(|wi| wi * dt).collect(),
                 id: lifted_alg.id,
             };
-            vio_exp(&scaled)
+            vio_exp_with_bias_group(&scaled, self.imu_bias_group)
         };
+        let lifted = self.prepare_observer_increment(lifted, &state, additive_bias_delta);
         self.x = self.x.compose(&lifted);
+    }
+
+    fn prepare_observer_increment(
+        &self,
+        mut lifted: VIOGroup,
+        state: &VIOState,
+        additive_bias_delta: nalgebra::Vector6<f64>,
+    ) -> VIOGroup {
+        if self.imu_bias_group == ImuBiasGroup::SemiDirect {
+            let b_action = SE3::new(lifted.a.rotation.clone(), lifted.w);
+            lifted.beta =
+                b_action.adjoint() * (state.sensor.input_bias + additive_bias_delta)
+                    - state.sensor.input_bias;
+        }
+        lifted.with_bias_group(self.imu_bias_group)
     }
 
     // ------------------------------------------------------------------
@@ -469,11 +506,12 @@ impl VIOEqF {
         if use_discrete_correction {
             let delta = suite
                 .lift_innovation_discrete(&DVector::from_column_slice(gamma.as_slice()), &self.xi0);
+            let delta = delta.with_bias_group(self.imu_bias_group);
             self.x = delta.compose(&self.x);
         } else {
             let delta_alg =
                 suite.lift_innovation(&DVector::from_column_slice(gamma.as_slice()), &self.xi0);
-            let delta = vio_exp(&delta_alg);
+            let delta = vio_exp_with_bias_group(&delta_alg, self.imu_bias_group);
             self.x = delta.compose(&self.x);
         }
 

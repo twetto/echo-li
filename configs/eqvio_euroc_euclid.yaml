@@ -66,6 +66,7 @@ eqf:
     useMedianDepth: true
     # Riccati variant: fast = per-sample; faster = batched per image sub-frame.
     riccatiVariant: faster
+    imuBiasGroup: semiDirect
   velocityNoise:
     acc: 0.012438843268295521
     accBias: 0.004462289865453429

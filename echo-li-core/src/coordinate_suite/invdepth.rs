@@ -444,48 +444,8 @@ impl EqFCoordinateSuite for InvDepthSuite {
         total_innovation: &DVector<f64>,
         xi0: &VIOState,
     ) -> VIOGroup {
-        // Sensor part identical to Euclidean.
-        // Landmark part uses InvDepth chart inverse to get perturbed position.
-        let s = VIOSensorState::CDIM;
-        let n = xi0.camera_landmarks.len();
-
-        let beta = total_innovation.fixed_rows::<6>(0).into_owned();
-        let a = SE3::exp(&total_innovation.fixed_rows::<6>(6).into_owned());
-
-        let gamma_v = total_innovation.fixed_rows::<3>(12).into_owned();
-        let v0 = xi0.sensor.velocity;
-        let w = v0 - a.rotation.act(&(v0 + gamma_v));
-
-        let b = xi0
-            .sensor
-            .camera_offset
-            .inverse()
-            .compose(&a)
-            .compose(&xi0.sensor.camera_offset)
-            .compose(&SE3::exp(
-                &total_innovation.fixed_rows::<6>(15).into_owned(),
-            ));
-
-        let mut q_vec = Vec::with_capacity(n);
-        let mut id_vec = Vec::with_capacity(n);
-        for i in 0..n {
-            let q0 = xi0.camera_landmarks[i].p;
-            let gamma_qi = total_innovation.fixed_rows::<3>(s + 3 * i).into_owned();
-            let q1 = point_chart_invdepth_inv(&gamma_qi, &q0);
-
-            let rot = SO3::from_vectors(&q1.normalize(), &q0.normalize());
-            let scale = q0.norm() / q1.norm();
-            q_vec.push(SOT3::new(rot, scale));
-            id_vec.push(xi0.camera_landmarks[i].id);
-        }
-
-        VIOGroup {
-            beta,
-            a,
-            w,
-            b,
-            q: q_vec,
-            id: id_vec,
-        }
+        let xi = self.state_chart_inv(total_innovation, xi0);
+        let inn_euc = EuclideanSuite.state_chart(&xi, xi0);
+        EuclideanSuite.lift_innovation_discrete(&inn_euc, xi0)
     }
 }

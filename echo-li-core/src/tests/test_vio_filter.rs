@@ -7,10 +7,11 @@ use crate::coordinate_suite::euclid::EuclideanSuite;
 use crate::mathematical::camera::{CameraModel, PinholeModel};
 use crate::mathematical::imu_velocity::IMUVelocity;
 use crate::mathematical::vio_eqf::VIOEqF;
+use crate::mathematical::vio_group::VIOGroup;
 use crate::mathematical::vio_state::{Landmark, VIOSensorState, VIOState, GRAVITY_CONSTANT};
 use crate::mathematical::vision_measurement::VisionMeasurement;
 use crate::tests::testing_utilities::*;
-use crate::{LandmarkDepthPrior, VIOFilter, VIOFilterSettings};
+use crate::{ImuBiasGroup, LandmarkDepthPrior, VIOFilter, VIOFilterSettings};
 
 fn make_xi0_with_landmarks(n: usize) -> VIOState {
     let mut landmarks = Vec::new();
@@ -85,6 +86,113 @@ fn test_eqf_new_identity_state() {
 fn test_eqf_new_get_ids() {
     let xi0 = make_xi0_with_landmarks(3);
     assert_eq!(xi0.get_ids(), vec![0, 1, 2]);
+}
+
+#[test]
+fn test_filter_new_wires_semi_direct_bias_group() {
+    let mut settings = VIOFilterSettings::default();
+    settings.imu_bias_group = ImuBiasGroup::SemiDirect;
+    let xi0 = make_xi0_with_landmarks(0);
+    let filter = VIOFilter::new(settings, xi0);
+
+    assert_eq!(filter.eqf.x.imu_bias_group, ImuBiasGroup::SemiDirect);
+}
+
+#[test]
+fn test_vio_group_semi_direct_bias_composition() {
+    let mut x = VIOGroup::identity_with_bias_group(&[], ImuBiasGroup::SemiDirect);
+    x.beta = Vector6::new(0.1, -0.2, 0.05, 0.3, -0.1, 0.2);
+    x.a = SE3::new(
+        SO3::exp(&Vector3::new(0.02, -0.03, 0.01)),
+        Vector3::new(0.4, -0.2, 0.1),
+    );
+    x.w = Vector3::new(0.2, -0.1, 0.3);
+
+    let mut y = VIOGroup::identity_with_bias_group(&[], ImuBiasGroup::SemiDirect);
+    y.beta = Vector6::new(-0.05, 0.04, 0.02, -0.2, 0.15, -0.03);
+    y.a = SE3::new(
+        SO3::exp(&Vector3::new(-0.01, 0.04, 0.02)),
+        Vector3::new(-0.3, 0.1, 0.2),
+    );
+    y.w = Vector3::new(-0.1, 0.05, 0.2);
+
+    let composed = x.compose(&y);
+    let expected_beta = x.beta + SE3::new(x.a.rotation.clone(), x.w).adjoint() * y.beta;
+
+    assert_abs_diff_eq!(composed.beta, expected_beta, epsilon = 1e-12);
+    assert_abs_diff_eq!(
+        composed.a.translation,
+        x.a.compose(&y.a).translation,
+        epsilon = 1e-12
+    );
+    assert_abs_diff_eq!(
+        composed.w,
+        x.w + x.a.rotation.act(&y.w),
+        epsilon = 1e-12
+    );
+}
+
+#[test]
+fn test_semi_direct_observer_integration_matches_kinematics() {
+    let mut rng = rand::rng();
+    let xi0 = reasonable_state_element(3, &mut rng);
+    let init_cov = DMatrix::<f64>::identity(xi0.dim(), xi0.dim()) * 0.01;
+    let mut eqf = VIOEqF::new_with_bias_group(xi0.clone(), &init_cov, ImuBiasGroup::SemiDirect);
+
+    let imu = random_velocity_element(&mut rng);
+    let dt = 0.01;
+
+    eqf.integrate_observer_state(&imu, dt, true);
+    let est = eqf.state_estimate();
+    let gt = crate::mathematical::vio_state::integrate_system_function(&xi0, &imu, dt);
+
+    assert!(
+        state_distance(&est, &gt) < 1e-10,
+        "Semi-direct observer integration diverged from kinematics: dist={}",
+        state_distance(&est, &gt)
+    );
+}
+
+#[test]
+fn test_semi_direct_bias_update_runs_for_all_charts() {
+    let cam = make_pinhole();
+
+    for coordinate_choice in ["Euclidean", "InvDepth", "Normal"] {
+        for use_discrete_correction in [false, true] {
+            let mut settings = VIOFilterSettings::default();
+            settings.coordinate_choice = coordinate_choice.to_string();
+            settings.imu_bias_group = ImuBiasGroup::SemiDirect;
+            settings.use_discrete_correction = use_discrete_correction;
+
+            let xi0 = make_xi0_with_landmarks(3);
+            let mut filter = VIOFilter::new(settings, xi0.clone());
+
+            filter.process_imu(stationary_imu(0.0));
+            filter.process_imu(stationary_imu(0.005));
+
+            let mut coords = HashMap::new();
+            for lm in &xi0.camera_landmarks {
+                let proj = cam.project(&lm.p) + Vector2::new(0.4, -0.25);
+                coords.insert(lm.id, Vector2::new(proj[0] as f32, proj[1] as f32));
+            }
+            let measurement = VisionMeasurement::new(0.005, coords);
+            filter.process_vision(measurement, &cam);
+
+            let est = filter.state_estimate();
+            assert!(
+                est.sensor.input_bias.iter().all(|v| v.is_finite()),
+                "non-finite bias for chart={coordinate_choice}, discrete={use_discrete_correction}"
+            );
+            assert!(
+                est.sensor.pose.translation.iter().all(|v| v.is_finite()),
+                "non-finite position for chart={coordinate_choice}, discrete={use_discrete_correction}"
+            );
+            assert!(
+                filter.eqf.sigma.iter().all(|v| v.is_finite()),
+                "non-finite covariance for chart={coordinate_choice}, discrete={use_discrete_correction}"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

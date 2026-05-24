@@ -4,6 +4,7 @@ use rand_distr::{Normal, Distribution};
 use echo_lie::{SO3, SE3, SOT3, base::LieGroup};
 use crate::mathematical::vio_state::{VIOState, VIOSensorState, Landmark};
 use crate::mathematical::vio_group::{VIOGroup, VIOAlgebra};
+use crate::ImuBiasGroup;
 
 pub fn log_norm(x: &VIOGroup) -> f64 {
     let mut sum_sq = x.beta.norm_squared();
@@ -89,6 +90,7 @@ pub fn random_group_element<R: Rng>(n_landmarks: usize, rng: &mut R) -> VIOGroup
         b: SE3::new(SO3::exp(&Vector3::new(rng.random(), rng.random(), rng.random())), Vector3::new(rng.random(), rng.random(), rng.random())),
         q,
         id,
+        imu_bias_group: ImuBiasGroup::Additive,
     }
 }
 
@@ -108,6 +110,7 @@ pub fn reasonable_group_element<R: Rng>(n_landmarks: usize, rng: &mut R) -> VIOG
         b: SE3::new(SO3::exp(&(Vector3::from_fn(|_, _| normal.sample(rng)) * 0.1)), Vector3::from_fn(|_, _| normal.sample(rng)) * 0.1),
         q,
         id,
+        imu_bias_group: ImuBiasGroup::Additive,
     }
 }
 

@@ -268,10 +268,11 @@ impl VIOFilter {
         let n_lm = xi0.camera_landmarks.len();
         let state_gain = settings.state_gain_matrix(n_lm);
         let init_cov = settings.initial_covariance(n_lm);
+        let imu_bias_group = settings.imu_bias_group;
 
         Self {
             settings,
-            eqf: VIOEqF::new(xi0, &init_cov),
+            eqf: VIOEqF::new_with_bias_group(xi0, &init_cov, imu_bias_group),
             suite,
             pending_imu: Vec::new(),
             input_gain,

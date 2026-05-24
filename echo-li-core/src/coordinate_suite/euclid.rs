@@ -7,6 +7,7 @@ use crate::mathematical::eqf_matrices::{EqFCoordinateSuite, RiccatiPropagationBl
 use crate::mathematical::imu_velocity::IMUVelocity;
 use crate::mathematical::vio_group::{state_group_action, VIOAlgebra, VIOGroup};
 use crate::mathematical::vio_state::{VIOSensorState, VIOState, GRAVITY_CONSTANT};
+use crate::ImuBiasGroup;
 
 pub struct EuclideanSuite;
 
@@ -401,6 +402,7 @@ impl EqFCoordinateSuite for EuclideanSuite {
             b,
             q: q_vec,
             id: id_vec,
+            imu_bias_group: ImuBiasGroup::Additive,
         }
     }
 }
