@@ -1,6 +1,6 @@
 use approx::assert_abs_diff_eq;
 use echo_lie::{SE3, SO3};
-use nalgebra::{DMatrix, SMatrix, Vector2, Vector3, Vector6};
+use nalgebra::{DMatrix, DVector, SMatrix, Vector2, Vector3, Vector6};
 use std::collections::HashMap;
 
 use crate::coordinate_suite::euclid::EuclideanSuite;
@@ -216,6 +216,49 @@ fn test_semi_direct_beta_for_physical_bias_update() {
     let after = ops.act_bias(&delta.compose(&current), &bias_origin);
 
     assert_abs_diff_eq!(after, before + physical_delta, epsilon = 1e-12);
+}
+
+#[test]
+fn test_semi_direct_stacked_update_preserves_physical_bias_increment() {
+    let suite = EuclideanSuite;
+    let mut xi0 = make_xi0_with_landmarks(0);
+    xi0.sensor.input_bias = Vector6::new(0.02, -0.01, 0.03, 0.1, -0.05, 0.04);
+
+    for use_discrete_correction in [false, true] {
+        let mut eqf = VIOEqF::new_with_bias_group(
+            xi0.clone(),
+            &DMatrix::<f64>::identity(VIOSensorState::CDIM, VIOSensorState::CDIM),
+            ImuBiasGroup::SemiDirect,
+        );
+        eqf.x.a = SE3::new(
+            SO3::exp(&Vector3::new(0.12, -0.05, 0.03)),
+            Vector3::new(0.2, -0.1, 0.05),
+        );
+        eqf.x.w = Vector3::new(0.08, -0.03, 0.1);
+        eqf.x.beta = Vector6::new(0.1, -0.2, 0.05, 0.3, -0.1, 0.2);
+
+        let before = eqf.state_estimate().sensor.input_bias;
+
+        let physical_bias_delta = Vector6::new(0.004, -0.002, 0.003, -0.01, 0.005, -0.006);
+        let mut residual = DVector::<f64>::zeros(VIOSensorState::CDIM);
+        residual
+            .fixed_rows_mut::<6>(0)
+            .copy_from(&physical_bias_delta);
+        residual
+            .fixed_rows_mut::<6>(6)
+            .copy_from(&Vector6::new(0.02, -0.01, 0.03, -0.04, 0.02, 0.01));
+
+        eqf.perform_stacked_update(
+            &suite,
+            &residual,
+            &DMatrix::<f64>::identity(VIOSensorState::CDIM, VIOSensorState::CDIM),
+            &DMatrix::<f64>::zeros(VIOSensorState::CDIM, VIOSensorState::CDIM),
+            use_discrete_correction,
+        );
+
+        let after = eqf.state_estimate().sensor.input_bias;
+        assert_abs_diff_eq!(after, before + physical_bias_delta, epsilon = 1e-12);
+    }
 }
 
 #[test]

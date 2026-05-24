@@ -503,16 +503,34 @@ impl VIOEqF {
         if use_discrete_correction {
             let delta = suite
                 .lift_innovation_discrete(&DVector::from_column_slice(gamma.as_slice()), &self.xi0);
-            let delta = delta.with_bias_group(self.imu_bias_group);
+            let physical_bias_delta = delta.beta;
+            let delta = self.prepare_correction_increment(delta, &physical_bias_delta);
             self.x = delta.compose(&self.x);
         } else {
             let delta_alg =
                 suite.lift_innovation(&DVector::from_column_slice(gamma.as_slice()), &self.xi0);
+            let physical_bias_delta = delta_alg.u_beta;
             let delta = vio_exp_with_bias_group(&delta_alg, self.imu_bias_group);
+            let delta = self.prepare_correction_increment(delta, &physical_bias_delta);
             self.x = delta.compose(&self.x);
         }
 
         self.enforce_spd();
+    }
+
+    fn prepare_correction_increment(
+        &self,
+        mut delta: VIOGroup,
+        physical_bias_delta: &nalgebra::Vector6<f64>,
+    ) -> VIOGroup {
+        let ops = BiasGroupOps::new(self.imu_bias_group);
+        delta.beta = ops.beta_for_physical_bias_update(
+            &self.x,
+            &delta,
+            &self.xi0.sensor.input_bias,
+            physical_bias_delta,
+        );
+        delta.with_bias_group(self.imu_bias_group)
     }
 
     // ------------------------------------------------------------------
