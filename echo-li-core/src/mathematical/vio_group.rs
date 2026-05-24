@@ -1,6 +1,7 @@
-use echo_lie::{base::LieGroup, SE3, SE23, SO3, SOT3};
+use echo_lie::{base::LieGroup, SE23, SE3, SO3, SOT3};
 use nalgebra::{Vector3, Vector4, Vector6};
 
+use crate::mathematical::bias_group_ops::BiasGroupOps;
 use crate::mathematical::vio_state::{Landmark, VIOSensorState, VIOState, GRAVITY_CONSTANT};
 use crate::ImuBiasGroup;
 
@@ -34,14 +35,9 @@ impl VIOGroup {
     }
 
     pub fn inverse(&self) -> Self {
-        let beta = match self.imu_bias_group {
-            ImuBiasGroup::Additive => -self.beta,
-            ImuBiasGroup::SemiDirect => {
-                -(self.bias_action_matrix().inverse().adjoint() * self.beta)
-            }
-        };
+        let ops = BiasGroupOps::new(self.imu_bias_group);
         Self {
-            beta,
+            beta: ops.inverse_beta(self),
             a: self.a.inverse(),
             w: -(self.a.rotation.inverse().act(&self.w)),
             b: self.b.inverse(),
@@ -52,29 +48,26 @@ impl VIOGroup {
     }
 
     pub fn compose(&self, other: &Self) -> Self {
-        let imu_bias_group = self.imu_bias_group;
-        let beta = match imu_bias_group {
-            ImuBiasGroup::Additive => self.beta + other.beta,
-            ImuBiasGroup::SemiDirect => self.beta + self.bias_action_matrix().adjoint() * other.beta,
-        };
+        let ops = BiasGroupOps::new(self.imu_bias_group);
         Self {
-            beta,
+            beta: ops.compose_beta(self, &other.beta),
             a: self.a.compose(&other.a),
             w: self.w + self.a.rotation.act(&other.w),
             b: self.b.compose(&other.b),
-            q: self.q.iter().zip(other.q.iter()).map(|(q1, q2)| q1.compose(q2)).collect(),
+            q: self
+                .q
+                .iter()
+                .zip(other.q.iter())
+                .map(|(q1, q2)| q1.compose(q2))
+                .collect(),
             id: self.id.clone(),
-            imu_bias_group,
+            imu_bias_group: ops.kind(),
         }
     }
 
     pub fn with_bias_group(mut self, imu_bias_group: ImuBiasGroup) -> Self {
         self.imu_bias_group = imu_bias_group;
         self
-    }
-
-    fn bias_action_matrix(&self) -> SE3 {
-        SE3::new(self.a.rotation.clone(), self.w)
     }
 }
 
@@ -96,7 +89,12 @@ impl std::ops::Sub for VIOAlgebra {
             u_a: self.u_a - rhs.u_a,
             u_b: self.u_b - rhs.u_b,
             u_w: self.u_w - rhs.u_w,
-            w: self.w.iter().zip(rhs.w.iter()).map(|(a, b)| a - b).collect(),
+            w: self
+                .w
+                .iter()
+                .zip(rhs.w.iter())
+                .map(|(a, b)| a - b)
+                .collect(),
             id: self.id,
         }
     }
@@ -110,19 +108,19 @@ impl std::ops::Sub for &VIOAlgebra {
             u_a: self.u_a - rhs.u_a,
             u_b: self.u_b - rhs.u_b,
             u_w: self.u_w - rhs.u_w,
-            w: self.w.iter().zip(rhs.w.iter()).map(|(a, b)| a - b).collect(),
+            w: self
+                .w
+                .iter()
+                .zip(rhs.w.iter())
+                .map(|(a, b)| a - b)
+                .collect(),
             id: self.id.clone(),
         }
     }
 }
 
 pub fn sensor_state_group_action(x: &VIOGroup, sensor: &VIOSensorState) -> VIOSensorState {
-    let input_bias = match x.imu_bias_group {
-        ImuBiasGroup::Additive => sensor.input_bias + x.beta,
-        ImuBiasGroup::SemiDirect => {
-            x.bias_action_matrix().inverse().adjoint() * (sensor.input_bias + x.beta)
-        }
-    };
+    let input_bias = BiasGroupOps::new(x.imu_bias_group).act_bias(x, &sensor.input_bias);
     VIOSensorState {
         input_bias,
         pose: sensor.pose.compose(&x.a),
@@ -149,15 +147,22 @@ pub fn state_group_action(x: &VIOGroup, state: &VIOState) -> VIOState {
 
 /// Continuous lift: maps (state, IMU velocity) to VIOAlgebra.
 /// Reference: liftVelocity() in Python vio_group.py
-pub fn lift_velocity(state: &VIOState, velocity: &crate::mathematical::imu_velocity::IMUVelocity) -> VIOAlgebra {
+pub fn lift_velocity(
+    state: &VIOState,
+    velocity: &crate::mathematical::imu_velocity::IMUVelocity,
+) -> VIOAlgebra {
     let sensor = &state.sensor;
     let v_est_gyr = velocity.gyr - sensor.gyro_bias();
     let v_est_acc = velocity.acc - sensor.accel_bias();
 
     // Bias lift
     let mut u_beta = Vector6::zeros();
-    u_beta.fixed_rows_mut::<3>(0).copy_from(&velocity.gyr_bias_vel);
-    u_beta.fixed_rows_mut::<3>(3).copy_from(&velocity.acc_bias_vel);
+    u_beta
+        .fixed_rows_mut::<3>(0)
+        .copy_from(&velocity.gyr_bias_vel);
+    u_beta
+        .fixed_rows_mut::<3>(3)
+        .copy_from(&velocity.acc_bias_vel);
 
     // SE(3) pose velocity: U_A = [omega; v] = [gyr; body_velocity]
     let mut u_a = Vector6::zeros();
@@ -183,7 +188,8 @@ pub fn lift_velocity(state: &VIOState, velocity: &crate::mathematical::imu_veloc
         let pp = p.norm_squared();
         let mut wi = Vector4::zeros();
         if pp > 1e-20 {
-            wi.fixed_rows_mut::<3>(0).copy_from(&(omega_c + p.cross(&v_c) / pp));
+            wi.fixed_rows_mut::<3>(0)
+                .copy_from(&(omega_c + p.cross(&v_c) / pp));
             wi[3] = p.dot(&v_c) / pp;
         } else {
             wi.fixed_rows_mut::<3>(0).copy_from(&omega_c);
@@ -192,7 +198,14 @@ pub fn lift_velocity(state: &VIOState, velocity: &crate::mathematical::imu_veloc
         id_vec.push(lm.id);
     }
 
-    VIOAlgebra { u_beta, u_a, u_b, u_w, w: w_vec, id: id_vec }
+    VIOAlgebra {
+        u_beta,
+        u_a,
+        u_b,
+        u_w,
+        w: w_vec,
+        id: id_vec,
+    }
 }
 
 pub fn vio_exp(lam: &VIOAlgebra) -> VIOGroup {
@@ -204,57 +217,63 @@ pub fn vio_exp_with_bias_group(lam: &VIOAlgebra, imu_bias_group: ImuBiasGroup) -
     ext_vel.fixed_rows_mut::<6>(0).copy_from(&lam.u_a);
     ext_vel.fixed_rows_mut::<3>(6).copy_from(&lam.u_w);
     let ext_pose = SE23::exp(&ext_vel);
-    let beta = match imu_bias_group {
-        ImuBiasGroup::Additive => lam.u_beta,
-        ImuBiasGroup::SemiDirect => {
-            let mut b_tangent = Vector6::zeros();
-            b_tangent.fixed_rows_mut::<3>(0).copy_from(&lam.u_a.fixed_rows::<3>(0));
-            b_tangent.fixed_rows_mut::<3>(3).copy_from(&lam.u_w);
-            SE3::left_jacobian(&b_tangent) * lam.u_beta
-        }
-    };
+    let ops = BiasGroupOps::new(imu_bias_group);
 
     VIOGroup {
-        beta,
+        beta: ops.exp_beta(lam),
         a: SE3::new(ext_pose.rotation, ext_pose.position),
         w: ext_pose.velocity,
         b: SE3::exp(&lam.u_b),
         q: lam.w.iter().map(|wi| SOT3::exp(wi)).collect(),
         id: lam.id.clone(),
-        imu_bias_group,
+        imu_bias_group: ops.kind(),
     }
 }
 
-pub fn lift_velocity_discrete(state: &VIOState, velocity: &crate::mathematical::imu_velocity::IMUVelocity, dt: f64) -> VIOGroup {
+pub fn lift_velocity_discrete(
+    state: &VIOState,
+    velocity: &crate::mathematical::imu_velocity::IMUVelocity,
+    dt: f64,
+) -> VIOGroup {
     let sensor = &state.sensor;
     let v_est_gyr = velocity.gyr - sensor.gyro_bias();
     let v_est_acc = velocity.acc - sensor.accel_bias();
 
     let mut beta = Vector6::zeros();
-    beta.fixed_rows_mut::<3>(0).copy_from(&(dt * velocity.gyr_bias_vel));
-    beta.fixed_rows_mut::<3>(3).copy_from(&(dt * velocity.acc_bias_vel));
+    beta.fixed_rows_mut::<3>(0)
+        .copy_from(&(dt * velocity.gyr_bias_vel));
+    beta.fixed_rows_mut::<3>(3)
+        .copy_from(&(dt * velocity.acc_bias_vel));
 
     // Pose: discrete integration
     let rot_change = SO3::exp(&(dt * v_est_gyr));
 
     let x_world = dt * (sensor.pose.rotation.act(&sensor.velocity))
-               + 0.5 * dt * dt * (sensor.pose.rotation.act(&v_est_acc)
-                                   + Vector3::new(0.0, 0.0, -GRAVITY_CONSTANT));
+        + 0.5
+            * dt
+            * dt
+            * (sensor.pose.rotation.act(&v_est_acc) + Vector3::new(0.0, 0.0, -GRAVITY_CONSTANT));
     let pose_change_x = sensor.pose.rotation.inverse().act(&x_world);
     let a = SE3::new(rot_change, pose_change_x);
 
     // Camera offset
-    let b = sensor.camera_offset.inverse().compose(&a).compose(&sensor.camera_offset);
+    let b = sensor
+        .camera_offset
+        .inverse()
+        .compose(&a)
+        .compose(&sensor.camera_offset);
 
     // Velocity change
     let body_vel_diff = v_est_acc - sensor.gravity_dir() * GRAVITY_CONSTANT;
     let w = sensor.velocity - (sensor.velocity + dt * body_vel_diff);
 
     // Point landmark discrete lifts
-    let camera_pose_change_inv = sensor.camera_offset.inverse()
-                               .compose(&a.inverse())
-                               .compose(&sensor.camera_offset);
-    
+    let camera_pose_change_inv = sensor
+        .camera_offset
+        .inverse()
+        .compose(&a.inverse())
+        .compose(&sensor.camera_offset);
+
     let mut q_vec = Vec::with_capacity(state.camera_landmarks.len());
     let mut id_vec = Vec::with_capacity(state.camera_landmarks.len());
     for lm in &state.camera_landmarks {

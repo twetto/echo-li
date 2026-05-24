@@ -2,6 +2,7 @@ use echo_lie::SOT3;
 use nalgebra::{DMatrix, DVector, SMatrix, Vector2};
 use std::collections::HashMap;
 
+use crate::mathematical::bias_group_ops::BiasGroupOps;
 use crate::mathematical::camera::CameraModel;
 use crate::mathematical::eqf_matrices::EqFCoordinateSuite;
 use crate::mathematical::imu_velocity::IMUVelocity;
@@ -9,7 +10,6 @@ use crate::mathematical::vio_group::{
     lift_velocity, lift_velocity_discrete, state_group_action, vio_exp_with_bias_group, VIOGroup,
 };
 use crate::mathematical::vio_state::{Landmark, VIOSensorState, VIOState};
-use echo_lie::SE3;
 use crate::ImuBiasGroup;
 
 pub struct VIOEqF {
@@ -109,12 +109,9 @@ impl VIOEqF {
         state: &VIOState,
         additive_bias_delta: nalgebra::Vector6<f64>,
     ) -> VIOGroup {
-        if self.imu_bias_group == ImuBiasGroup::SemiDirect {
-            let b_action = SE3::new(lifted.a.rotation.clone(), lifted.w);
-            lifted.beta =
-                b_action.adjoint() * (state.sensor.input_bias + additive_bias_delta)
-                    - state.sensor.input_bias;
-        }
+        let ops = BiasGroupOps::new(self.imu_bias_group);
+        lifted.beta =
+            ops.observer_increment_beta(&lifted, &state.sensor.input_bias, &additive_bias_delta);
         lifted.with_bias_group(self.imu_bias_group)
     }
 
