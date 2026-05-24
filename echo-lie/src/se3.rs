@@ -218,6 +218,18 @@ impl SE3 {
     pub fn right_jacobian(u: &Vector6<f64>) -> Matrix6<f64> {
         Self::left_jacobian(&-u)
     }
+
+    /// Inverse left Jacobian of SE(3).
+    pub fn inv_left_jacobian(u: &Vector6<f64>) -> Matrix6<f64> {
+        let w = u.fixed_rows::<3>(0).into_owned();
+        if w.norm() < 1e-6 {
+            return Matrix6::identity() - 0.5 * Self::adjoint_algebra(u);
+        }
+
+        Self::left_jacobian(u)
+            .try_inverse()
+            .expect("SE3 left Jacobian should be invertible near the identity")
+    }
 }
 
 // -- Group operations --

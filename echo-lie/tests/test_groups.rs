@@ -5,7 +5,7 @@
 
 use approx::assert_abs_diff_eq;
 use echo_lie::*;
-use nalgebra::{DMatrix, DVector, Matrix3, Matrix4, Matrix6, Vector3, Vector4, Vector6};
+use nalgebra::{DMatrix, DVector, Matrix3, Matrix4, Matrix6, SVector, Vector3, Vector4, Vector6};
 
 const N_TRIALS: usize = 100;
 
@@ -456,6 +456,97 @@ mod sen3_tests {
             let a = SEn3::exp(N, &u).adjoint();
             let b = DMatrix::identity(9, 9) + SEn3::adjoint_algebra(N, &u) * jl;
             assert_abs_diff_eq!(a, b, epsilon = 1e-8);
+        }
+    }
+}
+
+// =====================================================================
+// SemiDirectBias
+// =====================================================================
+mod semi_direct_bias_tests {
+    use super::*;
+    use echo_lie::base::LieGroup;
+
+    fn rand_algebra() -> SVector<f64, 15> {
+        SVector::<f64, 15>::from_fn(|i, _| {
+            let scale = if i < 3 { 0.1 } else { 0.5 };
+            scale * (rand::random::<f64>() - 0.5)
+        })
+    }
+
+    fn assert_group_eq(a: &SemiDirectBias, b: &SemiDirectBias, eps: f64) {
+        assert_abs_diff_eq!(a.d.rotation.as_matrix(), b.d.rotation.as_matrix(), epsilon = eps);
+        assert_abs_diff_eq!(a.d.position, b.d.position, epsilon = eps);
+        assert_abs_diff_eq!(a.d.velocity, b.d.velocity, epsilon = eps);
+        assert_abs_diff_eq!(a.delta, b.delta, epsilon = eps);
+    }
+
+    #[test]
+    fn exp_log() {
+        let zero = SVector::<f64, 15>::zeros();
+        assert_abs_diff_eq!(SemiDirectBias::exp(&zero).log(), zero, epsilon = 1e-12);
+
+        for _ in 0..N_TRIALS {
+            let u = rand_algebra();
+            let x = SemiDirectBias::exp(&u);
+            let u2 = x.log();
+            assert_abs_diff_eq!(u, u2, epsilon = 1e-10);
+        }
+    }
+
+    #[test]
+    fn associativity() {
+        for _ in 0..N_TRIALS {
+            let a = SemiDirectBias::exp(&rand_algebra());
+            let b = SemiDirectBias::exp(&rand_algebra());
+            let c = SemiDirectBias::exp(&rand_algebra());
+            let ab_c = a.compose(&b).compose(&c);
+            let a_bc = a.compose(&b.compose(&c));
+            assert_group_eq(&ab_c, &a_bc, 1e-10);
+        }
+    }
+
+    #[test]
+    fn identity_element() {
+        for _ in 0..N_TRIALS {
+            let x = SemiDirectBias::exp(&rand_algebra());
+            let id = SemiDirectBias::identity();
+            assert_group_eq(&x.compose(&id), &x, 1e-10);
+            assert_group_eq(&id.compose(&x), &x, 1e-10);
+        }
+    }
+
+    #[test]
+    fn inverse() {
+        for _ in 0..N_TRIALS {
+            let x = SemiDirectBias::exp(&rand_algebra());
+            let id = SemiDirectBias::identity();
+            assert_group_eq(&x.compose(&x.inverse()), &id, 1e-10);
+            assert_group_eq(&x.inverse().compose(&x), &id, 1e-10);
+        }
+    }
+
+    #[test]
+    fn product_law() {
+        for _ in 0..N_TRIALS {
+            let x = SemiDirectBias::exp(&rand_algebra());
+            let y = SemiDirectBias::exp(&rand_algebra());
+            let z = x.compose(&y);
+            let d_product = x.d.compose(&y.d);
+
+            assert_abs_diff_eq!(z.d.rotation.as_matrix(), d_product.rotation.as_matrix(), epsilon = 1e-10);
+            assert_abs_diff_eq!(z.d.position, d_product.position, epsilon = 1e-10);
+            assert_abs_diff_eq!(z.d.velocity, d_product.velocity, epsilon = 1e-10);
+            assert_abs_diff_eq!(z.delta, x.delta + x.b().adjoint() * y.delta, epsilon = 1e-10);
+        }
+    }
+
+    #[test]
+    fn accessors_use_expected_se23_slots() {
+        for _ in 0..N_TRIALS {
+            let x = SemiDirectBias::random();
+            assert_abs_diff_eq!(x.b().translation, x.d.velocity, epsilon = 1e-12);
+            assert_abs_diff_eq!(x.c().translation, x.d.position, epsilon = 1e-12);
         }
     }
 }

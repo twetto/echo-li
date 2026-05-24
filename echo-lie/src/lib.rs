@@ -1,6 +1,7 @@
 pub mod base;
 pub mod gln;
 pub mod se3;
+pub mod semi_direct_bias;
 pub mod sen3;
 pub mod sln;
 pub mod so3;
@@ -11,6 +12,7 @@ mod matfn;
 pub use base::{skew, vex};
 pub use gln::GLn;
 pub use se3::SE3;
+pub use semi_direct_bias::SemiDirectBias;
 pub use sen3::{SEn3, SE23};
 pub use sln::SLn;
 pub use so3::SO3;
