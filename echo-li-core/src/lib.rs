@@ -31,6 +31,14 @@ pub struct LandmarkDepthPrior {
     pub range_var: f64,
 }
 
+#[derive(Debug, Clone)]
+struct LandmarkInitCandidate {
+    id: u64,
+    uv: Vector2<f32>,
+    has_depth_prior: bool,
+    range_var: f64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImuBiasGroup {
     Additive,
@@ -372,7 +380,8 @@ impl VIOFilter {
         let observed_ids: HashSet<u64> = measurement.cam_coordinates.keys().cloned().collect();
 
         // --- Remove lost landmarks ---
-        let lost_ids: Vec<u64> = current_ids.difference(&observed_ids).cloned().collect();
+        let mut lost_ids: Vec<u64> = current_ids.difference(&observed_ids).cloned().collect();
+        lost_ids.sort_unstable();
         for id in &lost_ids {
             self.eqf.remove_landmark_by_id(*id);
         }
@@ -386,10 +395,16 @@ impl VIOFilter {
 
         // --- Add new landmarks ---
         let current_ids_after: HashSet<u64> = self.eqf.x.id.iter().cloned().collect();
-        let new_ids: Vec<u64> = observed_ids
-            .difference(&current_ids_after)
-            .cloned()
-            .collect();
+        let remaining_slots = self
+            .settings
+            .max_landmarks
+            .saturating_sub(self.eqf.x.id.len());
+        let new_ids = select_new_landmark_ids(
+            &measurement.cam_coordinates,
+            &current_ids_after,
+            depth_priors,
+            remaining_slots,
+        );
 
         let mut new_landmarks = Vec::new();
         for &id in &new_ids {
@@ -403,9 +418,9 @@ impl VIOFilter {
             } else {
                 self.settings.initial_scene_depth
             };
-            let prior = depth_priors.get(&id).filter(|prior| {
-                prior.range.is_finite() && prior.range > 0.0 && prior.range_var.is_finite()
-            });
+            let prior = depth_priors
+                .get(&id)
+                .filter(|prior| valid_depth_prior(prior));
             let range = prior.map(|prior| prior.range).unwrap_or(fallback_range);
             let p = bearing * range;
             if std::env::var_os("ECHO_LI_DEBUG_LANDMARK_INIT").is_some() {
@@ -453,7 +468,9 @@ impl VIOFilter {
         let mut outlier_ids = Vec::new();
         {
             let state_ids: HashSet<u64> = self.eqf.x.id.iter().cloned().collect();
-            for &id in observed_ids.intersection(&state_ids) {
+            let mut update_ids: Vec<_> = observed_ids.intersection(&state_ids).copied().collect();
+            update_ids.sort_unstable();
+            for id in update_ids {
                 if let Some(lm) = xi_hat.camera_landmarks.iter().find(|l| l.id == id) {
                     let y_pred = cam.project(&lm.p);
                     let uv = measurement.cam_coordinates.get(&id).unwrap();
@@ -515,6 +532,117 @@ impl VIOFilter {
 // Utility
 // ---------------------------------------------------------------------------
 
+fn valid_depth_prior(prior: &LandmarkDepthPrior) -> bool {
+    prior.range.is_finite() && prior.range > 0.0 && prior.range_var.is_finite()
+}
+
+fn min_anchor_distance_sq(uv: &Vector2<f32>, anchors: &[Vector2<f32>]) -> f32 {
+    anchors
+        .iter()
+        .map(|anchor| (uv - anchor).norm_squared())
+        .fold(f32::INFINITY, f32::min)
+}
+
+fn append_spatially_balanced_landmarks(
+    candidates: &mut Vec<LandmarkInitCandidate>,
+    anchors: &mut Vec<Vector2<f32>>,
+    selected: &mut Vec<u64>,
+    capacity: usize,
+) {
+    while selected.len() < capacity && !candidates.is_empty() {
+        let best_idx = candidates
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| {
+                let da = min_anchor_distance_sq(&a.uv, anchors);
+                let db = min_anchor_distance_sq(&b.uv, anchors);
+                da.total_cmp(&db)
+                    .then_with(|| b.range_var.total_cmp(&a.range_var))
+                    .then_with(|| b.id.cmp(&a.id))
+            })
+            .map(|(idx, _)| idx)
+            .expect("candidates is non-empty");
+
+        let candidate = candidates.swap_remove(best_idx);
+        anchors.push(candidate.uv);
+        selected.push(candidate.id);
+    }
+}
+
+fn select_new_landmark_ids(
+    cam_coordinates: &HashMap<u64, Vector2<f32>>,
+    current_ids: &HashSet<u64>,
+    depth_priors: &HashMap<u64, LandmarkDepthPrior>,
+    capacity: usize,
+) -> Vec<u64> {
+    if capacity == 0 || cam_coordinates.is_empty() {
+        return Vec::new();
+    }
+
+    let mut anchors = Vec::new();
+    let mut min_uv = Vector2::new(f32::INFINITY, f32::INFINITY);
+    let mut max_uv = Vector2::new(f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for uv in cam_coordinates.values() {
+        min_uv[0] = min_uv[0].min(uv[0]);
+        min_uv[1] = min_uv[1].min(uv[1]);
+        max_uv[0] = max_uv[0].max(uv[0]);
+        max_uv[1] = max_uv[1].max(uv[1]);
+    }
+
+    let mut current_ids_sorted: Vec<_> = current_ids.iter().copied().collect();
+    current_ids_sorted.sort_unstable();
+    for id in current_ids_sorted {
+        if let Some(uv) = cam_coordinates.get(&id) {
+            anchors.push(*uv);
+        }
+    }
+    if anchors.is_empty() {
+        anchors.push((min_uv + max_uv) * 0.5);
+    }
+
+    let mut sparse_candidates = Vec::new();
+    let mut fallback_candidates = Vec::new();
+    let mut candidate_ids: Vec<_> = cam_coordinates.keys().copied().collect();
+    candidate_ids.sort_unstable();
+    for id in candidate_ids {
+        if current_ids.contains(&id) {
+            continue;
+        }
+        let uv = cam_coordinates[&id];
+
+        let prior = depth_priors
+            .get(&id)
+            .filter(|prior| valid_depth_prior(prior));
+        let candidate = LandmarkInitCandidate {
+            id,
+            uv,
+            has_depth_prior: prior.is_some(),
+            range_var: prior.map(|prior| prior.range_var).unwrap_or(f64::INFINITY),
+        };
+        if candidate.has_depth_prior {
+            sparse_candidates.push(candidate);
+        } else {
+            fallback_candidates.push(candidate);
+        }
+    }
+
+    let mut selected = Vec::with_capacity(capacity.min(cam_coordinates.len()));
+    append_spatially_balanced_landmarks(
+        &mut sparse_candidates,
+        &mut anchors,
+        &mut selected,
+        capacity,
+    );
+    append_spatially_balanced_landmarks(
+        &mut fallback_candidates,
+        &mut anchors,
+        &mut selected,
+        capacity,
+    );
+
+    selected
+}
+
 pub fn landmarks_to_global(state: &VIOState) -> (HashMap<u64, Vector3<f64>>, Vector3<f64>, SO3) {
     let r_world_imu = state.sensor.pose.rotation;
     let p_imu_world = state.sensor.pose.translation;
@@ -531,4 +659,73 @@ pub fn landmarks_to_global(state: &VIOState) -> (HashMap<u64, Vector3<f64>>, Vec
     }
 
     (global_landmarks, p_cam_world, r_world_cam)
+}
+
+#[cfg(test)]
+mod landmark_init_selection_tests {
+    use super::*;
+
+    fn uv(u: f32, v: f32) -> Vector2<f32> {
+        Vector2::new(u, v)
+    }
+
+    #[test]
+    fn landmark_selection_is_spatially_balanced() {
+        let mut coords = HashMap::new();
+        coords.insert(10, uv(50.0, 50.0));
+        coords.insert(1, uv(0.0, 50.0));
+        coords.insert(2, uv(50.0, 50.0));
+        coords.insert(3, uv(100.0, 50.0));
+
+        let current_ids = HashSet::from([10]);
+        let selected = select_new_landmark_ids(&coords, &current_ids, &HashMap::new(), 2);
+
+        assert_eq!(selected, vec![1, 3]);
+    }
+
+    #[test]
+    fn landmark_selection_prefers_sparse_priors_before_fallback() {
+        let mut coords = HashMap::new();
+        coords.insert(1, uv(48.0, 50.0));
+        coords.insert(2, uv(100.0, 50.0));
+
+        let mut priors = HashMap::new();
+        priors.insert(
+            1,
+            LandmarkDepthPrior {
+                range: 5.0,
+                range_var: 1.0,
+            },
+        );
+
+        let selected = select_new_landmark_ids(&coords, &HashSet::new(), &priors, 1);
+
+        assert_eq!(selected, vec![1]);
+    }
+
+    #[test]
+    fn landmark_selection_is_independent_of_hashmap_iteration_order() {
+        let ids_and_uvs = [
+            (4, uv(10.0, 10.0)),
+            (2, uv(90.0, 10.0)),
+            (8, uv(10.0, 90.0)),
+            (6, uv(90.0, 90.0)),
+            (1, uv(50.0, 50.0)),
+        ];
+
+        let mut coords_a = HashMap::new();
+        for (id, uv) in ids_and_uvs {
+            coords_a.insert(id, uv);
+        }
+
+        let mut coords_b = HashMap::new();
+        for (id, uv) in ids_and_uvs.into_iter().rev() {
+            coords_b.insert(id, uv);
+        }
+
+        let selected_a = select_new_landmark_ids(&coords_a, &HashSet::new(), &HashMap::new(), 3);
+        let selected_b = select_new_landmark_ids(&coords_b, &HashSet::new(), &HashMap::new(), 3);
+
+        assert_eq!(selected_a, selected_b);
+    }
 }

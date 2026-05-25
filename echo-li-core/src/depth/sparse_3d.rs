@@ -200,7 +200,12 @@ impl Sparse3DFilter {
         };
 
         let reset_set: HashSet<_> = reset_features.iter().copied().collect();
-        for (&fid, &uv_curr) in &curr_uvs {
+        let mut curr_ids: Vec<_> = curr_uvs.keys().copied().collect();
+        curr_ids.sort_unstable();
+        for fid in curr_ids {
+            let &uv_curr = curr_uvs
+                .get(&fid)
+                .expect("sorted current ID must exist in current UV map");
             let Some(&uv_prev) = self.prev_uvs.get(&fid) else {
                 continue;
             };
@@ -274,6 +279,10 @@ impl Sparse3DFilter {
         self.remove_features(|feat| {
             reset_set.contains(&feat.feat_id) || !curr_uvs.contains_key(&feat.feat_id)
         });
+        self.features.sort_by_key(|feat| feat.feat_id);
+        for (slot, feat) in self.features.iter().enumerate() {
+            self.feature_slots.insert(feat.feat_id, slot);
+        }
         self.pending.retain(|id, _| curr_uvs.contains_key(id));
         self.prev_t_wc = Some(*t_wc);
         self.prev_stamp = stamp;

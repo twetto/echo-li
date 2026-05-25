@@ -17,7 +17,9 @@ use nalgebra::{Matrix3, Matrix4, Vector2};
 use rudolf_v::frontend::{Frontend, FrontendConfig, LbpPolicy};
 use rudolf_v::image::Image as RudolfImage;
 use rudolf_v::klt::LkMethod;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -55,6 +57,10 @@ struct Args {
     /// Run patch-grid direct depth mapper. Enabled automatically by PatchDepth config.
     #[arg(long, default_value_t = false)]
     patch_depth: bool,
+
+    /// Disable patch-grid direct depth mapper even when PatchDepth exists in YAML.
+    #[arg(long, default_value_t = false)]
+    no_patch_depth: bool,
 }
 
 fn write_trajectory(path: &std::path::Path, entries: &[(f64, VIOState)]) -> std::io::Result<()> {
@@ -139,6 +145,83 @@ fn parse_sparse_chart(name: &str) -> Sparse3DChart {
         "invdepth" | "invdepth3d" | "inverse-depth" => Sparse3DChart::InvDepth,
         _ => Sparse3DChart::Polar,
     }
+}
+
+fn hash_u64(hasher: &mut DefaultHasher, value: u64) {
+    value.hash(hasher);
+}
+
+fn hash_f64(hasher: &mut DefaultHasher, value: f64) {
+    value.to_bits().hash(hasher);
+}
+
+fn hash_f32(hasher: &mut DefaultHasher, value: f32) {
+    value.to_bits().hash(hasher);
+}
+
+fn hash_features(features: &[rudolf_v::fast::Feature]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    for feat in features {
+        hash_u64(&mut hasher, feat.id);
+        hash_f32(&mut hasher, feat.x);
+        hash_f32(&mut hasher, feat.y);
+        hash_f32(&mut hasher, feat.score);
+        feat.descriptor.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn hash_depth_priors(depth_priors: &HashMap<u64, LandmarkDepthPrior>) -> u64 {
+    let mut ids: Vec<_> = depth_priors.keys().copied().collect();
+    ids.sort_unstable();
+    let mut hasher = DefaultHasher::new();
+    for id in ids {
+        let prior = depth_priors[&id];
+        hash_u64(&mut hasher, id);
+        hash_f64(&mut hasher, prior.range);
+        hash_f64(&mut hasher, prior.range_var);
+    }
+    hasher.finish()
+}
+
+fn hash_sparse_filter(sparse: Option<&Sparse3DFilter>) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    if let Some(sparse) = sparse {
+        let mut ids: Vec<_> = sparse.features_iter().map(|feat| feat.feat_id).collect();
+        ids.sort_unstable();
+        for id in ids {
+            let (range, range_var) = sparse.query_range(id);
+            hash_u64(&mut hasher, id);
+            hash_f64(&mut hasher, range);
+            hash_f64(&mut hasher, range_var);
+        }
+    }
+    hasher.finish()
+}
+
+fn hash_state(state: &VIOState) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    let pose = &state.sensor.pose;
+    let q = pose.rotation.as_xyzw();
+    for v in q.iter() {
+        hash_f64(&mut hasher, *v);
+    }
+    for v in pose.translation.iter() {
+        hash_f64(&mut hasher, *v);
+    }
+    for v in state.sensor.velocity.iter() {
+        hash_f64(&mut hasher, *v);
+    }
+    for v in state.sensor.input_bias.iter() {
+        hash_f64(&mut hasher, *v);
+    }
+    for lm in &state.camera_landmarks {
+        hash_u64(&mut hasher, lm.id);
+        for v in lm.p.iter() {
+            hash_f64(&mut hasher, *v);
+        }
+    }
+    hasher.finish()
 }
 
 fn camera_pose_matrix(state: &VIOState) -> Matrix4<f64> {
@@ -609,11 +692,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
         };
 
-    let patch_depth_enabled = args.patch_depth
-        || vio_config
-            .as_ref()
-            .and_then(|conf| conf.patch_depth.as_ref())
-            .is_some();
+    let patch_depth_enabled = !args.no_patch_depth
+        && (args.patch_depth
+            || vio_config
+                .as_ref()
+                .and_then(|conf| conf.patch_depth.as_ref())
+                .is_some());
     let patch_depth_settings = vio_config
         .as_ref()
         .and_then(|conf| conf.patch_depth.as_ref())
@@ -822,6 +906,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut last_patch_depth_counts: Option<(usize, usize, usize, usize)> = None;
     #[cfg(feature = "rerun")]
     let mut last_patch_depth_output: Option<PatchDepthOutput> = None;
+    let trace_determinism = std::env::var_os("ECHO_LI_TRACE_DETERMINISM").is_some();
     #[cfg(feature = "rerun")]
     let mut patch_depth_vis_announced = false;
     let t_start = std::time::Instant::now();
@@ -865,7 +950,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let rudolf_img = RudolfImage::from_vec(img_w, img_h, gray_data);
 
-                let (features, _stats) = frontend.process(&rudolf_img);
+                let (features, stats) = frontend.process(&rudolf_img);
+                let feature_hash = trace_determinism.then(|| hash_features(features));
 
                 if let Some(f) = &mut filter {
                     #[cfg(feature = "rerun")]
@@ -909,6 +995,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                         HashMap::new()
                     };
+                    let depth_prior_hash =
+                        trace_determinism.then(|| hash_depth_priors(&depth_priors));
                     f.process_vision_with_depth_priors(
                         measurement.clone(),
                         cam_model.as_ref(),
@@ -917,6 +1005,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     vision_count += 1;
 
                     let state = f.eqf.state_estimate();
+                    let state_hash = trace_determinism.then(|| hash_state(&state));
                     let t_wc = camera_pose_matrix(&state);
                     if let Some(sparse) = &mut sparse_filter {
                         sparse.update(&sparse_measurement, &t_wc, None);
@@ -956,6 +1045,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                         }
+                    }
+                    if trace_determinism {
+                        eprintln!(
+                            "det frame={} stamp={:.9} features={} feature_hash={:016x} tracked={} lost={} rejected={} new={} occupied={}/{} priors={} prior_hash={:016x} sparse_hash={:016x} eqf_landmarks={} state_hash={:016x}",
+                            vision_count,
+                            img_data.stamp,
+                            measurement.cam_coordinates.len(),
+                            feature_hash.unwrap_or(0),
+                            stats.tracked,
+                            stats.lost,
+                            stats.rejected,
+                            stats.new_detections,
+                            stats.occupied_cells,
+                            stats.total_cells,
+                            depth_priors.len(),
+                            depth_prior_hash.unwrap_or(0),
+                            hash_sparse_filter(sparse_filter.as_ref()),
+                            state.camera_landmarks.len(),
+                            state_hash.unwrap_or(0),
+                        );
                     }
 
                     #[cfg(feature = "rerun")]

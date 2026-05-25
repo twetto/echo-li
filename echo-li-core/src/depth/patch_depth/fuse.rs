@@ -559,14 +559,23 @@ unsafe fn densify_row_avx2(
         let idx01 = _mm256_add_epi32(idx00, ref_w_vec);
         let idx11 = _mm256_add_epi32(idx01, _mm256_set1_epi32(1));
 
-        let p00 = _mm256_i32gather_ps::<4>(ref_slice.as_ptr(), idx00);
-        let p10 = _mm256_i32gather_ps::<4>(ref_slice.as_ptr(), idx10);
-        let p01 = _mm256_i32gather_ps::<4>(ref_slice.as_ptr(), idx01);
-        let p11 = _mm256_i32gather_ps::<4>(ref_slice.as_ptr(), idx11);
+        // AVX2 gather is unconditional. Keep invalid lanes in-bounds; their
+        // contribution is selected back to photo_w=1.0 below.
+        let zero_i32 = _mm256_setzero_si256();
+        let valid_idx_mask = _mm256_castps_si256(valid_mask);
+        let idx00_s = _mm256_blendv_epi8(zero_i32, idx00, valid_idx_mask);
+        let idx10_s = _mm256_blendv_epi8(zero_i32, idx10, valid_idx_mask);
+        let idx01_s = _mm256_blendv_epi8(zero_i32, idx01, valid_idx_mask);
+        let idx11_s = _mm256_blendv_epi8(zero_i32, idx11, valid_idx_mask);
+
+        let p00 = _mm256_i32gather_ps::<4>(ref_slice.as_ptr(), idx00_s);
+        let p10 = _mm256_i32gather_ps::<4>(ref_slice.as_ptr(), idx10_s);
+        let p01 = _mm256_i32gather_ps::<4>(ref_slice.as_ptr(), idx01_s);
+        let p11 = _mm256_i32gather_ps::<4>(ref_slice.as_ptr(), idx11_s);
 
         let valid_mask = if let Some(rv) = ref_valid_slice {
             let half_vec = _mm256_set1_ps(0.5);
-            let rv00 = _mm256_i32gather_ps::<4>(rv.as_ptr(), idx00);
+            let rv00 = _mm256_i32gather_ps::<4>(rv.as_ptr(), idx00_s);
             let rv_valid = _mm256_cmp_ps::<_CMP_GT_OQ>(rv00, half_vec);
             _mm256_and_ps(valid_mask, rv_valid)
         } else {
