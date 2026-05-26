@@ -1018,6 +1018,26 @@ fn test_filter_vision_initializes_new_landmark_from_range_prior() {
 }
 
 #[test]
+fn test_filter_vision_scene_depth_zero_disables_fallback_landmark_init() {
+    let mut settings = VIOFilterSettings::default();
+    settings.initial_scene_depth = 0.0;
+    let xi0 = make_xi0_with_landmarks(0);
+    let mut filter = VIOFilter::new(settings, xi0);
+
+    let cam = make_pinhole();
+    filter.process_imu(stationary_imu(0.0));
+    filter.process_imu(stationary_imu(0.005));
+
+    let mut coords = HashMap::new();
+    coords.insert(42u64, Vector2::new(400.0f32, 250.0f32));
+    let meas = VisionMeasurement::new(0.005, coords);
+
+    filter.process_vision(meas, &cam);
+
+    assert!(filter.eqf.xi0.camera_landmarks.is_empty());
+}
+
+#[test]
 fn test_filter_vision_removes_lost_landmarks() {
     let settings = VIOFilterSettings::default();
     let xi0 = make_xi0_with_landmarks(3);

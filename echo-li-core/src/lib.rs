@@ -367,6 +367,21 @@ impl VIOFilter {
         cam: &dyn CameraModel,
         depth_priors: &HashMap<u64, LandmarkDepthPrior>,
     ) {
+        self.process_vision_with_depth_priors_and_deferred_fallbacks(
+            measurement,
+            cam,
+            depth_priors,
+            &HashSet::new(),
+        );
+    }
+
+    pub fn process_vision_with_depth_priors_and_deferred_fallbacks(
+        &mut self,
+        measurement: VisionMeasurement,
+        cam: &dyn CameraModel,
+        depth_priors: &HashMap<u64, LandmarkDepthPrior>,
+        defer_fallback_ids: &HashSet<u64>,
+    ) {
         if self.eqf.current_time < 0.0 {
             return;
         }
@@ -403,6 +418,8 @@ impl VIOFilter {
             &measurement.cam_coordinates,
             &current_ids_after,
             depth_priors,
+            defer_fallback_ids,
+            self.settings.initial_scene_depth > 0.0,
             remaining_slots,
         );
 
@@ -533,7 +550,10 @@ impl VIOFilter {
 // ---------------------------------------------------------------------------
 
 fn valid_depth_prior(prior: &LandmarkDepthPrior) -> bool {
-    prior.range.is_finite() && prior.range > 0.0 && prior.range_var.is_finite()
+    prior.range.is_finite()
+        && prior.range > 0.0
+        && prior.range_var.is_finite()
+        && prior.range_var > 0.0
 }
 
 fn min_anchor_distance_sq(uv: &Vector2<f32>, anchors: &[Vector2<f32>]) -> f32 {
@@ -573,6 +593,8 @@ fn select_new_landmark_ids(
     cam_coordinates: &HashMap<u64, Vector2<f32>>,
     current_ids: &HashSet<u64>,
     depth_priors: &HashMap<u64, LandmarkDepthPrior>,
+    defer_fallback_ids: &HashSet<u64>,
+    allow_fallback_init: bool,
     capacity: usize,
 ) -> Vec<u64> {
     if capacity == 0 || cam_coordinates.is_empty() {
@@ -621,6 +643,10 @@ fn select_new_landmark_ids(
         };
         if candidate.has_depth_prior {
             sparse_candidates.push(candidate);
+        } else if defer_fallback_ids.contains(&id) {
+            continue;
+        } else if !allow_fallback_init {
+            continue;
         } else {
             fallback_candidates.push(candidate);
         }
@@ -678,7 +704,14 @@ mod landmark_init_selection_tests {
         coords.insert(3, uv(100.0, 50.0));
 
         let current_ids = HashSet::from([10]);
-        let selected = select_new_landmark_ids(&coords, &current_ids, &HashMap::new(), 2);
+        let selected = select_new_landmark_ids(
+            &coords,
+            &current_ids,
+            &HashMap::new(),
+            &HashSet::new(),
+            true,
+            2,
+        );
 
         assert_eq!(selected, vec![1, 3]);
     }
@@ -698,7 +731,8 @@ mod landmark_init_selection_tests {
             },
         );
 
-        let selected = select_new_landmark_ids(&coords, &HashSet::new(), &priors, 1);
+        let selected =
+            select_new_landmark_ids(&coords, &HashSet::new(), &priors, &HashSet::new(), true, 1);
 
         assert_eq!(selected, vec![1]);
     }
@@ -723,9 +757,101 @@ mod landmark_init_selection_tests {
             coords_b.insert(id, uv);
         }
 
-        let selected_a = select_new_landmark_ids(&coords_a, &HashSet::new(), &HashMap::new(), 3);
-        let selected_b = select_new_landmark_ids(&coords_b, &HashSet::new(), &HashMap::new(), 3);
+        let selected_a = select_new_landmark_ids(
+            &coords_a,
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+            true,
+            3,
+        );
+        let selected_b = select_new_landmark_ids(
+            &coords_b,
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+            true,
+            3,
+        );
 
         assert_eq!(selected_a, selected_b);
+    }
+
+    #[test]
+    fn landmark_selection_defers_sparse_tracks_without_valid_prior() {
+        let mut coords = HashMap::new();
+        coords.insert(1, uv(20.0, 50.0));
+        coords.insert(2, uv(80.0, 50.0));
+
+        let deferred = HashSet::from([1]);
+        let selected =
+            select_new_landmark_ids(&coords, &HashSet::new(), &HashMap::new(), &deferred, true, 2);
+
+        assert_eq!(selected, vec![2]);
+    }
+
+    #[test]
+    fn landmark_selection_allows_deferred_track_with_valid_prior() {
+        let mut coords = HashMap::new();
+        coords.insert(1, uv(20.0, 50.0));
+        coords.insert(2, uv(80.0, 50.0));
+
+        let mut priors = HashMap::new();
+        priors.insert(
+            1,
+            LandmarkDepthPrior {
+                range: 5.0,
+                range_var: 1.0,
+            },
+        );
+        let deferred = HashSet::from([1]);
+        let selected =
+            select_new_landmark_ids(&coords, &HashSet::new(), &priors, &deferred, true, 1);
+
+        assert_eq!(selected, vec![1]);
+    }
+
+    #[test]
+    fn landmark_selection_can_disable_fallback_scene_depth_init() {
+        let mut coords = HashMap::new();
+        coords.insert(1, uv(20.0, 50.0));
+        coords.insert(2, uv(80.0, 50.0));
+
+        let selected = select_new_landmark_ids(
+            &coords,
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+            false,
+            2,
+        );
+
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn landmark_selection_still_uses_sparse_prior_when_fallback_disabled() {
+        let mut coords = HashMap::new();
+        coords.insert(1, uv(20.0, 50.0));
+
+        let mut priors = HashMap::new();
+        priors.insert(
+            1,
+            LandmarkDepthPrior {
+                range: 5.0,
+                range_var: 1.0,
+            },
+        );
+
+        let selected = select_new_landmark_ids(
+            &coords,
+            &HashSet::new(),
+            &priors,
+            &HashSet::new(),
+            false,
+            1,
+        );
+
+        assert_eq!(selected, vec![1]);
     }
 }

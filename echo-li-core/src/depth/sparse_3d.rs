@@ -328,6 +328,10 @@ impl Sparse3DFilter {
         self.features.get(slot)
     }
 
+    pub fn has_track(&self, fid: u64) -> bool {
+        self.feature_slots.contains_key(&fid) || self.pending.contains_key(&fid)
+    }
+
     pub fn features_iter(&self) -> impl Iterator<Item = &FeatureState3D> {
         self.features.iter()
     }

@@ -18,7 +18,7 @@ use rudolf_v::frontend::{Frontend, FrontendConfig, LbpPolicy};
 use rudolf_v::image::Image as RudolfImage;
 use rudolf_v::klt::LkMethod;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -982,25 +982,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                         Vec::new()
                     };
-                    let depth_priors = if let Some(sparse) = &sparse_filter {
-                        measurement
-                            .cam_coordinates
-                            .keys()
-                            .filter_map(|&fid| {
-                                let (range, range_var) = sparse.query_range(fid);
-                                (range > 0.0 && range_var.is_finite())
-                                    .then_some((fid, LandmarkDepthPrior { range, range_var }))
-                            })
-                            .collect()
+                    let (depth_priors, defer_fallback_ids) = if let Some(sparse) = &sparse_filter {
+                        let mut priors = HashMap::new();
+                        let mut deferred = HashSet::new();
+                        for &fid in measurement.cam_coordinates.keys() {
+                            let (range, range_var) = sparse.query_range(fid);
+                            if range > 0.0 && range_var.is_finite() {
+                                priors.insert(fid, LandmarkDepthPrior { range, range_var });
+                            } else if sparse.has_track(fid) {
+                                deferred.insert(fid);
+                            }
+                        }
+                        (priors, deferred)
                     } else {
-                        HashMap::new()
+                        (HashMap::new(), HashSet::new())
                     };
                     let depth_prior_hash =
                         trace_determinism.then(|| hash_depth_priors(&depth_priors));
-                    f.process_vision_with_depth_priors(
+                    f.process_vision_with_depth_priors_and_deferred_fallbacks(
                         measurement.clone(),
                         cam_model.as_ref(),
                         &depth_priors,
+                        &defer_fallback_ids,
                     );
                     vision_count += 1;
 
