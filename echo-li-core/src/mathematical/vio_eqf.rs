@@ -99,11 +99,11 @@ impl VIOEqF {
             };
             vio_exp_with_bias_group(&scaled, self.imu_bias_group)
         };
-        let lifted = self.prepare_observer_increment(lifted, &state, additive_bias_delta);
+        let lifted = self.prepare_right_observer_increment(lifted, &state, additive_bias_delta);
         self.x = self.x.compose(&lifted);
     }
 
-    fn prepare_observer_increment(
+    fn prepare_right_observer_increment(
         &self,
         mut lifted: VIOGroup,
         state: &VIOState,
@@ -499,26 +499,31 @@ impl VIOEqF {
             return;
         }
 
-        // Lift to group correction
-        if use_discrete_correction {
-            let delta = suite
-                .lift_innovation_discrete(&DVector::from_column_slice(gamma.as_slice()), &self.xi0);
-            let physical_bias_delta = delta.beta;
-            let delta = self.prepare_correction_increment(delta, &physical_bias_delta);
-            self.x = delta.compose(&self.x);
-        } else {
-            let delta_alg =
-                suite.lift_innovation(&DVector::from_column_slice(gamma.as_slice()), &self.xi0);
-            let physical_bias_delta = delta_alg.u_beta;
-            let delta = vio_exp_with_bias_group(&delta_alg, self.imu_bias_group);
-            let delta = self.prepare_correction_increment(delta, &physical_bias_delta);
-            self.x = delta.compose(&self.x);
-        }
+        let delta = self.left_correction_increment(suite, &gamma, use_discrete_correction);
+        self.x = delta.compose(&self.x);
 
         self.enforce_spd();
     }
 
-    fn prepare_correction_increment(
+    fn left_correction_increment<S: EqFCoordinateSuite + ?Sized>(
+        &self,
+        suite: &S,
+        gamma: &DVector<f64>,
+        use_discrete_correction: bool,
+    ) -> VIOGroup {
+        if use_discrete_correction {
+            let delta = suite.lift_innovation_discrete(gamma, &self.xi0);
+            let physical_bias_delta = delta.beta;
+            return self.prepare_left_correction_increment(delta, &physical_bias_delta);
+        }
+
+        let delta_alg = suite.lift_innovation(gamma, &self.xi0);
+        let physical_bias_delta = delta_alg.u_beta;
+        let delta = vio_exp_with_bias_group(&delta_alg, self.imu_bias_group);
+        self.prepare_left_correction_increment(delta, &physical_bias_delta)
+    }
+
+    fn prepare_left_correction_increment(
         &self,
         mut delta: VIOGroup,
         physical_bias_delta: &nalgebra::Vector6<f64>,
