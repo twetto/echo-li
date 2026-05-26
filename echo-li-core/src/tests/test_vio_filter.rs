@@ -257,6 +257,32 @@ fn test_semi_direct_bias_process_noise_uses_action_matrix() {
     );
 }
 
+fn nontrivial_semi_direct_group(ids: &[u64]) -> VIOGroup {
+    let mut x = VIOGroup::identity_with_bias_group(ids, ImuBiasGroup::SemiDirect);
+    x.beta = Vector6::new(0.1, -0.2, 0.05, 0.3, -0.1, 0.2);
+    x.a = SE3::new(
+        SO3::exp(&Vector3::new(0.12, -0.05, 0.03)),
+        Vector3::new(0.2, -0.1, 0.05),
+    );
+    x.w = Vector3::new(0.08, -0.03, 0.1);
+    x.b = SE3::new(
+        SO3::exp(&Vector3::new(-0.03, 0.02, 0.01)),
+        Vector3::new(0.04, -0.02, 0.03),
+    );
+    x.q = ids
+        .iter()
+        .enumerate()
+        .map(|(i, _)| {
+            let k = i as f64 + 1.0;
+            echo_lie::SOT3::new(
+                SO3::exp(&Vector3::new(0.01 * k, -0.005 * k, 0.003 * k)),
+                1.0 + 0.01 * k,
+            )
+        })
+        .collect();
+    x
+}
+
 fn assert_semi_direct_a0t_matches_finite_difference<S: EqFCoordinateSuite>(
     suite: &S,
     name: &str,
@@ -379,6 +405,91 @@ fn test_semi_direct_observer_integration_matches_kinematics() {
         "Semi-direct observer integration diverged from kinematics: dist={}",
         state_distance(&est, &gt)
     );
+}
+
+#[test]
+fn test_semi_direct_observer_integration_matches_kinematics_from_nonidentity_group() {
+    let mut rng = rand::rng();
+    let xi0 = reasonable_state_element(3, &mut rng);
+    let init_cov = DMatrix::<f64>::identity(xi0.dim(), xi0.dim()) * 0.01;
+    let mut eqf = VIOEqF::new_with_bias_group(xi0.clone(), &init_cov, ImuBiasGroup::SemiDirect);
+    eqf.x = nontrivial_semi_direct_group(&xi0.get_ids());
+
+    let before = eqf.state_estimate();
+    let imu = random_velocity_element(&mut rng);
+    let dt = 0.01;
+
+    eqf.integrate_observer_state(&imu, dt, true);
+    let est = eqf.state_estimate();
+    let gt = crate::mathematical::vio_state::integrate_system_function(&before, &imu, dt);
+
+    assert!(
+        state_distance(&est, &gt) < 1e-10,
+        "Semi-direct observer integration from nonidentity group diverged: dist={}",
+        state_distance(&est, &gt)
+    );
+}
+
+fn assert_semi_direct_fast_and_faster_riccati_match_zero_noise<S: EqFCoordinateSuite>(
+    suite: &S,
+    name: &str,
+) {
+    let mut rng = rand::rng();
+    let xi0 = reasonable_state_element(2, &mut rng);
+    let init_cov = DMatrix::<f64>::identity(xi0.dim(), xi0.dim()) * 0.01;
+    let mut fast =
+        VIOEqF::new_with_bias_group(xi0.clone(), &init_cov, ImuBiasGroup::SemiDirect);
+    let mut faster = VIOEqF::new_with_bias_group(xi0.clone(), &init_cov, ImuBiasGroup::SemiDirect);
+    fast.x = nontrivial_semi_direct_group(&xi0.get_ids());
+    faster.x = fast.x.clone();
+
+    let zero_input = SMatrix::<f64, 12, 12>::zeros();
+    let zero_state = DMatrix::<f64>::zeros(xi0.dim(), xi0.dim());
+    let samples = [
+        IMUVelocity::new(
+            0.0,
+            Vector3::new(0.11, -0.05, 0.03),
+            Vector3::new(0.2, -0.1, 9.7),
+        ),
+        IMUVelocity::new(
+            0.01,
+            Vector3::new(0.10, -0.04, 0.02),
+            Vector3::new(0.1, -0.2, 9.8),
+        ),
+        IMUVelocity::new(
+            0.02,
+            Vector3::new(0.09, -0.03, 0.01),
+            Vector3::new(0.0, -0.1, 9.75),
+        ),
+    ];
+
+    for imu in &samples {
+        let dt = 0.005;
+        fast.integrate_riccati_fast(suite, imu, dt, &zero_input, &zero_state);
+        faster.accumulate_transition(suite, imu, dt);
+    }
+    faster.flush_riccati(&zero_input, &zero_state);
+
+    let diff = (&fast.sigma - &faster.sigma).norm();
+    assert!(
+        diff < 1e-10,
+        "{name} semi-direct fast/faster Riccati mismatch with zero process noise: ||diff||={diff:.2e}"
+    );
+}
+
+#[test]
+fn test_semi_direct_fast_and_faster_riccati_match_zero_noise() {
+    assert_semi_direct_fast_and_faster_riccati_match_zero_noise(&EuclideanSuite, "euclidean");
+}
+
+#[test]
+fn test_semi_direct_fast_and_faster_riccati_match_zero_noise_normal() {
+    assert_semi_direct_fast_and_faster_riccati_match_zero_noise(&NormalSuite::new(), "normal");
+}
+
+#[test]
+fn test_semi_direct_fast_and_faster_riccati_match_zero_noise_invdepth() {
+    assert_semi_direct_fast_and_faster_riccati_match_zero_noise(&InvDepthSuite::new(), "invdepth");
 }
 
 #[test]
