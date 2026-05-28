@@ -293,7 +293,12 @@ pub(super) fn build_pinhole_to_raw_lut(
     lut
 }
 
-fn undistort_sample(u: f64, v: f64, width: usize, height: usize) -> Option<UndistortSample> {
+pub(super) fn undistort_sample(
+    u: f64,
+    v: f64,
+    width: usize,
+    height: usize,
+) -> Option<UndistortSample> {
     if u < 0.0 || v < 0.0 || u >= (width - 1) as f64 || v >= (height - 1) as f64 {
         return None;
     }

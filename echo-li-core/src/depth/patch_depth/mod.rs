@@ -40,6 +40,7 @@ use simd_neon::fast_translation_accum_neon_if_available;
 pub enum PatchDepthCameraMode {
     RawDistorted,
     UndistortedPinhole,
+    TiledBearing,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +83,8 @@ pub struct PatchDepthSettings {
     pub var_floor: f64,
     pub status_weight_photo: f64,
     pub status_weight_seed: f64,
+    pub tiled_tile_size: usize,
+    pub tiled_tile_overlap: usize,
 }
 
 impl Default for PatchDepthSettings {
@@ -113,6 +116,8 @@ impl Default for PatchDepthSettings {
             var_floor: 1e-6,
             status_weight_photo: 1.0,
             status_weight_seed: 0.6,
+            tiled_tile_size: 96,
+            tiled_tile_overlap: 16,
         }
     }
 }
@@ -261,6 +266,16 @@ struct PatchAccum {
 }
 
 #[derive(Debug, Clone, Copy)]
+struct TiledPatchResult {
+    tile_idx: usize,
+    global_u: usize,
+    global_v: usize,
+    local_u: f64,
+    local_v: f64,
+    estimate: PatchEstimate,
+}
+
+#[derive(Debug, Clone, Copy)]
 struct UndistortSample {
     idx00: usize,
     idx10: usize,
@@ -271,9 +286,12 @@ struct UndistortSample {
 
 /// Undistort LUT for one pyramid level: maps each undistorted-pinhole pixel to
 /// a bilinear footprint in that level's raw (distorted) image.
+#[derive(Debug, Clone)]
 struct UndistortLut {
     width: usize,
     height: usize,
+    src_width: usize,
+    src_height: usize,
     idx00: Vec<u32>,
     idx10: Vec<u32>,
     idx01: Vec<u32>,
@@ -287,11 +305,23 @@ struct UndistortLut {
 
 impl UndistortLut {
     fn from_options(lut: Vec<Option<UndistortSample>>, width: usize, height: usize) -> Self {
+        Self::from_options_with_source(lut, width, height, width, height)
+    }
+
+    fn from_options_with_source(
+        lut: Vec<Option<UndistortSample>>,
+        width: usize,
+        height: usize,
+        src_width: usize,
+        src_height: usize,
+    ) -> Self {
         let n = lut.len();
         debug_assert_eq!(n, width * height);
         let mut out = Self {
             width,
             height,
+            src_width,
+            src_height,
             idx00: vec![0; n],
             idx10: vec![0; n],
             idx01: vec![0; n],
@@ -321,8 +351,8 @@ impl UndistortLut {
     /// Undistort one raw pyramid level into a pinhole `Image<f32>`. Invalid
     /// pixels (raw footprint out of bounds) are left at zero.
     fn undistort_level(&self, raw: &Image<f32>) -> Image<f32> {
-        debug_assert_eq!(raw.width(), self.width);
-        debug_assert_eq!(raw.height(), self.height);
+        debug_assert_eq!(raw.width(), self.src_width);
+        debug_assert_eq!(raw.height(), self.src_height);
         debug_assert_eq!(raw.stride(), raw.width());
         let src = raw.as_slice();
         let n = self.width * self.height;
@@ -353,6 +383,503 @@ impl UndistortLut {
     }
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct TiledBearingTile {
+    level: usize,
+    x0: usize,
+    y0: usize,
+    width: usize,
+    height: usize,
+    center_u: f64,
+    center_v: f64,
+    center_bearing: Vector3<f64>,
+    tangent_u: Vector3<f64>,
+    tangent_v: Vector3<f64>,
+    focal: f64,
+    lut: UndistortLut,
+}
+
+#[allow(dead_code)]
+impl TiledBearingTile {
+    fn contains_patch(&self, cu: f64, cv: f64, half: usize) -> bool {
+        let u_min = cu - half as f64;
+        let v_min = cv - half as f64;
+        let u_max = cu + half as f64;
+        let v_max = cv + half as f64;
+        u_min >= self.x0 as f64
+            && v_min >= self.y0 as f64
+            && u_max < (self.x0 + self.width) as f64
+            && v_max < (self.y0 + self.height) as f64
+    }
+
+    fn bearing_at_level_pixel(&self, u: f64, v: f64) -> Vector3<f64> {
+        let x = (u - self.center_u) / self.focal;
+        let y = (v - self.center_v) / self.focal;
+        (self.center_bearing + self.tangent_u * x + self.tangent_v * y).normalize()
+    }
+
+    fn project_to_level_pixel(&self, p: &Vector3<f64>) -> Option<Vector2<f64>> {
+        let z = p.dot(&self.center_bearing);
+        if z <= 1e-9 {
+            return None;
+        }
+        let x = p.dot(&self.tangent_u) / z;
+        let y = p.dot(&self.tangent_v) / z;
+        Some(Vector2::new(
+            self.center_u + self.focal * x,
+            self.center_v + self.focal * y,
+        ))
+    }
+
+    fn project_to_local_pixel(&self, p: &Vector3<f64>) -> Option<Vector2<f64>> {
+        self.project_to_level_pixel(p)
+            .map(|uv| self.global_to_local(uv))
+    }
+
+    fn projection_jacobian(&self, p: &Vector3<f64>) -> Option<nalgebra::Matrix2x3<f64>> {
+        let z = p.dot(&self.center_bearing);
+        if z <= 1e-9 {
+            return None;
+        }
+        let x = p.dot(&self.tangent_u);
+        let y = p.dot(&self.tangent_v);
+        let z2 = z * z;
+        let row_u = (self.tangent_u.transpose() * z - self.center_bearing.transpose() * x)
+            * (self.focal / z2);
+        let row_v = (self.tangent_v.transpose() * z - self.center_bearing.transpose() * y)
+            * (self.focal / z2);
+        Some(nalgebra::Matrix2x3::from_rows(&[row_u, row_v]))
+    }
+
+    fn warp_local_pixel(
+        &self,
+        u_local: f64,
+        v_local: f64,
+        rho: f64,
+        rel_pose: &RelativePose,
+    ) -> Option<(f64, f64, Vector3<f64>, Vector3<f64>)> {
+        if rho <= 0.0 {
+            return None;
+        }
+        let u = self.x0 as f64 + u_local;
+        let v = self.y0 as f64 + v_local;
+        let bearing = self.bearing_at_level_pixel(u, v);
+        let x_curr = bearing / rho;
+        let x_ref = rel_pose.r * x_curr + rel_pose.t;
+        let uv_ref = self.project_to_local_pixel(&x_ref)?;
+        Some((uv_ref[0], uv_ref[1], x_ref, bearing))
+    }
+
+    fn contains_point(&self, u: f64, v: f64) -> bool {
+        u >= self.x0 as f64
+            && v >= self.y0 as f64
+            && u < (self.x0 + self.width) as f64
+            && v < (self.y0 + self.height) as f64
+    }
+
+    fn global_to_local(&self, uv: Vector2<f64>) -> Vector2<f64> {
+        Vector2::new(uv[0] - self.x0 as f64, uv[1] - self.y0 as f64)
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct TiledBearingLevel {
+    level: usize,
+    width: usize,
+    height: usize,
+    tiles: Vec<TiledBearingTile>,
+}
+
+#[allow(dead_code)]
+impl TiledBearingLevel {
+    fn owning_tile_for_patch(&self, cu: f64, cv: f64, half: usize) -> Option<usize> {
+        self.tiles
+            .iter()
+            .position(|tile| tile.contains_patch(cu, cv, half))
+            .or_else(|| {
+                self.tiles
+                    .iter()
+                    .position(|tile| tile.contains_point(cu, cv))
+            })
+    }
+
+    fn patch_centers_in_tile(
+        &self,
+        tile_idx: usize,
+        settings: &PatchDepthSettings,
+    ) -> Vec<(usize, usize)> {
+        let Some(tile) = self.tiles.get(tile_idx) else {
+            return Vec::new();
+        };
+        let half = settings.patch_size / 2;
+        let mut centers = Vec::new();
+        for v in (half..self.height.saturating_sub(half)).step_by(settings.patch_stride) {
+            for u in (half..self.width.saturating_sub(half)).step_by(settings.patch_stride) {
+                if tile.contains_patch(u as f64, v as f64, half) {
+                    centers.push((u, v));
+                }
+            }
+        }
+        centers
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct TiledBearingImageTile {
+    tile: TiledBearingTile,
+    image: Image<f32>,
+    valid: Image<f32>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct TiledBearingFrameLevel {
+    level: usize,
+    width: usize,
+    height: usize,
+    tiles: Vec<TiledBearingImageTile>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct TiledBearingFrameProducts {
+    frame: Arc<FrameProducts>,
+    raw_pyramid: Arc<Vec<Image<f32>>>,
+    levels: Vec<TiledBearingFrameLevel>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct TiledBearingKeyframeTile {
+    tile: TiledBearingTile,
+    ref_image: Image<f32>,
+    bilinear_valid: Image<f32>,
+    grad_x: Image<f32>,
+    grad_y: Image<f32>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct TiledBearingKeyframeLevel {
+    level: usize,
+    width: usize,
+    height: usize,
+    tiles: Vec<TiledBearingKeyframeTile>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct TiledBearingKeyframe {
+    frame: Arc<FrameProducts>,
+    levels: Vec<TiledBearingKeyframeLevel>,
+}
+
+#[allow(dead_code)]
+fn build_tiled_bearing_levels(
+    camera: &dyn CameraModel,
+    intrinsics: &CameraIntrinsics,
+    width: usize,
+    height: usize,
+    scale: f64,
+    levels: usize,
+    tile_size: usize,
+    tile_overlap: usize,
+) -> Vec<TiledBearingLevel> {
+    let specs = undistort_level_specs(width, height, scale, levels);
+    specs
+        .iter()
+        .enumerate()
+        .map(|(level, spec)| {
+            let tiles = build_tiled_bearing_tiles_for_level(
+                camera,
+                intrinsics,
+                spec,
+                level,
+                tile_size,
+                tile_overlap,
+            );
+            TiledBearingLevel {
+                level,
+                width: spec.lw,
+                height: spec.lh,
+                tiles,
+            }
+        })
+        .collect()
+}
+
+#[allow(dead_code)]
+fn build_tiled_bearing_frame_levels(
+    layout: &[TiledBearingLevel],
+    raw_pyramid: &[Image<f32>],
+) -> Vec<TiledBearingFrameLevel> {
+    layout
+        .iter()
+        .zip(raw_pyramid)
+        .map(|(level, raw)| {
+            let tiles = level
+                .tiles
+                .iter()
+                .map(|tile| TiledBearingImageTile {
+                    tile: tile.clone(),
+                    image: tile.lut.undistort_level(raw),
+                    valid: tile.lut.valid_image(),
+                })
+                .collect();
+            TiledBearingFrameLevel {
+                level: level.level,
+                width: level.width,
+                height: level.height,
+                tiles,
+            }
+        })
+        .collect()
+}
+
+#[allow(dead_code)]
+fn assign_tiled_bearing_seeds(
+    level: &TiledBearingLevel,
+    seeds: &[SparseDepthPrior],
+    scale_from_original: f64,
+    patch_half: usize,
+) -> Vec<Vec<SparseDepthPrior>> {
+    let mut by_tile = vec![Vec::new(); level.tiles.len()];
+    for seed in seeds {
+        let scaled_uv = seed.uv * scale_from_original;
+        for (tile_idx, tile) in level.tiles.iter().enumerate() {
+            if !tile.contains_patch(scaled_uv[0], scaled_uv[1], patch_half)
+                && !tile.contains_point(scaled_uv[0], scaled_uv[1])
+            {
+                continue;
+            }
+            by_tile[tile_idx].push(SparseDepthPrior {
+                uv: tile.global_to_local(scaled_uv),
+                rho: seed.rho,
+                rho_var: seed.rho_var,
+            });
+        }
+    }
+    by_tile
+}
+
+#[allow(dead_code)]
+fn bilinear_valid_image_from_mask(mask: &Image<f32>) -> Image<f32> {
+    build_bilinear_valid_pyramid(std::slice::from_ref(mask))
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| {
+            Image::from_vec(
+                mask.width(),
+                mask.height(),
+                vec![0.0; mask.width() * mask.height()],
+            )
+        })
+}
+
+#[allow(dead_code)]
+fn build_tiled_bearing_tiles_for_level(
+    camera: &dyn CameraModel,
+    intrinsics: &CameraIntrinsics,
+    spec: &image_ops::UndistortLevelSpec,
+    level: usize,
+    tile_size: usize,
+    tile_overlap: usize,
+) -> Vec<TiledBearingTile> {
+    let tile_size = tile_size.max(2);
+    let tile_overlap = tile_overlap.min(tile_size.saturating_sub(1));
+    let stride = (tile_size - tile_overlap).max(1);
+    let mut tiles = Vec::new();
+    let mut y0 = 0;
+    loop {
+        let h = tile_size.min(spec.lh - y0);
+        let mut x0 = 0;
+        loop {
+            let w = tile_size.min(spec.lw - x0);
+            tiles.push(build_tiled_bearing_tile(
+                camera, intrinsics, spec, level, x0, y0, w, h,
+            ));
+            if x0 + w >= spec.lw {
+                break;
+            }
+            x0 = (x0 + stride).min(spec.lw - 1);
+        }
+        if y0 + h >= spec.lh {
+            break;
+        }
+        y0 = (y0 + stride).min(spec.lh - 1);
+    }
+    tiles
+}
+
+#[allow(dead_code)]
+fn build_tiled_bearing_tile(
+    camera: &dyn CameraModel,
+    intrinsics: &CameraIntrinsics,
+    spec: &image_ops::UndistortLevelSpec,
+    level: usize,
+    x0: usize,
+    y0: usize,
+    width: usize,
+    height: usize,
+) -> TiledBearingTile {
+    let center_u = x0 as f64 + 0.5 * (width.saturating_sub(1)) as f64;
+    let center_v = y0 as f64 + 0.5 * (height.saturating_sub(1)) as f64;
+    let raw_center_u = center_u / spec.level_scale;
+    let raw_center_v = center_v / spec.level_scale;
+    let center_bearing = camera
+        .undistort(&Vector2::new(raw_center_u, raw_center_v))
+        .normalize();
+    let (tangent_u, tangent_v) = image_axis_tangent_basis(
+        camera,
+        &center_bearing,
+        raw_center_u,
+        raw_center_v,
+        1.0 / spec.level_scale,
+    );
+    let focal = 0.5 * (intrinsics.fx + intrinsics.fy) * spec.level_scale;
+    let lut = build_tiled_bearing_lut(
+        camera,
+        spec,
+        x0,
+        y0,
+        width,
+        height,
+        center_u,
+        center_v,
+        focal,
+        &center_bearing,
+        &tangent_u,
+        &tangent_v,
+    );
+    TiledBearingTile {
+        level,
+        x0,
+        y0,
+        width,
+        height,
+        center_u,
+        center_v,
+        center_bearing,
+        tangent_u,
+        tangent_v,
+        focal,
+        lut,
+    }
+}
+
+#[allow(dead_code)]
+fn build_tiled_bearing_lut(
+    camera: &dyn CameraModel,
+    spec: &image_ops::UndistortLevelSpec,
+    x0: usize,
+    y0: usize,
+    width: usize,
+    height: usize,
+    center_u: f64,
+    center_v: f64,
+    focal: f64,
+    center_bearing: &Vector3<f64>,
+    tangent_u: &Vector3<f64>,
+    tangent_v: &Vector3<f64>,
+) -> UndistortLut {
+    let mut samples = Vec::with_capacity(width * height);
+    for v in y0..y0 + height {
+        for u in x0..x0 + width {
+            let x = (u as f64 - center_u) / focal;
+            let y = (v as f64 - center_v) / focal;
+            let bearing = (center_bearing + tangent_u * x + tangent_v * y).normalize();
+            let raw_uv = camera.project(&bearing);
+            let raw_u = raw_uv[0] * spec.level_scale + spec.raw_offset;
+            let raw_v = raw_uv[1] * spec.level_scale + spec.raw_offset;
+            samples.push(image_ops::undistort_sample(raw_u, raw_v, spec.lw, spec.lh));
+        }
+    }
+    UndistortLut::from_options_with_source(samples, width, height, spec.lw, spec.lh)
+}
+
+#[allow(dead_code)]
+fn image_axis_tangent_basis(
+    camera: &dyn CameraModel,
+    center_bearing: &Vector3<f64>,
+    raw_center_u: f64,
+    raw_center_v: f64,
+    raw_step: f64,
+) -> (Vector3<f64>, Vector3<f64>) {
+    let b = center_bearing.normalize();
+    let step = raw_step.max(1e-3);
+    let bu_plus = camera
+        .undistort(&Vector2::new(raw_center_u + step, raw_center_v))
+        .normalize();
+    let bu_minus = camera
+        .undistort(&Vector2::new(raw_center_u - step, raw_center_v))
+        .normalize();
+    let bv_plus = camera
+        .undistort(&Vector2::new(raw_center_u, raw_center_v + step))
+        .normalize();
+    let bv_minus = camera
+        .undistort(&Vector2::new(raw_center_u, raw_center_v - step))
+        .normalize();
+
+    let du = project_to_tangent(&(bu_plus - bu_minus), &b);
+    let mut tangent_u = normalize_or_fallback(du, image_axis_fallback_u(&b));
+    tangent_u = project_to_tangent(&tangent_u, &b).normalize();
+
+    let dv = project_to_tangent(&(bv_plus - bv_minus), &b);
+    let dv_orthogonal = project_to_tangent(&(dv - tangent_u * dv.dot(&tangent_u)), &b);
+    let mut tangent_v = normalize_or_fallback(dv_orthogonal, b.cross(&tangent_u));
+    tangent_v = project_to_tangent(&tangent_v, &b).normalize();
+
+    if tangent_v.dot(&dv) < 0.0 {
+        tangent_v = -tangent_v;
+    }
+    (tangent_u, tangent_v)
+}
+
+fn project_to_tangent(v: &Vector3<f64>, b: &Vector3<f64>) -> Vector3<f64> {
+    v - b * v.dot(b)
+}
+
+fn normalize_or_fallback(v: Vector3<f64>, fallback: Vector3<f64>) -> Vector3<f64> {
+    if v.norm_squared() > 1e-18 {
+        v.normalize()
+    } else {
+        fallback.normalize()
+    }
+}
+
+fn image_axis_fallback_u(b: &Vector3<f64>) -> Vector3<f64> {
+    let x_axis = Vector3::new(1.0, 0.0, 0.0);
+    let projected = project_to_tangent(&x_axis, b);
+    if projected.norm_squared() > 1e-18 {
+        projected
+    } else {
+        project_to_tangent(&Vector3::new(0.0, 1.0, 0.0), b)
+    }
+}
+
+fn warp_tiled_local_pixel(
+    curr_tile: &TiledBearingTile,
+    ref_tile: &TiledBearingTile,
+    u_local: f64,
+    v_local: f64,
+    rho: f64,
+    rel_pose: &RelativePose,
+) -> Option<(f64, f64, Vector3<f64>, Vector3<f64>)> {
+    if rho <= 0.0 {
+        return None;
+    }
+    let u = curr_tile.x0 as f64 + u_local;
+    let v = curr_tile.y0 as f64 + v_local;
+    let bearing = curr_tile.bearing_at_level_pixel(u, v);
+    let x_curr = bearing / rho;
+    let x_ref = rel_pose.r * x_curr + rel_pose.t;
+    let uv_ref = ref_tile.project_to_local_pixel(&x_ref)?;
+    Some((uv_ref[0], uv_ref[1], x_ref, bearing))
+}
+
 pub struct PatchDepthMapper {
     camera: Arc<dyn CameraModel>,
     pub(super) camera_mode: PatchDepthCameraMode,
@@ -368,6 +895,9 @@ pub struct PatchDepthMapper {
     keyframes: Vec<DepthKeyframe>,
     pyramid_work: Pyramid,
     pyramid_scratch: PyramidScratch,
+    tiled_keyframes: Vec<TiledBearingKeyframe>,
+    tiled_bearing_levels: Option<Arc<Vec<TiledBearingLevel>>>,
+    stereo_tiled_bearing_levels: Option<Arc<Vec<TiledBearingLevel>>>,
     /// Stereo: LUTs that rectify cam1 raw pixels into cam0's pinhole projection.
     stereo_undistort_luts: Option<Vec<UndistortLut>>,
     stereo_valid_pyramid: Option<Arc<Vec<Image<f32>>>>,
@@ -412,7 +942,7 @@ impl PatchDepthMapper {
     pub fn expected_seed_coordinates(&self) -> PatchDepthSeedCoordinates {
         match self.camera_mode {
             PatchDepthCameraMode::RawDistorted => PatchDepthSeedCoordinates::RawDistorted,
-            PatchDepthCameraMode::UndistortedPinhole => {
+            PatchDepthCameraMode::UndistortedPinhole | PatchDepthCameraMode::TiledBearing => {
                 PatchDepthSeedCoordinates::UndistortedPinhole
             }
         }
@@ -435,6 +965,16 @@ impl PatchDepthMapper {
             settings.n_pyramid_levels > 0,
             "n_pyramid_levels must be positive"
         );
+        anyhow::ensure!(
+            camera_mode != PatchDepthCameraMode::TiledBearing
+                || settings.warp_mode == PatchDepthWarpMode::FastTranslation,
+            "PatchDepth camera_mode=tiled_bearing requires warp_mode=fast_translation"
+        );
+        anyhow::ensure!(
+            camera_mode != PatchDepthCameraMode::TiledBearing
+                || settings.tiled_tile_overlap > settings.patch_size,
+            "PatchDepth camera_mode=tiled_bearing requires tiled_tile_overlap > patch_size for overlap blending"
+        );
 
         let bearing_lut = match camera_mode {
             PatchDepthCameraMode::RawDistorted => {
@@ -452,12 +992,14 @@ impl PatchDepthMapper {
                 }
                 lut
             }
-            PatchDepthCameraMode::UndistortedPinhole => Vec::new(),
+            PatchDepthCameraMode::UndistortedPinhole | PatchDepthCameraMode::TiledBearing => {
+                Vec::new()
+            }
         };
 
         let undistort_luts = match camera_mode {
             PatchDepthCameraMode::RawDistorted => None,
-            PatchDepthCameraMode::UndistortedPinhole => {
+            PatchDepthCameraMode::UndistortedPinhole | PatchDepthCameraMode::TiledBearing => {
                 let specs =
                     undistort_level_specs(width, height, settings.scale, settings.n_pyramid_levels);
                 let luts = specs
@@ -482,6 +1024,20 @@ impl PatchDepthMapper {
                     .collect::<Vec<_>>(),
             )
         });
+        let tiled_bearing_levels = if camera_mode == PatchDepthCameraMode::TiledBearing {
+            Some(Arc::new(build_tiled_bearing_levels(
+                camera.as_ref(),
+                &intrinsics,
+                width,
+                height,
+                settings.scale,
+                settings.n_pyramid_levels,
+                settings.tiled_tile_size,
+                settings.tiled_tile_overlap,
+            )))
+        } else {
+            None
+        };
 
         Ok(Self {
             camera,
@@ -496,6 +1052,9 @@ impl PatchDepthMapper {
             keyframes: Vec::new(),
             pyramid_work: empty_pyramid(),
             pyramid_scratch: PyramidScratch::new(width, height, 1.0),
+            tiled_keyframes: Vec::new(),
+            tiled_bearing_levels,
+            stereo_tiled_bearing_levels: None,
             stereo_undistort_luts: None,
             stereo_valid_pyramid: None,
             stereo_t_c1_c0: None,
@@ -529,6 +1088,9 @@ impl PatchDepthMapper {
         {
             return None;
         }
+        if self.camera_mode == PatchDepthCameraMode::TiledBearing {
+            return self.update_with_priors_tiled_bearing(frame, seeds, p_vv, dt);
+        }
 
         let depth_frame = self.depth_frame_products(frame)?;
         let median_depth = median_seed_depth(seeds).unwrap_or(self.settings.max_depth);
@@ -546,17 +1108,51 @@ impl PatchDepthMapper {
         ))
     }
 
+    fn update_with_priors_tiled_bearing(
+        &mut self,
+        frame: FrameProducts,
+        seeds: &[SparseDepthPrior],
+        p_vv: Option<&Matrix3<f64>>,
+        dt: f64,
+    ) -> Option<PatchDepthOutput> {
+        let depth_frame = self.tiled_bearing_frame_products(frame)?;
+        let median_depth = median_seed_depth(seeds).unwrap_or(self.settings.max_depth);
+        let selected = self.select_tiled_keyframe(&depth_frame.frame.pose_t_wc, median_depth);
+        self.manage_tiled_keyframes(&depth_frame, median_depth);
+        let (ref_keyframe, t_ref_curr) = selected?;
+        let sigma_warp_sq =
+            compute_sigma_warp_sq(&self.intrinsics, &t_ref_curr, p_vv, dt, median_depth);
+        Some(self.solve_tiled_bearing(
+            &depth_frame,
+            &ref_keyframe,
+            &t_ref_curr,
+            seeds,
+            sigma_warp_sq,
+        ))
+    }
+
     /// Set up stereo reference frame support. Builds rectification LUTs that
     /// map cam0-pinhole pixels to cam1 raw pixels, so cam1 images can be used
     /// as reference frames with the existing warp/project pipeline.
     ///
     /// `cam1_model` must use the same resolution as cam0.
-    pub fn init_stereo_ref(
-        &mut self,
-        cam1_model: &dyn CameraModel,
-        t_c1_c0: Matrix4<f64>,
-    ) {
+    pub fn init_stereo_ref(&mut self, cam1_model: &dyn CameraModel, t_c1_c0: Matrix4<f64>) {
+        self.stereo_t_c1_c0 = Some(t_c1_c0);
+        if self.camera_mode == PatchDepthCameraMode::TiledBearing {
+            self.stereo_tiled_bearing_levels = Some(Arc::new(build_tiled_bearing_levels(
+                cam1_model,
+                &self.intrinsics,
+                self.width,
+                self.height,
+                self.settings.scale,
+                self.settings.n_pyramid_levels,
+                self.settings.tiled_tile_size,
+                self.settings.tiled_tile_overlap,
+            )));
+            return;
+        }
         if self.camera_mode != PatchDepthCameraMode::UndistortedPinhole {
+            self.stereo_t_c1_c0 = None;
             return;
         }
         let specs = undistort_level_specs(
@@ -582,11 +1178,10 @@ impl PatchDepthMapper {
         );
         self.stereo_undistort_luts = Some(luts);
         self.stereo_valid_pyramid = Some(valid);
-        self.stereo_t_c1_c0 = Some(t_c1_c0);
     }
 
     pub fn has_stereo_ref(&self) -> bool {
-        self.stereo_undistort_luts.is_some()
+        self.stereo_undistort_luts.is_some() || self.stereo_tiled_bearing_levels.is_some()
     }
 
     /// Use cam1 as the reference frame instead of the motion-based keyframe pool.
@@ -602,6 +1197,16 @@ impl PatchDepthMapper {
     ) -> Option<PatchDepthOutput> {
         if seed_coordinates != self.expected_seed_coordinates() {
             return None;
+        }
+        if self.camera_mode == PatchDepthCameraMode::TiledBearing {
+            return self.update_with_stereo_ref_tiled_bearing(
+                sparse_filter,
+                measurement,
+                frame,
+                cam1_gray,
+                cam1_width,
+                cam1_height,
+            );
         }
         let stereo_luts = self.stereo_undistort_luts.as_ref()?;
         let t_c1_c0 = self.stereo_t_c1_c0?;
@@ -652,6 +1257,54 @@ impl PatchDepthMapper {
         Some(self.solve(&depth_frame, &ref_keyframe, &t_c1_c0, &seeds, 0.0))
     }
 
+    fn update_with_stereo_ref_tiled_bearing(
+        &mut self,
+        sparse_filter: &Sparse3DFilter,
+        measurement: &VisionMeasurement,
+        frame: FrameProducts,
+        cam1_gray: &[u8],
+        cam1_width: usize,
+        cam1_height: usize,
+    ) -> Option<PatchDepthOutput> {
+        if cam1_width != self.width
+            || cam1_height != self.height
+            || cam1_gray.len() != self.width * self.height
+        {
+            return None;
+        }
+        let stereo_layout = Arc::clone(self.stereo_tiled_bearing_levels.as_ref()?);
+        let t_c1_c0 = self.stereo_t_c1_c0?;
+        let seeds = self.gather_seeds(sparse_filter, measurement);
+        let depth_frame = self.tiled_bearing_frame_products(frame)?;
+
+        let raw_cam1_pyramid = Arc::new(self.build_depth_pyramid_from_u8(
+            cam1_gray,
+            cam1_width,
+            cam1_height,
+            self.settings.scale,
+            self.settings.n_pyramid_levels,
+        ));
+        let cam1_levels =
+            build_tiled_bearing_frame_levels(stereo_layout.as_ref(), raw_cam1_pyramid.as_ref());
+        let cam1_frame_products = TiledBearingFrameProducts {
+            frame: Arc::new(FrameProducts {
+                frame_id: 0,
+                stamp: depth_frame.frame.stamp,
+                gray: Vec::new(),
+                width: cam1_width,
+                height: cam1_height,
+                pose_t_wc: Matrix4::identity(),
+            }),
+            raw_pyramid: raw_cam1_pyramid,
+            levels: cam1_levels,
+        };
+        let ref_keyframe = self.make_tiled_bearing_keyframe(&cam1_frame_products);
+        let median_depth = median_seed_depth(&seeds).unwrap_or(self.settings.max_depth);
+        self.manage_tiled_keyframes(&depth_frame, median_depth);
+
+        Some(self.solve_tiled_bearing(&depth_frame, &ref_keyframe, &t_c1_c0, &seeds, 0.0))
+    }
+
     pub fn keyframe_count(&self) -> usize {
         self.keyframes.len()
     }
@@ -669,7 +1322,7 @@ impl PatchDepthMapper {
         );
         let (pyramid, valid_pyramid) = match self.camera_mode {
             PatchDepthCameraMode::RawDistorted => (raw_pyramid, None),
-            PatchDepthCameraMode::UndistortedPinhole => {
+            PatchDepthCameraMode::UndistortedPinhole | PatchDepthCameraMode::TiledBearing => {
                 let luts = self.undistort_luts.as_ref()?;
                 let undistorted: Vec<Image<f32>> = raw_pyramid
                     .iter()
@@ -684,6 +1337,119 @@ impl PatchDepthMapper {
             pyramid: Arc::new(pyramid),
             valid_pyramid,
         })
+    }
+
+    #[allow(dead_code)]
+    fn tiled_bearing_frame_products(
+        &mut self,
+        frame: FrameProducts,
+    ) -> Option<TiledBearingFrameProducts> {
+        let layout = Arc::clone(self.tiled_bearing_levels.as_ref()?);
+        let raw_pyramid = Arc::new(self.build_depth_pyramid_from_u8(
+            &frame.gray,
+            frame.width,
+            frame.height,
+            self.settings.scale,
+            self.settings.n_pyramid_levels,
+        ));
+        let levels = build_tiled_bearing_frame_levels(layout.as_ref(), raw_pyramid.as_ref());
+        Some(TiledBearingFrameProducts {
+            frame: Arc::new(frame),
+            raw_pyramid,
+            levels,
+        })
+    }
+
+    #[allow(dead_code)]
+    fn make_tiled_bearing_keyframe(
+        &self,
+        frame_products: &TiledBearingFrameProducts,
+    ) -> TiledBearingKeyframe {
+        let levels = frame_products
+            .levels
+            .iter()
+            .map(|level| {
+                let tiles = level
+                    .tiles
+                    .iter()
+                    .map(|tile| {
+                        let (grad_x, grad_y) = gradients(&tile.image);
+                        TiledBearingKeyframeTile {
+                            tile: tile.tile.clone(),
+                            ref_image: tile.image.clone(),
+                            bilinear_valid: bilinear_valid_image_from_mask(&tile.valid),
+                            grad_x,
+                            grad_y,
+                        }
+                    })
+                    .collect();
+                TiledBearingKeyframeLevel {
+                    level: level.level,
+                    width: level.width,
+                    height: level.height,
+                    tiles,
+                }
+            })
+            .collect();
+        TiledBearingKeyframe {
+            frame: Arc::clone(&frame_products.frame),
+            levels,
+        }
+    }
+
+    fn select_tiled_keyframe(
+        &self,
+        t_wc: &Matrix4<f64>,
+        median_depth: f64,
+    ) -> Option<(TiledBearingKeyframe, Matrix4<f64>)> {
+        let min_bl = self.settings.min_baseline_ratio * median_depth;
+        let max_bl = self.settings.max_baseline_ratio * median_depth;
+        let mut best: Option<(TiledBearingKeyframe, Matrix4<f64>, f64)> = None;
+
+        for keyframe in &self.tiled_keyframes {
+            let t_ref_curr = keyframe
+                .frame
+                .pose_t_wc
+                .try_inverse()
+                .unwrap_or_else(Matrix4::identity)
+                * t_wc;
+            let baseline = t_ref_curr.fixed_view::<3, 1>(0, 3).norm();
+            if baseline >= min_bl
+                && baseline <= max_bl
+                && best.as_ref().map(|(_, _, b)| baseline > *b).unwrap_or(true)
+            {
+                best = Some((keyframe.clone(), t_ref_curr, baseline));
+            }
+        }
+
+        best.map(|(kf, t, _)| (kf, t))
+    }
+
+    fn manage_tiled_keyframes(
+        &mut self,
+        depth_frame: &TiledBearingFrameProducts,
+        median_depth: f64,
+    ) {
+        if self.tiled_keyframes.len() < 2 {
+            self.tiled_keyframes
+                .push(self.make_tiled_bearing_keyframe(depth_frame));
+            return;
+        }
+
+        let min_bl = self.settings.min_baseline_ratio * median_depth;
+        let newest = &self.tiled_keyframes[self.tiled_keyframes.len() - 1];
+        let t_new_curr = newest
+            .frame
+            .pose_t_wc
+            .try_inverse()
+            .unwrap_or_else(Matrix4::identity)
+            * depth_frame.frame.pose_t_wc;
+        let baseline = t_new_curr.fixed_view::<3, 1>(0, 3).norm();
+        if baseline >= min_bl {
+            self.tiled_keyframes.remove(0);
+            self.tiled_keyframes
+                .push(self.make_tiled_bearing_keyframe(depth_frame));
+        }
     }
 
     fn build_depth_pyramid_from_u8(
@@ -714,16 +1480,20 @@ impl PatchDepthMapper {
         let mut seeds = Vec::new();
         for fid in fids {
             let uv_f32 = &measurement.cam_coordinates[&fid];
-            let (z, z_var) = sparse_filter.query(fid);
-            if z <= 0.0
-                || z < self.settings.min_depth
-                || z > self.settings.max_depth
-                || !z_var.is_finite()
+            let (depth, depth_var) = if self.camera_mode == PatchDepthCameraMode::TiledBearing {
+                sparse_filter.query_range(fid)
+            } else {
+                sparse_filter.query(fid)
+            };
+            if depth <= 0.0
+                || depth < self.settings.min_depth
+                || depth > self.settings.max_depth
+                || !depth_var.is_finite()
             {
                 continue;
             }
-            let rho = 1.0 / z;
-            let rho_var = z_var / z.powi(4);
+            let rho = 1.0 / depth;
+            let rho_var = depth_var / depth.powi(4);
             if rho.is_finite() && rho_var.is_finite() && rho_var > 0.0 {
                 seeds.push(SparseDepthPrior {
                     uv: Vector2::new(uv_f32[0] as f64, uv_f32[1] as f64),
@@ -909,6 +1679,295 @@ impl PatchDepthMapper {
                 &scaled_intrinsics[0],
                 &rel_pose,
             )
+        }
+    }
+
+    fn solve_tiled_bearing(
+        &self,
+        depth_frame: &TiledBearingFrameProducts,
+        ref_keyframe: &TiledBearingKeyframe,
+        t_ref_curr: &Matrix4<f64>,
+        seeds: &[SparseDepthPrior],
+        sigma_warp_sq: f64,
+    ) -> PatchDepthOutput {
+        let curr_level = &depth_frame.levels[0];
+        let ref_level = &ref_keyframe.levels[0];
+        let width = curr_level.width;
+        let height = curr_level.height;
+        let n = width * height;
+        let mut rho_acc = vec![0.0f32; n];
+        let mut w_acc = vec![0.0f32; n];
+        let mut status = vec![PatchStatus::Unknown; n];
+        let rel_pose = RelativePose::from_matrix(t_ref_curr);
+        let half = self.settings.patch_size / 2;
+        let scaled_seeds = scale_seeds(seeds, self.settings.scale);
+        let layout = self
+            .tiled_bearing_levels
+            .as_ref()
+            .and_then(|levels| levels.first())
+            .expect("tiled bearing layout must exist");
+        let tile_seeds = assign_tiled_bearing_seeds(layout, &scaled_seeds, 1.0, half);
+
+        #[cfg(feature = "parallel")]
+        let patch_results: Vec<TiledPatchResult> = {
+            let min_len = (curr_level.tiles.len() / (rayon::current_num_threads() * 8)).max(1);
+            (0..curr_level.tiles.len())
+                .into_par_iter()
+                .with_min_len(min_len)
+                .map(|tile_idx| {
+                    self.solve_tiled_bearing_tile_patches(
+                        tile_idx,
+                        curr_level,
+                        ref_level,
+                        layout,
+                        &tile_seeds,
+                        depth_frame,
+                        ref_keyframe,
+                        &rel_pose,
+                        sigma_warp_sq,
+                    )
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .flatten()
+                .collect()
+        };
+
+        #[cfg(not(feature = "parallel"))]
+        let patch_results: Vec<TiledPatchResult> = (0..curr_level.tiles.len())
+            .flat_map(|tile_idx| {
+                self.solve_tiled_bearing_tile_patches(
+                    tile_idx,
+                    curr_level,
+                    ref_level,
+                    layout,
+                    &tile_seeds,
+                    depth_frame,
+                    ref_keyframe,
+                    &rel_pose,
+                    sigma_warp_sq,
+                )
+            })
+            .collect();
+
+        for result in patch_results {
+            let Some(curr_tile) = curr_level.tiles.get(result.tile_idx) else {
+                continue;
+            };
+            if curr_tile
+                .tile
+                .contains_point(result.global_u as f64, result.global_v as f64)
+            {
+                self.accumulate_tiled_patch(
+                    &mut rho_acc,
+                    &mut w_acc,
+                    &mut status,
+                    width,
+                    height,
+                    &curr_tile.tile,
+                    result.local_u,
+                    result.local_v,
+                    result.estimate,
+                );
+            }
+        }
+
+        let mut depth = vec![f32::NAN; n];
+        let mut variance = vec![f32::INFINITY; n];
+        for idx in 0..n {
+            if w_acc[idx] > 0.0 && rho_acc[idx] > 0.0 {
+                depth[idx] = w_acc[idx] / rho_acc[idx];
+                variance[idx] = 1.0 / w_acc[idx];
+            }
+        }
+        PatchDepthOutput {
+            depth: DepthMap::from_vec(width, height, depth).expect("depth size"),
+            variance: DepthMap::from_vec(width, height, variance).expect("variance size"),
+            status: DepthMap::from_vec(width, height, status).expect("status size"),
+        }
+    }
+
+    fn solve_tiled_bearing_tile_patches(
+        &self,
+        tile_idx: usize,
+        curr_level: &TiledBearingFrameLevel,
+        ref_level: &TiledBearingKeyframeLevel,
+        layout: &TiledBearingLevel,
+        tile_seeds: &[Vec<SparseDepthPrior>],
+        depth_frame: &TiledBearingFrameProducts,
+        ref_keyframe: &TiledBearingKeyframe,
+        rel_pose: &RelativePose,
+        sigma_warp_sq: f64,
+    ) -> Vec<TiledPatchResult> {
+        let Some(curr_tile) = curr_level.tiles.get(tile_idx) else {
+            return Vec::new();
+        };
+        if ref_level.tiles.get(tile_idx).is_none() {
+            return Vec::new();
+        }
+        let Some(local_seeds) = tile_seeds.get(tile_idx) else {
+            return Vec::new();
+        };
+        let seed_grid = SeedGrid::new(
+            local_seeds,
+            self.settings.seed_radius_px * self.settings.scale,
+            curr_tile.tile.width,
+            curr_tile.tile.height,
+        );
+
+        layout
+            .patch_centers_in_tile(tile_idx, &self.settings)
+            .into_iter()
+            .map(|(global_u, global_v)| {
+                let local = curr_tile
+                    .tile
+                    .global_to_local(Vector2::new(global_u as f64, global_v as f64));
+                let estimate = self.solve_one_tiled_bearing_patch_level(
+                    global_u as f64,
+                    global_v as f64,
+                    local[0],
+                    local[1],
+                    local_seeds,
+                    &seed_grid,
+                    depth_frame,
+                    ref_keyframe,
+                    rel_pose,
+                    sigma_warp_sq,
+                );
+                TiledPatchResult {
+                    tile_idx,
+                    global_u,
+                    global_v,
+                    local_u: local[0],
+                    local_v: local[1],
+                    estimate,
+                }
+            })
+            .collect()
+    }
+
+    fn solve_one_tiled_bearing_patch_level(
+        &self,
+        global_cu: f64,
+        global_cv: f64,
+        local_cu: f64,
+        local_cv: f64,
+        seeds: &[SparseDepthPrior],
+        seed_grid: &SeedGrid,
+        depth_frame: &TiledBearingFrameProducts,
+        ref_keyframe: &TiledBearingKeyframe,
+        rel_pose: &RelativePose,
+        sigma_warp_sq: f64,
+    ) -> PatchEstimate {
+        let nearby = nearby_seed_weights(local_cu, local_cv, seeds, seed_grid, &self.settings);
+        if nearby.is_empty() {
+            return PatchEstimate::unknown();
+        }
+
+        let mut seed_rho_init = 0.0;
+        let mut seed_weight_total = 0.0;
+        let mut seed_precision_sum = 0.0;
+        for item in nearby.iter() {
+            let weighted_precision = item.w_spatial * item.precision;
+            seed_rho_init += weighted_precision * seeds[item.idx].rho;
+            seed_weight_total += weighted_precision;
+            seed_precision_sum += weighted_precision;
+        }
+
+        let rho_min = 1.0 / self.settings.max_depth;
+        let rho_max = 1.0 / self.settings.min_depth;
+        let rho_init = (seed_rho_init / seed_weight_total).clamp(rho_min, rho_max);
+        let mut rho = rho_init;
+        let mut final_residual = 1e10;
+        let mut final_curvature = 0.0;
+
+        for _ in 0..self.settings.n_gn_iters {
+            let (grad_photo, hess_photo, mean_res, valid) = self
+                .patch_residual_jacobian_fast_translation_tiled(
+                    global_cu,
+                    global_cv,
+                    rho,
+                    depth_frame,
+                    ref_keyframe,
+                    rel_pose,
+                    sigma_warp_sq,
+                );
+            if valid == 0 {
+                break;
+            }
+
+            let mut grad_seed = 0.0;
+            let mut hess_seed = 0.0;
+            for item in nearby.iter() {
+                let wp = self.settings.lambda_seed * item.w_spatial * item.precision;
+                grad_seed += wp * (rho - seeds[item.idx].rho);
+                hess_seed += wp;
+            }
+
+            let hess_total = hess_photo + hess_seed;
+            if hess_total < 1e-12 {
+                break;
+            }
+            rho = (rho - (grad_photo + grad_seed) / hess_total).clamp(rho_min, rho_max);
+            final_residual = mean_res;
+            final_curvature = hess_photo;
+        }
+
+        let min_curvature = self.settings.min_photo_curvature
+            * (self.settings.patch_size * self.settings.patch_size) as f64;
+        if final_curvature >= min_curvature && final_residual <= self.settings.max_photo_residual {
+            let hess_total = final_curvature + seed_precision_sum * self.settings.lambda_seed;
+            let var = 1.0 / hess_total.max(1e-12);
+            PatchEstimate::photo_refined(rho, var, &self.settings)
+        } else if final_residual > self.settings.max_photo_residual
+            && final_curvature >= min_curvature
+        {
+            PatchEstimate::rejected(rho)
+        } else {
+            let var = 1.0 / (seed_precision_sum * self.settings.lambda_seed).max(1e-12);
+            PatchEstimate::seed_only(rho_init, var, &self.settings)
+        }
+    }
+
+    fn accumulate_tiled_patch(
+        &self,
+        rho_acc: &mut [f32],
+        w_acc: &mut [f32],
+        status: &mut [PatchStatus],
+        width: usize,
+        height: usize,
+        tile: &TiledBearingTile,
+        cu: f64,
+        cv: f64,
+        estimate: PatchEstimate,
+    ) {
+        let Some(inv_var_w) = estimate.inv_var_weight_f32() else {
+            return;
+        };
+        let half = self.settings.patch_size / 2;
+        for dy in -(half as isize)..half as isize {
+            for dx in -(half as isize)..half as isize {
+                let local_u = cu + dx as f64;
+                let local_v = cv + dy as f64;
+                let global_u = tile.x0 as isize + local_u.round() as isize;
+                let global_v = tile.y0 as isize + local_v.round() as isize;
+                if global_u < 0
+                    || global_v < 0
+                    || global_u >= width as isize
+                    || global_v >= height as isize
+                {
+                    continue;
+                }
+                let idx = global_v as usize * width + global_u as usize;
+                let global_bearing = tile.bearing_at_level_pixel(global_u as f64, global_v as f64);
+                let z_over_range = global_bearing[2].max(1e-6);
+                let inv_z = estimate.rho / z_over_range;
+                rho_acc[idx] += inv_var_w * inv_z as f32;
+                w_acc[idx] += inv_var_w;
+                if (estimate.status as u8) > (status[idx] as u8) {
+                    status[idx] = estimate.status;
+                }
+            }
         }
     }
 
@@ -1518,6 +2577,173 @@ impl PatchDepthMapper {
         (grad, hess, sum_abs_res, n_valid)
     }
 
+    fn patch_residual_jacobian_fast_translation_tiled(
+        &self,
+        cu: f64,
+        cv: f64,
+        rho: f64,
+        depth_frame: &TiledBearingFrameProducts,
+        ref_keyframe: &TiledBearingKeyframe,
+        rel_pose: &RelativePose,
+        sigma_warp_sq: f64,
+    ) -> (f64, f64, f64, usize) {
+        let Some(layouts) = self.tiled_bearing_levels.as_ref() else {
+            return (0.0, 0.0, 0.0, 0);
+        };
+        let mut grad = 0.0;
+        let mut hess = 0.0;
+        let mut sum_abs_res = 0.0;
+        let mut n_valid = 0;
+        let half = self.settings.patch_size / 2;
+
+        for (level, layout) in layouts.iter().enumerate() {
+            let scale = 1.0 / (1usize << level) as f64;
+            let cu_l = cu * scale;
+            let cv_l = cv * scale;
+            let Some(tile_idx) = layout.owning_tile_for_patch(cu_l, cv_l, half) else {
+                continue;
+            };
+            let Some(curr_level) = depth_frame.levels.get(level) else {
+                continue;
+            };
+            let Some(ref_level) = ref_keyframe.levels.get(level) else {
+                continue;
+            };
+            let Some(curr_tile) = curr_level.tiles.get(tile_idx) else {
+                continue;
+            };
+            let Some(ref_tile) = ref_level.tiles.get(tile_idx) else {
+                continue;
+            };
+            let local = curr_tile.tile.global_to_local(Vector2::new(cu_l, cv_l));
+            let (g, h, sar, nv) = self.patch_residual_jacobian_fast_translation_tiled_level(
+                &curr_tile.tile,
+                &ref_tile.tile,
+                local[0],
+                local[1],
+                rho,
+                &curr_tile.image,
+                Some(&curr_tile.valid),
+                &ref_tile.ref_image,
+                Some(&ref_tile.bilinear_valid),
+                &ref_tile.grad_x,
+                &ref_tile.grad_y,
+                rel_pose,
+                sigma_warp_sq,
+            );
+            grad += g;
+            hess += h;
+            sum_abs_res += sar;
+            n_valid += nv;
+        }
+
+        (grad, hess, sum_abs_res / n_valid.max(1) as f64, n_valid)
+    }
+
+    #[allow(dead_code)]
+    fn patch_residual_jacobian_fast_translation_tiled_level(
+        &self,
+        curr_tile: &TiledBearingTile,
+        ref_tile: &TiledBearingTile,
+        cu: f64,
+        cv: f64,
+        rho: f64,
+        curr_img: &Image<f32>,
+        curr_valid: Option<&Image<f32>>,
+        ref_img: &Image<f32>,
+        ref_valid: Option<&Image<f32>>,
+        ref_grad_x: &Image<f32>,
+        ref_grad_y: &Image<f32>,
+        rel_pose: &RelativePose,
+        sigma_warp_sq: f64,
+    ) -> (f64, f64, f64, usize) {
+        let Some((u_ref_center, v_ref_center, x_ref_center, bearing_center)) =
+            warp_tiled_local_pixel(curr_tile, ref_tile, cu, cv, rho, rel_pose)
+        else {
+            return (0.0, 0.0, 0.0, 0);
+        };
+
+        let dx_ref_drho = rel_pose.r * (-bearing_center / (rho * rho));
+        let Some(du_dxref) = ref_tile.projection_jacobian(&x_ref_center) else {
+            return (0.0, 0.0, 0.0, 0);
+        };
+        let duv_drho = du_dxref * dx_ref_drho;
+        let du_drho = duv_drho[0];
+        let dv_drho = duv_drho[1];
+
+        let Some(patch) =
+            self.translated_patch_footprint(cu, cv, ref_img, u_ref_center, v_ref_center)
+        else {
+            return (0.0, 0.0, 0.0, 0);
+        };
+
+        let mut grad = 0.0;
+        let mut hess = 0.0;
+        let mut sum_abs_res = 0.0;
+        let mut n_valid = 0;
+        let sigma_photo_sq = self.settings.sigma_photo * self.settings.sigma_photo;
+        let constant_inv_sigma_photo_sq =
+            (sigma_warp_sq <= 1e-18).then_some(1.0 / sigma_photo_sq.max(1e-12));
+
+        for ly in 0..patch.side {
+            let cy = patch.curr_y0 + ly as isize;
+            if cy < 0 || cy >= curr_img.height() as isize {
+                continue;
+            }
+            unsafe {
+                let curr_row = curr_img.row_ptr(cy as usize);
+                let curr_mask_row = curr_valid.map(|mask| mask.row_ptr(cy as usize));
+                let ref_row0 = ref_img.row_ptr(patch.ref_fp.y + ly);
+                let ref_row1 = ref_img.row_ptr(patch.ref_fp.y + ly + 1);
+                let gx_row0 = ref_grad_x.row_ptr(patch.ref_fp.y + ly);
+                let gx_row1 = ref_grad_x.row_ptr(patch.ref_fp.y + ly + 1);
+                let gy_row0 = ref_grad_y.row_ptr(patch.ref_fp.y + ly);
+                let gy_row1 = ref_grad_y.row_ptr(patch.ref_fp.y + ly + 1);
+                let ref_mask_row = ref_valid.map(|mask| mask.row_ptr(patch.ref_fp.y + ly));
+                for lx in 0..patch.side {
+                    let cx = patch.curr_x0 + lx as isize;
+                    if cx < 0 || cx >= curr_img.width() as isize {
+                        continue;
+                    }
+                    if !mask_row_valid(curr_mask_row, cx as usize) {
+                        continue;
+                    }
+                    if !mask_row_valid(ref_mask_row, patch.ref_fp.x + lx) {
+                        continue;
+                    }
+
+                    let ix = patch.ref_fp.x + lx;
+                    let i_curr = *curr_row.add(cx as usize);
+                    let i_ref = bilerp_ptr(ref_row0, ref_row1, ix, patch.ref_fp.weights);
+                    let gx = bilerp_ptr(gx_row0, gx_row1, ix, patch.ref_fp.weights);
+                    let gy = bilerp_ptr(gy_row0, gy_row1, ix, patch.ref_fp.weights);
+
+                    let jac = gx as f64 * du_drho + gy as f64 * dv_drho;
+                    let residual = i_ref as f64 - i_curr as f64;
+                    let ar = residual.abs();
+                    let inv_sigma_eff_sq = photo_inv_sigma_eff_sq(
+                        gx,
+                        gy,
+                        sigma_photo_sq,
+                        sigma_warp_sq,
+                        constant_inv_sigma_photo_sq,
+                    );
+                    let weight = huber_weight_from_abs_res(
+                        ar,
+                        self.settings.photo_huber_delta,
+                        inv_sigma_eff_sq,
+                    );
+                    grad += weight * jac * residual;
+                    hess += weight * jac * jac;
+                    sum_abs_res += ar;
+                    n_valid += 1;
+                }
+            }
+        }
+
+        (grad, hess, sum_abs_res, n_valid)
+    }
+
     fn translated_patch_footprint(
         &self,
         cu: f64,
@@ -1639,7 +2865,7 @@ impl PatchDepthMapper {
         let original_v = v / intr.scale_from_original;
         match self.camera_mode {
             PatchDepthCameraMode::RawDistorted => self.bearing_at_original(original_u, original_v),
-            PatchDepthCameraMode::UndistortedPinhole => {
+            PatchDepthCameraMode::UndistortedPinhole | PatchDepthCameraMode::TiledBearing => {
                 if original_u < 0.0
                     || original_v < 0.0
                     || original_u >= (self.width - 1) as f64
@@ -1662,7 +2888,7 @@ impl PatchDepthMapper {
                 let uv = self.camera.project(p);
                 (uv[0] * scale_from_original, uv[1] * scale_from_original)
             }
-            PatchDepthCameraMode::UndistortedPinhole => {
+            PatchDepthCameraMode::UndistortedPinhole | PatchDepthCameraMode::TiledBearing => {
                 let z_inv = 1.0 / p[2];
                 (
                     (self.intrinsics.fx * p[0] * z_inv + self.intrinsics.cx) * scale_from_original,
@@ -1675,7 +2901,7 @@ impl PatchDepthMapper {
     fn projection_jacobian(&self, p: &Vector3<f64>) -> nalgebra::Matrix2x3<f64> {
         match self.camera_mode {
             PatchDepthCameraMode::RawDistorted => self.camera.projection_jacobian(p),
-            PatchDepthCameraMode::UndistortedPinhole => {
+            PatchDepthCameraMode::UndistortedPinhole | PatchDepthCameraMode::TiledBearing => {
                 let z_inv = 1.0 / p[2];
                 let z_inv2 = z_inv * z_inv;
                 nalgebra::Matrix2x3::new(

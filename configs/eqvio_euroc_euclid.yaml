@@ -122,11 +122,14 @@ Stereo:
   max_residual: 20.0
   histeq: global
 PatchDepth:
-  camera_mode: undistorted_pinhole
+  camera_mode: tiled_bearing
   warp_mode: fast_translation
   scale: 0.25
   patch_size: 8
   patch_stride: 4
+  # tiled_tile_size: 96
+  tiled_tile_size: 32
+  tiled_tile_overlap: 16
   cell_size: 8
   seed_radius_px: 64
   min_baseline_ratio: 0.005

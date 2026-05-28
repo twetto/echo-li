@@ -10,11 +10,11 @@ use echo_li_core::depth::sparse_3d::{Sparse3DChart, Sparse3DFilter};
 use echo_li_core::depth::sparse_gb::SparseVogSettings;
 use echo_li_core::initialization::{check_stationary, estimate_initial_pose};
 use echo_li_core::mathematical::camera::CameraModel;
-use rudolf_v::camera::CameraIntrinsics as RudolfCameraIntrinsics;
 use echo_li_core::mathematical::*;
 use echo_li_core::trajectory_metrics::TrajectoryMetrics;
 use echo_li_core::{LandmarkDepthPrior, VIOFilter, VIOFilterSettings};
 use nalgebra::{Matrix3, Matrix4, Vector2};
+use rudolf_v::camera::CameraIntrinsics as RudolfCameraIntrinsics;
 use rudolf_v::camera::StereoRig;
 use rudolf_v::frontend::{Frontend, FrontendConfig, LbpPolicy};
 use rudolf_v::image::Image as RudolfImage;
@@ -1212,13 +1212,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if !patch_gray_data.is_empty() {
                                 let patch_measurement = match mapper.camera_mode() {
                                     PatchDepthCameraMode::RawDistorted => &measurement,
-                                    PatchDepthCameraMode::UndistortedPinhole => &sparse_measurement,
+                                    PatchDepthCameraMode::UndistortedPinhole
+                                    | PatchDepthCameraMode::TiledBearing => &sparse_measurement,
                                 };
                                 let patch_seed_coordinates = match mapper.camera_mode() {
                                     PatchDepthCameraMode::RawDistorted => {
                                         PatchDepthSeedCoordinates::RawDistorted
                                     }
-                                    PatchDepthCameraMode::UndistortedPinhole => {
+                                    PatchDepthCameraMode::UndistortedPinhole
+                                    | PatchDepthCameraMode::TiledBearing => {
                                         PatchDepthSeedCoordinates::UndistortedPinhole
                                     }
                                 };
@@ -1230,25 +1232,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     height: img_h,
                                     pose_t_wc: t_wc,
                                 };
-                                let patch_output =
-                                    if let Some(cam1_gray) = &cam1_gray_for_patch {
-                                        mapper.update_with_stereo_ref(
-                                            sparse,
-                                            patch_measurement,
-                                            patch_seed_coordinates,
-                                            frame,
-                                            cam1_gray,
-                                            img_w,
-                                            img_h,
-                                        )
-                                    } else {
-                                        mapper.update(
-                                            sparse,
-                                            patch_measurement,
-                                            patch_seed_coordinates,
-                                            frame,
-                                        )
-                                    };
+                                let patch_output = if let Some(cam1_gray) = &cam1_gray_for_patch {
+                                    mapper.update_with_stereo_ref(
+                                        sparse,
+                                        patch_measurement,
+                                        patch_seed_coordinates,
+                                        frame,
+                                        cam1_gray,
+                                        img_w,
+                                        img_h,
+                                    )
+                                } else {
+                                    mapper.update(
+                                        sparse,
+                                        patch_measurement,
+                                        patch_seed_coordinates,
+                                        frame,
+                                    )
+                                };
                                 last_patch_depth_counts =
                                     patch_output.as_ref().map(patch_depth_status_counts);
                                 #[cfg(feature = "rerun")]

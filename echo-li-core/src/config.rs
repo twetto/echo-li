@@ -312,6 +312,10 @@ pub struct PatchDepthConfig {
     #[serde(default)]
     pub status_weight_seed: Option<f64>,
     #[serde(default)]
+    pub tiled_tile_size: Option<usize>,
+    #[serde(default)]
+    pub tiled_tile_overlap: Option<usize>,
+    #[serde(default)]
     pub vis_min_depth: Option<f64>,
     #[serde(default)]
     pub vis_max_depth: Option<f64>,
@@ -329,6 +333,8 @@ impl PatchDepthConfig {
                 "undistorted_pinhole" | "undistorted-pinhole" | "pinhole" => {
                     PatchDepthCameraMode::UndistortedPinhole
                 }
+                "tiled_bearing" | "tiled-bearing" | "tiledbearing" | "tiled_pinhole"
+                | "tiled-pinhole" | "tiledpinhole" => PatchDepthCameraMode::TiledBearing,
                 _ => PatchDepthCameraMode::RawDistorted,
             };
         }
@@ -412,6 +418,12 @@ impl PatchDepthConfig {
         }
         if let Some(v) = self.status_weight_seed {
             settings.status_weight_seed = v;
+        }
+        if let Some(v) = self.tiled_tile_size {
+            settings.tiled_tile_size = v;
+        }
+        if let Some(v) = self.tiled_tile_overlap {
+            settings.tiled_tile_overlap = v;
         }
         settings
     }
