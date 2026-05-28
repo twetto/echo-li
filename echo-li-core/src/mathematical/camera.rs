@@ -1,9 +1,29 @@
 use nalgebra::{Matrix2x3, Vector2, Vector3};
+use rudolf_v::camera::CameraIntrinsics as RudolfIntrinsics;
 
 pub trait CameraModel: Send + Sync {
     fn project(&self, p: &Vector3<f64>) -> Vector2<f64>;
     fn undistort(&self, uv: &Vector2<f64>) -> Vector3<f64>;
     fn projection_jacobian(&self, p: &Vector3<f64>) -> Matrix2x3<f64>;
+}
+
+impl CameraModel for RudolfIntrinsics {
+    fn project(&self, p: &Vector3<f64>) -> Vector2<f64> {
+        let (u, v) = self
+            .project_point([p[0], p[1], p[2]])
+            .unwrap_or((0.0, 0.0));
+        Vector2::new(u, v)
+    }
+
+    fn undistort(&self, uv: &Vector2<f64>) -> Vector3<f64> {
+        let (x, y) = self.normalize_undistorted(uv[0], uv[1]);
+        Vector3::new(x, y, 1.0).normalize()
+    }
+
+    fn projection_jacobian(&self, p: &Vector3<f64>) -> Matrix2x3<f64> {
+        let j = self.projection_jacobian([p[0], p[1], p[2]]);
+        Matrix2x3::new(j[0][0], j[0][1], j[0][2], j[1][0], j[1][1], j[1][2])
+    }
 }
 
 pub struct PinholeModel {

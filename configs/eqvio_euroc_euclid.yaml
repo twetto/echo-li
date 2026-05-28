@@ -85,7 +85,7 @@ SparseVog:
   # max_pool_size: 500
   min_track_length: 5
   # conv_variance_threshold: 0.02 # var(z) gate for query()
-  conv_variance_threshold: 0.5 # var(z) gate for query()
+  conv_variance_threshold: 2.0 # var(z) gate for query()
   # init_depth_var: 1.0
   init_depth_var: 10.0
   # sigma_pixel: 0.5              # pixel noise for obs tau^2 = z^4 * sigma^2 / drive^2

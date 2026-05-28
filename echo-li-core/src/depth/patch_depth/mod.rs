@@ -368,6 +368,10 @@ pub struct PatchDepthMapper {
     keyframes: Vec<DepthKeyframe>,
     pyramid_work: Pyramid,
     pyramid_scratch: PyramidScratch,
+    /// Stereo: LUTs that rectify cam1 raw pixels into cam0's pinhole projection.
+    stereo_undistort_luts: Option<Vec<UndistortLut>>,
+    stereo_valid_pyramid: Option<Arc<Vec<Image<f32>>>>,
+    stereo_t_c1_c0: Option<Matrix4<f64>>,
 }
 
 impl PatchDepthMapper {
@@ -432,18 +436,24 @@ impl PatchDepthMapper {
             "n_pyramid_levels must be positive"
         );
 
-        let mut bearing_lut = Vec::with_capacity(width * height);
-        for v in 0..height {
-            for u in 0..width {
-                let uv = Vector2::new(u as f64, v as f64);
-                let bearing = camera.undistort(&uv);
-                if bearing[2].abs() > 1e-12 {
-                    bearing_lut.push(bearing / bearing[2]);
-                } else {
-                    bearing_lut.push(Vector3::new(0.0, 0.0, 1.0));
+        let bearing_lut = match camera_mode {
+            PatchDepthCameraMode::RawDistorted => {
+                let mut lut = Vec::with_capacity(width * height);
+                for v in 0..height {
+                    for u in 0..width {
+                        let uv = Vector2::new(u as f64, v as f64);
+                        let bearing = camera.undistort(&uv);
+                        if bearing[2].abs() > 1e-12 {
+                            lut.push(bearing / bearing[2]);
+                        } else {
+                            lut.push(Vector3::new(0.0, 0.0, 1.0));
+                        }
+                    }
                 }
+                lut
             }
-        }
+            PatchDepthCameraMode::UndistortedPinhole => Vec::new(),
+        };
 
         let undistort_luts = match camera_mode {
             PatchDepthCameraMode::RawDistorted => None,
@@ -486,6 +496,9 @@ impl PatchDepthMapper {
             keyframes: Vec::new(),
             pyramid_work: empty_pyramid(),
             pyramid_scratch: PyramidScratch::new(width, height, 1.0),
+            stereo_undistort_luts: None,
+            stereo_valid_pyramid: None,
+            stereo_t_c1_c0: None,
         })
     }
 
@@ -531,6 +544,112 @@ impl PatchDepthMapper {
             seeds,
             sigma_warp_sq,
         ))
+    }
+
+    /// Set up stereo reference frame support. Builds rectification LUTs that
+    /// map cam0-pinhole pixels to cam1 raw pixels, so cam1 images can be used
+    /// as reference frames with the existing warp/project pipeline.
+    ///
+    /// `cam1_model` must use the same resolution as cam0.
+    pub fn init_stereo_ref(
+        &mut self,
+        cam1_model: &dyn CameraModel,
+        t_c1_c0: Matrix4<f64>,
+    ) {
+        if self.camera_mode != PatchDepthCameraMode::UndistortedPinhole {
+            return;
+        }
+        let specs = undistort_level_specs(
+            self.width,
+            self.height,
+            self.settings.scale,
+            self.settings.n_pyramid_levels,
+        );
+        let luts: Vec<UndistortLut> = specs
+            .iter()
+            .map(|spec| {
+                UndistortLut::from_options(
+                    build_pinhole_to_raw_lut(cam1_model, &self.intrinsics, spec),
+                    spec.lw,
+                    spec.lh,
+                )
+            })
+            .collect();
+        let valid = Arc::new(
+            luts.iter()
+                .map(UndistortLut::valid_image)
+                .collect::<Vec<_>>(),
+        );
+        self.stereo_undistort_luts = Some(luts);
+        self.stereo_valid_pyramid = Some(valid);
+        self.stereo_t_c1_c0 = Some(t_c1_c0);
+    }
+
+    pub fn has_stereo_ref(&self) -> bool {
+        self.stereo_undistort_luts.is_some()
+    }
+
+    /// Use cam1 as the reference frame instead of the motion-based keyframe pool.
+    pub fn update_with_stereo_ref(
+        &mut self,
+        sparse_filter: &Sparse3DFilter,
+        measurement: &VisionMeasurement,
+        seed_coordinates: PatchDepthSeedCoordinates,
+        frame: FrameProducts,
+        cam1_gray: &[u8],
+        cam1_width: usize,
+        cam1_height: usize,
+    ) -> Option<PatchDepthOutput> {
+        if seed_coordinates != self.expected_seed_coordinates() {
+            return None;
+        }
+        let stereo_luts = self.stereo_undistort_luts.as_ref()?;
+        let t_c1_c0 = self.stereo_t_c1_c0?;
+
+        let raw_cam1_pyr = build_pyramid_from_u8(
+            cam1_gray,
+            cam1_width,
+            cam1_height,
+            self.settings.scale,
+            self.settings.n_pyramid_levels,
+        );
+        let rectified_pyr: Vec<Image<f32>> = raw_cam1_pyr
+            .iter()
+            .zip(stereo_luts)
+            .map(|(raw, lut)| lut.undistort_level(raw))
+            .collect();
+        let ref_valid_pyr = self.stereo_valid_pyramid.clone();
+        let bv_pyr = ref_valid_pyr
+            .as_ref()
+            .map(|p| build_bilinear_valid_pyramid(p));
+        let mut grad_x_pyr = Vec::with_capacity(self.settings.n_pyramid_levels);
+        let mut grad_y_pyr = Vec::with_capacity(self.settings.n_pyramid_levels);
+        for img in &rectified_pyr {
+            let (gx, gy) = gradients(img);
+            grad_x_pyr.push(gx);
+            grad_y_pyr.push(gy);
+        }
+        let ref_keyframe = DepthKeyframe {
+            frame: Arc::new(FrameProducts {
+                frame_id: 0,
+                stamp: frame.stamp,
+                gray: Vec::new(),
+                width: cam1_width,
+                height: cam1_height,
+                pose_t_wc: Matrix4::identity(),
+            }),
+            ref_pyramid: Arc::new(rectified_pyr),
+            bilinear_valid_pyramid: bv_pyr.map(Arc::new),
+            grad_x_pyramid: grad_x_pyr,
+            grad_y_pyramid: grad_y_pyr,
+        };
+
+        let seeds = self.gather_seeds(sparse_filter, measurement);
+        let depth_frame = self.depth_frame_products(frame)?;
+        let median_depth = median_seed_depth(&seeds).unwrap_or(self.settings.max_depth);
+        self.manage_keyframes(&depth_frame, median_depth);
+
+        Some(self.solve(&depth_frame, &ref_keyframe, &t_c1_c0, &seeds, 0.0))
     }
 
     pub fn keyframe_count(&self) -> usize {
@@ -590,8 +709,11 @@ impl PatchDepthMapper {
         sparse_filter: &Sparse3DFilter,
         measurement: &VisionMeasurement,
     ) -> Vec<SparseDepthPrior> {
+        let mut fids: Vec<u64> = measurement.cam_coordinates.keys().copied().collect();
+        fids.sort_unstable();
         let mut seeds = Vec::new();
-        for (&fid, uv_f32) in &measurement.cam_coordinates {
+        for fid in fids {
+            let uv_f32 = &measurement.cam_coordinates[&fid];
             let (z, z_var) = sparse_filter.query(fid);
             if z <= 0.0
                 || z < self.settings.min_depth

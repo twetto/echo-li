@@ -9,7 +9,8 @@ use echo_li_core::depth::patch_depth::{
 use echo_li_core::depth::sparse_3d::{Sparse3DChart, Sparse3DFilter};
 use echo_li_core::depth::sparse_gb::SparseVogSettings;
 use echo_li_core::initialization::{check_stationary, estimate_initial_pose};
-use echo_li_core::mathematical::camera::{CameraModel, PinholeModel, RadTanModel};
+use echo_li_core::mathematical::camera::CameraModel;
+use rudolf_v::camera::CameraIntrinsics as RudolfCameraIntrinsics;
 use echo_li_core::mathematical::*;
 use echo_li_core::trajectory_metrics::TrajectoryMetrics;
 use echo_li_core::{LandmarkDepthPrior, VIOFilter, VIOFilterSettings};
@@ -648,51 +649,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "Camera intrinsics: {}x{} fx={:.1} fy={:.1} cx={:.1} cy={:.1}",
                 intr.width, intr.height, intr.fx, intr.fy, intr.cx, intr.cy
             );
-            let model: Arc<dyn CameraModel> = match (
-                intr.distortion_model.as_deref(),
-                &intr.distortion_coefficients,
-            ) {
-                (Some("radial-tangential"), Some(d)) if d.len() >= 4 => {
-                    println!(
-                        "Distortion: radial-tangential k1={:.4} k2={:.4} p1={:.6} p2={:.6}",
-                        d[0], d[1], d[2], d[3]
-                    );
-                    Arc::new(RadTanModel {
-                        fx: intr.fx,
-                        fy: intr.fy,
-                        cx: intr.cx,
-                        cy: intr.cy,
-                        k1: d[0],
-                        k2: d[1],
-                        p1: d[2],
-                        p2: d[3],
-                    })
-                }
-                _ => {
-                    println!("Distortion: none (pinhole)");
-                    Arc::new(PinholeModel {
-                        fx: intr.fx,
-                        fy: intr.fy,
-                        cx: intr.cx,
-                        cy: intr.cy,
-                    })
-                }
+            let distortion = intr
+                .distortion_coefficients
+                .as_deref()
+                .unwrap_or_default()
+                .to_vec();
+            if distortion.len() >= 4 {
+                println!(
+                    "Distortion: radial-tangential k1={:.4} k2={:.4} p1={:.6} p2={:.6}",
+                    distortion[0], distortion[1], distortion[2], distortion[3]
+                );
+            } else {
+                println!("Distortion: none (pinhole)");
+            }
+            let rudolf_cam = RudolfCameraIntrinsics {
+                fx: intr.fx,
+                fy: intr.fy,
+                cx: intr.cx,
+                cy: intr.cy,
+                resolution: [intr.width, intr.height],
+                distortion,
             };
             (
-                model,
+                Arc::new(rudolf_cam) as Arc<dyn CameraModel>,
                 Matrix3::new(intr.fx, 0.0, intr.cx, 0.0, intr.fy, intr.cy, 0.0, 0.0, 1.0),
                 intr.width,
                 intr.height,
             )
         } else {
             println!("No intrinsics found, using EuRoC defaults");
+            let rudolf_cam = RudolfCameraIntrinsics::new(458.65, 457.3, 367.2, 248.3, 752, 480);
             (
-                Arc::new(PinholeModel {
-                    fx: 458.65,
-                    fy: 457.3,
-                    cx: 367.2,
-                    cy: 248.3,
-                }) as Arc<dyn CameraModel>,
+                Arc::new(rudolf_cam) as Arc<dyn CameraModel>,
                 Matrix3::new(458.65, 0.0, 367.2, 0.0, 457.3, 248.3, 0.0, 0.0, 1.0),
                 752,
                 480,
@@ -913,7 +901,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut imu_it = initial_imu.into_iter().chain(raw_imu_it).peekable();
 
     let mut patch_depth_mapper = if patch_depth_enabled {
-        let mapper = PatchDepthMapper::new(
+        let mut mapper = PatchDepthMapper::new(
             Arc::clone(&cam_model),
             CameraIntrinsics::from_matrix(&k_matrix),
             img_w,
@@ -938,6 +926,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             patch_depth_cov_vis_min,
             patch_depth_cov_vis_max
         );
+        if let Some(matcher) = &stereo_matcher {
+            let rig = matcher.rig();
+            let mut t_c1_c0 = Matrix4::<f64>::identity();
+            for r in 0..3 {
+                for c in 0..3 {
+                    t_c1_c0[(r, c)] = rig.r_10[r][c];
+                }
+                t_c1_c0[(r, 3)] = rig.t_10[r];
+            }
+            mapper.init_stereo_ref(&rig.cam1, t_c1_c0);
+            println!(
+                "Patch depth: stereo ref from cam1 (baseline={:.4}m)",
+                rig.baseline_meters()
+            );
+        }
         Some(mapper)
     } else {
         println!("Patch depth: disabled");
@@ -1039,6 +1042,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 // --- Stereo matching + deferred RANSAC validation ---
                 let mut stereo_depth_priors: HashMap<u64, LandmarkDepthPrior> = HashMap::new();
+                let mut cam1_gray_for_patch: Option<Vec<u8>> = None;
                 if let Some(matcher) = &mut stereo_matcher {
                     let cam1_loaded = if let Some(cam1_it) = &mut cam1_image_it {
                         while let Some(next_cam1) = cam1_it.peek() {
@@ -1057,6 +1061,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     };
 
                     if let Some(cam1_img) = cam1_loaded {
+                        if patch_depth_mapper
+                            .as_ref()
+                            .map_or(false, |m| m.has_stereo_ref())
+                        {
+                            let cam1_eq = rudolf_v::histeq::equalize_histogram(&cam1_img);
+                            cam1_gray_for_patch =
+                                Some(cam1_eq.as_slice()[..img_w * img_h].to_vec());
+                        }
                         let cam0_pyramid = frontend.current_pyramid();
                         let matches = matcher.match_features(&cam1_img, &features, cam0_pyramid);
                         let rig = matcher.rig();
@@ -1070,7 +1082,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                         // 3D-3D RANSAC against previous frame's stereo points.
                         let mut corrs_with_id: Vec<(u64, Correspondence3d)> = Vec::new();
-                        for (&id, &p_curr) in &curr_3d {
+                        let mut curr_3d_ids: Vec<u64> = curr_3d.keys().copied().collect();
+                        curr_3d_ids.sort_unstable();
+                        for id in curr_3d_ids {
+                            let p_curr = curr_3d[&id];
                             if let Some(&p_prev) = prev_stereo_3d.get(&id) {
                                 corrs_with_id.push((
                                     id,
@@ -1215,12 +1230,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     height: img_h,
                                     pose_t_wc: t_wc,
                                 };
-                                let patch_output = mapper.update(
-                                    sparse,
-                                    patch_measurement,
-                                    patch_seed_coordinates,
-                                    frame,
-                                );
+                                let patch_output =
+                                    if let Some(cam1_gray) = &cam1_gray_for_patch {
+                                        mapper.update_with_stereo_ref(
+                                            sparse,
+                                            patch_measurement,
+                                            patch_seed_coordinates,
+                                            frame,
+                                            cam1_gray,
+                                            img_w,
+                                            img_h,
+                                        )
+                                    } else {
+                                        mapper.update(
+                                            sparse,
+                                            patch_measurement,
+                                            patch_seed_coordinates,
+                                            frame,
+                                        )
+                                    };
                                 last_patch_depth_counts =
                                     patch_output.as_ref().map(patch_depth_status_counts);
                                 #[cfg(feature = "rerun")]
