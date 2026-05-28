@@ -1,9 +1,9 @@
-use std::path::{Path, PathBuf};
+use echo_lie::{SE3, SO3};
+use nalgebra::{Matrix4, Vector3};
+use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use serde::{Deserialize, Serialize};
-use nalgebra::{Matrix4, Vector3};
-use echo_lie::{SO3, SE3};
+use std::path::{Path, PathBuf};
 
 use crate::mathematical::{IMUVelocity, StampedPose};
 
@@ -37,7 +37,7 @@ impl ASLDatasetReader {
         if root.join("mav0").exists() {
             root = root.join("mav0");
         }
-        
+
         let mut reader = Self {
             path: root,
             intrinsics: None,
@@ -54,10 +54,12 @@ impl ASLDatasetReader {
             if let Ok(f) = File::open(cam_conf) {
                 let val: serde_yaml::Value = serde_yaml::from_reader(f).unwrap();
                 if let Some(intr) = val.get("intrinsics") {
-                    let dist_model = val.get("distortion_model")
+                    let dist_model = val
+                        .get("distortion_model")
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string());
-                    let dist_coeffs = val.get("distortion_coefficients")
+                    let dist_coeffs = val
+                        .get("distortion_coefficients")
                         .and_then(|v| v.as_sequence())
                         .map(|seq| seq.iter().filter_map(|v| v.as_f64()).collect());
                     self.intrinsics = Some(CameraIntrinsics {
@@ -94,10 +96,20 @@ impl ASLDatasetReader {
         reader.lines().skip(1).filter_map(|line| {
             let l = line.ok()?;
             let parts: Vec<&str> = l.split(',').collect();
-            if parts.len() < 7 { return None; }
+            if parts.len() < 7 {
+                return None;
+            }
             let t = parts[0].parse::<f64>().ok()? * 1e-9;
-            let gyr = Vector3::new(parts[1].parse().ok()?, parts[2].parse().ok()?, parts[3].parse().ok()?);
-            let acc = Vector3::new(parts[4].parse().ok()?, parts[5].parse().ok()?, parts[6].parse().ok()?);
+            let gyr = Vector3::new(
+                parts[1].parse().ok()?,
+                parts[2].parse().ok()?,
+                parts[3].parse().ok()?,
+            );
+            let acc = Vector3::new(
+                parts[4].parse().ok()?,
+                parts[5].parse().ok()?,
+                parts[6].parse().ok()?,
+            );
             Some(IMUVelocity::new(t, gyr, acc))
         })
     }
@@ -112,7 +124,9 @@ impl ASLDatasetReader {
         reader.lines().skip(1).filter_map(move |line| {
             let l = line.ok()?;
             let parts: Vec<&str> = l.split(',').collect();
-            if parts.is_empty() { return None; }
+            if parts.is_empty() {
+                return None;
+            }
             let t = parts[0].parse::<f64>().ok()? * 1e-9;
             let fname = parts[1].trim();
             Some(ImageIterItem {
@@ -122,9 +136,41 @@ impl ASLDatasetReader {
         })
     }
 
+    pub fn root_path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn cam1_image_iter(&self) -> impl Iterator<Item = ImageIterItem> {
+        let cam_csv = self.path.join("cam1/data.csv");
+        let file = File::open(cam_csv).expect("Failed to open cam1/data.csv");
+        let reader = BufReader::new(file);
+        let root = self.path.join("cam1/data");
+        let lag = self.cam_lag;
+
+        reader.lines().skip(1).filter_map(move |line| {
+            let l = line.ok()?;
+            let parts: Vec<&str> = l.split(',').collect();
+            if parts.is_empty() {
+                return None;
+            }
+            let t = parts[0].parse::<f64>().ok()? * 1e-9;
+            let fname = parts[1].trim();
+            Some(ImageIterItem {
+                stamp: t + lag,
+                image_path: root.join(fname),
+            })
+        })
+    }
+
+    pub fn has_cam1(&self) -> bool {
+        self.path.join("cam1/sensor.yaml").exists()
+    }
+
     pub fn groundtruth(&self) -> Vec<StampedPose> {
         let gt_csv = self.path.join("state_groundtruth_estimate0/data.csv");
-        if !gt_csv.exists() { return Vec::new(); }
+        if !gt_csv.exists() {
+            return Vec::new();
+        }
         let file = File::open(gt_csv).expect("Failed to open GT");
         let reader = BufReader::new(file);
 
@@ -133,14 +179,22 @@ impl ASLDatasetReader {
             let l = line.unwrap();
             let p: Vec<&str> = l.split(',').collect();
             let t = p[0].parse::<f64>().unwrap() * 1e-9;
-            let pos = Vector3::new(p[1].parse().unwrap(), p[2].parse().unwrap(), p[3].parse().unwrap());
+            let pos = Vector3::new(
+                p[1].parse().unwrap(),
+                p[2].parse().unwrap(),
+                p[3].parse().unwrap(),
+            );
             let q = nalgebra::Quaternion::new(
                 p[4].parse().unwrap(), // w
                 p[5].parse().unwrap(), // x
                 p[6].parse().unwrap(), // y
-                p[7].parse().unwrap()  // z
+                p[7].parse().unwrap(), // z
             );
-            let rot = SO3::from_matrix(&nalgebra::UnitQuaternion::from_quaternion(q).to_rotation_matrix().into_inner());
+            let rot = SO3::from_matrix(
+                &nalgebra::UnitQuaternion::from_quaternion(q)
+                    .to_rotation_matrix()
+                    .into_inner(),
+            );
             let pose = SE3::new(rot, pos);
             poses.push(StampedPose::new(t, pose));
         }

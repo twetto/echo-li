@@ -417,6 +417,34 @@ impl PatchDepthConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct StereoConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub pyramid_levels: Option<usize>,
+    #[serde(default)]
+    pub patch_half_size: Option<usize>,
+    #[serde(default)]
+    pub max_iterations: Option<usize>,
+    #[serde(default)]
+    pub convergence_eps: Option<f64>,
+    #[serde(default)]
+    pub min_inv_depth: Option<f64>,
+    #[serde(default)]
+    pub max_inv_depth: Option<f64>,
+    #[serde(default)]
+    pub init_inv_depth: Option<f64>,
+    #[serde(default)]
+    pub max_residual: Option<f32>,
+    #[serde(default)]
+    pub n_search_candidates: Option<usize>,
+    #[serde(default)]
+    pub knn_propagation: Option<usize>,
+    #[serde(default)]
+    pub histeq: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VIOConfig {
     #[serde(rename = "RudolfV")]
@@ -425,6 +453,8 @@ pub struct VIOConfig {
     pub sparse_vog: Option<SparseVogConfig>,
     #[serde(rename = "PatchDepth", default)]
     pub patch_depth: Option<PatchDepthConfig>,
+    #[serde(rename = "Stereo", default)]
+    pub stereo: Option<StereoConfig>,
     pub eqf: EqfConfig,
     pub main: MainConfig,
 }

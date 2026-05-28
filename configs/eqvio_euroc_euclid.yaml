@@ -112,6 +112,15 @@ SparseVog:
   pd_min_plane_features: 15
   vis_min_depth: 0.5
   vis_max_depth: 5.0
+Stereo:
+  enabled: true
+  pyramid_levels: 3
+  patch_half_size: 4
+  max_iterations: 30
+  n_search_candidates: 0
+  knn_propagation: 5
+  max_residual: 20.0
+  histeq: global
 PatchDepth:
   camera_mode: undistorted_pinhole
   warp_mode: fast_translation

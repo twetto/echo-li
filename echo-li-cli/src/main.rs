@@ -14,9 +14,12 @@ use echo_li_core::mathematical::*;
 use echo_li_core::trajectory_metrics::TrajectoryMetrics;
 use echo_li_core::{LandmarkDepthPrior, VIOFilter, VIOFilterSettings};
 use nalgebra::{Matrix3, Matrix4, Vector2};
+use rudolf_v::camera::StereoRig;
 use rudolf_v::frontend::{Frontend, FrontendConfig, LbpPolicy};
 use rudolf_v::image::Image as RudolfImage;
 use rudolf_v::klt::LkMethod;
+use rudolf_v::rigid_ransac::{Correspondence3d, Rigid3dRansacConfig};
+use rudolf_v::stereo::{StereoConfig as RudolfStereoConfig, StereoMatcher};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -61,6 +64,10 @@ struct Args {
     /// Disable patch-grid direct depth mapper even when PatchDepth exists in YAML.
     #[arg(long, default_value_t = false)]
     no_patch_depth: bool,
+
+    /// Enable stereo matching for EqF landmark depth initialization (requires cam1).
+    #[arg(long, default_value_t = false)]
+    stereo: bool,
 }
 
 fn write_trajectory(path: &std::path::Path, entries: &[(f64, VIOState)]) -> std::io::Result<()> {
@@ -772,6 +779,80 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut frontend = Frontend::new(frontend_config, img_w, img_h);
     println!("Tracker: Rudolf-V, max_features={}", tracker_max_features);
 
+    let stereo_enabled = args.stereo
+        || vio_config
+            .as_ref()
+            .and_then(|c| c.stereo.as_ref())
+            .map_or(false, |s| s.enabled);
+    let mut stereo_matcher: Option<StereoMatcher> = if stereo_enabled && reader.has_cam1() {
+        let root = reader.root_path();
+        let rig = StereoRig::from_euroc(
+            &root.join("cam0/sensor.yaml"),
+            &root.join("cam1/sensor.yaml"),
+        )
+        .expect("Failed to load stereo rig");
+        let mut stereo_cfg = RudolfStereoConfig::default();
+        if let Some(conf) = vio_config.as_ref().and_then(|c| c.stereo.as_ref()) {
+            if let Some(v) = conf.pyramid_levels {
+                stereo_cfg.pyramid_levels = v;
+            }
+            if let Some(v) = conf.patch_half_size {
+                stereo_cfg.patch_half_size = v;
+            }
+            if let Some(v) = conf.max_iterations {
+                stereo_cfg.max_iterations = v;
+            }
+            if let Some(v) = conf.convergence_eps {
+                stereo_cfg.convergence_eps = v;
+            }
+            if let Some(v) = conf.min_inv_depth {
+                stereo_cfg.min_inv_depth = v;
+            }
+            if let Some(v) = conf.max_inv_depth {
+                stereo_cfg.max_inv_depth = v;
+            }
+            if let Some(v) = conf.init_inv_depth {
+                stereo_cfg.init_inv_depth = v;
+            }
+            if let Some(v) = conf.max_residual {
+                stereo_cfg.max_residual = v;
+            }
+            if let Some(v) = conf.n_search_candidates {
+                stereo_cfg.n_search_candidates = v;
+            }
+            if let Some(v) = conf.knn_propagation {
+                stereo_cfg.knn_propagation = v;
+            }
+            if let Some(h) = &conf.histeq {
+                stereo_cfg.histeq = match h.to_ascii_lowercase().as_str() {
+                    "global" => rudolf_v::histeq::HistEqMethod::Global,
+                    _ => rudolf_v::histeq::HistEqMethod::None,
+                };
+            }
+        }
+        println!(
+            "Stereo: baseline={:.4}m cam1 {}×{} patch_half={} levels={} iters={} search={}",
+            rig.baseline_meters(),
+            rig.cam1.resolution[0],
+            rig.cam1.resolution[1],
+            stereo_cfg.patch_half_size,
+            stereo_cfg.pyramid_levels,
+            stereo_cfg.max_iterations,
+            stereo_cfg.n_search_candidates,
+        );
+        Some(StereoMatcher::new(rig, stereo_cfg, img_w, img_h))
+    } else {
+        if stereo_enabled && !reader.has_cam1() {
+            eprintln!("Warning: stereo requested but cam1 data not found");
+        }
+        None
+    };
+    let mut cam1_image_it = if stereo_matcher.is_some() {
+        Some(reader.cam1_image_iter().peekable())
+    } else {
+        None
+    };
+
     // Initialize Rerun visualization
     #[cfg(feature = "rerun")]
     let rec: Option<rerun::RecordingStream> = if args.vis {
@@ -903,6 +984,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut states_out: Vec<(f64, VIOState)> = Vec::new();
     let mut imu_count: usize = 0;
     let mut vision_count: usize = 0;
+    let mut prev_stereo_3d: HashMap<u64, [f64; 3]> = HashMap::new();
+    let stereo_ransac_cfg = Rigid3dRansacConfig::default();
     let mut last_patch_depth_counts: Option<(usize, usize, usize, usize)> = None;
     #[cfg(feature = "rerun")]
     let mut last_patch_depth_output: Option<PatchDepthOutput> = None;
@@ -950,8 +1033,103 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let rudolf_img = RudolfImage::from_vec(img_w, img_h, gray_data);
 
-                let (features, stats) = frontend.process(&rudolf_img);
-                let feature_hash = trace_determinism.then(|| hash_features(features));
+                let (features_ref, stats) = frontend.process(&rudolf_img);
+                let features: Vec<rudolf_v::fast::Feature> = features_ref.to_vec();
+                let feature_hash = trace_determinism.then(|| hash_features(&features));
+
+                // --- Stereo matching + deferred RANSAC validation ---
+                let mut stereo_depth_priors: HashMap<u64, LandmarkDepthPrior> = HashMap::new();
+                if let Some(matcher) = &mut stereo_matcher {
+                    let cam1_loaded = if let Some(cam1_it) = &mut cam1_image_it {
+                        while let Some(next_cam1) = cam1_it.peek() {
+                            if next_cam1.stamp >= img_data.stamp {
+                                break;
+                            }
+                            cam1_it.next();
+                        }
+                        cam1_it.next().and_then(|cam1_data| {
+                            image::open(&cam1_data.image_path).ok().map(|dyn_img| {
+                                RudolfImage::from_vec(img_w, img_h, dyn_img.to_luma8().into_raw())
+                            })
+                        })
+                    } else {
+                        None
+                    };
+
+                    if let Some(cam1_img) = cam1_loaded {
+                        let cam0_pyramid = frontend.current_pyramid();
+                        let matches = matcher.match_features(&cam1_img, &features, cam0_pyramid);
+                        let rig = matcher.rig();
+
+                        let mut curr_3d: HashMap<u64, [f64; 3]> = HashMap::new();
+                        for (feat, m) in features.iter().zip(matches.iter()) {
+                            if let Some(p) = m.point_cam0(rig, feat) {
+                                curr_3d.insert(feat.id, p);
+                            }
+                        }
+
+                        // 3D-3D RANSAC against previous frame's stereo points.
+                        let mut corrs_with_id: Vec<(u64, Correspondence3d)> = Vec::new();
+                        for (&id, &p_curr) in &curr_3d {
+                            if let Some(&p_prev) = prev_stereo_3d.get(&id) {
+                                corrs_with_id.push((
+                                    id,
+                                    Correspondence3d {
+                                        p1: p_prev,
+                                        p2: p_curr,
+                                    },
+                                ));
+                            }
+                        }
+                        let mut outlier_ids: Vec<u64> = Vec::new();
+                        if corrs_with_id.len() >= 3 {
+                            let corrs_only: Vec<Correspondence3d> =
+                                corrs_with_id.iter().map(|(_, c)| *c).collect();
+                            if let Some(result) = rudolf_v::rigid_ransac::estimate_rigid_ransac(
+                                &corrs_only,
+                                &stereo_ransac_cfg,
+                            ) {
+                                for ((id, _), &is_in) in
+                                    corrs_with_id.iter().zip(result.inliers.iter())
+                                {
+                                    if is_in {
+                                        // RANSAC-validated: promote to depth prior.
+                                        let p = curr_3d[id];
+                                        let range =
+                                            (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
+                                        if range > 0.0 {
+                                            let baseline = rig.baseline_meters();
+                                            let m_res = matches
+                                                .iter()
+                                                .find(|m| m.id == *id)
+                                                .map(|m| m.residual)
+                                                .unwrap_or(10.0);
+                                            let range_var =
+                                                (m_res as f64 / 20.0).powi(2) * range * range
+                                                    / (baseline * baseline);
+                                            stereo_depth_priors.insert(
+                                                *id,
+                                                LandmarkDepthPrior {
+                                                    range,
+                                                    range_var: range_var.max(1e-4),
+                                                },
+                                            );
+                                        }
+                                    } else {
+                                        outlier_ids.push(*id);
+                                    }
+                                }
+                            }
+                        }
+                        if !outlier_ids.is_empty() {
+                            frontend.drop_tracks(&outlier_ids);
+                            for id in &outlier_ids {
+                                curr_3d.remove(id);
+                            }
+                        }
+                        prev_stereo_3d = curr_3d;
+                    }
+                }
 
                 if let Some(f) = &mut filter {
                     #[cfg(feature = "rerun")]
@@ -963,7 +1141,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .collect();
 
                     let mut feat_uvs = HashMap::new();
-                    for feat in features {
+                    for feat in &features {
                         feat_uvs.insert(feat.id, Vector2::new(feat.x, feat.y));
                     }
 
@@ -982,21 +1160,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                         Vec::new()
                     };
-                    let (depth_priors, defer_fallback_ids) = if let Some(sparse) = &sparse_filter {
-                        let mut priors = HashMap::new();
-                        let mut deferred = HashSet::new();
-                        for &fid in measurement.cam_coordinates.keys() {
-                            let (range, range_var) = sparse.query_range(fid);
-                            if range > 0.0 && range_var.is_finite() {
-                                priors.insert(fid, LandmarkDepthPrior { range, range_var });
-                            } else if sparse.has_track(fid) {
-                                deferred.insert(fid);
+                    let (mut depth_priors, defer_fallback_ids) =
+                        if let Some(sparse) = &sparse_filter {
+                            let mut priors = HashMap::new();
+                            let mut deferred = HashSet::new();
+                            for &fid in measurement.cam_coordinates.keys() {
+                                let (range, range_var) = sparse.query_range(fid);
+                                if range > 0.0 && range_var.is_finite() {
+                                    priors.insert(fid, LandmarkDepthPrior { range, range_var });
+                                } else if sparse.has_track(fid) {
+                                    deferred.insert(fid);
+                                }
                             }
-                        }
-                        (priors, deferred)
-                    } else {
-                        (HashMap::new(), HashSet::new())
-                    };
+                            (priors, deferred)
+                        } else {
+                            (HashMap::new(), HashSet::new())
+                        };
+                    // Stereo priors override SparseVog (known baseline → tighter variance).
+                    depth_priors.extend(stereo_depth_priors.iter().map(|(&id, p)| (id, *p)));
                     let depth_prior_hash =
                         trace_determinism.then(|| hash_depth_priors(&depth_priors));
                     f.process_vision_with_depth_priors_and_deferred_fallbacks(
