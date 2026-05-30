@@ -605,6 +605,308 @@ fn send_rerun_blueprint(
     Ok(())
 }
 
+fn build_camera_model(
+    reader: &ASLDatasetReader,
+) -> (Arc<dyn CameraModel>, Matrix3<f64>, usize, usize) {
+    if let Some(intr) = &reader.intrinsics {
+        println!(
+            "Camera intrinsics: {}x{} fx={:.1} fy={:.1} cx={:.1} cy={:.1}",
+            intr.width, intr.height, intr.fx, intr.fy, intr.cx, intr.cy
+        );
+        let distortion = intr
+            .distortion_coefficients
+            .as_deref()
+            .unwrap_or_default()
+            .to_vec();
+        if distortion.len() >= 4 {
+            println!(
+                "Distortion: radial-tangential k1={:.4} k2={:.4} p1={:.6} p2={:.6}",
+                distortion[0], distortion[1], distortion[2], distortion[3]
+            );
+        } else {
+            println!("Distortion: none (pinhole)");
+        }
+        let rudolf_cam = RudolfCameraIntrinsics {
+            fx: intr.fx,
+            fy: intr.fy,
+            cx: intr.cx,
+            cy: intr.cy,
+            resolution: [intr.width, intr.height],
+            distortion,
+        };
+        (
+            Arc::new(rudolf_cam) as Arc<dyn CameraModel>,
+            Matrix3::new(intr.fx, 0.0, intr.cx, 0.0, intr.fy, intr.cy, 0.0, 0.0, 1.0),
+            intr.width,
+            intr.height,
+        )
+    } else {
+        println!("No intrinsics found, using EuRoC defaults");
+        let rudolf_cam = RudolfCameraIntrinsics::new(458.65, 457.3, 367.2, 248.3, 752, 480);
+        (
+            Arc::new(rudolf_cam) as Arc<dyn CameraModel>,
+            Matrix3::new(458.65, 0.0, 367.2, 0.0, 457.3, 248.3, 0.0, 0.0, 1.0),
+            752,
+            480,
+        )
+    }
+}
+
+fn build_frontend(
+    vio_config: Option<&VIOConfig>,
+    img_w: usize,
+    img_h: usize,
+) -> Result<(Frontend, usize), Box<dyn std::error::Error>> {
+    let mut config = FrontendConfig::default();
+    if let Some(conf) = vio_config {
+        config.max_features = conf.rudolf_v.max_features;
+        config.pyramid_levels = conf.rudolf_v.max_level;
+        if let Some(fast_threshold) = conf.rudolf_v.fast_threshold {
+            config.fast_threshold = fast_threshold;
+        }
+        if conf.rudolf_v.equalise_image_histogram {
+            config.histeq = rudolf_v::histeq::HistEqMethod::Global;
+        }
+        config.cell_size = conf.rudolf_v.feature_dist as usize;
+        if let Some(policy) = &conf.rudolf_v.lbp_policy {
+            config.lbp_policy = match policy.to_ascii_lowercase().as_str() {
+                "softpenalty" | "soft_penalty" | "soft-penalty" => LbpPolicy::SoftPenalty,
+                "hardreject" | "hard_reject" | "hard-reject" => LbpPolicy::HardReject,
+                _ => {
+                    return Err(format!(
+                        "unsupported RudolfV.lbpPolicy '{}'; expected SoftPenalty or HardReject",
+                        policy
+                    )
+                    .into());
+                }
+            };
+        }
+    } else {
+        config.max_features = 40;
+        config.cell_size = 100;
+        config.histeq = rudolf_v::histeq::HistEqMethod::Global;
+    }
+    config.klt_method = LkMethod::InverseCompositional;
+    let tracker_max_features = config.max_features;
+    println!("Tracker: Rudolf-V, max_features={}", tracker_max_features);
+    Ok((Frontend::new(config, img_w, img_h), tracker_max_features))
+}
+
+fn build_stereo_matcher(
+    args: &Args,
+    vio_config: Option<&VIOConfig>,
+    reader: &ASLDatasetReader,
+    img_w: usize,
+    img_h: usize,
+) -> Option<StereoMatcher> {
+    let stereo_enabled = args.stereo
+        || vio_config
+            .and_then(|c| c.stereo.as_ref())
+            .map_or(false, |s| s.enabled);
+    if !stereo_enabled || !reader.has_cam1() {
+        if stereo_enabled && !reader.has_cam1() {
+            eprintln!("Warning: stereo requested but cam1 data not found");
+        }
+        return None;
+    }
+    let root = reader.root_path();
+    let rig = StereoRig::from_euroc(
+        &root.join("cam0/sensor.yaml"),
+        &root.join("cam1/sensor.yaml"),
+    )
+    .expect("Failed to load stereo rig");
+    let mut stereo_cfg = RudolfStereoConfig::default();
+    if let Some(conf) = vio_config.and_then(|c| c.stereo.as_ref()) {
+        if let Some(v) = conf.pyramid_levels {
+            stereo_cfg.pyramid_levels = v;
+        }
+        if let Some(v) = conf.patch_half_size {
+            stereo_cfg.patch_half_size = v;
+        }
+        if let Some(v) = conf.max_iterations {
+            stereo_cfg.max_iterations = v;
+        }
+        if let Some(v) = conf.convergence_eps {
+            stereo_cfg.convergence_eps = v;
+        }
+        if let Some(v) = conf.min_inv_depth {
+            stereo_cfg.min_inv_depth = v;
+        }
+        if let Some(v) = conf.max_inv_depth {
+            stereo_cfg.max_inv_depth = v;
+        }
+        if let Some(v) = conf.init_inv_depth {
+            stereo_cfg.init_inv_depth = v;
+        }
+        if let Some(v) = conf.max_residual {
+            stereo_cfg.max_residual = v;
+        }
+        if let Some(v) = conf.n_search_candidates {
+            stereo_cfg.n_search_candidates = v;
+        }
+        if let Some(v) = conf.knn_propagation {
+            stereo_cfg.knn_propagation = v;
+        }
+        if let Some(h) = &conf.histeq {
+            stereo_cfg.histeq = match h.to_ascii_lowercase().as_str() {
+                "global" => rudolf_v::histeq::HistEqMethod::Global,
+                _ => rudolf_v::histeq::HistEqMethod::None,
+            };
+        }
+    }
+    println!(
+        "Stereo: baseline={:.4}m cam1 {}×{} patch_half={} levels={} iters={} search={}",
+        rig.baseline_meters(),
+        rig.cam1.resolution[0],
+        rig.cam1.resolution[1],
+        stereo_cfg.patch_half_size,
+        stereo_cfg.pyramid_levels,
+        stereo_cfg.max_iterations,
+        stereo_cfg.n_search_candidates,
+    );
+    Some(StereoMatcher::new(rig, stereo_cfg, img_w, img_h))
+}
+
+fn build_patch_depth_mapper(
+    enabled: bool,
+    settings: PatchDepthSettings,
+    cam_model: Arc<dyn CameraModel>,
+    k_matrix: Matrix3<f64>,
+    img_w: usize,
+    img_h: usize,
+    stereo_matcher: Option<&StereoMatcher>,
+) -> Result<Option<PatchDepthMapper>, Box<dyn std::error::Error>> {
+    if !enabled {
+        println!("Patch depth: disabled");
+        return Ok(None);
+    }
+    println!(
+        "Patch depth: enabled mode={:?} warp={:?} scale={:.2}, patch={} stride={} levels={}",
+        settings.camera_mode,
+        settings.warp_mode,
+        settings.scale,
+        settings.patch_size,
+        settings.patch_stride,
+        settings.n_pyramid_levels
+    );
+    let mut mapper = PatchDepthMapper::new(
+        cam_model,
+        CameraIntrinsics::from_matrix(&k_matrix),
+        img_w,
+        img_h,
+        settings,
+    )?;
+    if let Some(matcher) = stereo_matcher {
+        let rig = matcher.rig();
+        let mut t_c1_c0 = Matrix4::<f64>::identity();
+        for r in 0..3 {
+            for c in 0..3 {
+                t_c1_c0[(r, c)] = rig.r_10[r][c];
+            }
+            t_c1_c0[(r, 3)] = rig.t_10[r];
+        }
+        mapper.init_stereo_ref(&rig.cam1, t_c1_c0);
+        println!(
+            "Patch depth: stereo ref from cam1 (baseline={:.4}m)",
+            rig.baseline_meters()
+        );
+    }
+    Ok(Some(mapper))
+}
+
+fn build_sparse_filter(
+    args: &Args,
+    vio_config: Option<&VIOConfig>,
+    k_matrix: Matrix3<f64>,
+    tracker_max_features: usize,
+) -> Option<Sparse3DFilter> {
+    if let Some(sparse_conf) = vio_config.and_then(|c| c.sparse_vog.as_ref()) {
+        if !sparse_conf.enabled {
+            println!("Sparse filter: disabled by config");
+            return None;
+        }
+        let chart = parse_sparse_chart(&sparse_conf.parametrization);
+        let settings = sparse_conf.to_sparse_settings();
+        println!(
+            "Sparse filter: {:?}, max_pool_size={}",
+            chart, settings.max_pool_size
+        );
+        return Some(Sparse3DFilter::new(k_matrix, chart, settings));
+    }
+    if args.sparse {
+        let chart = parse_sparse_chart(&args.sparse_chart);
+        let mut settings = SparseVogSettings::default();
+        settings.max_pool_size = tracker_max_features.max(300);
+        println!(
+            "Sparse filter: {:?}, max_pool_size={}",
+            chart, settings.max_pool_size
+        );
+        return Some(Sparse3DFilter::new(k_matrix, chart, settings));
+    }
+    None
+}
+
+fn write_outputs(
+    output_dir: &std::path::Path,
+    states_out: &[(f64, VIOState)],
+    gt_poses: &[StampedPose],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !states_out.is_empty() {
+        let traj_file = output_dir.join("estimated_trajectory.txt");
+        write_trajectory(&traj_file, states_out)?;
+        println!("Trajectory written to {}", traj_file.display());
+    }
+
+    if !gt_poses.is_empty() {
+        let gt_file = output_dir.join("groundtruth_trajectory.txt");
+        write_groundtruth(&gt_file, gt_poses)?;
+        println!("Ground truth written to {}", gt_file.display());
+
+        if !states_out.is_empty() {
+            let est_poses: Vec<(f64, echo_lie::SE3)> = states_out
+                .iter()
+                .map(|(t, s)| (*t, s.sensor.pose.clone()))
+                .collect();
+            let alignment = echo_li_core::alignment::align_trajectories(&est_poses, gt_poses);
+            let aligned: Vec<(f64, VIOState)> = states_out
+                .iter()
+                .map(|(t, s)| {
+                    let mut s_aligned = s.clone();
+                    s_aligned.sensor.pose = alignment.compose(&s.sensor.pose);
+                    (*t, s_aligned)
+                })
+                .collect();
+            let aligned_file = output_dir.join("aligned_trajectory.txt");
+            write_trajectory(&aligned_file, &aligned)?;
+            println!("Aligned trajectory written to {}", aligned_file.display());
+
+            if let Some(metrics) = echo_li_core::trajectory_metrics::compute_ate_metrics(
+                &est_poses, gt_poses, &alignment,
+            ) {
+                println!(
+                    "ATE position: rmse={:.4} m mean={:.4} m median={:.4} m max={:.4} m",
+                    metrics.ate_position_m.rmse,
+                    metrics.ate_position_m.mean,
+                    metrics.ate_position_m.median,
+                    metrics.ate_position_m.max
+                );
+                println!(
+                    "ATE attitude: rmse={:.4} deg mean={:.4} deg median={:.4} deg max={:.4} deg",
+                    metrics.ate_attitude_deg.rmse,
+                    metrics.ate_attitude_deg.mean,
+                    metrics.ate_attitude_deg.median,
+                    metrics.ate_attitude_deg.max
+                );
+                let metrics_file = output_dir.join("trajectory_metrics.txt");
+                write_trajectory_metrics(&metrics_file, &metrics)?;
+                println!("Trajectory metrics written to {}", metrics_file.display());
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
@@ -643,49 +945,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         settings.max_landmarks
     );
 
-    let (cam_model, k_matrix, img_w, img_h): (Arc<dyn CameraModel>, Matrix3<f64>, usize, usize) =
-        if let Some(intr) = &reader.intrinsics {
-            println!(
-                "Camera intrinsics: {}x{} fx={:.1} fy={:.1} cx={:.1} cy={:.1}",
-                intr.width, intr.height, intr.fx, intr.fy, intr.cx, intr.cy
-            );
-            let distortion = intr
-                .distortion_coefficients
-                .as_deref()
-                .unwrap_or_default()
-                .to_vec();
-            if distortion.len() >= 4 {
-                println!(
-                    "Distortion: radial-tangential k1={:.4} k2={:.4} p1={:.6} p2={:.6}",
-                    distortion[0], distortion[1], distortion[2], distortion[3]
-                );
-            } else {
-                println!("Distortion: none (pinhole)");
-            }
-            let rudolf_cam = RudolfCameraIntrinsics {
-                fx: intr.fx,
-                fy: intr.fy,
-                cx: intr.cx,
-                cy: intr.cy,
-                resolution: [intr.width, intr.height],
-                distortion,
-            };
-            (
-                Arc::new(rudolf_cam) as Arc<dyn CameraModel>,
-                Matrix3::new(intr.fx, 0.0, intr.cx, 0.0, intr.fy, intr.cy, 0.0, 0.0, 1.0),
-                intr.width,
-                intr.height,
-            )
-        } else {
-            println!("No intrinsics found, using EuRoC defaults");
-            let rudolf_cam = RudolfCameraIntrinsics::new(458.65, 457.3, 367.2, 248.3, 752, 480);
-            (
-                Arc::new(rudolf_cam) as Arc<dyn CameraModel>,
-                Matrix3::new(458.65, 0.0, 367.2, 0.0, 457.3, 248.3, 0.0, 0.0, 1.0),
-                752,
-                480,
-            )
-        };
+    let (cam_model, k_matrix, img_w, img_h) = build_camera_model(&reader);
 
     let patch_depth_enabled = !args.no_patch_depth
         && (args.patch_depth
@@ -732,109 +992,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .unwrap_or((0.1, 5.0));
 
-    // Initialize Rudolf-V Frontend
-    let mut frontend_config = FrontendConfig::default();
-    if let Some(conf) = &vio_config {
-        frontend_config.max_features = conf.rudolf_v.max_features;
-        frontend_config.pyramid_levels = conf.rudolf_v.max_level;
-        if let Some(fast_threshold) = conf.rudolf_v.fast_threshold {
-            frontend_config.fast_threshold = fast_threshold;
-        }
-        if conf.rudolf_v.equalise_image_histogram {
-            frontend_config.histeq = rudolf_v::histeq::HistEqMethod::Global;
-        }
-        frontend_config.cell_size = conf.rudolf_v.feature_dist as usize;
-        if let Some(policy) = &conf.rudolf_v.lbp_policy {
-            frontend_config.lbp_policy = match policy.to_ascii_lowercase().as_str() {
-                "softpenalty" | "soft_penalty" | "soft-penalty" => LbpPolicy::SoftPenalty,
-                "hardreject" | "hard_reject" | "hard-reject" => LbpPolicy::HardReject,
-                _ => {
-                    return Err(format!(
-                        "unsupported RudolfV.lbpPolicy '{}'; expected SoftPenalty or HardReject",
-                        policy
-                    )
-                    .into());
-                }
-            };
-        }
-    } else {
-        frontend_config.max_features = 40;
-        frontend_config.cell_size = 100;
-        frontend_config.histeq = rudolf_v::histeq::HistEqMethod::Global;
-    }
-    frontend_config.klt_method = LkMethod::InverseCompositional;
-    let tracker_max_features = frontend_config.max_features;
-    let mut frontend = Frontend::new(frontend_config, img_w, img_h);
-    println!("Tracker: Rudolf-V, max_features={}", tracker_max_features);
+    let (mut frontend, tracker_max_features) = build_frontend(vio_config.as_ref(), img_w, img_h)?;
 
-    let stereo_enabled = args.stereo
-        || vio_config
-            .as_ref()
-            .and_then(|c| c.stereo.as_ref())
-            .map_or(false, |s| s.enabled);
-    let mut stereo_matcher: Option<StereoMatcher> = if stereo_enabled && reader.has_cam1() {
-        let root = reader.root_path();
-        let rig = StereoRig::from_euroc(
-            &root.join("cam0/sensor.yaml"),
-            &root.join("cam1/sensor.yaml"),
-        )
-        .expect("Failed to load stereo rig");
-        let mut stereo_cfg = RudolfStereoConfig::default();
-        if let Some(conf) = vio_config.as_ref().and_then(|c| c.stereo.as_ref()) {
-            if let Some(v) = conf.pyramid_levels {
-                stereo_cfg.pyramid_levels = v;
-            }
-            if let Some(v) = conf.patch_half_size {
-                stereo_cfg.patch_half_size = v;
-            }
-            if let Some(v) = conf.max_iterations {
-                stereo_cfg.max_iterations = v;
-            }
-            if let Some(v) = conf.convergence_eps {
-                stereo_cfg.convergence_eps = v;
-            }
-            if let Some(v) = conf.min_inv_depth {
-                stereo_cfg.min_inv_depth = v;
-            }
-            if let Some(v) = conf.max_inv_depth {
-                stereo_cfg.max_inv_depth = v;
-            }
-            if let Some(v) = conf.init_inv_depth {
-                stereo_cfg.init_inv_depth = v;
-            }
-            if let Some(v) = conf.max_residual {
-                stereo_cfg.max_residual = v;
-            }
-            if let Some(v) = conf.n_search_candidates {
-                stereo_cfg.n_search_candidates = v;
-            }
-            if let Some(v) = conf.knn_propagation {
-                stereo_cfg.knn_propagation = v;
-            }
-            if let Some(h) = &conf.histeq {
-                stereo_cfg.histeq = match h.to_ascii_lowercase().as_str() {
-                    "global" => rudolf_v::histeq::HistEqMethod::Global,
-                    _ => rudolf_v::histeq::HistEqMethod::None,
-                };
-            }
-        }
-        println!(
-            "Stereo: baseline={:.4}m cam1 {}×{} patch_half={} levels={} iters={} search={}",
-            rig.baseline_meters(),
-            rig.cam1.resolution[0],
-            rig.cam1.resolution[1],
-            stereo_cfg.patch_half_size,
-            stereo_cfg.pyramid_levels,
-            stereo_cfg.max_iterations,
-            stereo_cfg.n_search_candidates,
-        );
-        Some(StereoMatcher::new(rig, stereo_cfg, img_w, img_h))
-    } else {
-        if stereo_enabled && !reader.has_cam1() {
-            eprintln!("Warning: stereo requested but cam1 data not found");
-        }
-        None
-    };
+    let mut stereo_matcher =
+        build_stereo_matcher(&args, vio_config.as_ref(), &reader, img_w, img_h);
     let mut cam1_image_it = if stereo_matcher.is_some() {
         Some(reader.cam1_image_iter().peekable())
     } else {
@@ -900,24 +1061,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // images, just like every other IMU sample.
     let mut imu_it = initial_imu.into_iter().chain(raw_imu_it).peekable();
 
-    let mut patch_depth_mapper = if patch_depth_enabled {
-        let mut mapper = PatchDepthMapper::new(
-            Arc::clone(&cam_model),
-            CameraIntrinsics::from_matrix(&k_matrix),
-            img_w,
-            img_h,
-            patch_depth_settings.clone(),
-        )?;
-        println!(
-            "Patch depth: enabled mode={:?} warp={:?} scale={:.2}, patch={} stride={} levels={}",
-            patch_depth_settings.camera_mode,
-            patch_depth_settings.warp_mode,
-            patch_depth_settings.scale,
-            patch_depth_settings.patch_size,
-            patch_depth_settings.patch_stride,
-            patch_depth_settings.n_pyramid_levels
-        );
-        #[cfg(feature = "rerun")]
+    let mut patch_depth_mapper = build_patch_depth_mapper(
+        patch_depth_enabled,
+        patch_depth_settings,
+        Arc::clone(&cam_model),
+        k_matrix,
+        img_w,
+        img_h,
+        stereo_matcher.as_ref(),
+    )?;
+    #[cfg(feature = "rerun")]
+    if patch_depth_mapper.is_some() {
         println!(
             "Patch depth visualization: fixed depth range [{:.2}, {:.2}] m, \
              covariance std-dev range [{:.2}, {:.2}] m",
@@ -926,64 +1080,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             patch_depth_cov_vis_min,
             patch_depth_cov_vis_max
         );
-        if let Some(matcher) = &stereo_matcher {
-            let rig = matcher.rig();
-            let mut t_c1_c0 = Matrix4::<f64>::identity();
-            for r in 0..3 {
-                for c in 0..3 {
-                    t_c1_c0[(r, c)] = rig.r_10[r][c];
-                }
-                t_c1_c0[(r, 3)] = rig.t_10[r];
-            }
-            mapper.init_stereo_ref(&rig.cam1, t_c1_c0);
-            println!(
-                "Patch depth: stereo ref from cam1 (baseline={:.4}m)",
-                rig.baseline_meters()
-            );
-        }
-        Some(mapper)
-    } else {
-        println!("Patch depth: disabled");
-        None
-    };
-    let mut sparse_filter = if let Some(conf) = &vio_config {
-        if let Some(sparse_conf) = &conf.sparse_vog {
-            if sparse_conf.enabled {
-                let sparse_chart = parse_sparse_chart(&sparse_conf.parametrization);
-                let sparse_settings = sparse_conf.to_sparse_settings();
-                println!(
-                    "Sparse filter: {:?}, max_pool_size={}",
-                    sparse_chart, sparse_settings.max_pool_size
-                );
-                Some(Sparse3DFilter::new(k_matrix, sparse_chart, sparse_settings))
-            } else {
-                println!("Sparse filter: disabled by config");
-                None
-            }
-        } else if args.sparse {
-            let sparse_chart = parse_sparse_chart(&args.sparse_chart);
-            let mut sparse_settings = SparseVogSettings::default();
-            sparse_settings.max_pool_size = tracker_max_features.max(300);
-            println!(
-                "Sparse filter: {:?}, max_pool_size={}",
-                sparse_chart, sparse_settings.max_pool_size
-            );
-            Some(Sparse3DFilter::new(k_matrix, sparse_chart, sparse_settings))
-        } else {
-            None
-        }
-    } else if args.sparse {
-        let sparse_chart = parse_sparse_chart(&args.sparse_chart);
-        let mut sparse_settings = SparseVogSettings::default();
-        sparse_settings.max_pool_size = tracker_max_features.max(300);
-        println!(
-            "Sparse filter: {:?}, max_pool_size={}",
-            sparse_chart, sparse_settings.max_pool_size
-        );
-        Some(Sparse3DFilter::new(k_matrix, sparse_chart, sparse_settings))
-    } else {
-        None
-    };
+    }
+    let mut sparse_filter =
+        build_sparse_filter(&args, vio_config.as_ref(), k_matrix, tracker_max_features);
     let mut states_out: Vec<(f64, VIOState)> = Vec::new();
     let mut imu_count: usize = 0;
     let mut vision_count: usize = 0;
@@ -1537,7 +1636,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         imu_count, vision_count, elapsed
     );
 
-    // Write trajectory output
     let dataset_name = PathBuf::from(&args.dataset)
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -1546,62 +1644,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.output
             .unwrap_or_else(|| format!("eqvio_output_{}", dataset_name)),
     );
-
-    if !states_out.is_empty() {
-        let traj_file = output_dir.join("estimated_trajectory.txt");
-        write_trajectory(&traj_file, &states_out)?;
-        println!("Trajectory written to {}", traj_file.display());
-    }
-
     let gt_poses = reader.groundtruth();
-    if !gt_poses.is_empty() {
-        let gt_file = output_dir.join("groundtruth_trajectory.txt");
-        write_groundtruth(&gt_file, &gt_poses)?;
-        println!("Ground truth written to {}", gt_file.display());
-
-        // Aligned trajectory
-        if !states_out.is_empty() {
-            let est_poses: Vec<(f64, echo_lie::SE3)> = states_out
-                .iter()
-                .map(|(t, s)| (*t, s.sensor.pose.clone()))
-                .collect();
-            let alignment = echo_li_core::alignment::align_trajectories(&est_poses, &gt_poses);
-            let aligned: Vec<(f64, VIOState)> = states_out
-                .iter()
-                .map(|(t, s)| {
-                    let mut s_aligned = s.clone();
-                    let aligned_pose = alignment.compose(&s.sensor.pose);
-                    s_aligned.sensor.pose = aligned_pose;
-                    (*t, s_aligned)
-                })
-                .collect();
-            let aligned_file = output_dir.join("aligned_trajectory.txt");
-            write_trajectory(&aligned_file, &aligned)?;
-            println!("Aligned trajectory written to {}", aligned_file.display());
-
-            if let Some(metrics) = echo_li_core::trajectory_metrics::compute_ate_metrics(
-                &est_poses, &gt_poses, &alignment,
-            ) {
-                println!(
-                    "ATE position: rmse={:.4} m mean={:.4} m median={:.4} m max={:.4} m",
-                    metrics.ate_position_m.rmse,
-                    metrics.ate_position_m.mean,
-                    metrics.ate_position_m.median,
-                    metrics.ate_position_m.max
-                );
-                println!(
-                    "ATE attitude: rmse={:.4} deg mean={:.4} deg median={:.4} deg max={:.4} deg",
-                    metrics.ate_attitude_deg.rmse,
-                    metrics.ate_attitude_deg.mean,
-                    metrics.ate_attitude_deg.median,
-                    metrics.ate_attitude_deg.max
-                );
-                let metrics_file = output_dir.join("trajectory_metrics.txt");
-                write_trajectory_metrics(&metrics_file, &metrics)?;
-                println!("Trajectory metrics written to {}", metrics_file.display());
-            }
-        }
-    }
+    write_outputs(&output_dir, &states_out, &gt_poses)?;
 
     println!("Done.");
     Ok(())

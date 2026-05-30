@@ -860,6 +860,11 @@ fn image_axis_fallback_u(b: &Vector3<f64>) -> Vector3<f64> {
     }
 }
 
+fn smoothstep01(x: f64) -> f64 {
+    let x = x.clamp(0.0, 1.0);
+    x * x * (3.0 - 2.0 * x)
+}
+
 fn warp_tiled_local_pixel(
     curr_tile: &TiledBearingTile,
     ref_tile: &TiledBearingTile,
@@ -902,6 +907,52 @@ pub struct PatchDepthMapper {
     stereo_undistort_luts: Option<Vec<UndistortLut>>,
     stereo_valid_pyramid: Option<Arc<Vec<Image<f32>>>>,
     stereo_t_c1_c0: Option<Matrix4<f64>>,
+}
+
+// Eigenvalue test for a 2×2 symmetric structure tensor [[gxx, gxy], [gxy, gyy]].
+// Returns true if the patch has sufficient texture for reliable depth estimation.
+// Inputs must be already normalized (divided by pixel count).
+//
+// When `epipolar` is Some, the min_eigen check uses the directional curvature
+// ê^T S ê rather than λ_min. An edge perpendicular to the epipolar line has
+// ê^T S ê ≈ λ_max even though λ_min ≈ 0, so it correctly passes: that edge
+// provides all the depth information the photometric solver needs. The condition
+// number check is skipped when the epipolar direction is known, because only the
+// epipolar direction matters for the solve. When epipolar is None (degenerate
+// camera motion or unknown direction), both the λ_min and condition checks are
+// applied as a conservative fallback.
+pub(crate) fn structure_tensor_passes(
+    gxx: f64,
+    gxy: f64,
+    gyy: f64,
+    min_eigen: f64,
+    max_condition: f64,
+    epipolar: Option<(f64, f64)>,
+) -> bool {
+    let trace = gxx + gyy;
+    let discr = ((gxx - gyy) * (gxx - gyy) + 4.0 * gxy * gxy).sqrt();
+    let lambda_min = 0.5 * (trace - discr);
+    let lambda_max = 0.5 * (trace + discr);
+
+    if let Some((ex, ey)) = epipolar {
+        let h_epi = gxx * ex * ex + 2.0 * gxy * ex * ey + gyy * ey * ey;
+        if min_eigen > 0.0 && h_epi < min_eigen {
+            return false;
+        }
+    } else {
+        if min_eigen > 0.0 && lambda_min < min_eigen {
+            return false;
+        }
+        if max_condition > 0.0 {
+            if lambda_min <= 1e-12 {
+                return false;
+            }
+            if lambda_max / lambda_min > max_condition {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 impl PatchDepthMapper {
@@ -1958,17 +2009,57 @@ impl PatchDepthMapper {
                 {
                     continue;
                 }
+                let tile_w = self.tiled_blend_weight(tile, local_u, local_v, width, height);
+                if tile_w <= 0.0 {
+                    continue;
+                }
                 let idx = global_v as usize * width + global_u as usize;
                 let global_bearing = tile.bearing_at_level_pixel(global_u as f64, global_v as f64);
                 let z_over_range = global_bearing[2].max(1e-6);
                 let inv_z = estimate.rho / z_over_range;
-                rho_acc[idx] += inv_var_w * inv_z as f32;
-                w_acc[idx] += inv_var_w;
+                let w = inv_var_w * tile_w;
+                rho_acc[idx] += w * inv_z as f32;
+                w_acc[idx] += w;
                 if (estimate.status as u8) > (status[idx] as u8) {
                     status[idx] = estimate.status;
                 }
             }
         }
+    }
+
+    fn tiled_blend_weight(
+        &self,
+        tile: &TiledBearingTile,
+        local_u: f64,
+        local_v: f64,
+        width: usize,
+        height: usize,
+    ) -> f32 {
+        let margin = self
+            .settings
+            .tiled_tile_overlap
+            .saturating_sub(self.settings.patch_size)
+            .max(1) as f64;
+        let right = tile.width.saturating_sub(1) as f64;
+        let bottom = tile.height.saturating_sub(1) as f64;
+
+        let mut wx = 1.0;
+        if tile.x0 > 0 {
+            wx *= smoothstep01(local_u / margin);
+        }
+        if tile.x0 + tile.width < width {
+            wx *= smoothstep01((right - local_u) / margin);
+        }
+
+        let mut wy = 1.0;
+        if tile.y0 > 0 {
+            wy *= smoothstep01(local_v / margin);
+        }
+        if tile.y0 + tile.height < height {
+            wy *= smoothstep01((bottom - local_v) / margin);
+        }
+
+        (wx * wy) as f32
     }
 
     fn solve_one_patch(
@@ -2106,11 +2197,29 @@ impl PatchDepthMapper {
             return true;
         }
 
-        let Some((u_ref_center, v_ref_center, _, _)) =
+        let Some((u_ref_center, v_ref_center, x_ref, bearing)) =
             self.warp_scaled_pixel(cu, cv, rho, intr, rel_pose)
         else {
             return false;
         };
+
+        // Epipolar direction in the reference image: derivative of the projected
+        // reference point with respect to inverse depth ρ = d(proj(R·b/ρ + t))/dρ,
+        // simplified to J_proj · (R·b) using the pinhole model. The scale and
+        // sign cancel on normalisation; None signals degenerate motion (along the
+        // optical axis) and falls back to the conservative λ_min check.
+        let epipolar = {
+            let q = rel_pose.r * bearing;
+            let eu = self.intrinsics.fx * (q[0] * x_ref[2] - x_ref[0] * q[2]);
+            let ev = self.intrinsics.fy * (q[1] * x_ref[2] - x_ref[1] * q[2]);
+            let norm = (eu * eu + ev * ev).sqrt();
+            if norm > 1e-12 {
+                Some((eu / norm, ev / norm))
+            } else {
+                None
+            }
+        };
+
         let half = self.settings.patch_size / 2;
         let side = half * 2;
         let Some(fp) = bilinear_patch_footprint(
@@ -2151,25 +2260,14 @@ impl PatchDepthMapper {
         gxx *= inv_n;
         gxy *= inv_n;
         gyy *= inv_n;
-
-        let trace = gxx + gyy;
-        let discr = ((gxx - gyy) * (gxx - gyy) + 4.0 * gxy * gxy).sqrt();
-        let lambda_min = 0.5 * (trace - discr);
-        let lambda_max = 0.5 * (trace + discr);
-
-        if self.settings.min_structure_eigen > 0.0 && lambda_min < self.settings.min_structure_eigen
-        {
-            return false;
-        }
-        if self.settings.max_structure_condition > 0.0 {
-            if lambda_min <= 1e-12 {
-                return false;
-            }
-            if lambda_max / lambda_min > self.settings.max_structure_condition {
-                return false;
-            }
-        }
-        true
+        structure_tensor_passes(
+            gxx,
+            gxy,
+            gyy,
+            self.settings.min_structure_eigen,
+            self.settings.max_structure_condition,
+            epipolar,
+        )
     }
 
     fn search_initial_rho(

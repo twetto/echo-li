@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use nalgebra::{Matrix4, Vector2};
 
+use super::structure_tensor_passes;
 use super::*;
 use crate::core_types::CameraIntrinsics;
 use crate::depth::sparse_3d::{Sparse3DChart, Sparse3DFilter};
@@ -266,6 +267,39 @@ fn tiled_bearing_fusion_converts_range_to_z_depth() {
     let bearing_z = tile.bearing_at_level_pixel(28.0, 28.0)[2] as f32;
     assert!((z_depth - range * bearing_z).abs() < 1e-5);
     assert!(z_depth < range);
+}
+
+#[test]
+fn tiled_bearing_fusion_feathers_internal_tile_edges() {
+    let (camera, intr) = camera();
+    let settings = PatchDepthSettings {
+        camera_mode: PatchDepthCameraMode::TiledBearing,
+        warp_mode: PatchDepthWarpMode::FastTranslation,
+        patch_size: 4,
+        patch_stride: 2,
+        tiled_tile_size: 16,
+        tiled_tile_overlap: 12,
+        ..PatchDepthSettings::default()
+    };
+    let mapper = PatchDepthMapper::new(Arc::clone(&camera), intr, 32, 32, settings).unwrap();
+    let layout = mapper.tiled_bearing_levels.as_ref().unwrap();
+    let tile = layout[0]
+        .tiles
+        .iter()
+        .find(|tile| tile.x0 > 0 && tile.y0 > 0 && tile.x0 + tile.width < 32)
+        .expect("test layout should contain an internal tile");
+
+    let center_w = mapper.tiled_blend_weight(
+        tile,
+        0.5 * (tile.width - 1) as f64,
+        0.5 * (tile.height - 1) as f64,
+        32,
+        32,
+    );
+    let edge_w = mapper.tiled_blend_weight(tile, 0.0, 0.5 * (tile.height - 1) as f64, 32, 32);
+
+    assert!(center_w > 0.9);
+    assert_eq!(edge_w, 0.0);
 }
 
 #[test]
@@ -639,4 +673,158 @@ fn tiled_bearing_patch_and_seed_overlap_is_deterministic() {
             assert!(seed.uv[1] >= 0.0 && seed.uv[1] < tile.height as f64);
         }
     }
+}
+
+// --- structure_tensor_passes unit tests ---
+// Uses known analytic eigenvalues:
+//   [[3,1],[1,3]] → λ_min=2, λ_max=4, condition=2
+//   [[5,0],[0,1]] → λ_min=1, λ_max=5, condition=5
+//   [[4,0],[0,0]] → λ_min=0, λ_max=4  (edge-like)
+//   [[2,0],[0,2]] → λ_min=2, λ_max=2, condition=1  (isotropic)
+
+#[test]
+fn structure_tensor_both_disabled_always_passes() {
+    assert!(structure_tensor_passes(0.0, 0.0, 0.0, 0.0, 0.0, None));
+    assert!(structure_tensor_passes(4.0, 0.0, 0.0, 0.0, 0.0, None));
+}
+
+#[test]
+fn structure_tensor_min_eigen_rejects_edge_patch() {
+    // [[4,0],[0,0]] → λ_min=0 < 1.0
+    assert!(!structure_tensor_passes(4.0, 0.0, 0.0, 1.0, 0.0, None));
+}
+
+#[test]
+fn structure_tensor_min_eigen_accepts_corner_patch() {
+    // [[2,0],[0,2]] → λ_min=2 ≥ 1.0
+    assert!(structure_tensor_passes(2.0, 0.0, 2.0, 1.0, 0.0, None));
+}
+
+#[test]
+fn structure_tensor_min_eigen_boundary_is_inclusive() {
+    // [[3,1],[1,3]] → λ_min=2; threshold=2.0 → pass (not strictly less than)
+    assert!(structure_tensor_passes(3.0, 1.0, 3.0, 2.0, 0.0, None));
+    // threshold=2.01 → fail
+    assert!(!structure_tensor_passes(3.0, 1.0, 3.0, 2.01, 0.0, None));
+}
+
+#[test]
+fn structure_tensor_condition_rejects_anisotropic_patch() {
+    // [[5,0],[0,1]] → condition=5 > 3.0
+    assert!(!structure_tensor_passes(5.0, 0.0, 1.0, 0.0, 3.0, None));
+}
+
+#[test]
+fn structure_tensor_condition_accepts_isotropic_patch() {
+    // [[3,1],[1,3]] → condition=2 ≤ 3.0
+    assert!(structure_tensor_passes(3.0, 1.0, 3.0, 0.0, 3.0, None));
+}
+
+#[test]
+fn structure_tensor_degenerate_gradient_fails_condition_check() {
+    // λ_min=0 ≤ 1e-12 guard fires before division
+    assert!(!structure_tensor_passes(0.0, 0.0, 0.0, 0.0, 1.0, None));
+}
+
+#[test]
+fn structure_tensor_both_active_passes_both_gates() {
+    // [[3,1],[1,3]] → λ_min=2 ≥ 1.5, condition=2 ≤ 3.0
+    assert!(structure_tensor_passes(3.0, 1.0, 3.0, 1.5, 3.0, None));
+}
+
+#[test]
+fn structure_tensor_both_active_fails_condition_despite_min_eigen_ok() {
+    // [[5,0],[0,1]] → λ_min=1 ≥ 0.5, condition=5 > 3.0
+    assert!(!structure_tensor_passes(5.0, 0.0, 1.0, 0.5, 3.0, None));
+}
+
+// --- epipolar direction tests ---
+// Edge patch: gxx=4, gxy=0, gyy=0 → λ_min=0, λ_max=4 (gradient only in x).
+
+#[test]
+fn structure_tensor_epipolar_accepts_edge_perpendicular_to_epi_line() {
+    // Epipolar direction = (1,0): gradient is entirely along depth-sensing direction.
+    // ê^T S ê = 4 ≥ min_eigen=1 → passes, despite λ_min=0.
+    assert!(structure_tensor_passes(
+        4.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        Some((1.0, 0.0))
+    ));
+}
+
+#[test]
+fn structure_tensor_epipolar_rejects_edge_parallel_to_epi_line() {
+    // Epipolar direction = (0,1): gradient is orthogonal to depth-sensing direction.
+    // ê^T S ê = 0 < min_eigen=1 → fails, correctly: this edge gives no depth info.
+    assert!(!structure_tensor_passes(
+        4.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        Some((0.0, 1.0))
+    ));
+}
+
+#[test]
+fn structure_tensor_epipolar_diagonal_edge() {
+    // Edge at 45° and epipolar at 45°: ê = (1/√2, 1/√2), gxx=2, gxy=2, gyy=2.
+    // ê^T S ê = 2*(0.5) + 2*2*(0.5) + 2*(0.5) = 1 + 2 + 1 = 4 ≥ min_eigen=1.
+    let e = 1.0_f64 / 2.0_f64.sqrt();
+    assert!(structure_tensor_passes(
+        2.0,
+        2.0,
+        2.0,
+        1.0,
+        0.0,
+        Some((e, e))
+    ));
+}
+
+#[test]
+fn structure_tensor_epipolar_skips_condition_check_for_pure_edge() {
+    // With epipolar known, condition check is skipped. A pure edge (λ_min=0)
+    // that would fail the condition guard (λ_min ≤ 1e-12) still passes when
+    // the epipolar direction is aligned with the gradient.
+    assert!(structure_tensor_passes(
+        4.0,
+        0.0,
+        0.0,
+        0.5,
+        2.0,
+        Some((1.0, 0.0))
+    ));
+}
+
+#[test]
+fn structure_tensor_min_eigen_active_suppresses_all_depth_output() {
+    // Rejected patches have inv_var_w=0 and are skipped in the densify step,
+    // so they leave the output pixel as Unknown. With min_structure_eigen=1e6
+    // no real image can pass, so the entire depth output should be Unknown.
+    let (camera, intr) = camera();
+    let settings = PatchDepthSettings {
+        min_structure_eigen: 1e6,
+        min_photo_curvature: 0.0,
+        max_photo_residual: 255.0,
+        ..PatchDepthSettings::default()
+    };
+    let mut mapper = PatchDepthMapper::new(camera, intr, 32, 32, settings).unwrap();
+    let seeds = vec![SparseDepthPrior {
+        uv: Vector2::new(16.0, 16.0),
+        rho: 0.5,
+        rho_var: 0.01,
+    }];
+    let img = textured_image();
+    assert!(mapper
+        .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
+        .is_none());
+    let out = mapper
+        .update_with_priors(frame(1, 0.02, img), &seeds, None, 0.0)
+        .unwrap();
+    assert!(!out.status.data.contains(&PatchStatus::PhotoRefined));
+    assert!(!out.status.data.contains(&PatchStatus::SeedOnly));
+    assert!(out.status.data.iter().all(|s| *s == PatchStatus::Unknown));
 }
