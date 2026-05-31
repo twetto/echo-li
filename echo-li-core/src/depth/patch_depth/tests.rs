@@ -53,8 +53,8 @@ fn keyframe_buffer_uses_baseline_gate() {
     let mut mapper = PatchDepthMapper::new(camera, intr, 32, 32, settings).unwrap();
     let seeds = vec![SparseDepthPrior {
         uv: Vector2::new(16.0, 16.0),
-        rho: 0.5,
-        rho_var: 0.01,
+        eta: 0.693,
+        eta_var: 0.04,
     }];
 
     let img = textured_image();
@@ -82,8 +82,8 @@ fn seed_priors_produce_cell_depths() {
     let mut mapper = PatchDepthMapper::new(camera, intr, 32, 32, settings).unwrap();
     let seeds = vec![SparseDepthPrior {
         uv: Vector2::new(16.0, 16.0),
-        rho: 0.5,
-        rho_var: 0.01,
+        eta: 0.693,
+        eta_var: 0.04,
     }];
     let img = vec![120u8; 32 * 32];
 
@@ -112,8 +112,8 @@ fn bearing_lut_handles_distorted_path_for_photometric_solve() {
     let mut mapper = PatchDepthMapper::new(camera, intr, 32, 32, settings).unwrap();
     let seeds = vec![SparseDepthPrior {
         uv: Vector2::new(16.0, 16.0),
-        rho: 0.5,
-        rho_var: 0.01,
+        eta: 0.693,
+        eta_var: 0.04,
     }];
     let img = textured_image();
 
@@ -139,8 +139,8 @@ fn fast_translation_refines_undistorted_pinhole_patches() {
     let mut mapper = PatchDepthMapper::new(camera, intr, 32, 32, settings).unwrap();
     let seeds = vec![SparseDepthPrior {
         uv: Vector2::new(16.0, 16.0),
-        rho: 0.5,
-        rho_var: 0.01,
+        eta: 0.693,
+        eta_var: 0.04,
     }];
     let img = textured_image();
 
@@ -168,8 +168,8 @@ fn fast_translation_refines_undistorted_pinhole_4x4_patches() {
     let mut mapper = PatchDepthMapper::new(camera, intr, 32, 32, settings).unwrap();
     let seeds = vec![SparseDepthPrior {
         uv: Vector2::new(16.0, 16.0),
-        rho: 0.5,
-        rho_var: 0.01,
+        eta: 0.693,
+        eta_var: 0.04,
     }];
     let img = textured_image();
 
@@ -211,8 +211,8 @@ fn tiled_bearing_mode_runs_tile_local_update() {
     let mut mapper = PatchDepthMapper::new(camera, intr, 32, 32, settings).unwrap();
     let seeds = vec![SparseDepthPrior {
         uv: Vector2::new(16.0, 16.0),
-        rho: 0.5,
-        rho_var: 0.01,
+        eta: 0.693,
+        eta_var: 0.04,
     }];
     let img = textured_image();
 
@@ -263,7 +263,7 @@ fn tiled_bearing_fusion_converts_range_to_z_depth() {
 
     let idx = 28 * 32 + 28;
     let z_depth = w_acc[idx] / rho_acc[idx];
-    let range = 1.0 / estimate.rho as f32;
+    let range = estimate.eta.exp() as f32;
     let bearing_z = tile.bearing_at_level_pixel(28.0, 28.0)[2] as f32;
     assert!((z_depth - range * bearing_z).abs() < 1e-5);
     assert!(z_depth < range);
@@ -337,8 +337,8 @@ fn tiled_bearing_mode_runs_with_two_pyramid_levels() {
     let mut mapper = PatchDepthMapper::new(camera, intr, 32, 32, settings).unwrap();
     let seeds = vec![SparseDepthPrior {
         uv: Vector2::new(16.0, 16.0),
-        rho: 0.5,
-        rho_var: 0.01,
+        eta: 0.693,
+        eta_var: 0.04,
     }];
     let img = textured_image();
 
@@ -655,13 +655,13 @@ fn tiled_bearing_patch_and_seed_overlap_is_deterministic() {
     let seeds = vec![
         SparseDepthPrior {
             uv: Vector2::new(8.0, 8.0),
-            rho: 0.5,
-            rho_var: 0.01,
+            eta: 0.693,
+            eta_var: 0.04,
         },
         SparseDepthPrior {
             uv: Vector2::new(28.0, 28.0),
-            rho: 0.25,
-            rho_var: 0.02,
+            eta: 1.386,
+            eta_var: 0.32,
         },
     ];
     let assigned = assign_tiled_bearing_seeds(level, &seeds, 1.0, half);
@@ -814,8 +814,8 @@ fn structure_tensor_min_eigen_active_suppresses_all_depth_output() {
     let mut mapper = PatchDepthMapper::new(camera, intr, 32, 32, settings).unwrap();
     let seeds = vec![SparseDepthPrior {
         uv: Vector2::new(16.0, 16.0),
-        rho: 0.5,
-        rho_var: 0.01,
+        eta: 0.693,
+        eta_var: 0.04,
     }];
     let img = textured_image();
     assert!(mapper

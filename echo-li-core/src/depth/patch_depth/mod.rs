@@ -151,8 +151,11 @@ pub struct FrameProducts {
 #[derive(Debug, Clone)]
 pub struct SparseDepthPrior {
     pub uv: Vector2<f64>,
-    pub rho: f64,
-    pub rho_var: f64,
+    /// Log-range η = ln(range). Conversion from sensor output happens in
+    /// `seeds_from_sparse_filter`; the GN solvers consume this directly.
+    pub eta: f64,
+    /// Variance of η (= var_rho / rho²).
+    pub eta_var: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -192,9 +195,9 @@ pub(super) struct ScaledIntrinsics {
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct PatchEstimate {
-    pub(super) rho: f64,
-    #[allow(dead_code)]
-    pub(super) var: f64,
+    /// Log-range η = ln(range) of the 3D point at the patch centre.
+    pub(super) eta: f64,
+    pub(super) eta_var: f64,
     pub(super) status: PatchStatus,
     pub(super) inv_var_w: f64,
 }
@@ -202,37 +205,37 @@ pub(super) struct PatchEstimate {
 impl PatchEstimate {
     pub(super) fn unknown() -> Self {
         Self {
-            rho: 0.0,
-            var: 1e10,
+            eta: 0.0,
+            eta_var: f64::INFINITY,
             status: PatchStatus::Unknown,
             inv_var_w: 0.0,
         }
     }
 
-    fn rejected(rho: f64) -> Self {
+    fn rejected(eta: f64) -> Self {
         Self {
-            rho,
-            var: 1e10,
+            eta,
+            eta_var: f64::INFINITY,
             status: PatchStatus::Rejected,
             inv_var_w: 0.0,
         }
     }
 
-    fn photo_refined(rho: f64, var: f64, settings: &PatchDepthSettings) -> Self {
+    fn photo_refined(eta: f64, eta_var: f64, settings: &PatchDepthSettings) -> Self {
         Self {
-            rho,
-            var,
+            eta,
+            eta_var,
             status: PatchStatus::PhotoRefined,
-            inv_var_w: settings.status_weight_photo / var.max(settings.var_floor),
+            inv_var_w: settings.status_weight_photo / eta_var.max(settings.var_floor),
         }
     }
 
-    fn seed_only(rho: f64, var: f64, settings: &PatchDepthSettings) -> Self {
+    fn seed_only(eta: f64, eta_var: f64, settings: &PatchDepthSettings) -> Self {
         Self {
-            rho,
-            var,
+            eta,
+            eta_var,
             status: PatchStatus::SeedOnly,
-            inv_var_w: settings.status_weight_seed / var.max(settings.var_floor),
+            inv_var_w: settings.status_weight_seed / eta_var.max(settings.var_floor),
         }
     }
 
@@ -657,8 +660,8 @@ fn assign_tiled_bearing_seeds(
             }
             by_tile[tile_idx].push(SparseDepthPrior {
                 uv: tile.global_to_local(scaled_uv),
-                rho: seed.rho,
-                rho_var: seed.rho_var,
+                eta: seed.eta,
+                eta_var: seed.eta_var,
             });
         }
     }
@@ -885,6 +888,25 @@ fn warp_tiled_local_pixel(
     Some((uv_ref[0], uv_ref[1], x_ref, bearing))
 }
 
+/// Tiled warp at log-range η.  Tile bearings are already unit, so
+/// `x_curr = unit_b · exp(η)` directly.  Returns `(u_local_ref, v_local_ref, x_ref, unit_b)`.
+fn warp_tiled_local_pixel_eta(
+    curr_tile: &TiledBearingTile,
+    ref_tile: &TiledBearingTile,
+    u_local: f64,
+    v_local: f64,
+    eta: f64,
+    rel_pose: &RelativePose,
+) -> Option<(f64, f64, Vector3<f64>, Vector3<f64>)> {
+    let u = curr_tile.x0 as f64 + u_local;
+    let v = curr_tile.y0 as f64 + v_local;
+    let unit_b = curr_tile.bearing_at_level_pixel(u, v);
+    let x_curr = unit_b * eta.exp();
+    let x_ref = rel_pose.r * x_curr + rel_pose.t;
+    let uv_ref = ref_tile.project_to_local_pixel(&x_ref)?;
+    Some((uv_ref[0], uv_ref[1], x_ref, unit_b))
+}
+
 pub struct PatchDepthMapper {
     camera: Arc<dyn CameraModel>,
     pub(super) camera_mode: PatchDepthCameraMode,
@@ -907,6 +929,55 @@ pub struct PatchDepthMapper {
     stereo_undistort_luts: Option<Vec<UndistortLut>>,
     stereo_valid_pyramid: Option<Arc<Vec<Image<f32>>>>,
     stereo_t_c1_c0: Option<Matrix4<f64>>,
+}
+
+// ---------------------------------------------------------------------------
+// Log-range depth conversion helpers.
+//
+// Internally the GN solver optimises η = ln(range), where range is the
+// Euclidean distance from the camera to the 3D point.  All warp paths use
+// unit bearings: x_curr = unit_b · exp(η).
+//
+// Seed conversion (rho_to_eta) uses bearing_norm = ‖b_non_unit‖ = 1/unit_b.z:
+//   pinhole (rho = 1/z, b = [bx,by,1]): bearing_norm = ‖b‖, η = ln(‖b‖/ρ) = ln(range)
+//   tiled   (rho = 1/range, unit b):     bearing_norm = 1,   η = ln(1/ρ)   = ln(range)
+//
+// This avoids the 1/ρ² singularity in the Jacobian near large depths.
+// ---------------------------------------------------------------------------
+
+/// Converts inverse depth ρ to log-range η = ln(range).
+///
+/// `range_per_z` encodes the rho semantics:
+/// - Inverse-z prior (`rho = 1/z`, pinhole bearing `b = [bx,by,1]`):
+///   pass `range_per_z = norm(b) = 1/unit_b.z`. Then `eta = ln(norm/rho) = ln(range)`.
+/// - Inverse-range prior (`rho = 1/range`, unit bearing):
+///   pass `range_per_z = 1.0`. Then `eta = ln(1/rho) = ln(range)`.
+///
+/// Do NOT pass `unit_b.norm()` (= 1.0) when the prior is inverse-z — that
+/// conflates the two cases and silently drops the `1/unit_b.z` factor.
+/// For omnidirectional models where `unit_b.z <= 0`, inverse-z priors are
+/// undefined; use range priors (`query_range`) directly.
+pub(crate) fn rho_to_eta(rho: f64, range_per_z: f64) -> f64 {
+    (range_per_z / rho).ln()
+}
+
+/// Converts log-range η back to inverse depth ρ.
+/// Pass the same `range_per_z` used in `rho_to_eta`.
+pub(crate) fn eta_to_rho(eta: f64, range_per_z: f64) -> f64 {
+    range_per_z * (-eta).exp()
+}
+
+/// Propagates inverse-depth variance to log-range variance via the delta method.
+/// Holds for both inverse-z and inverse-range: dη/dρ = −1/ρ → var(η) ≈ var(ρ)/ρ².
+pub(crate) fn rho_var_to_eta_var(rho: f64, rho_var: f64) -> f64 {
+    rho_var / (rho * rho)
+}
+
+/// Propagates log-range variance back to inverse-depth variance.
+/// Pass the same `range_per_z` used in `rho_to_eta`.
+pub(crate) fn eta_var_to_rho_var(eta: f64, range_per_z: f64, eta_var: f64) -> f64 {
+    let rho = eta_to_rho(eta, range_per_z);
+    eta_var * rho * rho
 }
 
 // Eigenvalue test for a 2×2 symmetric structure tensor [[gxx, gxy], [gxy, gyy]].
@@ -1526,12 +1597,16 @@ impl PatchDepthMapper {
         sparse_filter: &Sparse3DFilter,
         measurement: &VisionMeasurement,
     ) -> Vec<SparseDepthPrior> {
+        let intr_orig = ScaledIntrinsics {
+            scale_from_original: 1.0,
+        };
+        let is_tiled = self.camera_mode == PatchDepthCameraMode::TiledBearing;
         let mut fids: Vec<u64> = measurement.cam_coordinates.keys().copied().collect();
         fids.sort_unstable();
         let mut seeds = Vec::new();
         for fid in fids {
             let uv_f32 = &measurement.cam_coordinates[&fid];
-            let (depth, depth_var) = if self.camera_mode == PatchDepthCameraMode::TiledBearing {
+            let (depth, depth_var) = if is_tiled {
                 sparse_filter.query_range(fid)
             } else {
                 sparse_filter.query(fid)
@@ -1543,14 +1618,21 @@ impl PatchDepthMapper {
             {
                 continue;
             }
+            let uv = Vector2::new(uv_f32[0] as f64, uv_f32[1] as f64);
+            // range_per_z = ‖bearing‖; for tiled seeds (rho = 1/range) this is 1.0.
+            let range_per_z = if is_tiled {
+                1.0
+            } else {
+                self.bearing_for_scaled_pixel(uv[0], uv[1], &intr_orig)
+                    .map(|b| b.norm())
+                    .unwrap_or(1.0)
+            };
             let rho = 1.0 / depth;
             let rho_var = depth_var / depth.powi(4);
-            if rho.is_finite() && rho_var.is_finite() && rho_var > 0.0 {
-                seeds.push(SparseDepthPrior {
-                    uv: Vector2::new(uv_f32[0] as f64, uv_f32[1] as f64),
-                    rho,
-                    rho_var,
-                });
+            let eta = rho_to_eta(rho, range_per_z);
+            let eta_var = rho_var_to_eta_var(rho, rho_var);
+            if eta.is_finite() && eta_var.is_finite() && eta_var > 0.0 {
+                seeds.push(SparseDepthPrior { uv, eta, eta_var });
             }
         }
         seeds
@@ -1915,20 +1997,21 @@ impl PatchDepthMapper {
             return PatchEstimate::unknown();
         }
 
-        let mut seed_rho_init = 0.0;
-        let mut seed_weight_total = 0.0;
-        let mut seed_precision_sum = 0.0;
-        for item in nearby.iter() {
-            let weighted_precision = item.w_spatial * item.precision;
-            seed_rho_init += weighted_precision * seeds[item.idx].rho;
-            seed_weight_total += weighted_precision;
-            seed_precision_sum += weighted_precision;
-        }
+        // Seeds already in η space. eta = ln(range), precision = 1/eta_var.
+        let eta_min = self.settings.min_depth.ln();
+        let eta_max = self.settings.max_depth.ln();
 
-        let rho_min = 1.0 / self.settings.max_depth;
-        let rho_max = 1.0 / self.settings.min_depth;
-        let rho_init = (seed_rho_init / seed_weight_total).clamp(rho_min, rho_max);
-        let mut rho = rho_init;
+        let mut seed_eta_sum = 0.0;
+        let mut seed_weight_total = 0.0;
+        let mut seed_precision_sum_eta = 0.0;
+        for item in nearby.iter() {
+            let wp = item.w_spatial * item.precision;
+            seed_eta_sum += wp * seeds[item.idx].eta;
+            seed_weight_total += wp;
+            seed_precision_sum_eta += wp;
+        }
+        let eta_init = (seed_eta_sum / seed_weight_total).clamp(eta_min, eta_max);
+        let mut eta = eta_init;
         let mut final_residual = 1e10;
         let mut final_curvature = 0.0;
 
@@ -1937,7 +2020,7 @@ impl PatchDepthMapper {
                 .patch_residual_jacobian_fast_translation_tiled(
                     global_cu,
                     global_cv,
-                    rho,
+                    eta,
                     depth_frame,
                     ref_keyframe,
                     rel_pose,
@@ -1951,7 +2034,7 @@ impl PatchDepthMapper {
             let mut hess_seed = 0.0;
             for item in nearby.iter() {
                 let wp = self.settings.lambda_seed * item.w_spatial * item.precision;
-                grad_seed += wp * (rho - seeds[item.idx].rho);
+                grad_seed += wp * (eta - seeds[item.idx].eta);
                 hess_seed += wp;
             }
 
@@ -1959,24 +2042,23 @@ impl PatchDepthMapper {
             if hess_total < 1e-12 {
                 break;
             }
-            rho = (rho - (grad_photo + grad_seed) / hess_total).clamp(rho_min, rho_max);
+            eta = (eta - (grad_photo + grad_seed) / hess_total).clamp(eta_min, eta_max);
             final_residual = mean_res;
             final_curvature = hess_photo;
         }
-
         let min_curvature = self.settings.min_photo_curvature
             * (self.settings.patch_size * self.settings.patch_size) as f64;
         if final_curvature >= min_curvature && final_residual <= self.settings.max_photo_residual {
-            let hess_total = final_curvature + seed_precision_sum * self.settings.lambda_seed;
-            let var = 1.0 / hess_total.max(1e-12);
-            PatchEstimate::photo_refined(rho, var, &self.settings)
+            let eta_var = 1.0
+                / (final_curvature + seed_precision_sum_eta * self.settings.lambda_seed).max(1e-12);
+            PatchEstimate::photo_refined(eta, eta_var, &self.settings)
         } else if final_residual > self.settings.max_photo_residual
             && final_curvature >= min_curvature
         {
-            PatchEstimate::rejected(rho)
+            PatchEstimate::rejected(eta)
         } else {
-            let var = 1.0 / (seed_precision_sum * self.settings.lambda_seed).max(1e-12);
-            PatchEstimate::seed_only(rho_init, var, &self.settings)
+            let eta_var = 1.0 / (seed_precision_sum_eta * self.settings.lambda_seed).max(1e-12);
+            PatchEstimate::seed_only(eta_init, eta_var, &self.settings)
         }
     }
 
@@ -2015,8 +2097,9 @@ impl PatchDepthMapper {
                 }
                 let idx = global_v as usize * width + global_u as usize;
                 let global_bearing = tile.bearing_at_level_pixel(global_u as f64, global_v as f64);
-                let z_over_range = global_bearing[2].max(1e-6);
-                let inv_z = estimate.rho / z_over_range;
+                let unit_b_z = global_bearing[2].max(1e-6);
+                // eta = ln(range); z_per_pixel = exp(eta) * unit_b.z
+                let inv_z = (-estimate.eta).exp() / unit_b_z;
                 let w = inv_var_w * tile_w;
                 rho_acc[idx] += w * inv_z as f32;
                 w_acc[idx] += w;
@@ -2080,35 +2163,45 @@ impl PatchDepthMapper {
             return PatchEstimate::unknown();
         }
 
-        let mut seed_rho_init = 0.0;
+        // η bounds: range = z * bearing_norm, so eta = ln(range) = ln(z * bearing_norm).
+        let range_per_z = match self
+            .bearing_for_scaled_pixel(cu, cv, &intrinsics_by_level[0])
+            .map(|b| b.norm())
+        {
+            Some(n) => n,
+            None => return PatchEstimate::unknown(),
+        };
+        let eta_min = (self.settings.min_depth * range_per_z).ln();
+        let eta_max = (self.settings.max_depth * range_per_z).ln();
+
+        // Seeds already in η space (converted in gather_seeds). precision = 1/eta_var.
+        let mut seed_eta_sum = 0.0;
         let mut seed_weight_total = 0.0;
         let mut seed_precision_sum = 0.0;
         for item in nearby.iter() {
-            let weighted_precision = item.w_spatial * item.precision;
-            seed_rho_init += weighted_precision * seeds[item.idx].rho;
-            seed_weight_total += weighted_precision;
-            seed_precision_sum += weighted_precision;
+            let wp = item.w_spatial * item.precision;
+            seed_eta_sum += wp * seeds[item.idx].eta;
+            seed_weight_total += wp;
+            seed_precision_sum += wp;
         }
+        let eta_init = (seed_eta_sum / seed_weight_total).clamp(eta_min, eta_max);
 
-        let rho_min = 1.0 / self.settings.max_depth;
-        let rho_max = 1.0 / self.settings.min_depth;
-        let rho_init = (seed_rho_init / seed_weight_total).clamp(rho_min, rho_max);
         if !self.patch_has_enough_structure(
             cu,
             cv,
-            rho_init,
+            eta_init,
             ref_keyframe,
             &intrinsics_by_level[0],
             &RelativePose::from_matrix(t_ref_curr),
         ) {
-            return PatchEstimate::rejected(rho_init);
+            return PatchEstimate::rejected(eta_init);
         }
-        let mut rho = self.search_initial_rho(
+        let mut eta = self.search_initial_eta(
             cu,
             cv,
-            rho_init,
-            rho_min,
-            rho_max,
+            eta_init,
+            eta_min,
+            eta_max,
             curr_pyramid,
             curr_valid_pyramid,
             ref_keyframe,
@@ -2125,7 +2218,7 @@ impl PatchDepthMapper {
                 self.patch_residual_jacobian_fast_translation(
                     cu,
                     cv,
-                    rho,
+                    eta,
                     curr_pyramid,
                     curr_valid_pyramid,
                     ref_keyframe,
@@ -2137,7 +2230,7 @@ impl PatchDepthMapper {
                 self.patch_residual_jacobian(
                     cu,
                     cv,
-                    rho,
+                    eta,
                     curr_pyramid,
                     curr_valid_pyramid,
                     ref_keyframe,
@@ -2154,7 +2247,7 @@ impl PatchDepthMapper {
             let mut hess_seed = 0.0;
             for item in nearby.iter() {
                 let wp = self.settings.lambda_seed * item.w_spatial * item.precision;
-                grad_seed += wp * (rho - seeds[item.idx].rho);
+                grad_seed += wp * (eta - seeds[item.idx].eta);
                 hess_seed += wp;
             }
 
@@ -2162,7 +2255,7 @@ impl PatchDepthMapper {
             if hess_total < 1e-12 {
                 break;
             }
-            rho = (rho - (grad_photo + grad_seed) / hess_total).clamp(rho_min, rho_max);
+            eta = (eta - (grad_photo + grad_seed) / hess_total).clamp(eta_min, eta_max);
             final_residual = mean_res;
             final_curvature = hess_photo;
         }
@@ -2170,16 +2263,16 @@ impl PatchDepthMapper {
         let min_curvature = self.settings.min_photo_curvature
             * (self.settings.patch_size * self.settings.patch_size) as f64;
         if final_curvature >= min_curvature && final_residual <= self.settings.max_photo_residual {
-            let hess_total = final_curvature + seed_precision_sum * self.settings.lambda_seed;
-            let var = 1.0 / hess_total.max(1e-12);
-            PatchEstimate::photo_refined(rho, var, &self.settings)
+            let eta_var =
+                1.0 / (final_curvature + seed_precision_sum * self.settings.lambda_seed).max(1e-12);
+            PatchEstimate::photo_refined(eta, eta_var, &self.settings)
         } else if final_residual > self.settings.max_photo_residual
             && final_curvature >= min_curvature
         {
-            PatchEstimate::rejected(rho)
+            PatchEstimate::rejected(eta)
         } else {
-            let var = 1.0 / (seed_precision_sum * self.settings.lambda_seed).max(1e-12);
-            PatchEstimate::seed_only(rho_init, var, &self.settings)
+            let eta_var = 1.0 / (seed_precision_sum * self.settings.lambda_seed).max(1e-12);
+            PatchEstimate::seed_only(eta_init, eta_var, &self.settings)
         }
     }
 
@@ -2187,7 +2280,7 @@ impl PatchDepthMapper {
         &self,
         cu: f64,
         cv: f64,
-        rho: f64,
+        eta: f64,
         ref_keyframe: &DepthKeyframe,
         intr: &ScaledIntrinsics,
         rel_pose: &RelativePose,
@@ -2197,19 +2290,17 @@ impl PatchDepthMapper {
             return true;
         }
 
-        let Some((u_ref_center, v_ref_center, x_ref, bearing)) =
-            self.warp_scaled_pixel(cu, cv, rho, intr, rel_pose)
+        let Some((u_ref_center, v_ref_center, x_ref, _unit_b)) =
+            self.warp_with_eta(cu, cv, eta, intr, rel_pose)
         else {
             return false;
         };
 
-        // Epipolar direction in the reference image: derivative of the projected
-        // reference point with respect to inverse depth ρ = d(proj(R·b/ρ + t))/dρ,
-        // simplified to J_proj · (R·b) using the pinhole model. The scale and
-        // sign cancel on normalisation; None signals degenerate motion (along the
-        // optical axis) and falls back to the conservative λ_min check.
+        // Epipolar direction: dx_ref/dη = x_ref − t (the log-range identity).
+        // Project to image space via J_proj.  Scale and sign cancel on normalisation;
+        // None signals degenerate motion (pure forward) and falls back to λ_min.
         let epipolar = {
-            let q = rel_pose.r * bearing;
+            let q = x_ref - rel_pose.t;
             let eu = self.intrinsics.fx * (q[0] * x_ref[2] - x_ref[0] * q[2]);
             let ev = self.intrinsics.fy * (q[1] * x_ref[2] - x_ref[1] * q[2]);
             let norm = (eu * eu + ev * ev).sqrt();
@@ -2270,13 +2361,13 @@ impl PatchDepthMapper {
         )
     }
 
-    fn search_initial_rho(
+    fn search_initial_eta(
         &self,
         cu: f64,
         cv: f64,
-        rho_init: f64,
-        rho_min: f64,
-        rho_max: f64,
+        eta_init: f64,
+        eta_min: f64,
+        eta_max: f64,
         curr_pyramid: &[Image<f32>],
         curr_valid_pyramid: Option<&[Image<f32>]>,
         ref_keyframe: &DepthKeyframe,
@@ -2285,12 +2376,12 @@ impl PatchDepthMapper {
     ) -> f64 {
         let n = self.settings.n_search_candidates.max(1);
         if n == 1 {
-            return rho_init;
+            return eta_init;
         }
         let half_range = self.settings.search_half_range.max(0.0);
-        let lo = (rho_init * (1.0 - half_range)).clamp(rho_min, rho_max);
-        let hi = (rho_init * (1.0 + half_range)).clamp(rho_min, rho_max);
-        let mut best_rho = rho_init;
+        let lo = (eta_init - half_range).clamp(eta_min, eta_max);
+        let hi = (eta_init + half_range).clamp(eta_min, eta_max);
+        let mut best_eta = eta_init;
         let mut best_cost = f64::INFINITY;
         let use_fast_translation = self.settings.warp_mode == PatchDepthWarpMode::FastTranslation
             && self.camera_mode == PatchDepthCameraMode::UndistortedPinhole;
@@ -2300,12 +2391,12 @@ impl PatchDepthMapper {
             } else {
                 0.0
             };
-            let rho = lo + (hi - lo) * a;
+            let eta = lo + (hi - lo) * a;
             let (cost, valid) = if use_fast_translation {
                 self.patch_cost_fast_translation(
                     cu,
                     cv,
-                    rho,
+                    eta,
                     &curr_pyramid[0],
                     curr_valid_pyramid.map(|p| &p[0]),
                     &ref_keyframe.ref_pyramid[0],
@@ -2317,7 +2408,7 @@ impl PatchDepthMapper {
                 self.patch_cost(
                     cu,
                     cv,
-                    rho,
+                    eta,
                     &curr_pyramid[0],
                     curr_valid_pyramid.map(|p| &p[0]),
                     &ref_keyframe.ref_pyramid[0],
@@ -2328,17 +2419,17 @@ impl PatchDepthMapper {
             };
             if valid > 0 && cost < best_cost {
                 best_cost = cost;
-                best_rho = rho;
+                best_eta = eta;
             }
         }
-        best_rho
+        best_eta
     }
 
     fn patch_cost(
         &self,
         cu: f64,
         cv: f64,
-        rho: f64,
+        eta: f64,
         curr_img: &Image<f32>,
         curr_valid: Option<&Image<f32>>,
         ref_img: &Image<f32>,
@@ -2360,8 +2451,7 @@ impl PatchDepthMapper {
                 if !sample_valid_nearest(curr_valid, pu, pv) {
                     continue;
                 }
-                let Some((u_ref, v_ref, _, _)) =
-                    self.warp_scaled_pixel(pu, pv, rho, intr, &rel_pose)
+                let Some((u_ref, v_ref, _, _)) = self.warp_with_eta(pu, pv, eta, intr, &rel_pose)
                 else {
                     continue;
                 };
@@ -2385,7 +2475,7 @@ impl PatchDepthMapper {
         &self,
         cu: f64,
         cv: f64,
-        rho: f64,
+        eta: f64,
         curr_img: &Image<f32>,
         curr_valid: Option<&Image<f32>>,
         ref_img: &Image<f32>,
@@ -2395,7 +2485,7 @@ impl PatchDepthMapper {
     ) -> (f64, usize) {
         let rel_pose = RelativePose::from_matrix(t_ref_curr);
         let Some((u_ref_center, v_ref_center, _, _)) =
-            self.warp_scaled_pixel(cu, cv, rho, intr, &rel_pose)
+            self.warp_with_eta(cu, cv, eta, intr, &rel_pose)
         else {
             return (0.0, 0);
         };
@@ -2451,7 +2541,7 @@ impl PatchDepthMapper {
         &self,
         cu: f64,
         cv: f64,
-        rho: f64,
+        eta: f64,
         curr_pyramid: &[Image<f32>],
         curr_valid_pyramid: Option<&[Image<f32>]>,
         ref_keyframe: &DepthKeyframe,
@@ -2470,7 +2560,7 @@ impl PatchDepthMapper {
             let (g, h, sar, nv) = self.patch_residual_jacobian_level(
                 cu * scale,
                 cv * scale,
-                rho,
+                eta,
                 &curr_pyramid[level],
                 curr_valid_pyramid.map(|p| &p[level]),
                 &ref_keyframe.ref_pyramid[level],
@@ -2497,7 +2587,7 @@ impl PatchDepthMapper {
         &self,
         cu: f64,
         cv: f64,
-        rho: f64,
+        eta: f64,
         curr_pyramid: &[Image<f32>],
         curr_valid_pyramid: Option<&[Image<f32>]>,
         ref_keyframe: &DepthKeyframe,
@@ -2516,7 +2606,7 @@ impl PatchDepthMapper {
             let (g, h, sar, nv) = self.patch_residual_jacobian_fast_translation_level(
                 cu * scale,
                 cv * scale,
-                rho,
+                eta,
                 &curr_pyramid[level],
                 curr_valid_pyramid.map(|p| &p[level]),
                 &ref_keyframe.ref_pyramid[level],
@@ -2543,7 +2633,7 @@ impl PatchDepthMapper {
         &self,
         cu: f64,
         cv: f64,
-        rho: f64,
+        eta: f64,
         curr_img: &Image<f32>,
         curr_valid: Option<&Image<f32>>,
         ref_img: &Image<f32>,
@@ -2554,16 +2644,16 @@ impl PatchDepthMapper {
         rel_pose: &RelativePose,
         sigma_warp_sq: f64,
     ) -> (f64, f64, f64, usize) {
-        let Some((u_ref_center, v_ref_center, x_ref_center, bearing_center)) =
-            self.warp_scaled_pixel(cu, cv, rho, intr, rel_pose)
+        let Some((u_ref_center, v_ref_center, x_ref_center, _unit_b)) =
+            self.warp_with_eta(cu, cv, eta, intr, rel_pose)
         else {
             return (0.0, 0.0, 0.0, 0);
         };
 
-        let dx_ref_drho = rel_pose.r * (-bearing_center / (rho * rho));
-        let du_dxref = self.projection_jacobian(&x_ref_center) * dx_ref_drho;
-        let du_drho = intr.scale_from_original * du_dxref[0];
-        let dv_drho = intr.scale_from_original * du_dxref[1];
+        let dx_ref_deta = x_ref_center - rel_pose.t;
+        let du_dxref = self.projection_jacobian(&x_ref_center) * dx_ref_deta;
+        let du_deta = intr.scale_from_original * du_dxref[0];
+        let dv_deta = intr.scale_from_original * du_dxref[1];
 
         let Some(patch) =
             self.translated_patch_footprint(cu, cv, ref_img, u_ref_center, v_ref_center)
@@ -2588,8 +2678,8 @@ impl PatchDepthMapper {
                 ref_grad_x,
                 ref_grad_y,
                 patch,
-                du_drho as f32,
-                dv_drho as f32,
+                du_deta as f32,
+                dv_deta as f32,
                 inv_sigma_photo_sq as f32,
                 self.settings.photo_huber_delta as f32,
             ) {
@@ -2607,8 +2697,8 @@ impl PatchDepthMapper {
                 ref_grad_x,
                 ref_grad_y,
                 patch,
-                du_drho as f32,
-                dv_drho as f32,
+                du_deta as f32,
+                dv_deta as f32,
                 inv_sigma_photo_sq as f32,
                 self.settings.photo_huber_delta as f32,
             ) {
@@ -2649,7 +2739,7 @@ impl PatchDepthMapper {
                     let gx = bilerp_ptr(gx_row0, gx_row1, ix, patch.ref_fp.weights);
                     let gy = bilerp_ptr(gy_row0, gy_row1, ix, patch.ref_fp.weights);
 
-                    let jac = gx as f64 * du_drho + gy as f64 * dv_drho;
+                    let jac = gx as f64 * du_deta + gy as f64 * dv_deta;
                     let residual = i_ref as f64 - i_curr as f64;
                     let ar = residual.abs();
                     let inv_sigma_eff_sq = photo_inv_sigma_eff_sq(
@@ -2679,7 +2769,7 @@ impl PatchDepthMapper {
         &self,
         cu: f64,
         cv: f64,
-        rho: f64,
+        eta: f64,
         depth_frame: &TiledBearingFrameProducts,
         ref_keyframe: &TiledBearingKeyframe,
         rel_pose: &RelativePose,
@@ -2719,7 +2809,7 @@ impl PatchDepthMapper {
                 &ref_tile.tile,
                 local[0],
                 local[1],
-                rho,
+                eta,
                 &curr_tile.image,
                 Some(&curr_tile.valid),
                 &ref_tile.ref_image,
@@ -2745,7 +2835,7 @@ impl PatchDepthMapper {
         ref_tile: &TiledBearingTile,
         cu: f64,
         cv: f64,
-        rho: f64,
+        eta: f64,
         curr_img: &Image<f32>,
         curr_valid: Option<&Image<f32>>,
         ref_img: &Image<f32>,
@@ -2755,19 +2845,19 @@ impl PatchDepthMapper {
         rel_pose: &RelativePose,
         sigma_warp_sq: f64,
     ) -> (f64, f64, f64, usize) {
-        let Some((u_ref_center, v_ref_center, x_ref_center, bearing_center)) =
-            warp_tiled_local_pixel(curr_tile, ref_tile, cu, cv, rho, rel_pose)
+        let Some((u_ref_center, v_ref_center, x_ref_center, _unit_b)) =
+            warp_tiled_local_pixel_eta(curr_tile, ref_tile, cu, cv, eta, rel_pose)
         else {
             return (0.0, 0.0, 0.0, 0);
         };
 
-        let dx_ref_drho = rel_pose.r * (-bearing_center / (rho * rho));
+        let dx_ref_deta = x_ref_center - rel_pose.t;
         let Some(du_dxref) = ref_tile.projection_jacobian(&x_ref_center) else {
             return (0.0, 0.0, 0.0, 0);
         };
-        let duv_drho = du_dxref * dx_ref_drho;
-        let du_drho = duv_drho[0];
-        let dv_drho = duv_drho[1];
+        let duv_deta = du_dxref * dx_ref_deta;
+        let du_deta = duv_deta[0];
+        let dv_deta = duv_deta[1];
 
         let Some(patch) =
             self.translated_patch_footprint(cu, cv, ref_img, u_ref_center, v_ref_center)
@@ -2816,7 +2906,7 @@ impl PatchDepthMapper {
                     let gx = bilerp_ptr(gx_row0, gx_row1, ix, patch.ref_fp.weights);
                     let gy = bilerp_ptr(gy_row0, gy_row1, ix, patch.ref_fp.weights);
 
-                    let jac = gx as f64 * du_drho + gy as f64 * dv_drho;
+                    let jac = gx as f64 * du_deta + gy as f64 * dv_deta;
                     let residual = i_ref as f64 - i_curr as f64;
                     let ar = residual.abs();
                     let inv_sigma_eff_sq = photo_inv_sigma_eff_sq(
@@ -2865,7 +2955,7 @@ impl PatchDepthMapper {
         &self,
         cu: f64,
         cv: f64,
-        rho: f64,
+        eta: f64,
         curr_img: &Image<f32>,
         curr_valid: Option<&Image<f32>>,
         ref_img: &Image<f32>,
@@ -2882,8 +2972,6 @@ impl PatchDepthMapper {
         let mut sum_abs_res = 0.0;
         let mut n_valid = 0;
         let sigma_photo_sq = self.settings.sigma_photo * self.settings.sigma_photo;
-        let dx_curr_drho_scale = -1.0 / (rho * rho);
-        let r_dx_curr_drho = rel_pose.r * dx_curr_drho_scale;
 
         for dy in -(half as isize)..half as isize {
             for dx in -(half as isize)..half as isize {
@@ -2895,8 +2983,8 @@ impl PatchDepthMapper {
                 if !sample_valid_nearest(curr_valid, pu, pv) {
                     continue;
                 }
-                let Some((u_ref, v_ref, x_ref, bearing)) =
-                    self.warp_scaled_pixel(pu, pv, rho, intr, rel_pose)
+                let Some((u_ref, v_ref, x_ref, _unit_b)) =
+                    self.warp_with_eta(pu, pv, eta, intr, rel_pose)
                 else {
                     continue;
                 };
@@ -2906,11 +2994,11 @@ impl PatchDepthMapper {
                     continue;
                 };
 
-                let dx_ref_drho = r_dx_curr_drho * bearing;
-                let du_dxref = self.projection_jacobian(&x_ref) * dx_ref_drho;
-                let du_drho = intr.scale_from_original * du_dxref[0];
-                let dv_drho = intr.scale_from_original * du_dxref[1];
-                let jac = gx as f64 * du_drho + gy as f64 * dv_drho;
+                let dx_ref_deta = x_ref - rel_pose.t;
+                let du_dxref = self.projection_jacobian(&x_ref) * dx_ref_deta;
+                let du_deta = intr.scale_from_original * du_dxref[0];
+                let dv_deta = intr.scale_from_original * du_dxref[1];
+                let jac = gx as f64 * du_deta + gy as f64 * dv_deta;
 
                 let residual = i_ref as f64 - i_curr as f64;
                 let ar = residual.abs();
@@ -2951,6 +3039,28 @@ impl PatchDepthMapper {
         }
         let (u_ref, v_ref) = self.project_scaled(&x_ref, intr.scale_from_original);
         Some((u_ref, v_ref, x_ref, bearing))
+    }
+
+    /// Warp a pixel at log-range η = ln(range).  All modes normalise the bearing to unit
+    /// length before computing `x_curr = unit_b · exp(η)`, so the return bearing is unit.
+    /// Returns `(u_ref, v_ref, x_ref, unit_b)`.
+    pub(super) fn warp_with_eta(
+        &self,
+        u: f64,
+        v: f64,
+        eta: f64,
+        intr: &ScaledIntrinsics,
+        rel_pose: &RelativePose,
+    ) -> Option<(f64, f64, Vector3<f64>, Vector3<f64>)> {
+        let bearing = self.bearing_for_scaled_pixel(u, v, intr)?;
+        let unit_b = bearing.normalize();
+        let x_curr = unit_b * eta.exp();
+        let x_ref = rel_pose.r * x_curr + rel_pose.t;
+        if x_ref[2] <= 1e-6 {
+            return None;
+        }
+        let (u_ref, v_ref) = self.project_scaled(&x_ref, intr.scale_from_original);
+        Some((u_ref, v_ref, x_ref, unit_b))
     }
 
     pub(super) fn bearing_for_scaled_pixel(
@@ -2994,6 +3104,14 @@ impl PatchDepthMapper {
                 )
             }
         }
+    }
+
+    /// Returns `unit_b.z = 1/bearing_norm` for the given pixel; used by fuse.rs
+    /// to convert `exp(eta_mean)` (geometric-mean range) to z-depth.
+    pub(super) fn unit_b_z_for_pixel(&self, u: f64, v: f64, intr: &ScaledIntrinsics) -> f64 {
+        self.bearing_for_scaled_pixel(u, v, intr)
+            .map(|b| 1.0 / b.norm())
+            .unwrap_or(1.0)
     }
 
     fn projection_jacobian(&self, p: &Vector3<f64>) -> nalgebra::Matrix2x3<f64> {

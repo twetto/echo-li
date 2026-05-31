@@ -87,15 +87,15 @@ pub(super) fn median_seed_depth(seeds: &[SparseDepthPrior]) -> Option<f64> {
     if seeds.is_empty() {
         return None;
     }
-    let mut depths: Vec<f64> = seeds
+    let mut ranges: Vec<f64> = seeds
         .iter()
-        .filter_map(|seed| (seed.rho > 0.0).then_some(1.0 / seed.rho))
+        .filter_map(|seed| seed.eta.is_finite().then_some(seed.eta.exp()))
         .collect();
-    if depths.is_empty() {
+    if ranges.is_empty() {
         return None;
     }
-    depths.sort_by(|a, b| a.total_cmp(b));
-    Some(depths[depths.len() / 2])
+    ranges.sort_by(|a, b| a.total_cmp(b));
+    Some(ranges[ranges.len() / 2])
 }
 
 pub(super) fn scale_seeds(seeds: &[SparseDepthPrior], scale: f64) -> Vec<SparseDepthPrior> {
@@ -103,8 +103,8 @@ pub(super) fn scale_seeds(seeds: &[SparseDepthPrior], scale: f64) -> Vec<SparseD
         .iter()
         .map(|seed| SparseDepthPrior {
             uv: seed.uv * scale,
-            rho: seed.rho,
-            rho_var: seed.rho_var,
+            eta: seed.eta,
+            eta_var: seed.eta_var,
         })
         .collect()
 }
@@ -140,13 +140,13 @@ pub(super) fn nearby_seed_weights(
                 }
                 let dist = dist_sq.sqrt();
                 let w_spatial = 1.0 - dist / radius;
-                let var_capped = seeds[idx]
-                    .rho_var
+                let eta_var_capped = seeds[idx]
+                    .eta_var
                     .max(settings.sigma_seed_floor * settings.sigma_seed_floor);
                 if !out.push(NearbySeed {
                     idx,
                     w_spatial,
-                    precision: 1.0 / var_capped,
+                    precision: 1.0 / eta_var_capped,
                 }) {
                     return out;
                 }

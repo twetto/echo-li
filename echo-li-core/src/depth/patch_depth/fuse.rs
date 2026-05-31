@@ -156,7 +156,7 @@ fn densify_pixels_generic(
             if iu_start > iu_end {
                 continue;
             }
-            let mut rho_acc = 0.0_f32;
+            let mut eta_acc = 0.0_f32;
             let mut w_acc = 0.0_f32;
             let mut best_status = PatchStatus::Unknown;
             for iv in iv_start..=iv_end {
@@ -166,15 +166,22 @@ fn densify_pixels_generic(
                         continue;
                     };
                     let photo_w = if patch.status == PatchStatus::PhotoRefined {
+                        let cu = iu * grid.stride + grid.half;
+                        let cv = iv * grid.stride + grid.half;
+                        let range_per_z = mapper
+                            .bearing_for_scaled_pixel(cu as f64, cv as f64, intr)
+                            .map(|b| b.norm())
+                            .unwrap_or(1.0);
+                        let rho_center = range_per_z * (-patch.eta).exp();
                         compute_photo_weight(
-                            px, py, patch.rho, curr_img, curr_valid, ref_img, ref_valid, mapper,
+                            px, py, rho_center, curr_img, curr_valid, ref_img, ref_valid, mapper,
                             intr, rel_pose,
                         )
                     } else {
                         1.0_f32
                     };
                     let w = inv_var_w * photo_w;
-                    rho_acc += w * patch.rho as f32;
+                    eta_acc += w * patch.eta as f32;
                     w_acc += w;
                     if (patch.status as u8) > (best_status as u8) {
                         best_status = patch.status;
@@ -183,7 +190,8 @@ fn densify_pixels_generic(
             }
             if w_acc > 0.0 {
                 let idx = py * width + px;
-                depth[idx] = w_acc / rho_acc;
+                let unit_b_z = mapper.unit_b_z_for_pixel(px as f64, py as f64, intr) as f32;
+                depth[idx] = (eta_acc / w_acc).exp() * unit_b_z;
                 variance[idx] = 1.0 / w_acc;
                 status[idx] = best_status;
             }
@@ -210,7 +218,7 @@ struct RowWarpCoeffs {
 impl RowWarpCoeffs {
     fn new(
         py: usize,
-        rho: f64,
+        z: f64,
         mapper: &PatchDepthMapper,
         intr: &ScaledIntrinsics,
         rel_pose: &RelativePose,
@@ -222,31 +230,19 @@ impl RowWarpCoeffs {
         let cy = mapper.intrinsics.cy;
 
         // bearing = [(px/s - cx)/fx, (py/s - cy)/fy, 1.0]
-        // x_curr = bearing / rho
+        // x_curr = bearing * z  (since rho = 1/z, bearing/rho = bearing*z)
         // x_ref = R * x_curr + t
-        //
-        // bearing_x = px * (1/(s*fx)) + (-cx/fx)
-        // bearing_y = py * (1/(s*fy)) + (-cy/fy)  [constant for row]
-        // bearing_z = 1.0
-        let inv_rho = 1.0 / rho;
         let kx = 1.0 / (s * fx);
         let bx = -cx / fx;
         let by_val = (py as f64 / s - cy) / fy;
 
-        // x_curr = [bearing_x / rho, bearing_y / rho, 1/rho]
-        // x_ref[j] = sum_i R[j][i] * x_curr[i] + t[j]
-        //          = R[j][0]*(px*kx + bx)/rho + R[j][1]*by_val/rho + R[j][2]/rho + t[j]
-        //          = px * (R[j][0]*kx/rho) + (R[j][0]*bx/rho + R[j][1]*by_val/rho + R[j][2]/rho + t[j])
         let r = &rel_pose.r;
         let t = &rel_pose.t;
         let mut a = [0.0f32; 3];
         let mut b = [0.0f32; 3];
         for j in 0..3 {
-            a[j] = (r[(j, 0)] * kx * inv_rho) as f32;
-            b[j] = (r[(j, 0)] * bx * inv_rho
-                + r[(j, 1)] * by_val * inv_rho
-                + r[(j, 2)] * inv_rho
-                + t[j]) as f32;
+            a[j] = (r[(j, 0)] * kx * z) as f32;
+            b[j] = (r[(j, 0)] * bx * z + r[(j, 1)] * by_val * z + r[(j, 2)] * z + t[j]) as f32;
         }
 
         Self {
@@ -285,12 +281,17 @@ fn densify_pixels_pinhole(
     rel_pose: &RelativePose,
 ) -> PatchDepthOutput {
     let n = width * height;
-    let mut rho_buf = vec![0.0_f32; n];
+    let mut eta_buf = vec![0.0_f32; n];
     let mut w_buf = vec![0.0_f32; n];
     let mut status_buf = vec![PatchStatus::Unknown; n];
 
     let ref_w = ref_img.width();
     let ref_h = ref_img.height();
+    let s = intr.scale_from_original;
+    let fx = mapper.intrinsics.fx as f32;
+    let fy = mapper.intrinsics.fy as f32;
+    let cx = mapper.intrinsics.cx as f32;
+    let cy = mapper.intrinsics.cy as f32;
 
     for iv in 0..grid.n_v {
         for iu in 0..grid.n_u {
@@ -299,14 +300,22 @@ fn densify_pixels_pinhole(
                 continue;
             };
 
-            let patch_rho_f32 = patch.rho as f32;
-            let weighted_rho = inv_var_w * patch_rho_f32;
+            let patch_eta_f32 = patch.eta as f32;
+            let weighted_eta = inv_var_w * patch_eta_f32;
 
             let patch_size = 2 * grid.half;
             let py_start = iv * grid.stride;
             let py_end = (py_start + patch_size).min(height);
             let px_start = iu * grid.stride;
             let px_end = (px_start + patch_size).min(width);
+
+            // Patch centre z-depth for RowWarpCoeffs (photo weighting warp).
+            let cu = (iu * grid.stride + grid.half) as f64;
+            let cv = (iv * grid.stride + grid.half) as f64;
+            let bx_c = (cu / s - mapper.intrinsics.cx) / mapper.intrinsics.fx;
+            let by_c = (cv / s - mapper.intrinsics.cy) / mapper.intrinsics.fy;
+            let range_per_z_center = (bx_c * bx_c + by_c * by_c + 1.0).sqrt();
+            let z_center = patch.eta.exp() / range_per_z_center;
 
             if patch.status == PatchStatus::PhotoRefined {
                 #[cfg(target_arch = "x86_64")]
@@ -316,7 +325,7 @@ fn densify_pixels_pinhole(
                 let use_avx2 = false;
 
                 for py in py_start..py_end {
-                    let coeffs = RowWarpCoeffs::new(py, patch.rho, mapper, intr, rel_pose);
+                    let coeffs = RowWarpCoeffs::new(py, z_center, mapper, intr, rel_pose);
                     let curr_row = &curr_img.as_slice()[py * curr_img.width()..];
                     let valid_row = curr_valid.map(|v| &v.as_slice()[py * v.width()..]);
                     let row_off = py * width;
@@ -337,8 +346,8 @@ fn densify_pixels_pinhole(
                                     ref_w,
                                     ref_h,
                                     inv_var_w,
-                                    patch_rho_f32,
-                                    &mut rho_buf[row_off..],
+                                    patch_eta_f32,
+                                    &mut eta_buf[row_off..],
                                     &mut w_buf[row_off..],
                                     &mut status_buf[row_off..],
                                     PatchStatus::PhotoRefined,
@@ -361,8 +370,8 @@ fn densify_pixels_pinhole(
                                 ref_w,
                                 ref_h,
                                 inv_var_w,
-                                patch_rho_f32,
-                                &mut rho_buf[row_off..],
+                                patch_eta_f32,
+                                &mut eta_buf[row_off..],
                                 &mut w_buf[row_off..],
                                 &mut status_buf[row_off..],
                                 PatchStatus::PhotoRefined,
@@ -407,7 +416,7 @@ fn densify_pixels_pinhole(
                         };
                         let w = inv_var_w * photo_w;
                         let idx = row_off + px;
-                        rho_buf[idx] += w * patch_rho_f32;
+                        eta_buf[idx] += w * patch_eta_f32;
                         w_buf[idx] += w;
                         if (patch.status as u8) > (status_buf[idx] as u8) {
                             status_buf[idx] = patch.status;
@@ -420,7 +429,7 @@ fn densify_pixels_pinhole(
                     let row_off = py * width;
                     for px in px_start..px_end {
                         let idx = row_off + px;
-                        rho_buf[idx] += weighted_rho;
+                        eta_buf[idx] += weighted_eta;
                         w_buf[idx] += inv_var_w;
                         if (patch.status as u8) > (status_buf[idx] as u8) {
                             status_buf[idx] = patch.status;
@@ -431,12 +440,19 @@ fn densify_pixels_pinhole(
         }
     }
 
+    // Convert accumulated eta mean → z-depth via per-pixel bearing direction.
     let mut depth = vec![f32::NAN; n];
     let mut variance = vec![f32::INFINITY; n];
-    for i in 0..n {
-        if w_buf[i] > 0.0 {
-            depth[i] = w_buf[i] / rho_buf[i];
-            variance[i] = 1.0 / w_buf[i];
+    for py in 0..height {
+        for px in 0..width {
+            let i = py * width + px;
+            if w_buf[i] > 0.0 {
+                let bx = (px as f32 / s as f32 - cx) / fx;
+                let by = (py as f32 / s as f32 - cy) / fy;
+                let unit_b_z = 1.0 / (bx * bx + by * by + 1.0).sqrt();
+                depth[i] = (eta_buf[i] / w_buf[i]).exp() * unit_b_z;
+                variance[i] = 1.0 / w_buf[i];
+            }
         }
     }
 
@@ -474,8 +490,8 @@ unsafe fn densify_row_avx2(
     ref_w: usize,
     ref_h: usize,
     inv_var_w: f32,
-    patch_rho: f32,
-    rho_buf: &mut [f32],
+    patch_eta: f32,
+    eta_buf: &mut [f32],
     w_buf: &mut [f32],
     status_buf: &mut [PatchStatus],
     patch_status: PatchStatus,
@@ -601,15 +617,15 @@ unsafe fn densify_row_avx2(
         let photo_w = _mm256_blendv_ps(one, photo_w_valid, valid_mask);
 
         let inv_var_w_vec = _mm256_set1_ps(inv_var_w);
-        let patch_rho_vec = _mm256_set1_ps(patch_rho);
+        let patch_eta_vec = _mm256_set1_ps(patch_eta);
         let w = _mm256_mul_ps(inv_var_w_vec, photo_w);
-        let w_rho = _mm256_mul_ps(w, patch_rho_vec);
+        let w_eta = _mm256_mul_ps(w, patch_eta_vec);
 
-        let rho_ptr = rho_buf.as_mut_ptr().add(px_start);
+        let eta_ptr = eta_buf.as_mut_ptr().add(px_start);
         let w_ptr = w_buf.as_mut_ptr().add(px_start);
-        let rho_old = _mm256_loadu_ps(rho_ptr);
+        let eta_old = _mm256_loadu_ps(eta_ptr);
         let w_old = _mm256_loadu_ps(w_ptr);
-        _mm256_storeu_ps(rho_ptr, _mm256_add_ps(rho_old, w_rho));
+        _mm256_storeu_ps(eta_ptr, _mm256_add_ps(eta_old, w_eta));
         _mm256_storeu_ps(w_ptr, _mm256_add_ps(w_old, w));
 
         let status_ptr = &mut status_buf[px_start..px_start + 8];
@@ -633,8 +649,8 @@ unsafe fn densify_row_neon(
     ref_w: usize,
     ref_h: usize,
     inv_var_w: f32,
-    patch_rho: f32,
-    rho_buf: &mut [f32],
+    patch_eta: f32,
+    eta_buf: &mut [f32],
     w_buf: &mut [f32],
     status_buf: &mut [PatchStatus],
     patch_status: PatchStatus,
@@ -736,13 +752,13 @@ unsafe fn densify_row_neon(
         let photo_w = vbslq_f32(valid_mask, photo_w_valid, one);
 
         let w = vmulq_f32(vdupq_n_f32(inv_var_w), photo_w);
-        let w_rho = vmulq_f32(w, vdupq_n_f32(patch_rho));
+        let w_eta = vmulq_f32(w, vdupq_n_f32(patch_eta));
 
-        let rho_ptr = rho_buf.as_mut_ptr().add(px_start);
+        let eta_ptr = eta_buf.as_mut_ptr().add(px_start);
         let w_ptr = w_buf.as_mut_ptr().add(px_start);
-        let rho_old = vld1q_f32(rho_ptr);
+        let eta_old = vld1q_f32(eta_ptr);
         let w_old = vld1q_f32(w_ptr);
-        vst1q_f32(rho_ptr, vaddq_f32(rho_old, w_rho));
+        vst1q_f32(eta_ptr, vaddq_f32(eta_old, w_eta));
         vst1q_f32(w_ptr, vaddq_f32(w_old, w));
 
         let status_ptr = &mut status_buf[px_start..px_start + 4];
@@ -844,7 +860,7 @@ fn densify_pixels_pinhole_parallel(
                 return;
             }
 
-            let mut rho_row = vec![0.0_f32; width];
+            let mut eta_row = vec![0.0_f32; width];
             let mut w_row = vec![0.0_f32; width];
             let mut status_row = vec![PatchStatus::Unknown; width];
 
@@ -861,14 +877,22 @@ fn densify_pixels_pinhole_parallel(
                         continue;
                     };
 
-                    let patch_rho_f32 = patch.rho as f32;
-                    let weighted_rho = inv_var_w * patch_rho_f32;
+                    let patch_eta_f32 = patch.eta as f32;
+                    let weighted_eta = inv_var_w * patch_eta_f32;
 
                     let px_start = iu * grid.stride;
                     let px_end = (px_start + patch_size).min(width);
 
                     if patch.status == PatchStatus::PhotoRefined {
-                        let coeffs = RowWarpCoeffs::new(py, patch.rho, mapper, intr, rel_pose);
+                        let cu = (iu * grid.stride + grid.half) as f64;
+                        let cv = (iv * grid.stride + grid.half) as f64;
+                        let bx_c = (cu / intr.scale_from_original - mapper.intrinsics.cx)
+                            / mapper.intrinsics.fx;
+                        let by_c = (cv / intr.scale_from_original - mapper.intrinsics.cy)
+                            / mapper.intrinsics.fy;
+                        let range_per_z_c = (bx_c * bx_c + by_c * by_c + 1.0).sqrt();
+                        let z_center = patch.eta.exp() / range_per_z_c;
+                        let coeffs = RowWarpCoeffs::new(py, z_center, mapper, intr, rel_pose);
                         let mut px = px_start;
 
                         #[cfg(target_arch = "x86_64")]
@@ -885,8 +909,8 @@ fn densify_pixels_pinhole_parallel(
                                         ref_w,
                                         ref_h,
                                         inv_var_w,
-                                        patch_rho_f32,
-                                        &mut rho_row,
+                                        patch_eta_f32,
+                                        &mut eta_row,
                                         &mut w_row,
                                         &mut status_row,
                                         PatchStatus::PhotoRefined,
@@ -909,8 +933,8 @@ fn densify_pixels_pinhole_parallel(
                                     ref_w,
                                     ref_h,
                                     inv_var_w,
-                                    patch_rho_f32,
-                                    &mut rho_row,
+                                    patch_eta_f32,
+                                    &mut eta_row,
                                     &mut w_row,
                                     &mut status_row,
                                     PatchStatus::PhotoRefined,
@@ -944,7 +968,7 @@ fn densify_pixels_pinhole_parallel(
                                 1.0_f32
                             };
                             let w = inv_var_w * photo_w;
-                            rho_row[px] += w * patch_rho_f32;
+                            eta_row[px] += w * patch_eta_f32;
                             w_row[px] += w;
                             if (patch.status as u8) > (status_row[px] as u8) {
                                 status_row[px] = patch.status;
@@ -952,7 +976,7 @@ fn densify_pixels_pinhole_parallel(
                         }
                     } else {
                         for px in px_start..px_end {
-                            rho_row[px] += weighted_rho;
+                            eta_row[px] += weighted_eta;
                             w_row[px] += inv_var_w;
                             if (patch.status as u8) > (status_row[px] as u8) {
                                 status_row[px] = patch.status;
@@ -962,9 +986,17 @@ fn densify_pixels_pinhole_parallel(
                 }
             }
 
+            let s = intr.scale_from_original as f32;
+            let fx = mapper.intrinsics.fx as f32;
+            let fy = mapper.intrinsics.fy as f32;
+            let cx = mapper.intrinsics.cx as f32;
+            let cy = mapper.intrinsics.cy as f32;
             for px in 0..width {
                 if w_row[px] > 0.0 {
-                    d_row[px] = w_row[px] / rho_row[px];
+                    let bx = (px as f32 / s - cx) / fx;
+                    let by = (py as f32 / s - cy) / fy;
+                    let unit_b_z = 1.0 / (bx * bx + by * by + 1.0).sqrt();
+                    d_row[px] = (eta_row[px] / w_row[px]).exp() * unit_b_z;
                     v_row[px] = 1.0 / w_row[px];
                     s_row[px] = status_row[px];
                 }
@@ -1017,7 +1049,7 @@ fn densify_pixels_generic_parallel(
                     continue;
                 }
 
-                let mut rho_acc = 0.0_f32;
+                let mut eta_acc = 0.0_f32;
                 let mut w_acc = 0.0_f32;
                 let mut best_status = PatchStatus::Unknown;
 
@@ -1029,8 +1061,15 @@ fn densify_pixels_generic_parallel(
                         };
 
                         let photo_w = if patch.status == PatchStatus::PhotoRefined {
+                            let cu = iu * grid.stride + grid.half;
+                            let cv = iv * grid.stride + grid.half;
+                            let range_per_z = mapper
+                                .bearing_for_scaled_pixel(cu as f64, cv as f64, intr)
+                                .map(|b| b.norm())
+                                .unwrap_or(1.0);
+                            let rho_center = range_per_z * (-patch.eta).exp();
                             compute_photo_weight(
-                                px, py, patch.rho, curr_img, curr_valid, ref_img, ref_valid,
+                                px, py, rho_center, curr_img, curr_valid, ref_img, ref_valid,
                                 mapper, intr, rel_pose,
                             )
                         } else {
@@ -1038,7 +1077,7 @@ fn densify_pixels_generic_parallel(
                         };
 
                         let w = inv_var_w * photo_w;
-                        rho_acc += w * patch.rho as f32;
+                        eta_acc += w * patch.eta as f32;
                         w_acc += w;
 
                         if (patch.status as u8) > (best_status as u8) {
@@ -1048,7 +1087,8 @@ fn densify_pixels_generic_parallel(
                 }
 
                 if w_acc > 0.0 {
-                    d_row[px] = w_acc / rho_acc;
+                    let unit_b_z = mapper.unit_b_z_for_pixel(px as f64, py as f64, intr) as f32;
+                    d_row[px] = (eta_acc / w_acc).exp() * unit_b_z;
                     v_row[px] = 1.0 / w_acc;
                     s_row[px] = best_status;
                 }
