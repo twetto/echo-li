@@ -93,11 +93,12 @@ fn seed_priors_produce_cell_depths() {
     let out = mapper
         .update_with_priors(frame(1, 0.02, img), &seeds, None, 0.0)
         .unwrap();
+    // Output is log-range η; seed η = ln(2) so range = exp(η) ≈ 2.0.
     assert!(out
-        .depth
+        .eta
         .data
         .iter()
-        .any(|z| z.is_finite() && (*z - 2.0).abs() < 0.1));
+        .any(|e| e.is_finite() && (e.exp() - 2.0).abs() < 0.1));
     assert!(out.status.data.contains(&PatchStatus::SeedOnly));
 }
 
@@ -222,12 +223,12 @@ fn tiled_bearing_mode_runs_tile_local_update() {
     let out = mapper
         .update_with_priors(frame(1, 0.02, img), &seeds, None, 0.0)
         .unwrap();
-    assert!(out.depth.data.iter().any(|z| z.is_finite() && *z > 0.0));
+    assert!(out.eta.data.iter().any(|e| e.is_finite()));
     assert!(out.status.data.contains(&PatchStatus::PhotoRefined));
 }
 
 #[test]
-fn tiled_bearing_fusion_converts_range_to_z_depth() {
+fn tiled_bearing_fusion_accumulates_log_range() {
     let (camera, intr) = camera();
     let settings = PatchDepthSettings {
         camera_mode: PatchDepthCameraMode::TiledBearing,
@@ -245,12 +246,12 @@ fn tiled_bearing_fusion_converts_range_to_z_depth() {
     let tile = &level.tiles[tile_idx];
     let local = tile.global_to_local(Vector2::new(28.0, 28.0));
     let estimate = PatchEstimate::seed_only(0.5, 0.01, &mapper.settings);
-    let mut rho_acc = vec![0.0f32; 32 * 32];
+    let mut eta_acc = vec![0.0f32; 32 * 32];
     let mut w_acc = vec![0.0f32; 32 * 32];
     let mut status = vec![PatchStatus::Unknown; 32 * 32];
 
     mapper.accumulate_tiled_patch(
-        &mut rho_acc,
+        &mut eta_acc,
         &mut w_acc,
         &mut status,
         32,
@@ -259,14 +260,15 @@ fn tiled_bearing_fusion_converts_range_to_z_depth() {
         local[0],
         local[1],
         estimate,
+        None,
     );
 
+    // Fusion stays in log-range space: the accumulated mean is η itself (range is
+    // tile-frame-independent), with the η→z/3D conversion deferred to the consumer.
     let idx = 28 * 32 + 28;
-    let z_depth = w_acc[idx] / rho_acc[idx];
-    let range = estimate.eta.exp() as f32;
-    let bearing_z = tile.bearing_at_level_pixel(28.0, 28.0)[2] as f32;
-    assert!((z_depth - range * bearing_z).abs() < 1e-5);
-    assert!(z_depth < range);
+    let fused_eta = eta_acc[idx] / w_acc[idx];
+    assert!((fused_eta - estimate.eta as f32).abs() < 1e-5);
+    assert!((fused_eta.exp() - estimate.eta.exp() as f32).abs() < 1e-4);
 }
 
 #[test]
@@ -348,7 +350,7 @@ fn tiled_bearing_mode_runs_with_two_pyramid_levels() {
     let out = mapper
         .update_with_priors(frame(1, 0.02, img), &seeds, None, 0.0)
         .unwrap();
-    assert!(out.depth.data.iter().any(|z| z.is_finite() && *z > 0.0));
+    assert!(out.eta.data.iter().any(|e| e.is_finite()));
     assert!(out.status.data.contains(&PatchStatus::PhotoRefined));
 }
 

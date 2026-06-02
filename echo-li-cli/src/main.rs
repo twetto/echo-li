@@ -294,17 +294,19 @@ fn patch_depth_rgb_for_vis(
     if vis_min_depth <= 0.0 || vis_max_depth <= vis_min_depth {
         return rgb;
     }
-    let dw = output.depth.width;
-    let dh = output.depth.height;
+    let dw = output.eta.width;
+    let dh = output.eta.height;
     for y in 0..img_h {
         let dy = y * dh / img_h;
         for x in 0..img_w {
             let dx = x * dw / img_w;
-            let depth = output.depth.data[dy * dw + dx];
-            if !depth.is_finite() || depth <= 0.0 {
+            let eta = output.eta.data[dy * dw + dx];
+            if !eta.is_finite() {
                 continue;
             }
-            let color = color_for_depth(depth as f64, vis_min_depth, vis_max_depth);
+            // Output is log-range η; show range = exp(η) (thin edge conversion).
+            let range = (eta as f64).exp();
+            let color = color_for_depth(range, vis_min_depth, vis_max_depth);
             let out = (y * img_w + x) * 3;
             rgb[out] = ((color >> 24) & 0xFF) as u8;
             rgb[out + 1] = ((color >> 16) & 0xFF) as u8;
@@ -315,10 +317,11 @@ fn patch_depth_rgb_for_vis(
     rgb
 }
 
-/// Render the patch-depth covariance as a depth standard-deviation image
-/// (metres). `output.variance` is the variance of inverse depth (rho), so the
-/// depth standard deviation is `sqrt(var(rho)) * z^2`. Low std-dev (confident)
-/// maps to blue, high std-dev (uncertain) to red.
+/// Render the patch-depth confidence as a relative range-std image.
+/// `output.eta_var` is `var(η)` for `η = ln(range)`, so `sqrt(var(η)) ≈ σ_range/range`
+/// is a dimensionless relative depth uncertainty — no `z` conversion needed. Note
+/// its absolute scale is uncalibrated (it bakes in status/photo weights), so the
+/// thresholds are relative. Low (confident) maps to blue, high (uncertain) to red.
 #[cfg(feature = "rerun")]
 fn patch_depth_cov_rgb_for_vis(
     output: &PatchDepthOutput,
@@ -331,20 +334,21 @@ fn patch_depth_cov_rgb_for_vis(
     if cov_vis_max <= cov_vis_min {
         return rgb;
     }
-    let dw = output.depth.width;
-    let dh = output.depth.height;
+    let dw = output.eta.width;
+    let dh = output.eta.height;
     for y in 0..img_h {
         let dy = y * dh / img_h;
         for x in 0..img_w {
             let dx = x * dw / img_w;
             let idx = dy * dw + dx;
-            let depth = output.depth.data[idx];
-            let rho_var = output.variance.data[idx];
-            if !depth.is_finite() || depth <= 0.0 || !rho_var.is_finite() || rho_var <= 0.0 {
+            let eta = output.eta.data[idx];
+            let eta_var = output.eta_var.data[idx];
+            if !eta.is_finite() || !eta_var.is_finite() || eta_var <= 0.0 {
                 continue;
             }
-            let std_depth = (rho_var as f64).sqrt() * (depth as f64) * (depth as f64);
-            let color = color_for_scalar(std_depth, cov_vis_min, cov_vis_max);
+            // sqrt(var(η)) ≈ σ_range/range: relative range std (dimensionless).
+            let rel_std = (eta_var as f64).sqrt();
+            let color = color_for_scalar(rel_std, cov_vis_min, cov_vis_max);
             let out = (y * img_w + x) * 3;
             rgb[out] = ((color >> 24) & 0xFF) as u8;
             rgb[out + 1] = ((color >> 16) & 0xFF) as u8;

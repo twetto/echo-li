@@ -64,12 +64,14 @@ impl PyPatchDepthMapper {
             pose_t_wc: pose,
         };
 
+        // Priors are log-range: (u, v, eta = ln(range), eta_var). The caller holds
+        // the camera model, so it converts metric/inverse depth → eta on its side.
         let seeds: Vec<SparseDepthPrior> = priors
             .into_iter()
-            .map(|(u, v, rho, rho_var)| SparseDepthPrior {
+            .map(|(u, v, eta, eta_var)| SparseDepthPrior {
                 uv: Vector2::new(u, v),
-                rho,
-                rho_var,
+                eta,
+                eta_var,
             })
             .collect();
 
@@ -79,16 +81,18 @@ impl PyPatchDepthMapper {
         match result {
             Some(output) => {
                 let dict = pyo3::types::PyDict::new(py);
-                let dw = output.depth.width;
-                let dh = output.depth.height;
+                let dw = output.eta.width;
+                let dh = output.eta.height;
 
-                let depth = Array2::from_shape_vec((dh, dw), output.depth.data)
+                // Output is log-range η = ln(range); convert on the Python side with
+                // np.exp(eta) for range. eta_var is a relative range variance.
+                let eta = Array2::from_shape_vec((dh, dw), output.eta.data)
                     .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-                dict.set_item("depth", PyArray2::from_owned_array(py, depth))?;
+                dict.set_item("eta", PyArray2::from_owned_array(py, eta))?;
 
-                let var = Array2::from_shape_vec((dh, dw), output.variance.data)
+                let eta_var = Array2::from_shape_vec((dh, dw), output.eta_var.data)
                     .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-                dict.set_item("variance", PyArray2::from_owned_array(py, var))?;
+                dict.set_item("eta_var", PyArray2::from_owned_array(py, eta_var))?;
 
                 let status_u8: Vec<u8> = output.status.data.iter().map(|s| *s as u8).collect();
                 let status = Array2::from_shape_vec((dh, dw), status_u8)

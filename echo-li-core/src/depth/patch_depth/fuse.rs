@@ -142,8 +142,8 @@ fn densify_pixels_generic(
     rel_pose: &RelativePose,
 ) -> PatchDepthOutput {
     let n = width * height;
-    let mut depth = vec![f32::NAN; n];
-    let mut variance = vec![f32::INFINITY; n];
+    let mut eta = vec![f32::NAN; n];
+    let mut eta_var = vec![f32::INFINITY; n];
     let mut status = vec![PatchStatus::Unknown; n];
 
     for py in 0..height {
@@ -190,16 +190,15 @@ fn densify_pixels_generic(
             }
             if w_acc > 0.0 {
                 let idx = py * width + px;
-                let unit_b_z = mapper.unit_b_z_for_pixel(px as f64, py as f64, intr) as f32;
-                depth[idx] = (eta_acc / w_acc).exp() * unit_b_z;
-                variance[idx] = 1.0 / w_acc;
+                eta[idx] = eta_acc / w_acc;
+                eta_var[idx] = 1.0 / w_acc;
                 status[idx] = best_status;
             }
         }
     }
     PatchDepthOutput {
-        depth: DepthMap::from_vec(width, height, depth).expect("depth size"),
-        variance: DepthMap::from_vec(width, height, variance).expect("variance size"),
+        eta: DepthMap::from_vec(width, height, eta).expect("eta size"),
+        eta_var: DepthMap::from_vec(width, height, eta_var).expect("eta_var size"),
         status: DepthMap::from_vec(width, height, status).expect("status size"),
     }
 }
@@ -288,10 +287,6 @@ fn densify_pixels_pinhole(
     let ref_w = ref_img.width();
     let ref_h = ref_img.height();
     let s = intr.scale_from_original;
-    let fx = mapper.intrinsics.fx as f32;
-    let fy = mapper.intrinsics.fy as f32;
-    let cx = mapper.intrinsics.cx as f32;
-    let cy = mapper.intrinsics.cy as f32;
 
     for iv in 0..grid.n_v {
         for iu in 0..grid.n_u {
@@ -440,25 +435,19 @@ fn densify_pixels_pinhole(
         }
     }
 
-    // Convert accumulated eta mean → z-depth via per-pixel bearing direction.
-    let mut depth = vec![f32::NAN; n];
-    let mut variance = vec![f32::INFINITY; n];
-    for py in 0..height {
-        for px in 0..width {
-            let i = py * width + px;
-            if w_buf[i] > 0.0 {
-                let bx = (px as f32 / s as f32 - cx) / fx;
-                let by = (py as f32 / s as f32 - cy) / fy;
-                let unit_b_z = 1.0 / (bx * bx + by * by + 1.0).sqrt();
-                depth[i] = (eta_buf[i] / w_buf[i]).exp() * unit_b_z;
-                variance[i] = 1.0 / w_buf[i];
-            }
+    // Reduce accumulated weighted-eta sums to the per-pixel eta mean.
+    let mut eta = vec![f32::NAN; n];
+    let mut eta_var = vec![f32::INFINITY; n];
+    for i in 0..n {
+        if w_buf[i] > 0.0 {
+            eta[i] = eta_buf[i] / w_buf[i];
+            eta_var[i] = 1.0 / w_buf[i];
         }
     }
 
     PatchDepthOutput {
-        depth: DepthMap::from_vec(width, height, depth).expect("depth size"),
-        variance: DepthMap::from_vec(width, height, variance).expect("variance size"),
+        eta: DepthMap::from_vec(width, height, eta).expect("eta size"),
+        eta_var: DepthMap::from_vec(width, height, eta_var).expect("eta_var size"),
         status: DepthMap::from_vec(width, height, status_buf).expect("status size"),
     }
 }
@@ -830,8 +819,8 @@ fn densify_pixels_pinhole_parallel(
     use rayon::prelude::*;
 
     let n = width * height;
-    let mut depth = vec![f32::NAN; n];
-    let mut variance = vec![f32::INFINITY; n];
+    let mut eta = vec![f32::NAN; n];
+    let mut eta_var = vec![f32::INFINITY; n];
     let mut status = vec![PatchStatus::Unknown; n];
 
     let ref_w = ref_img.width();
@@ -848,9 +837,8 @@ fn densify_pixels_pinhole_parallel(
     let patch_size = 2 * grid.half;
     let min_len = (height / (rayon::current_num_threads() * 8)).max(1);
 
-    depth
-        .par_chunks_mut(width)
-        .zip(variance.par_chunks_mut(width))
+    eta.par_chunks_mut(width)
+        .zip(eta_var.par_chunks_mut(width))
         .zip(status.par_chunks_mut(width))
         .enumerate()
         .with_min_len(min_len)
@@ -986,17 +974,9 @@ fn densify_pixels_pinhole_parallel(
                 }
             }
 
-            let s = intr.scale_from_original as f32;
-            let fx = mapper.intrinsics.fx as f32;
-            let fy = mapper.intrinsics.fy as f32;
-            let cx = mapper.intrinsics.cx as f32;
-            let cy = mapper.intrinsics.cy as f32;
             for px in 0..width {
                 if w_row[px] > 0.0 {
-                    let bx = (px as f32 / s - cx) / fx;
-                    let by = (py as f32 / s - cy) / fy;
-                    let unit_b_z = 1.0 / (bx * bx + by * by + 1.0).sqrt();
-                    d_row[px] = (eta_row[px] / w_row[px]).exp() * unit_b_z;
+                    d_row[px] = eta_row[px] / w_row[px];
                     v_row[px] = 1.0 / w_row[px];
                     s_row[px] = status_row[px];
                 }
@@ -1004,8 +984,8 @@ fn densify_pixels_pinhole_parallel(
         });
 
     PatchDepthOutput {
-        depth: DepthMap::from_vec(width, height, depth).expect("depth size"),
-        variance: DepthMap::from_vec(width, height, variance).expect("variance size"),
+        eta: DepthMap::from_vec(width, height, eta).expect("eta size"),
+        eta_var: DepthMap::from_vec(width, height, eta_var).expect("eta_var size"),
         status: DepthMap::from_vec(width, height, status).expect("status size"),
     }
 }
@@ -1026,14 +1006,13 @@ fn densify_pixels_generic_parallel(
     use rayon::prelude::*;
 
     let n = width * height;
-    let mut depth = vec![f32::NAN; n];
-    let mut variance = vec![f32::INFINITY; n];
+    let mut eta = vec![f32::NAN; n];
+    let mut eta_var = vec![f32::INFINITY; n];
     let mut status = vec![PatchStatus::Unknown; n];
 
     let min_len = (height / (rayon::current_num_threads() * 8)).max(1);
-    depth
-        .par_chunks_mut(width)
-        .zip(variance.par_chunks_mut(width))
+    eta.par_chunks_mut(width)
+        .zip(eta_var.par_chunks_mut(width))
         .zip(status.par_chunks_mut(width))
         .enumerate()
         .with_min_len(min_len)
@@ -1087,8 +1066,7 @@ fn densify_pixels_generic_parallel(
                 }
 
                 if w_acc > 0.0 {
-                    let unit_b_z = mapper.unit_b_z_for_pixel(px as f64, py as f64, intr) as f32;
-                    d_row[px] = (eta_acc / w_acc).exp() * unit_b_z;
+                    d_row[px] = eta_acc / w_acc;
                     v_row[px] = 1.0 / w_acc;
                     s_row[px] = best_status;
                 }
@@ -1096,8 +1074,8 @@ fn densify_pixels_generic_parallel(
         });
 
     PatchDepthOutput {
-        depth: DepthMap::from_vec(width, height, depth).expect("depth size"),
-        variance: DepthMap::from_vec(width, height, variance).expect("variance size"),
+        eta: DepthMap::from_vec(width, height, eta).expect("eta size"),
+        eta_var: DepthMap::from_vec(width, height, eta_var).expect("eta_var size"),
         status: DepthMap::from_vec(width, height, status).expect("status size"),
     }
 }

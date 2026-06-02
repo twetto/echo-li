@@ -133,8 +133,17 @@ pub enum PatchStatus {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PatchDepthOutput {
-    pub depth: DepthMap<f32>,
-    pub variance: DepthMap<f32>,
+    /// Per-pixel log-range `η = ln(range)`, where `range` is the Euclidean
+    /// camera-to-point distance. `NaN` marks pixels with no estimate. Convert at
+    /// the consumer: `range = exp(η)`, 3D point `= exp(η) · unit_b[u,v]` (from the
+    /// bearing LUT), z-depth `= exp(η) · unit_b.z`. Range is projection-agnostic
+    /// and stays valid at wide FoV where z-depth degenerates.
+    pub eta: DepthMap<f32>,
+    /// Per-pixel `var(η)` ≈ relative range variance (`σ_range/range ≈ σ_η`).
+    /// This is the reciprocal of an accumulated *confidence weight* that bakes in
+    /// `status_weight`, fusion `photo_w`/`tile_w`, and a `var_floor` clamp — so its
+    /// absolute scale is **not** calibrated; use it only as a relative gate.
+    pub eta_var: DepthMap<f32>,
     pub status: DepthMap<PatchStatus>,
 }
 
@@ -578,6 +587,17 @@ struct TiledBearingKeyframeLevel {
 struct TiledBearingKeyframe {
     frame: Arc<FrameProducts>,
     levels: Vec<TiledBearingKeyframeLevel>,
+}
+
+/// Level-0 image context for per-pixel photometric weighting during tiled fusion.
+/// All images are tile-local crops; coordinates passed alongside are tile-local.
+struct TiledPhotoContext<'a> {
+    curr_img: &'a Image<f32>,
+    curr_valid: &'a Image<f32>,
+    ref_tile: &'a TiledBearingTile,
+    ref_img: &'a Image<f32>,
+    ref_valid: &'a Image<f32>,
+    rel_pose: &'a RelativePose,
 }
 
 #[allow(dead_code)]
@@ -1828,7 +1848,7 @@ impl PatchDepthMapper {
         let width = curr_level.width;
         let height = curr_level.height;
         let n = width * height;
-        let mut rho_acc = vec![0.0f32; n];
+        let mut eta_acc = vec![0.0f32; n];
         let mut w_acc = vec![0.0f32; n];
         let mut status = vec![PatchStatus::Unknown; n];
         let rel_pose = RelativePose::from_matrix(t_ref_curr);
@@ -1887,35 +1907,48 @@ impl PatchDepthMapper {
             let Some(curr_tile) = curr_level.tiles.get(result.tile_idx) else {
                 continue;
             };
-            if curr_tile
+            if !curr_tile
                 .tile
                 .contains_point(result.global_u as f64, result.global_v as f64)
             {
-                self.accumulate_tiled_patch(
-                    &mut rho_acc,
-                    &mut w_acc,
-                    &mut status,
-                    width,
-                    height,
-                    &curr_tile.tile,
-                    result.local_u,
-                    result.local_v,
-                    result.estimate,
-                );
+                continue;
             }
+            let photo = ref_level
+                .tiles
+                .get(result.tile_idx)
+                .map(|ref_tile| TiledPhotoContext {
+                    curr_img: &curr_tile.image,
+                    curr_valid: &curr_tile.valid,
+                    ref_tile: &ref_tile.tile,
+                    ref_img: &ref_tile.ref_image,
+                    ref_valid: &ref_tile.bilinear_valid,
+                    rel_pose: &rel_pose,
+                });
+            self.accumulate_tiled_patch(
+                &mut eta_acc,
+                &mut w_acc,
+                &mut status,
+                width,
+                height,
+                &curr_tile.tile,
+                result.local_u,
+                result.local_v,
+                result.estimate,
+                photo.as_ref(),
+            );
         }
 
-        let mut depth = vec![f32::NAN; n];
-        let mut variance = vec![f32::INFINITY; n];
+        let mut eta = vec![f32::NAN; n];
+        let mut eta_var = vec![f32::INFINITY; n];
         for idx in 0..n {
-            if w_acc[idx] > 0.0 && rho_acc[idx] > 0.0 {
-                depth[idx] = w_acc[idx] / rho_acc[idx];
-                variance[idx] = 1.0 / w_acc[idx];
+            if w_acc[idx] > 0.0 {
+                eta[idx] = eta_acc[idx] / w_acc[idx];
+                eta_var[idx] = 1.0 / w_acc[idx];
             }
         }
         PatchDepthOutput {
-            depth: DepthMap::from_vec(width, height, depth).expect("depth size"),
-            variance: DepthMap::from_vec(width, height, variance).expect("variance size"),
+            eta: DepthMap::from_vec(width, height, eta).expect("eta size"),
+            eta_var: DepthMap::from_vec(width, height, eta_var).expect("eta_var size"),
             status: DepthMap::from_vec(width, height, status).expect("status size"),
         }
     }
@@ -2062,9 +2095,10 @@ impl PatchDepthMapper {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn accumulate_tiled_patch(
         &self,
-        rho_acc: &mut [f32],
+        eta_acc: &mut [f32],
         w_acc: &mut [f32],
         status: &mut [PatchStatus],
         width: usize,
@@ -2073,10 +2107,16 @@ impl PatchDepthMapper {
         cu: f64,
         cv: f64,
         estimate: PatchEstimate,
+        photo: Option<&TiledPhotoContext>,
     ) {
         let Some(inv_var_w) = estimate.inv_var_weight_f32() else {
             return;
         };
+        // Per-pixel photometric weighting only applies to photo-refined patches; seed-only
+        // and the geometry-only test path fall back to a flat weight of 1.0.
+        let photo_ctx = (estimate.status == PatchStatus::PhotoRefined)
+            .then_some(photo)
+            .flatten();
         let half = self.settings.patch_size / 2;
         for dy in -(half as isize)..half as isize {
             for dx in -(half as isize)..half as isize {
@@ -2095,19 +2135,67 @@ impl PatchDepthMapper {
                 if tile_w <= 0.0 {
                     continue;
                 }
+                let photo_w = match photo_ctx {
+                    Some(ctx) => {
+                        self.tiled_pixel_photo_weight(tile, local_u, local_v, estimate.eta, ctx)
+                    }
+                    None => 1.0,
+                };
                 let idx = global_v as usize * width + global_u as usize;
-                let global_bearing = tile.bearing_at_level_pixel(global_u as f64, global_v as f64);
-                let unit_b_z = global_bearing[2].max(1e-6);
-                // eta = ln(range); z_per_pixel = exp(eta) * unit_b.z
-                let inv_z = (-estimate.eta).exp() / unit_b_z;
-                let w = inv_var_w * tile_w;
-                rho_acc[idx] += w * inv_z as f32;
+                // eta = ln(range) is tile-frame-independent (range is purely radial), so
+                // overlapping tiles fuse their eta directly — a geometric mean of range.
+                // The eta -> 3D/z conversion is deferred to the consumer (vis / mapping).
+                let w = inv_var_w * tile_w * photo_w;
+                eta_acc[idx] += w * estimate.eta as f32;
                 w_acc[idx] += w;
                 if (estimate.status as u8) > (status[idx] as u8) {
                     status[idx] = estimate.status;
                 }
             }
         }
+    }
+
+    /// Per-pixel photometric agreement weight for a tiled patch: warps the current
+    /// tile-local pixel into the reference tile at the patch's η and down-weights pixels
+    /// whose reprojected intensity disagrees, mirroring the pinhole densify path.
+    fn tiled_pixel_photo_weight(
+        &self,
+        curr_tile: &TiledBearingTile,
+        local_u: f64,
+        local_v: f64,
+        eta: f64,
+        ctx: &TiledPhotoContext,
+    ) -> f32 {
+        let cx = local_u.round();
+        let cy = local_v.round();
+        if cx < 0.0
+            || cy < 0.0
+            || cx >= ctx.curr_img.width() as f64
+            || cy >= ctx.curr_img.height() as f64
+        {
+            return 1.0;
+        }
+        let (cx, cy) = (cx as usize, cy as usize);
+        if ctx.curr_valid.as_slice()[cy * ctx.curr_valid.width() + cx] < 0.5 {
+            return 1.0;
+        }
+        let i_curr = ctx.curr_img.as_slice()[cy * ctx.curr_img.width() + cx];
+        let Some((u_ref, v_ref, _, _)) = warp_tiled_local_pixel_eta(
+            curr_tile,
+            ctx.ref_tile,
+            local_u,
+            local_v,
+            eta,
+            ctx.rel_pose,
+        ) else {
+            return 1.0;
+        };
+        let Some(i_ref) = sample_bilinear_valid(ctx.ref_img, Some(ctx.ref_valid), u_ref, v_ref)
+        else {
+            return 1.0;
+        };
+        let residual = (i_ref - i_curr).abs();
+        1.0 / residual.max(1.0)
     }
 
     fn tiled_blend_weight(
@@ -3104,14 +3192,6 @@ impl PatchDepthMapper {
                 )
             }
         }
-    }
-
-    /// Returns `unit_b.z = 1/bearing_norm` for the given pixel; used by fuse.rs
-    /// to convert `exp(eta_mean)` (geometric-mean range) to z-depth.
-    pub(super) fn unit_b_z_for_pixel(&self, u: f64, v: f64, intr: &ScaledIntrinsics) -> f64 {
-        self.bearing_for_scaled_pixel(u, v, intr)
-            .map(|b| 1.0 / b.norm())
-            .unwrap_or(1.0)
     }
 
     fn projection_jacobian(&self, p: &Vector3<f64>) -> nalgebra::Matrix2x3<f64> {
