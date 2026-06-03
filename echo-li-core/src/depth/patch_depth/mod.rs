@@ -19,9 +19,9 @@ mod simd;
 #[cfg(target_arch = "aarch64")]
 mod simd_neon;
 
+use fuse::PatchGrid;
 #[cfg(not(feature = "parallel"))]
 use fuse::densify_pixels;
-use fuse::PatchGrid;
 #[cfg(feature = "parallel")]
 use fuse::{densify_pixels_parallel, patch_centers};
 use image_ops::{
@@ -30,7 +30,7 @@ use image_ops::{
     sample_bilinear_valid, sample_bilinear_valid_with_grad, sample_nearest, sample_valid_nearest,
     scaled_intrinsics, undistort_level_specs,
 };
-use seeds::{median_seed_depth, nearby_seed_weights, scale_seeds, SeedGrid};
+use seeds::{SeedGrid, median_seed_depth, nearby_seed_weights, scale_seeds};
 #[cfg(target_arch = "x86_64")]
 use simd::fast_translation_accum_avx2_if_available;
 #[cfg(target_arch = "aarch64")]
@@ -41,6 +41,10 @@ pub enum PatchDepthCameraMode {
     RawDistorted,
     UndistortedPinhole,
     TiledBearing,
+    /// Per-patch local tangent rectification: wide-FoV, seamless replacement for
+    /// `TiledBearing`. Works in the raw image (like `RawDistorted`) but rectifies
+    /// each patch into its own tangent frame for the FastTranslation solve.
+    PerPatchBearing,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,7 +210,6 @@ pub(super) struct ScaledIntrinsics {
 pub(super) struct PatchEstimate {
     /// Log-range η = ln(range) of the 3D point at the patch centre.
     pub(super) eta: f64,
-    pub(super) eta_var: f64,
     pub(super) status: PatchStatus,
     pub(super) inv_var_w: f64,
 }
@@ -215,7 +218,6 @@ impl PatchEstimate {
     pub(super) fn unknown() -> Self {
         Self {
             eta: 0.0,
-            eta_var: f64::INFINITY,
             status: PatchStatus::Unknown,
             inv_var_w: 0.0,
         }
@@ -224,7 +226,6 @@ impl PatchEstimate {
     fn rejected(eta: f64) -> Self {
         Self {
             eta,
-            eta_var: f64::INFINITY,
             status: PatchStatus::Rejected,
             inv_var_w: 0.0,
         }
@@ -233,7 +234,6 @@ impl PatchEstimate {
     fn photo_refined(eta: f64, eta_var: f64, settings: &PatchDepthSettings) -> Self {
         Self {
             eta,
-            eta_var,
             status: PatchStatus::PhotoRefined,
             inv_var_w: settings.status_weight_photo / eta_var.max(settings.var_floor),
         }
@@ -242,7 +242,6 @@ impl PatchEstimate {
     fn seed_only(eta: f64, eta_var: f64, settings: &PatchDepthSettings) -> Self {
         Self {
             eta,
-            eta_var,
             status: PatchStatus::SeedOnly,
             inv_var_w: settings.status_weight_seed / eta_var.max(settings.var_floor),
         }
@@ -888,26 +887,6 @@ fn smoothstep01(x: f64) -> f64 {
     x * x * (3.0 - 2.0 * x)
 }
 
-fn warp_tiled_local_pixel(
-    curr_tile: &TiledBearingTile,
-    ref_tile: &TiledBearingTile,
-    u_local: f64,
-    v_local: f64,
-    rho: f64,
-    rel_pose: &RelativePose,
-) -> Option<(f64, f64, Vector3<f64>, Vector3<f64>)> {
-    if rho <= 0.0 {
-        return None;
-    }
-    let u = curr_tile.x0 as f64 + u_local;
-    let v = curr_tile.y0 as f64 + v_local;
-    let bearing = curr_tile.bearing_at_level_pixel(u, v);
-    let x_curr = bearing / rho;
-    let x_ref = rel_pose.r * x_curr + rel_pose.t;
-    let uv_ref = ref_tile.project_to_local_pixel(&x_ref)?;
-    Some((uv_ref[0], uv_ref[1], x_ref, bearing))
-}
-
 /// Tiled warp at log-range η.  Tile bearings are already unit, so
 /// `x_curr = unit_b · exp(η)` directly.  Returns `(u_local_ref, v_local_ref, x_ref, unit_b)`.
 fn warp_tiled_local_pixel_eta(
@@ -981,23 +960,10 @@ pub(crate) fn rho_to_eta(rho: f64, range_per_z: f64) -> f64 {
     (range_per_z / rho).ln()
 }
 
-/// Converts log-range η back to inverse depth ρ.
-/// Pass the same `range_per_z` used in `rho_to_eta`.
-pub(crate) fn eta_to_rho(eta: f64, range_per_z: f64) -> f64 {
-    range_per_z * (-eta).exp()
-}
-
 /// Propagates inverse-depth variance to log-range variance via the delta method.
 /// Holds for both inverse-z and inverse-range: dη/dρ = −1/ρ → var(η) ≈ var(ρ)/ρ².
 pub(crate) fn rho_var_to_eta_var(rho: f64, rho_var: f64) -> f64 {
     rho_var / (rho * rho)
-}
-
-/// Propagates log-range variance back to inverse-depth variance.
-/// Pass the same `range_per_z` used in `rho_to_eta`.
-pub(crate) fn eta_var_to_rho_var(eta: f64, range_per_z: f64, eta_var: f64) -> f64 {
-    let rho = eta_to_rho(eta, range_per_z);
-    eta_var * rho * rho
 }
 
 // Eigenvalue test for a 2×2 symmetric structure tensor [[gxx, gxy], [gxy, gyy]].
@@ -1046,6 +1012,27 @@ pub(crate) fn structure_tensor_passes(
     true
 }
 
+/// Build the working-scale image pyramid from raw `u8` gray, reusing Rudolf-V's
+/// `Pyramid`/scratch buffers. Dyadic scales take Rudolf-V's `build_reuse` fast
+/// path and slice out the kept levels; non-dyadic scales fall back to
+/// `build_pyramid_from_u8`.
+pub(super) fn build_working_pyramid(
+    pyramid_work: &mut Pyramid,
+    pyramid_scratch: &mut PyramidScratch,
+    gray: &[u8],
+    width: usize,
+    height: usize,
+    scale: f64,
+    levels: usize,
+) -> Vec<Image<f32>> {
+    if let Some(offset) = dyadic_scale_offset(scale) {
+        let src = Image::from_vec(width, height, gray.to_vec());
+        pyramid_work.build_reuse(&src, offset + levels, pyramid_scratch);
+        return pyramid_work.levels[offset..offset + levels].to_vec();
+    }
+    build_pyramid_from_u8(gray, width, height, scale, levels)
+}
+
 impl PatchDepthMapper {
     pub fn new(
         camera: Arc<dyn CameraModel>,
@@ -1083,7 +1070,9 @@ impl PatchDepthMapper {
 
     pub fn expected_seed_coordinates(&self) -> PatchDepthSeedCoordinates {
         match self.camera_mode {
-            PatchDepthCameraMode::RawDistorted => PatchDepthSeedCoordinates::RawDistorted,
+            PatchDepthCameraMode::RawDistorted | PatchDepthCameraMode::PerPatchBearing => {
+                PatchDepthSeedCoordinates::RawDistorted
+            }
             PatchDepthCameraMode::UndistortedPinhole | PatchDepthCameraMode::TiledBearing => {
                 PatchDepthSeedCoordinates::UndistortedPinhole
             }
@@ -1119,7 +1108,7 @@ impl PatchDepthMapper {
         );
 
         let bearing_lut = match camera_mode {
-            PatchDepthCameraMode::RawDistorted => {
+            PatchDepthCameraMode::RawDistorted | PatchDepthCameraMode::PerPatchBearing => {
                 let mut lut = Vec::with_capacity(width * height);
                 for v in 0..height {
                     for u in 0..width {
@@ -1140,7 +1129,7 @@ impl PatchDepthMapper {
         };
 
         let undistort_luts = match camera_mode {
-            PatchDepthCameraMode::RawDistorted => None,
+            PatchDepthCameraMode::RawDistorted | PatchDepthCameraMode::PerPatchBearing => None,
             PatchDepthCameraMode::UndistortedPinhole | PatchDepthCameraMode::TiledBearing => {
                 let specs =
                     undistort_level_specs(width, height, settings.scale, settings.n_pyramid_levels);
@@ -1419,7 +1408,9 @@ impl PatchDepthMapper {
         let seeds = self.gather_seeds(sparse_filter, measurement);
         let depth_frame = self.tiled_bearing_frame_products(frame)?;
 
-        let raw_cam1_pyramid = Arc::new(self.build_depth_pyramid_from_u8(
+        let raw_cam1_pyramid = Arc::new(build_working_pyramid(
+            &mut self.pyramid_work,
+            &mut self.pyramid_scratch,
             cam1_gray,
             cam1_width,
             cam1_height,
@@ -1455,7 +1446,9 @@ impl PatchDepthMapper {
         // Build the pyramid on the raw image, then undistort each kept level.
         // Undistorting the small downsampled levels instead of the full-res
         // frame is ~16x less work; the anti-alias blur happens in raw space.
-        let raw_pyramid = self.build_depth_pyramid_from_u8(
+        let raw_pyramid = build_working_pyramid(
+            &mut self.pyramid_work,
+            &mut self.pyramid_scratch,
             &frame.gray,
             frame.width,
             frame.height,
@@ -1463,7 +1456,9 @@ impl PatchDepthMapper {
             self.settings.n_pyramid_levels,
         );
         let (pyramid, valid_pyramid) = match self.camera_mode {
-            PatchDepthCameraMode::RawDistorted => (raw_pyramid, None),
+            PatchDepthCameraMode::RawDistorted | PatchDepthCameraMode::PerPatchBearing => {
+                (raw_pyramid, None)
+            }
             PatchDepthCameraMode::UndistortedPinhole | PatchDepthCameraMode::TiledBearing => {
                 let luts = self.undistort_luts.as_ref()?;
                 let undistorted: Vec<Image<f32>> = raw_pyramid
@@ -1487,7 +1482,9 @@ impl PatchDepthMapper {
         frame: FrameProducts,
     ) -> Option<TiledBearingFrameProducts> {
         let layout = Arc::clone(self.tiled_bearing_levels.as_ref()?);
-        let raw_pyramid = Arc::new(self.build_depth_pyramid_from_u8(
+        let raw_pyramid = Arc::new(build_working_pyramid(
+            &mut self.pyramid_work,
+            &mut self.pyramid_scratch,
             &frame.gray,
             frame.width,
             frame.height,
@@ -1592,24 +1589,6 @@ impl PatchDepthMapper {
             self.tiled_keyframes
                 .push(self.make_tiled_bearing_keyframe(depth_frame));
         }
-    }
-
-    fn build_depth_pyramid_from_u8(
-        &mut self,
-        gray: &[u8],
-        width: usize,
-        height: usize,
-        scale: f64,
-        levels: usize,
-    ) -> Vec<Image<f32>> {
-        if let Some(offset) = dyadic_scale_offset(scale) {
-            let src = Image::from_vec(width, height, gray.to_vec());
-            self.pyramid_work
-                .build_reuse(&src, offset + levels, &mut self.pyramid_scratch);
-            return self.pyramid_work.levels[offset..offset + levels].to_vec();
-        }
-
-        build_pyramid_from_u8(gray, width, height, scale, levels)
     }
 
     fn gather_seeds(
@@ -1768,7 +1747,7 @@ impl PatchDepthMapper {
                 .par_iter()
                 .with_min_len(min_len)
                 .map(|&(u, v)| {
-                    let estimate = self.solve_one_patch(
+                    let estimate = self.solve_one_patch_dispatch(
                         u as f64,
                         v as f64,
                         &scaled_seeds,
@@ -1805,7 +1784,7 @@ impl PatchDepthMapper {
             let half = self.settings.patch_size / 2;
             for v in (half..height.saturating_sub(half)).step_by(self.settings.patch_stride) {
                 for u in (half..width.saturating_sub(half)).step_by(self.settings.patch_stride) {
-                    let estimate = self.solve_one_patch(
+                    let estimate = self.solve_one_patch_dispatch(
                         u as f64,
                         v as f64,
                         &scaled_seeds,
@@ -2233,6 +2212,51 @@ impl PatchDepthMapper {
         (wx * wy) as f32
     }
 
+    /// Pick the per-patch solver for the (non-tiled) `solve` path: `PerPatchBearing`
+    /// uses per-patch tangent rectification; all others use `solve_one_patch`.
+    #[allow(clippy::too_many_arguments)]
+    fn solve_one_patch_dispatch(
+        &self,
+        cu: f64,
+        cv: f64,
+        seeds: &[SparseDepthPrior],
+        seed_grid: &SeedGrid,
+        curr_pyramid: &[Image<f32>],
+        curr_valid_pyramid: Option<&[Image<f32>]>,
+        ref_keyframe: &DepthKeyframe,
+        intrinsics_by_level: &[ScaledIntrinsics],
+        t_ref_curr: &Matrix4<f64>,
+        sigma_warp_sq: f64,
+    ) -> PatchEstimate {
+        if self.camera_mode == PatchDepthCameraMode::PerPatchBearing {
+            self.solve_one_per_patch_bearing(
+                cu,
+                cv,
+                seeds,
+                seed_grid,
+                curr_pyramid,
+                curr_valid_pyramid,
+                ref_keyframe,
+                intrinsics_by_level,
+                t_ref_curr,
+                sigma_warp_sq,
+            )
+        } else {
+            self.solve_one_patch(
+                cu,
+                cv,
+                seeds,
+                seed_grid,
+                curr_pyramid,
+                curr_valid_pyramid,
+                ref_keyframe,
+                intrinsics_by_level,
+                t_ref_curr,
+                sigma_warp_sq,
+            )
+        }
+    }
+
     fn solve_one_patch(
         &self,
         cu: f64,
@@ -2361,6 +2385,154 @@ impl PatchDepthMapper {
         } else {
             let eta_var = 1.0 / (seed_precision_sum * self.settings.lambda_seed).max(1e-12);
             PatchEstimate::seed_only(eta_init, eta_var, &self.settings)
+        }
+    }
+
+    /// Per-patch target-anchored solve: build a per-patch tangent tile centered on
+    /// the patch (with epipolar margin), rectify the current + keyframe raw level-0
+    /// images into it once, then run the shared FastTranslation SIMD leaf in η.
+    /// Seamless wide-FoV (each patch at its own tangent centre) without the global
+    /// pinhole's negative-Z. Mirrors `solve_one_patch`'s seed/init/gate logic.
+    #[allow(clippy::too_many_arguments)]
+    fn solve_one_per_patch_bearing(
+        &self,
+        cu: f64,
+        cv: f64,
+        seeds: &[SparseDepthPrior],
+        seed_grid: &SeedGrid,
+        curr_pyramid: &[Image<f32>],
+        _curr_valid_pyramid: Option<&[Image<f32>]>,
+        ref_keyframe: &DepthKeyframe,
+        intrinsics_by_level: &[ScaledIntrinsics],
+        t_ref_curr: &Matrix4<f64>,
+        sigma_warp_sq: f64,
+    ) -> PatchEstimate {
+        let nearby = nearby_seed_weights(cu, cv, seeds, seed_grid, &self.settings);
+        if nearby.is_empty() {
+            return PatchEstimate::unknown();
+        }
+
+        // η bounds + seed init (range = z * ‖bearing‖), identical to solve_one_patch.
+        let range_per_z = match self
+            .bearing_for_scaled_pixel(cu, cv, &intrinsics_by_level[0])
+            .map(|b| b.norm())
+        {
+            Some(n) => n,
+            None => return PatchEstimate::unknown(),
+        };
+        let eta_min = (self.settings.min_depth * range_per_z).ln();
+        let eta_max = (self.settings.max_depth * range_per_z).ln();
+        let mut seed_eta_sum = 0.0;
+        let mut seed_weight_total = 0.0;
+        let mut seed_precision_sum = 0.0;
+        for item in nearby.iter() {
+            let wp = item.w_spatial * item.precision;
+            seed_eta_sum += wp * seeds[item.idx].eta;
+            seed_weight_total += wp;
+            seed_precision_sum += wp;
+        }
+        let eta_init = (seed_eta_sum / seed_weight_total).clamp(eta_min, eta_max);
+        let seed_var = 1.0 / (seed_precision_sum * self.settings.lambda_seed).max(1e-12);
+
+        // One per-patch tangent tile, centred on the patch and shared by the
+        // current and keyframe rectifications. Current and reference MUST use the
+        // same tangent basis — FastTranslation's translated square assumes the two
+        // patches differ only by a translation; differing tile centres would
+        // rotate them relative to each other (by the warp angle) and break it.
+        // The tile must be big enough to contain the warp displacement, like a
+        // TiledBearing tile, so we size it from `tiled_tile_size`.
+        let specs = undistort_level_specs(self.width, self.height, self.settings.scale, 1);
+        let spec = &specs[0];
+        let (lw, lh) = (spec.lw, spec.lh);
+        let tile_side = self
+            .settings
+            .tiled_tile_size
+            .max(2 * self.settings.patch_size);
+        if tile_side >= lw || tile_side >= lh {
+            return PatchEstimate::seed_only(eta_init, seed_var, &self.settings);
+        }
+        let x0 =
+            (cu.round() as i64 - (tile_side as i64) / 2).clamp(0, (lw - tile_side) as i64) as usize;
+        let y0 =
+            (cv.round() as i64 - (tile_side as i64) / 2).clamp(0, (lh - tile_side) as i64) as usize;
+        let tile = build_tiled_bearing_tile(
+            self.camera.as_ref(),
+            &self.intrinsics,
+            spec,
+            0,
+            x0,
+            y0,
+            tile_side,
+            tile_side,
+        );
+        let curr_rect = tile.lut.undistort_level(&curr_pyramid[0]);
+        let ref_rect = tile.lut.undistort_level(&ref_keyframe.ref_pyramid[0]);
+        let valid = tile.lut.valid_image();
+        let (gx, gy) = gradients(&ref_rect);
+
+        let local_cu = cu - x0 as f64;
+        let local_cv = cv - y0 as f64;
+        let rel_pose = RelativePose::from_matrix(t_ref_curr);
+
+        let mut eta = eta_init;
+        let mut final_residual = 1e10;
+        let mut final_curvature = 0.0;
+        let mut observed = false;
+        for _ in 0..self.settings.n_gn_iters {
+            let (grad_photo, hess_photo, sum_abs_res, valid_n) = self
+                .patch_residual_jacobian_fast_translation_tiled_level(
+                    &tile,
+                    &tile,
+                    local_cu,
+                    local_cv,
+                    eta,
+                    &curr_rect,
+                    Some(&valid),
+                    &ref_rect,
+                    Some(&valid),
+                    &gx,
+                    &gy,
+                    &rel_pose,
+                    sigma_warp_sq,
+                );
+            if valid_n == 0 {
+                break;
+            }
+            observed = true;
+            let mut grad_seed = 0.0;
+            let mut hess_seed = 0.0;
+            for item in nearby.iter() {
+                let wp = self.settings.lambda_seed * item.w_spatial * item.precision;
+                grad_seed += wp * (eta - seeds[item.idx].eta);
+                hess_seed += wp;
+            }
+            let hess_total = hess_photo + hess_seed;
+            if hess_total < 1e-12 {
+                break;
+            }
+            eta = (eta - (grad_photo + grad_seed) / hess_total).clamp(eta_min, eta_max);
+            // The tiled leaf returns the *summed* abs residual; the gate (and the
+            // UP path's wrapper) work in per-pixel mean. Divide so the
+            // `<= max_photo_residual` test matches UndistortedPinhole's scale.
+            final_residual = sum_abs_res / valid_n.max(1) as f64;
+            final_curvature = hess_photo;
+        }
+
+        let min_curvature = self.settings.min_photo_curvature
+            * (self.settings.patch_size * self.settings.patch_size) as f64;
+
+        if observed
+            && final_curvature >= min_curvature
+            && final_residual <= self.settings.max_photo_residual
+        {
+            let eta_var =
+                1.0 / (final_curvature + seed_precision_sum * self.settings.lambda_seed).max(1e-12);
+            PatchEstimate::photo_refined(eta, eta_var, &self.settings)
+        } else {
+            // Warp left the tile, too little curvature, or residual too high:
+            // fall back to the (trustworthy, converged) seed so coverage stays
+            // dense rather than dropping the patch.
+            PatchEstimate::seed_only(eta_init, seed_var, &self.settings)
         }
     }
 
@@ -3160,7 +3332,9 @@ impl PatchDepthMapper {
         let original_u = u / intr.scale_from_original;
         let original_v = v / intr.scale_from_original;
         match self.camera_mode {
-            PatchDepthCameraMode::RawDistorted => self.bearing_at_original(original_u, original_v),
+            PatchDepthCameraMode::RawDistorted | PatchDepthCameraMode::PerPatchBearing => {
+                self.bearing_at_original(original_u, original_v)
+            }
             PatchDepthCameraMode::UndistortedPinhole | PatchDepthCameraMode::TiledBearing => {
                 if original_u < 0.0
                     || original_v < 0.0
@@ -3180,7 +3354,7 @@ impl PatchDepthMapper {
 
     pub(super) fn project_scaled(&self, p: &Vector3<f64>, scale_from_original: f64) -> (f64, f64) {
         match self.camera_mode {
-            PatchDepthCameraMode::RawDistorted => {
+            PatchDepthCameraMode::RawDistorted | PatchDepthCameraMode::PerPatchBearing => {
                 let uv = self.camera.project(p);
                 (uv[0] * scale_from_original, uv[1] * scale_from_original)
             }
@@ -3196,7 +3370,9 @@ impl PatchDepthMapper {
 
     fn projection_jacobian(&self, p: &Vector3<f64>) -> nalgebra::Matrix2x3<f64> {
         match self.camera_mode {
-            PatchDepthCameraMode::RawDistorted => self.camera.projection_jacobian(p),
+            PatchDepthCameraMode::RawDistorted | PatchDepthCameraMode::PerPatchBearing => {
+                self.camera.projection_jacobian(p)
+            }
             PatchDepthCameraMode::UndistortedPinhole | PatchDepthCameraMode::TiledBearing => {
                 let z_inv = 1.0 / p[2];
                 let z_inv2 = z_inv * z_inv;

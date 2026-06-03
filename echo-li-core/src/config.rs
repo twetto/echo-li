@@ -2,9 +2,9 @@ use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::path::Path;
 
+use crate::ImuBiasGroup;
 use crate::depth::patch_depth::{PatchDepthCameraMode, PatchDepthSettings, PatchDepthWarpMode};
 use crate::depth::sparse_gb::{DepthParametrization, SparseVogSettings};
-use crate::ImuBiasGroup;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -335,6 +335,8 @@ impl PatchDepthConfig {
                 }
                 "tiled_bearing" | "tiled-bearing" | "tiledbearing" | "tiled_pinhole"
                 | "tiled-pinhole" | "tiledpinhole" => PatchDepthCameraMode::TiledBearing,
+                "per_patch_bearing" | "per-patch-bearing" | "perpatchbearing" | "per_patch"
+                | "per-patch" | "perpatch" => PatchDepthCameraMode::PerPatchBearing,
                 _ => PatchDepthCameraMode::RawDistorted,
             };
         }

@@ -784,6 +784,7 @@ fn build_patch_depth_mapper(
         println!("Patch depth: disabled");
         return Ok(None);
     }
+    let intrinsics = CameraIntrinsics::from_matrix(&k_matrix);
     println!(
         "Patch depth: enabled mode={:?} warp={:?} scale={:.2}, patch={} stride={} levels={}",
         settings.camera_mode,
@@ -793,13 +794,7 @@ fn build_patch_depth_mapper(
         settings.patch_stride,
         settings.n_pyramid_levels
     );
-    let mut mapper = PatchDepthMapper::new(
-        cam_model,
-        CameraIntrinsics::from_matrix(&k_matrix),
-        img_w,
-        img_h,
-        settings,
-    )?;
+    let mut mapper = PatchDepthMapper::new(cam_model, intrinsics, img_w, img_h, settings)?;
     if let Some(matcher) = stereo_matcher {
         let rig = matcher.rig();
         let mut t_c1_c0 = Matrix4::<f64>::identity();
@@ -1313,20 +1308,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         sparse.update(&sparse_measurement, &t_wc, None);
                         if let Some(mapper) = &mut patch_depth_mapper {
                             if !patch_gray_data.is_empty() {
-                                let patch_measurement = match mapper.camera_mode() {
-                                    PatchDepthCameraMode::RawDistorted => &measurement,
-                                    PatchDepthCameraMode::UndistortedPinhole
-                                    | PatchDepthCameraMode::TiledBearing => &sparse_measurement,
-                                };
-                                let patch_seed_coordinates = match mapper.camera_mode() {
-                                    PatchDepthCameraMode::RawDistorted => {
-                                        PatchDepthSeedCoordinates::RawDistorted
-                                    }
-                                    PatchDepthCameraMode::UndistortedPinhole
-                                    | PatchDepthCameraMode::TiledBearing => {
-                                        PatchDepthSeedCoordinates::UndistortedPinhole
-                                    }
-                                };
                                 let frame = FrameProducts {
                                     frame_id: vision_count as u64,
                                     stamp: img_data.stamp,
@@ -1335,24 +1316,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     height: img_h,
                                     pose_t_wc: t_wc,
                                 };
-                                let patch_output = if let Some(cam1_gray) = &cam1_gray_for_patch {
-                                    mapper.update_with_stereo_ref(
-                                        sparse,
-                                        patch_measurement,
-                                        patch_seed_coordinates,
-                                        frame,
-                                        cam1_gray,
-                                        img_w,
-                                        img_h,
-                                    )
-                                } else {
-                                    mapper.update(
-                                        sparse,
-                                        patch_measurement,
-                                        patch_seed_coordinates,
-                                        frame,
-                                    )
-                                };
+                                // RawDistorted/PerPatchBearing rectify the raw image,
+                                // so seeds stay in raw distorted coords; the pinhole-
+                                // based modes consume undistorted-pinhole coords.
+                                let (patch_measurement, patch_seed_coordinates) =
+                                    match mapper.camera_mode() {
+                                        PatchDepthCameraMode::RawDistorted
+                                        | PatchDepthCameraMode::PerPatchBearing => {
+                                            (&measurement, PatchDepthSeedCoordinates::RawDistorted)
+                                        }
+                                        PatchDepthCameraMode::UndistortedPinhole
+                                        | PatchDepthCameraMode::TiledBearing => (
+                                            &sparse_measurement,
+                                            PatchDepthSeedCoordinates::UndistortedPinhole,
+                                        ),
+                                    };
+                                let patch_output: Option<PatchDepthOutput> =
+                                    if let Some(cam1_gray) = &cam1_gray_for_patch {
+                                        mapper.update_with_stereo_ref(
+                                            sparse,
+                                            patch_measurement,
+                                            patch_seed_coordinates,
+                                            frame,
+                                            cam1_gray,
+                                            img_w,
+                                            img_h,
+                                        )
+                                    } else {
+                                        mapper.update(
+                                            sparse,
+                                            patch_measurement,
+                                            patch_seed_coordinates,
+                                            frame,
+                                        )
+                                    };
                                 last_patch_depth_counts =
                                     patch_output.as_ref().map(patch_depth_status_counts);
                                 #[cfg(feature = "rerun")]

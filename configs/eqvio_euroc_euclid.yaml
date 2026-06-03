@@ -113,7 +113,8 @@ SparseVog:
   vis_min_depth: 0.5
   vis_max_depth: 5.0
 Stereo:
-  enabled: true
+  # enabled: true
+  enabled: false
   pyramid_levels: 3
   patch_half_size: 4
   max_iterations: 30
@@ -122,14 +123,18 @@ Stereo:
   max_residual: 20.0
   histeq: global
 PatchDepth:
-  camera_mode: tiled_bearing
+  # per_patch_bearing: target-anchored per-patch tangent rectification (wide-FoV,
+  # seamless). A/B against tiled_bearing by switching this line.
+  camera_mode: per_patch_bearing
+  # camera_mode: undistorted_pinhole
   warp_mode: fast_translation
+  # warp_mode: exact
   scale: 0.25
   patch_size: 8
   patch_stride: 4
   # tiled_tile_size: 96
-  tiled_tile_size: 32
-  tiled_tile_overlap: 16
+  tiled_tile_size: 64
+  tiled_tile_overlap: 4
   cell_size: 8
   seed_radius_px: 64
   min_baseline_ratio: 0.005
@@ -142,4 +147,4 @@ PatchDepth:
   vis_max_depth: 5.0
   n_search_candidates: 1
   cov_vis_min: 0.0
-  cov_vis_max: 1.0
+  cov_vis_max: 0.5
