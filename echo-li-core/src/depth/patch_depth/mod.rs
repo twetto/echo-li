@@ -19,9 +19,9 @@ mod simd;
 #[cfg(target_arch = "aarch64")]
 mod simd_neon;
 
-use fuse::PatchGrid;
 #[cfg(not(feature = "parallel"))]
 use fuse::densify_pixels;
+use fuse::PatchGrid;
 #[cfg(feature = "parallel")]
 use fuse::{densify_pixels_parallel, patch_centers};
 use image_ops::{
@@ -30,7 +30,7 @@ use image_ops::{
     sample_bilinear_valid, sample_bilinear_valid_with_grad, sample_nearest, sample_valid_nearest,
     scaled_intrinsics, undistort_level_specs,
 };
-use seeds::{SeedGrid, median_seed_depth, nearby_seed_weights, scale_seeds};
+use seeds::{median_seed_depth, nearby_seed_weights, scale_seeds, SeedGrid};
 #[cfg(target_arch = "x86_64")]
 use simd::fast_translation_accum_avx2_if_available;
 #[cfg(target_arch = "aarch64")]
@@ -792,6 +792,146 @@ fn build_tiled_bearing_tile(
     }
 }
 
+fn build_tiled_bearing_tile_geometry_from_center(
+    camera: &dyn CameraModel,
+    intrinsics: &CameraIntrinsics,
+    spec: &image_ops::UndistortLevelSpec,
+    level: usize,
+    x0: usize,
+    y0: usize,
+    width: usize,
+    height: usize,
+    center_bearing: Vector3<f64>,
+) -> TiledBearingTile {
+    let center_u = x0 as f64 + 0.5 * (width.saturating_sub(1)) as f64;
+    let center_v = y0 as f64 + 0.5 * (height.saturating_sub(1)) as f64;
+    let center_bearing = center_bearing.normalize();
+    let (tangent_u, tangent_v) = projection_jacobian_tangent_basis(camera, &center_bearing);
+    let focal = 0.5 * (intrinsics.fx + intrinsics.fy) * spec.level_scale;
+    TiledBearingTile {
+        level,
+        x0,
+        y0,
+        width,
+        height,
+        center_u,
+        center_v,
+        center_bearing,
+        tangent_u,
+        tangent_v,
+        focal,
+        lut: UndistortLut {
+            width,
+            height,
+            src_width: spec.lw,
+            src_height: spec.lh,
+            idx00: Vec::new(),
+            idx10: Vec::new(),
+            idx01: Vec::new(),
+            idx11: Vec::new(),
+            w00: Vec::new(),
+            w10: Vec::new(),
+            w01: Vec::new(),
+            w11: Vec::new(),
+            valid: Vec::new(),
+        },
+    }
+}
+
+#[inline(always)]
+fn sample_bilinear_raw_nomask_slice(
+    data: &[f32],
+    width: usize,
+    height: usize,
+    stride: usize,
+    u: f64,
+    v: f64,
+) -> Option<f32> {
+    if u < 0.0 || v < 0.0 || u >= (width - 1) as f64 || v >= (height - 1) as f64 {
+        return None;
+    }
+    let x = u as usize;
+    let y = v as usize;
+    let dx = (u - x as f64) as f32;
+    let dy = (v - y as f64) as f32;
+    let w00 = (1.0 - dx) * (1.0 - dy);
+    let w10 = dx * (1.0 - dy);
+    let w01 = (1.0 - dx) * dy;
+    let w11 = dx * dy;
+    unsafe {
+        let r0 = data.as_ptr().add(y * stride);
+        let r1 = data.as_ptr().add((y + 1) * stride);
+        Some(w00 * *r0.add(x) + w10 * *r0.add(x + 1) + w01 * *r1.add(x) + w11 * *r1.add(x + 1))
+    }
+}
+
+#[inline(always)]
+fn sample_bilinear_raw_nomask_with_grad_slice(
+    img: &[f32],
+    grad_x: &[f32],
+    grad_y: &[f32],
+    width: usize,
+    height: usize,
+    stride: usize,
+    u: f64,
+    v: f64,
+) -> Option<(f32, f32, f32)> {
+    if u < 0.0 || v < 0.0 || u >= (width - 1) as f64 || v >= (height - 1) as f64 {
+        return None;
+    }
+    let x = u as usize;
+    let y = v as usize;
+    let dx = (u - x as f64) as f32;
+    let dy = (v - y as f64) as f32;
+    let w00 = (1.0 - dx) * (1.0 - dy);
+    let w10 = dx * (1.0 - dy);
+    let w01 = (1.0 - dx) * dy;
+    let w11 = dx * dy;
+    unsafe {
+        let i0 = img.as_ptr().add(y * stride);
+        let i1 = img.as_ptr().add((y + 1) * stride);
+        let gx0 = grad_x.as_ptr().add(y * stride);
+        let gx1 = grad_x.as_ptr().add((y + 1) * stride);
+        let gy0 = grad_y.as_ptr().add(y * stride);
+        let gy1 = grad_y.as_ptr().add((y + 1) * stride);
+        let sample = |r0: *const f32, r1: *const f32| {
+            w00 * *r0.add(x) + w10 * *r0.add(x + 1) + w01 * *r1.add(x) + w11 * *r1.add(x + 1)
+        };
+        Some((sample(i0, i1), sample(gx0, gx1), sample(gy0, gy1)))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PerPatchAffineMap {
+    raw_center: Vector2<f64>,
+    raw_du: Vector2<f64>,
+    raw_dv: Vector2<f64>,
+    center_u: f64,
+    center_v: f64,
+}
+
+impl PerPatchAffineMap {
+    fn from_tile(
+        camera: &dyn CameraModel,
+        spec: &image_ops::UndistortLevelSpec,
+        tile: &TiledBearingTile,
+    ) -> Option<Self> {
+        let center_raw = camera.project_ray(&tile.center_bearing)?;
+        let proj_j = camera.projection_jacobian(&tile.center_bearing);
+        let level_per_tangent = spec.level_scale / tile.focal;
+        Some(Self {
+            raw_center: Vector2::new(
+                center_raw[0] * spec.level_scale + spec.raw_offset,
+                center_raw[1] * spec.level_scale + spec.raw_offset,
+            ),
+            raw_du: proj_j * tile.tangent_u * level_per_tangent,
+            raw_dv: proj_j * tile.tangent_v * level_per_tangent,
+            center_u: tile.center_u,
+            center_v: tile.center_v,
+        })
+    }
+}
+
 #[allow(dead_code)]
 fn build_tiled_bearing_lut(
     camera: &dyn CameraModel,
@@ -850,6 +990,27 @@ fn image_axis_tangent_basis(
     tangent_u = project_to_tangent(&tangent_u, &b).normalize();
 
     let dv = project_to_tangent(&(bv_plus - bv_minus), &b);
+    let dv_orthogonal = project_to_tangent(&(dv - tangent_u * dv.dot(&tangent_u)), &b);
+    let mut tangent_v = normalize_or_fallback(dv_orthogonal, b.cross(&tangent_u));
+    tangent_v = project_to_tangent(&tangent_v, &b).normalize();
+
+    if tangent_v.dot(&dv) < 0.0 {
+        tangent_v = -tangent_v;
+    }
+    (tangent_u, tangent_v)
+}
+
+fn projection_jacobian_tangent_basis(
+    camera: &dyn CameraModel,
+    center_bearing: &Vector3<f64>,
+) -> (Vector3<f64>, Vector3<f64>) {
+    let b = center_bearing.normalize();
+    let j = camera.projection_jacobian(&b);
+    let du = project_to_tangent(&Vector3::new(j[(0, 0)], j[(0, 1)], j[(0, 2)]), &b);
+    let mut tangent_u = normalize_or_fallback(du, image_axis_fallback_u(&b));
+    tangent_u = project_to_tangent(&tangent_u, &b).normalize();
+
+    let dv = project_to_tangent(&Vector3::new(j[(1, 0)], j[(1, 1)], j[(1, 2)]), &b);
     let dv_orthogonal = project_to_tangent(&(dv - tangent_u * dv.dot(&tangent_u)), &b);
     let mut tangent_v = normalize_or_fallback(dv_orthogonal, b.cross(&tangent_u));
     tangent_v = project_to_tangent(&tangent_v, &b).normalize();
@@ -1757,6 +1918,7 @@ impl PatchDepthMapper {
                         ref_keyframe,
                         &scaled_intrinsics,
                         t_ref_curr,
+                        &rel_pose,
                         sigma_warp_sq,
                     );
                     (u, v, estimate)
@@ -1794,6 +1956,7 @@ impl PatchDepthMapper {
                         ref_keyframe,
                         &scaled_intrinsics,
                         t_ref_curr,
+                        &rel_pose,
                         sigma_warp_sq,
                     );
                     grid.set(u, v, estimate);
@@ -2226,6 +2389,7 @@ impl PatchDepthMapper {
         ref_keyframe: &DepthKeyframe,
         intrinsics_by_level: &[ScaledIntrinsics],
         t_ref_curr: &Matrix4<f64>,
+        rel_pose: &RelativePose,
         sigma_warp_sq: f64,
     ) -> PatchEstimate {
         if self.camera_mode == PatchDepthCameraMode::PerPatchBearing {
@@ -2238,7 +2402,7 @@ impl PatchDepthMapper {
                 curr_valid_pyramid,
                 ref_keyframe,
                 intrinsics_by_level,
-                t_ref_curr,
+                rel_pose,
                 sigma_warp_sq,
             )
         } else {
@@ -2388,11 +2552,10 @@ impl PatchDepthMapper {
         }
     }
 
-    /// Per-patch target-anchored solve: build a per-patch tangent tile centered on
-    /// the patch (with epipolar margin), rectify the current + keyframe raw level-0
-    /// images into it once, then run the shared FastTranslation SIMD leaf in η.
-    /// Seamless wide-FoV (each patch at its own tangent centre) without the global
-    /// pinhole's negative-Z. Mirrors `solve_one_patch`'s seed/init/gate logic.
+    /// Per-patch target-anchored solve: approximate the local raw projection by a
+    /// patch-local affine chart, then solve the translated patch directly in raw
+    /// images. This keeps PPB seamless for wide FoV without materializing a
+    /// rectified tile image per patch.
     #[allow(clippy::too_many_arguments)]
     fn solve_one_per_patch_bearing(
         &self,
@@ -2404,7 +2567,7 @@ impl PatchDepthMapper {
         _curr_valid_pyramid: Option<&[Image<f32>]>,
         ref_keyframe: &DepthKeyframe,
         intrinsics_by_level: &[ScaledIntrinsics],
-        t_ref_curr: &Matrix4<f64>,
+        rel_pose: &RelativePose,
         sigma_warp_sq: f64,
     ) -> PatchEstimate {
         let nearby = nearby_seed_weights(cu, cv, seeds, seed_grid, &self.settings);
@@ -2413,13 +2576,12 @@ impl PatchDepthMapper {
         }
 
         // η bounds + seed init (range = z * ‖bearing‖), identical to solve_one_patch.
-        let range_per_z = match self
-            .bearing_for_scaled_pixel(cu, cv, &intrinsics_by_level[0])
-            .map(|b| b.norm())
-        {
-            Some(n) => n,
-            None => return PatchEstimate::unknown(),
+        let Some(center_bearing) = self.bearing_for_scaled_pixel(cu, cv, &intrinsics_by_level[0])
+        else {
+            return PatchEstimate::unknown();
         };
+        let range_per_z = center_bearing.norm();
+        let unit_center_bearing = center_bearing / range_per_z;
         let eta_min = (self.settings.min_depth * range_per_z).ln();
         let eta_max = (self.settings.max_depth * range_per_z).ln();
         let mut seed_eta_sum = 0.0;
@@ -2444,10 +2606,29 @@ impl PatchDepthMapper {
         let specs = undistort_level_specs(self.width, self.height, self.settings.scale, 1);
         let spec = &specs[0];
         let (lw, lh) = (spec.lw, spec.lh);
-        let tile_side = self
+        // Size the per-patch tile to just contain the warp displacement at the
+        // seed depth, plus a margin for the bilinear footprint and GN drift —
+        // not a fixed `tiled_tile_size`. The tile build is O(side²) and is by far
+        // the dominant cost (per-pixel camera.project in the LUT), so for the
+        // common small-baseline case this is a large win; large displacements
+        // clamp back up to `tiled_tile_size`, matching the old behaviour.
+        let disp = {
+            let x_ref = rel_pose.r * (unit_center_bearing * eta_init.exp()) + rel_pose.t;
+            if x_ref[2] > 1e-6 {
+                let (u_ref, v_ref) =
+                    self.project_scaled(&x_ref, intrinsics_by_level[0].scale_from_original);
+                (u_ref - cu).hypot(v_ref - cv)
+            } else {
+                0.0
+            }
+        };
+        let margin = self.settings.patch_size as f64;
+        let need = (self.settings.patch_size as f64 + 2.0 * (disp + margin)).ceil() as usize;
+        let max_side = self
             .settings
             .tiled_tile_size
             .max(2 * self.settings.patch_size);
+        let tile_side = need.clamp(2 * self.settings.patch_size, max_side);
         if tile_side >= lw || tile_side >= lh {
             return PatchEstimate::seed_only(eta_init, seed_var, &self.settings);
         }
@@ -2455,7 +2636,12 @@ impl PatchDepthMapper {
             (cu.round() as i64 - (tile_side as i64) / 2).clamp(0, (lw - tile_side) as i64) as usize;
         let y0 =
             (cv.round() as i64 - (tile_side as i64) / 2).clamp(0, (lh - tile_side) as i64) as usize;
-        let tile = build_tiled_bearing_tile(
+        let tile_center_u = x0 as f64 + 0.5 * (tile_side.saturating_sub(1)) as f64;
+        let tile_center_v = y0 as f64 + 0.5 * (tile_side.saturating_sub(1)) as f64;
+        let tile_center_bearing = self
+            .bearing_for_scaled_pixel(tile_center_u, tile_center_v, &intrinsics_by_level[0])
+            .unwrap_or(unit_center_bearing);
+        let tile = build_tiled_bearing_tile_geometry_from_center(
             self.camera.as_ref(),
             &self.intrinsics,
             spec,
@@ -2464,15 +2650,14 @@ impl PatchDepthMapper {
             y0,
             tile_side,
             tile_side,
+            tile_center_bearing,
         );
-        let curr_rect = tile.lut.undistort_level(&curr_pyramid[0]);
-        let ref_rect = tile.lut.undistort_level(&ref_keyframe.ref_pyramid[0]);
-        let valid = tile.lut.valid_image();
-        let (gx, gy) = gradients(&ref_rect);
+        let Some(affine) = PerPatchAffineMap::from_tile(self.camera.as_ref(), spec, &tile) else {
+            return PatchEstimate::seed_only(eta_init, seed_var, &self.settings);
+        };
 
         let local_cu = cu - x0 as f64;
         let local_cv = cv - y0 as f64;
-        let rel_pose = RelativePose::from_matrix(t_ref_curr);
 
         let mut eta = eta_init;
         let mut final_residual = 1e10;
@@ -2480,19 +2665,17 @@ impl PatchDepthMapper {
         let mut observed = false;
         for _ in 0..self.settings.n_gn_iters {
             let (grad_photo, hess_photo, sum_abs_res, valid_n) = self
-                .patch_residual_jacobian_fast_translation_tiled_level(
+                .patch_residual_jacobian_per_patch_bearing_affine(
                     &tile,
-                    &tile,
+                    &affine,
                     local_cu,
                     local_cv,
                     eta,
-                    &curr_rect,
-                    Some(&valid),
-                    &ref_rect,
-                    Some(&valid),
-                    &gx,
-                    &gy,
-                    &rel_pose,
+                    &curr_pyramid[0],
+                    &ref_keyframe.ref_pyramid[0],
+                    &ref_keyframe.grad_x_pyramid[0],
+                    &ref_keyframe.grad_y_pyramid[0],
+                    rel_pose,
                     sigma_warp_sq,
                 );
             if valid_n == 0 {
@@ -3186,6 +3369,136 @@ impl PatchDepthMapper {
                     sum_abs_res += ar;
                     n_valid += 1;
                 }
+            }
+        }
+
+        (grad, hess, sum_abs_res, n_valid)
+    }
+
+    fn patch_residual_jacobian_per_patch_bearing_affine(
+        &self,
+        tile: &TiledBearingTile,
+        affine: &PerPatchAffineMap,
+        cu: f64,
+        cv: f64,
+        eta: f64,
+        curr_img: &Image<f32>,
+        ref_img: &Image<f32>,
+        ref_grad_x: &Image<f32>,
+        ref_grad_y: &Image<f32>,
+        rel_pose: &RelativePose,
+        sigma_warp_sq: f64,
+    ) -> (f64, f64, f64, usize) {
+        let Some((u_ref_center, v_ref_center, x_ref_center, _unit_b)) =
+            warp_tiled_local_pixel_eta(tile, tile, cu, cv, eta, rel_pose)
+        else {
+            return (0.0, 0.0, 0.0, 0);
+        };
+
+        let dx_ref_deta = x_ref_center - rel_pose.t;
+        let Some(du_dxref) = tile.projection_jacobian(&x_ref_center) else {
+            return (0.0, 0.0, 0.0, 0);
+        };
+        let duv_deta = du_dxref * dx_ref_deta;
+        let du_deta = duv_deta[0];
+        let dv_deta = duv_deta[1];
+
+        let half = self.settings.patch_size / 2;
+        let side = self.settings.patch_size;
+        let sigma_photo_sq = self.settings.sigma_photo * self.settings.sigma_photo;
+        let constant_inv_sigma_photo_sq =
+            (sigma_warp_sq <= 1e-18).then_some(1.0 / sigma_photo_sq.max(1e-12));
+        let mut grad = 0.0;
+        let mut hess = 0.0;
+        let mut sum_abs_res = 0.0;
+        let mut n_valid = 0;
+
+        let curr_data = curr_img.as_slice();
+        let ref_data = ref_img.as_slice();
+        let ref_gx_data = ref_grad_x.as_slice();
+        let ref_gy_data = ref_grad_y.as_slice();
+        let width = curr_img.width();
+        let height = curr_img.height();
+        let stride = curr_img.stride();
+        debug_assert_eq!(ref_img.width(), width);
+        debug_assert_eq!(ref_img.height(), height);
+        debug_assert_eq!(ref_img.stride(), stride);
+        debug_assert_eq!(ref_grad_x.width(), width);
+        debug_assert_eq!(ref_grad_x.height(), height);
+        debug_assert_eq!(ref_grad_x.stride(), stride);
+        debug_assert_eq!(ref_grad_y.width(), width);
+        debug_assert_eq!(ref_grad_y.height(), height);
+        debug_assert_eq!(ref_grad_y.stride(), stride);
+
+        let raw_du_x = affine.raw_du[0];
+        let raw_du_y = affine.raw_du[1];
+        let raw_dv_x = affine.raw_dv[0];
+        let raw_dv_y = affine.raw_dv[1];
+        let curr_base_u = tile.x0 as f64 + cu - half as f64 - affine.center_u;
+        let curr_base_v = tile.y0 as f64 + cv - half as f64 - affine.center_v;
+        let ref_base_u = tile.x0 as f64 + u_ref_center - half as f64 - affine.center_u;
+        let ref_base_v = tile.y0 as f64 + v_ref_center - half as f64 - affine.center_v;
+
+        for ly in 0..side {
+            let curr_du = curr_base_u;
+            let curr_dv = curr_base_v + ly as f64;
+            let ref_du = ref_base_u;
+            let ref_dv = ref_base_v + ly as f64;
+            let mut curr_raw_u = affine.raw_center[0] + raw_du_x * curr_du + raw_dv_x * curr_dv;
+            let mut curr_raw_v = affine.raw_center[1] + raw_du_y * curr_du + raw_dv_y * curr_dv;
+            let mut ref_raw_u = affine.raw_center[0] + raw_du_x * ref_du + raw_dv_x * ref_dv;
+            let mut ref_raw_v = affine.raw_center[1] + raw_du_y * ref_du + raw_dv_y * ref_dv;
+            for _ in 0..side {
+                let Some(i_curr) = sample_bilinear_raw_nomask_slice(
+                    curr_data, width, height, stride, curr_raw_u, curr_raw_v,
+                ) else {
+                    curr_raw_u += raw_du_x;
+                    curr_raw_v += raw_du_y;
+                    ref_raw_u += raw_du_x;
+                    ref_raw_v += raw_du_y;
+                    continue;
+                };
+                let Some((i_ref, raw_gx, raw_gy)) = sample_bilinear_raw_nomask_with_grad_slice(
+                    ref_data,
+                    ref_gx_data,
+                    ref_gy_data,
+                    width,
+                    height,
+                    stride,
+                    ref_raw_u,
+                    ref_raw_v,
+                ) else {
+                    curr_raw_u += raw_du_x;
+                    curr_raw_v += raw_du_y;
+                    ref_raw_u += raw_du_x;
+                    ref_raw_v += raw_du_y;
+                    continue;
+                };
+                let gx = (raw_gx as f64 * raw_du_x + raw_gy as f64 * raw_du_y) as f32;
+                let gy = (raw_gx as f64 * raw_dv_x + raw_gy as f64 * raw_dv_y) as f32;
+                let jac = gx as f64 * du_deta + gy as f64 * dv_deta;
+                let residual = i_ref as f64 - i_curr as f64;
+                let ar = residual.abs();
+                let inv_sigma_eff_sq = photo_inv_sigma_eff_sq(
+                    gx,
+                    gy,
+                    sigma_photo_sq,
+                    sigma_warp_sq,
+                    constant_inv_sigma_photo_sq,
+                );
+                let weight = huber_weight_from_abs_res(
+                    ar,
+                    self.settings.photo_huber_delta,
+                    inv_sigma_eff_sq,
+                );
+                grad += weight * jac * residual;
+                hess += weight * jac * jac;
+                sum_abs_res += ar;
+                n_valid += 1;
+                curr_raw_u += raw_du_x;
+                curr_raw_v += raw_du_y;
+                ref_raw_u += raw_du_x;
+                ref_raw_v += raw_du_y;
             }
         }
 

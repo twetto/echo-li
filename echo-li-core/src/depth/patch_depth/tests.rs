@@ -58,23 +58,17 @@ fn keyframe_buffer_uses_baseline_gate() {
     }];
 
     let img = textured_image();
-    assert!(
-        mapper
-            .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
-            .is_none()
-    );
+    assert!(mapper
+        .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
+        .is_none());
     assert_eq!(mapper.keyframe_count(), 1);
-    assert!(
-        mapper
-            .update_with_priors(frame(1, 0.001, img.clone()), &seeds, None, 0.0)
-            .is_none()
-    );
+    assert!(mapper
+        .update_with_priors(frame(1, 0.001, img.clone()), &seeds, None, 0.0)
+        .is_none());
     assert_eq!(mapper.keyframe_count(), 2);
-    assert!(
-        mapper
-            .update_with_priors(frame(2, 0.02, img), &seeds, None, 0.0)
-            .is_some()
-    );
+    assert!(mapper
+        .update_with_priors(frame(2, 0.02, img), &seeds, None, 0.0)
+        .is_some());
     assert_eq!(mapper.keyframe_count(), 2);
 }
 
@@ -93,21 +87,18 @@ fn seed_priors_produce_cell_depths() {
     }];
     let img = vec![120u8; 32 * 32];
 
-    assert!(
-        mapper
-            .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
-            .is_none()
-    );
+    assert!(mapper
+        .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
+        .is_none());
     let out = mapper
         .update_with_priors(frame(1, 0.02, img), &seeds, None, 0.0)
         .unwrap();
     // Output is log-range η; seed η = ln(2) so range = exp(η) ≈ 2.0.
-    assert!(
-        out.eta
-            .data
-            .iter()
-            .any(|e| e.is_finite() && (e.exp() - 2.0).abs() < 0.1)
-    );
+    assert!(out
+        .eta
+        .data
+        .iter()
+        .any(|e| e.is_finite() && (e.exp() - 2.0).abs() < 0.1));
     assert!(out.status.data.contains(&PatchStatus::SeedOnly));
 }
 
@@ -127,11 +118,9 @@ fn bearing_lut_handles_distorted_path_for_photometric_solve() {
     }];
     let img = textured_image();
 
-    assert!(
-        mapper
-            .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
-            .is_none()
-    );
+    assert!(mapper
+        .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
+        .is_none());
     let out = mapper
         .update_with_priors(frame(1, 0.02, img), &seeds, None, 0.0)
         .unwrap();
@@ -156,11 +145,9 @@ fn fast_translation_refines_undistorted_pinhole_patches() {
     }];
     let img = textured_image();
 
-    assert!(
-        mapper
-            .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
-            .is_none()
-    );
+    assert!(mapper
+        .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
+        .is_none());
     let out = mapper
         .update_with_priors(frame(1, 0.02, img), &seeds, None, 0.0)
         .unwrap();
@@ -187,11 +174,9 @@ fn fast_translation_refines_undistorted_pinhole_4x4_patches() {
     }];
     let img = textured_image();
 
-    assert!(
-        mapper
-            .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
-            .is_none()
-    );
+    assert!(mapper
+        .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
+        .is_none());
     let out = mapper
         .update_with_priors(frame(1, 0.02, img), &seeds, None, 0.0)
         .unwrap();
@@ -232,11 +217,9 @@ fn tiled_bearing_mode_runs_tile_local_update() {
     }];
     let img = textured_image();
 
-    assert!(
-        mapper
-            .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
-            .is_none()
-    );
+    assert!(mapper
+        .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
+        .is_none());
     let out = mapper
         .update_with_priors(frame(1, 0.02, img), &seeds, None, 0.0)
         .unwrap();
@@ -333,10 +316,9 @@ fn tiled_bearing_requires_fast_translation_warp() {
         Ok(_) => panic!("tiled_bearing should reject exact warp mode"),
         Err(err) => err,
     };
-    assert!(
-        err.to_string()
-            .contains("requires warp_mode=fast_translation")
-    );
+    assert!(err
+        .to_string()
+        .contains("requires warp_mode=fast_translation"));
 }
 
 #[test]
@@ -362,11 +344,9 @@ fn tiled_bearing_mode_runs_with_two_pyramid_levels() {
     }];
     let img = textured_image();
 
-    assert!(
-        mapper
-            .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
-            .is_none()
-    );
+    assert!(mapper
+        .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
+        .is_none());
     let out = mapper
         .update_with_priors(frame(1, 0.02, img), &seeds, None, 0.0)
         .unwrap();
@@ -397,11 +377,9 @@ fn per_patch_bearing_mode_runs() {
     }];
     let img = textured_image();
 
-    assert!(
-        mapper
-            .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
-            .is_none()
-    );
+    assert!(mapper
+        .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
+        .is_none());
     let out = mapper
         .update_with_priors(frame(1, 0.02, img), &seeds, None, 0.0)
         .unwrap();
@@ -875,11 +853,9 @@ fn structure_tensor_min_eigen_active_suppresses_all_depth_output() {
         eta_var: 0.04,
     }];
     let img = textured_image();
-    assert!(
-        mapper
-            .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
-            .is_none()
-    );
+    assert!(mapper
+        .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
+        .is_none());
     let out = mapper
         .update_with_priors(frame(1, 0.02, img), &seeds, None, 0.0)
         .unwrap();

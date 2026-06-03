@@ -302,8 +302,8 @@ pub(super) fn undistort_sample(
     if u < 0.0 || v < 0.0 || u >= (width - 1) as f64 || v >= (height - 1) as f64 {
         return None;
     }
-    let ix = u.floor() as usize;
-    let iy = v.floor() as usize;
+    let ix = u as usize;
+    let iy = v as usize;
     let dx = (u - ix as f64) as f32;
     let dy = (v - iy as f64) as f32;
     let one_minus_dx = 1.0 - dx;

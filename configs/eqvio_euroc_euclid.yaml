@@ -127,6 +127,7 @@ PatchDepth:
   # seamless). A/B against tiled_bearing by switching this line.
   camera_mode: per_patch_bearing
   # camera_mode: undistorted_pinhole
+  # camera_mode: raw_distorted
   warp_mode: fast_translation
   # warp_mode: exact
   scale: 0.25
