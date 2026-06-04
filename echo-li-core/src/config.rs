@@ -280,6 +280,8 @@ pub struct PatchDepthConfig {
     #[serde(default)]
     pub n_gn_iters: Option<usize>,
     #[serde(default)]
+    pub gn_eta_convergence_tol: Option<f64>,
+    #[serde(default)]
     pub fd_eps: Option<f64>,
     #[serde(default)]
     pub lambda_seed: Option<f64>,
@@ -372,6 +374,9 @@ impl PatchDepthConfig {
         }
         if let Some(v) = self.n_gn_iters {
             settings.n_gn_iters = v;
+        }
+        if let Some(v) = self.gn_eta_convergence_tol {
+            settings.gn_eta_convergence_tol = v;
         }
         if let Some(v) = self.fd_eps {
             settings.fd_eps = v;

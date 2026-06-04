@@ -39,6 +39,12 @@ use simd::{
 #[cfg(target_arch = "aarch64")]
 use simd_neon::fast_translation_accum_neon_if_available;
 
+/// Default Gauss-Newton convergence tolerance on the log-range step `|Δη|`. Below
+/// this the depth update is sub-0.1% of range; further iterations are wasted leaf
+/// evaluations. Overridable via `PatchDepthSettings::gn_eta_convergence_tol`
+/// (config key `gn_eta_convergence_tol`); used to early-exit the GN loop.
+const GN_ETA_CONVERGENCE_TOL: f64 = 1e-3;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PatchDepthCameraMode {
     RawDistorted,
@@ -74,6 +80,8 @@ pub struct PatchDepthSettings {
     pub photo_huber_delta: f64,
     pub sigma_photo: f64,
     pub n_gn_iters: usize,
+    /// Gauss-Newton early-exit tolerance on `|Δη|` (per-patch-bearing solve).
+    pub gn_eta_convergence_tol: f64,
     pub fd_eps: f64,
     pub lambda_seed: f64,
     pub seed_radius_px: f64,
@@ -107,6 +115,7 @@ impl Default for PatchDepthSettings {
             photo_huber_delta: 5.0,
             sigma_photo: 5.0,
             n_gn_iters: 5,
+            gn_eta_convergence_tol: GN_ETA_CONVERGENCE_TOL,
             fd_eps: 1e-3,
             lambda_seed: 1.0,
             seed_radius_px: 32.0,
@@ -2696,12 +2705,21 @@ impl PatchDepthMapper {
             if hess_total < 1e-12 {
                 break;
             }
-            eta = (eta - (grad_photo + grad_seed) / hess_total).clamp(eta_min, eta_max);
+            let eta_next = (eta - (grad_photo + grad_seed) / hess_total).clamp(eta_min, eta_max);
+            let delta = (eta_next - eta).abs();
+            eta = eta_next;
             // The tiled leaf returns the *summed* abs residual; the gate (and the
             // UP path's wrapper) work in per-pixel mean. Divide so the
             // `<= max_photo_residual` test matches UndistortedPinhole's scale.
             final_residual = sum_abs_res / valid_n.max(1) as f64;
             final_curvature = hess_photo;
+            // η = ln(range); the default sub-1e-3 step is <0.1% range — below
+            // noise. The photo leaf is the dominant per-patch cost, so stopping
+            // once the GN step converges (often by iter 2-3) skips redundant leaf
+            // calls without changing the refined depth or the photo/seed gate.
+            if delta < self.settings.gn_eta_convergence_tol {
+                break;
+            }
         }
 
         let min_curvature = self.settings.min_photo_curvature
