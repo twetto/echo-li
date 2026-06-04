@@ -4,6 +4,7 @@ mod camera;
 mod frontend;
 mod patch_depth;
 mod sparse_3d;
+mod stereo;
 mod vio_filter;
 
 #[pymodule]
@@ -15,5 +16,6 @@ fn _echo_li(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<vio_filter::PyVIOFilter>()?;
     m.add_class::<sparse_3d::PySparse3DFilter>()?;
     m.add_class::<patch_depth::PyPatchDepthMapper>()?;
+    m.add_class::<stereo::PyStereo>()?;
     Ok(())
 }

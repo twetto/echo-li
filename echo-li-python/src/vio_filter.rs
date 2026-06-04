@@ -10,7 +10,7 @@ use echo_li_core::mathematical::camera::CameraModel;
 use echo_li_core::mathematical::imu_velocity::IMUVelocity;
 use echo_li_core::mathematical::vio_state::{VIOSensorState, VIOState};
 use echo_li_core::mathematical::vision_measurement::VisionMeasurement;
-use echo_li_core::{landmarks_to_global, VIOFilter};
+use echo_li_core::{landmarks_to_global, LandmarkDepthPrior, VIOFilter};
 use echo_lie::SE3;
 use nalgebra::{Matrix4, Vector2, Vector3};
 use numpy::{PyReadonlyArray2, PyUntypedArrayMethods};
@@ -80,12 +80,7 @@ impl PyVIOFilter {
         Ok(())
     }
 
-    fn process_imu(
-        &mut self,
-        stamp: f64,
-        gyro: [f64; 3],
-        accel: [f64; 3],
-    ) {
+    fn process_imu(&mut self, stamp: f64, gyro: [f64; 3], accel: [f64; 3]) {
         let imu = IMUVelocity::new(
             stamp,
             Vector3::new(gyro[0], gyro[1], gyro[2]),
@@ -116,11 +111,7 @@ impl PyVIOFilter {
         self.filter.process_imu(imu);
     }
 
-    fn process_vision(
-        &mut self,
-        stamp: f64,
-        feature_uvs: HashMap<u64, [f32; 2]>,
-    ) {
+    fn process_vision(&mut self, stamp: f64, feature_uvs: HashMap<u64, [f32; 2]>) {
         if !self.initialized {
             return;
         }
@@ -130,22 +121,59 @@ impl PyVIOFilter {
             .map(|(id, uv)| (id, Vector2::new(uv[0], uv[1])))
             .collect();
         let measurement = VisionMeasurement::new(stamp, cam_coords);
-        self.filter.process_vision(measurement, self.camera.as_ref());
+        self.filter
+            .process_vision(measurement, self.camera.as_ref());
     }
 
-    fn get_pose<'py>(&self, py: Python<'py>) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
+    /// Vision update with per-landmark range priors. Use this to seed new
+    /// landmarks from a stereo triangulation: for each feature id give
+    /// `(range, range_var)` where `range` is the euclidean distance from the
+    /// camera origin to the 3D point (cam.undistort(uv) returns a unit-norm
+    /// bearing, and the landmark is initialised as `bearing * range`) and
+    /// `range_var` is its variance. The filter only consumes priors when
+    /// initialising a new landmark; tracked landmarks ignore them.
+    fn process_vision_with_depth_priors(
+        &mut self,
+        stamp: f64,
+        feature_uvs: HashMap<u64, [f32; 2]>,
+        depth_priors: HashMap<u64, [f64; 2]>,
+    ) {
+        if !self.initialized {
+            return;
+        }
+
+        let cam_coords: HashMap<u64, Vector2<f32>> = feature_uvs
+            .into_iter()
+            .map(|(id, uv)| (id, Vector2::new(uv[0], uv[1])))
+            .collect();
+        let priors: HashMap<u64, LandmarkDepthPrior> = depth_priors
+            .into_iter()
+            .map(|(id, rv)| {
+                (
+                    id,
+                    LandmarkDepthPrior {
+                        range: rv[0],
+                        range_var: rv[1],
+                    },
+                )
+            })
+            .collect();
+        let measurement = VisionMeasurement::new(stamp, cam_coords);
+        self.filter
+            .process_vision_with_depth_priors(measurement, self.camera.as_ref(), &priors);
+    }
+
+    fn get_pose<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
         let state = self.filter.state_estimate();
         let pos = state.sensor.pose.translation;
         let q = state.sensor.pose.rotation.as_xyzw();
 
-        let pos_arr = PyArray1::from_owned_array(
-            py,
-            Array1::from_vec(vec![pos[0], pos[1], pos[2]]),
-        );
-        let q_arr = PyArray1::from_owned_array(
-            py,
-            Array1::from_vec(vec![q[0], q[1], q[2], q[3]]),
-        );
+        let pos_arr =
+            PyArray1::from_owned_array(py, Array1::from_vec(vec![pos[0], pos[1], pos[2]]));
+        let q_arr = PyArray1::from_owned_array(py, Array1::from_vec(vec![q[0], q[1], q[2], q[3]]));
         Ok((pos_arr, q_arr))
     }
 
@@ -173,10 +201,8 @@ impl PyVIOFilter {
         let (global_lm, _, _) = landmarks_to_global(&state);
         let dict = pyo3::types::PyDict::new(py);
         for (id, pos) in &global_lm {
-            let arr = PyArray1::from_owned_array(
-                py,
-                Array1::from_vec(vec![pos[0], pos[1], pos[2]]),
-            );
+            let arr =
+                PyArray1::from_owned_array(py, Array1::from_vec(vec![pos[0], pos[1], pos[2]]));
             dict.set_item(id, arr)?;
         }
         Ok(dict)

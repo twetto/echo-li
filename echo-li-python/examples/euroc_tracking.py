@@ -35,16 +35,24 @@ def load_imu(dataset_root: Path):
             yield t, gyr, acc
 
 
-def load_images(dataset_root: Path, cam_lag: float = 0.0):
-    """Yield (stamp_s, image_path) from cam0/data.csv."""
-    csv_path = dataset_root / "cam0" / "data.csv"
-    data_dir = dataset_root / "cam0" / "data"
+def load_images(dataset_root: Path, cam_lag: float = 0.0, cam: str = "cam0"):
+    """Yield (stamp_s, image_path) from <cam>/data.csv."""
+    csv_path = dataset_root / cam / "data.csv"
+    data_dir = dataset_root / cam / "data"
     with open(csv_path) as f:
         reader = csv.reader(f)
         next(reader)
         for row in reader:
             t = int(row[0]) * 1e-9 + cam_lag
             yield t, data_dir / row[1].strip()
+
+
+def index_cam1(dataset_root: Path):
+    """Return list of (stamp_s, path) for cam1, sorted by stamp."""
+    cam1_dir = dataset_root / "cam1"
+    if not (cam1_dir / "data.csv").exists():
+        return None
+    return list(load_images(dataset_root, cam_lag=0.0, cam="cam1"))
 
 
 def load_ground_truth(dataset_root: Path):
@@ -100,6 +108,11 @@ def main():
     parser.add_argument("--max-features", type=int, default=200)
     parser.add_argument("--cam-lag", type=float, default=0.0)
     parser.add_argument("--no-display", action="store_true", help="Disable OpenCV window")
+    parser.add_argument(
+        "--stereo",
+        action="store_true",
+        help="Enable stereo landmark initialization (requires --config and cam1)",
+    )
     args = parser.parse_args()
 
     dataset_root = Path(args.dataset)
@@ -142,6 +155,26 @@ def main():
             print(f"Camera extrinsics (T_BS) loaded")
         print(f"VIO filter loaded from {args.config}")
 
+    # Optionally set up stereo matcher for landmark depth priors.
+    stereo = None
+    cam1_index = None
+    if args.stereo:
+        if not args.config:
+            print("--stereo requires --config (uses the YAML's Stereo: section)")
+        else:
+            cam1_index = index_cam1(dataset_root)
+            if cam1_index is None:
+                print(f"--stereo requested but {dataset_root / 'cam1'} not found")
+            else:
+                stereo = echo_li.Stereo.from_euroc(
+                    str(dataset_root / "cam0" / "sensor.yaml"),
+                    str(dataset_root / "cam1" / "sensor.yaml"),
+                    w,
+                    h,
+                    args.config,
+                )
+                print(f"Stereo: {stereo}")
+
     # Set up trajectory visualizer when VIO is active
     visualiser = None
     if vio:
@@ -155,6 +188,7 @@ def main():
     show = not args.no_display
     frame_count = 0
     t_start = time.time()
+    cam1_cursor = 0  # index into cam1_index, advanced monotonically
 
     for stamp, etype, data in events:
         if etype == "imu":
@@ -175,10 +209,28 @@ def main():
         features, stats = tracker.process(gray)
         frame_count += 1
 
-        # Run VIO vision update
+        # Run VIO vision update (optionally with stereo-derived depth priors).
+        priors = None
         if vio and vio.is_initialized:
             feature_uvs = {f["id"]: (f["x"], f["y"]) for f in features}
-            vio.process_vision(stamp, feature_uvs)
+            if stereo is not None and cam1_index is not None:
+                # Pick the cam1 frame nearest in time to this cam0 frame.
+                # Streams march forward so a linear advance suffices.
+                while (
+                    cam1_cursor + 1 < len(cam1_index)
+                    and abs(cam1_index[cam1_cursor + 1][0] - stamp)
+                    < abs(cam1_index[cam1_cursor][0] - stamp)
+                ):
+                    cam1_cursor += 1
+                cam1_stamp, cam1_path = cam1_index[cam1_cursor]
+                if abs(cam1_stamp - stamp) < 0.025:  # within ~half a 20 Hz period
+                    cam1_gray = cv2.imread(str(cam1_path), cv2.IMREAD_GRAYSCALE)
+                    if cam1_gray is not None:
+                        priors = dict(stereo.range_priors(cam1_gray, tracker))
+            if priors:
+                vio.process_vision_with_depth_priors(stamp, feature_uvs, priors)
+            else:
+                vio.process_vision(stamp, feature_uvs)
 
             if visualiser:
                 pos, _ = vio.get_pose()
@@ -194,6 +246,8 @@ def main():
             if vio and vio.is_initialized:
                 pos, quat = vio.get_pose()
                 msg += f"  pos=({pos[0]:+.2f}, {pos[1]:+.2f}, {pos[2]:+.2f})"
+                if stereo is not None and priors is not None:
+                    msg += f"  stereo_priors={len(priors)}"
             print(msg)
 
         # Display

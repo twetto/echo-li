@@ -81,11 +81,7 @@ impl FrontendConfig {
         } else {
             "none".to_string()
         };
-        let lbp_policy = rv
-            .lbp_policy
-            .as_deref()
-            .unwrap_or("soft")
-            .to_string();
+        let lbp_policy = rv.lbp_policy.as_deref().unwrap_or("soft").to_string();
         let defaults = frontend::FrontendConfig::default();
         Ok(Self {
             max_features: rv.max_features,
@@ -164,6 +160,16 @@ pub struct PyFrontend {
     inner: Frontend,
     width: usize,
     height: usize,
+}
+
+impl PyFrontend {
+    pub(crate) fn inner(&self) -> &Frontend {
+        &self.inner
+    }
+
+    pub(crate) fn dimensions(&self) -> (usize, usize) {
+        (self.width, self.height)
+    }
 }
 
 #[pymethods]
