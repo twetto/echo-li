@@ -265,17 +265,15 @@ unsafe fn bounds_mask8(
     v_hm1: std::arch::x86_64::__m256,
 ) -> std::arch::x86_64::__m256 {
     use std::arch::x86_64::{_CMP_GE_OQ, _CMP_LT_OQ, _mm256_and_ps, _mm256_cmp_ps};
-    unsafe {
-        let mu = _mm256_and_ps(
-            _mm256_cmp_ps(u, v_zero, _CMP_GE_OQ),
-            _mm256_cmp_ps(u, v_wm1, _CMP_LT_OQ),
-        );
-        let mv = _mm256_and_ps(
-            _mm256_cmp_ps(v, v_zero, _CMP_GE_OQ),
-            _mm256_cmp_ps(v, v_hm1, _CMP_LT_OQ),
-        );
-        _mm256_and_ps(mu, mv)
-    }
+    let mu = _mm256_and_ps(
+        _mm256_cmp_ps(u, v_zero, _CMP_GE_OQ),
+        _mm256_cmp_ps(u, v_wm1, _CMP_LT_OQ),
+    );
+    let mv = _mm256_and_ps(
+        _mm256_cmp_ps(v, v_zero, _CMP_GE_OQ),
+        _mm256_cmp_ps(v, v_hm1, _CMP_LT_OQ),
+    );
+    _mm256_and_ps(mu, mv)
 }
 
 /// Bilinear sample of 8 lanes via gather. Indices are clamped to keep all four
