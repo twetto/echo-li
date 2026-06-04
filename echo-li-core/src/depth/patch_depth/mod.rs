@@ -19,9 +19,9 @@ mod simd;
 #[cfg(target_arch = "aarch64")]
 mod simd_neon;
 
+use fuse::PatchGrid;
 #[cfg(not(feature = "parallel"))]
 use fuse::densify_pixels;
-use fuse::PatchGrid;
 #[cfg(feature = "parallel")]
 use fuse::{densify_pixels_parallel, patch_centers};
 use image_ops::{
@@ -30,9 +30,12 @@ use image_ops::{
     sample_bilinear_valid, sample_bilinear_valid_with_grad, sample_nearest, sample_valid_nearest,
     scaled_intrinsics, undistort_level_specs,
 };
-use seeds::{median_seed_depth, nearby_seed_weights, scale_seeds, SeedGrid};
+use seeds::{SeedGrid, median_seed_depth, nearby_seed_weights, scale_seeds};
 #[cfg(target_arch = "x86_64")]
-use simd::fast_translation_accum_avx2_if_available;
+use simd::{
+    PerPatchAffineGeom, fast_translation_accum_avx2_if_available,
+    per_patch_affine_accum_avx2_if_available,
+};
 #[cfg(target_arch = "aarch64")]
 use simd_neon::fast_translation_accum_neon_if_available;
 
@@ -3438,6 +3441,38 @@ impl PatchDepthMapper {
         let curr_base_v = tile.y0 as f64 + cv - half as f64 - affine.center_v;
         let ref_base_u = tile.x0 as f64 + u_ref_center - half as f64 - affine.center_u;
         let ref_base_v = tile.y0 as f64 + v_ref_center - half as f64 - affine.center_v;
+
+        // SIMD leaf: constant photometric weight only (sigma_warp_sq == 0), the
+        // same precondition as FastTranslation's AVX2 path.
+        #[cfg(target_arch = "x86_64")]
+        if let Some(inv_sigma_photo_sq) = constant_inv_sigma_photo_sq {
+            // The reference Jacobian raw_gx·cgx + raw_gy·cgy folds the gradient
+            // rotation (raw→tangent) and the tangent→η chain into two scalars.
+            let cgx = raw_du_x * du_deta + raw_dv_x * dv_deta;
+            let cgy = raw_du_y * du_deta + raw_dv_y * dv_deta;
+            if let Some(accum) = per_patch_affine_accum_avx2_if_available(
+                curr_img,
+                ref_img,
+                ref_grad_x,
+                ref_grad_y,
+                side,
+                PerPatchAffineGeom {
+                    raw_center: [affine.raw_center[0] as f32, affine.raw_center[1] as f32],
+                    raw_du: [raw_du_x as f32, raw_du_y as f32],
+                    raw_dv: [raw_dv_x as f32, raw_dv_y as f32],
+                    curr_base_u: curr_base_u as f32,
+                    curr_base_v: curr_base_v as f32,
+                    ref_base_u: ref_base_u as f32,
+                    ref_base_v: ref_base_v as f32,
+                    cgx: cgx as f32,
+                    cgy: cgy as f32,
+                },
+                inv_sigma_photo_sq as f32,
+                self.settings.photo_huber_delta as f32,
+            ) {
+                return (accum.grad, accum.hess, accum.sum_abs_res, accum.n_valid);
+            }
+        }
 
         for ly in 0..side {
             let curr_du = curr_base_u;

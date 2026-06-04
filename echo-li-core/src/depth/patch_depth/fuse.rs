@@ -1,5 +1,5 @@
-use super::image_ops::sample_bilinear_valid;
 use super::PatchDepthCameraMode;
+use super::image_ops::sample_bilinear_valid;
 use super::{
     PatchDepthMapper, PatchDepthOutput, PatchDepthSettings, PatchEstimate, PatchStatus,
     RelativePose, ScaledIntrinsics,
@@ -79,6 +79,9 @@ impl PatchGrid {
     }
 
     #[inline(always)]
+    // Pixel-major overlap queries are used only by the `parallel` densify paths;
+    // the scalar paths iterate patch footprints directly.
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     fn overlap_u(&self, px: usize) -> (usize, usize) {
         let half = self.half;
         let stride = self.stride;
@@ -92,6 +95,7 @@ impl PatchGrid {
     }
 
     #[inline(always)]
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     fn overlap_v(&self, py: usize) -> (usize, usize) {
         let half = self.half;
         let stride = self.stride;
@@ -128,6 +132,91 @@ pub(super) fn densify_pixels(
     )
 }
 
+/// Per-patch affine approximation of the current→reference warp, for the photo
+/// weighting in the generic (distorted / per-patch-bearing) densify path. The
+/// exact warp (`warp_scaled_pixel`: bearing LUT + camera projection) is too
+/// expensive per output pixel; over an 8 px patch the warp is smooth, so we
+/// linearise it about the patch centre with three exact warps and evaluate the
+/// resulting affine map per pixel. Crucially the affine map is *linear in px*
+/// per row, so it fits `RowWarpCoeffs` (with `xr2 ≡ 1`, identity projection) and
+/// reuses the FastTranslation SIMD densify kernel unchanged.
+struct AffineWarp {
+    cu: f32,
+    cv: f32,
+    u0: f32,
+    v0: f32,
+    // (∂u_ref/∂px, ∂v_ref/∂px) and (∂u_ref/∂py, ∂v_ref/∂py).
+    juu: f32,
+    jvu: f32,
+    juv: f32,
+    jvv: f32,
+    valid: bool,
+}
+
+impl AffineWarp {
+    fn new(
+        cu: f64,
+        cv: f64,
+        rho: f64,
+        mapper: &PatchDepthMapper,
+        intr: &ScaledIntrinsics,
+        rel_pose: &RelativePose,
+    ) -> Self {
+        let warp = |u: f64, v: f64| {
+            mapper
+                .warp_scaled_pixel(u, v, rho, intr, rel_pose)
+                .map(|(ur, vr, _, _)| (ur, vr))
+        };
+        let invalid = Self {
+            cu: cu as f32,
+            cv: cv as f32,
+            u0: 0.0,
+            v0: 0.0,
+            juu: 0.0,
+            jvu: 0.0,
+            juv: 0.0,
+            jvv: 0.0,
+            valid: false,
+        };
+        let (Some((u0, v0)), Some((uu, vu)), Some((uv, vv))) =
+            (warp(cu, cv), warp(cu + 1.0, cv), warp(cu, cv + 1.0))
+        else {
+            return invalid;
+        };
+        Self {
+            cu: cu as f32,
+            cv: cv as f32,
+            u0: u0 as f32,
+            v0: v0 as f32,
+            juu: (uu - u0) as f32,
+            jvu: (vu - v0) as f32,
+            juv: (uv - u0) as f32,
+            jvv: (vv - v0) as f32,
+            valid: true,
+        }
+    }
+
+    /// Express the affine warp of one image row as a `RowWarpCoeffs`. With
+    /// `a[2]=0, b[2]=1` the kernel's `xr2` is constant 1 (so `z_inv≈1`) and
+    /// `fx_s=fy_s=1, cx_s=cy_s=0` makes the projection the identity, yielding
+    /// `u_ref = juu·px + b[0]`, `v_ref = jvu·px + b[1]`.
+    fn row_coeffs(&self, py: usize) -> RowWarpCoeffs {
+        let dpy = py as f32 - self.cv;
+        RowWarpCoeffs {
+            a: [self.juu, self.jvu, 0.0],
+            b: [
+                self.u0 - self.juu * self.cu + self.juv * dpy,
+                self.v0 - self.jvu * self.cu + self.jvv * dpy,
+                1.0,
+            ],
+            fx_s: 1.0,
+            fy_s: 1.0,
+            cx_s: 0.0,
+            cy_s: 0.0,
+        }
+    }
+}
+
 #[cfg(not(feature = "parallel"))]
 fn densify_pixels_generic(
     grid: &PatchGrid,
@@ -142,64 +231,153 @@ fn densify_pixels_generic(
     rel_pose: &RelativePose,
 ) -> PatchDepthOutput {
     let n = width * height;
-    let mut eta = vec![f32::NAN; n];
-    let mut eta_var = vec![f32::INFINITY; n];
-    let mut status = vec![PatchStatus::Unknown; n];
+    let mut eta_buf = vec![0.0_f32; n];
+    let mut w_buf = vec![0.0_f32; n];
+    let mut status_buf = vec![PatchStatus::Unknown; n];
 
-    for py in 0..height {
-        let (iv_start, iv_end) = grid.overlap_v(py);
-        if iv_start > iv_end {
-            continue;
-        }
-        for px in 0..width {
-            let (iu_start, iu_end) = grid.overlap_u(px);
-            if iu_start > iu_end {
+    let ref_w = ref_img.width();
+    let ref_h = ref_img.height();
+
+    #[cfg(target_arch = "x86_64")]
+    let use_avx2 =
+        std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma");
+    #[cfg(not(target_arch = "x86_64"))]
+    let use_avx2 = false;
+
+    let patch_size = 2 * grid.half;
+
+    for iv in 0..grid.n_v {
+        for iu in 0..grid.n_u {
+            let patch = grid.get(iu, iv);
+            let Some(inv_var_w) = patch.inv_var_weight_f32() else {
                 continue;
-            }
-            let mut eta_acc = 0.0_f32;
-            let mut w_acc = 0.0_f32;
-            let mut best_status = PatchStatus::Unknown;
-            for iv in iv_start..=iv_end {
-                for iu in iu_start..=iu_end {
-                    let patch = grid.get(iu, iv);
-                    let Some(inv_var_w) = patch.inv_var_weight_f32() else {
-                        continue;
-                    };
-                    let photo_w = if patch.status == PatchStatus::PhotoRefined {
-                        let cu = iu * grid.stride + grid.half;
-                        let cv = iv * grid.stride + grid.half;
-                        let range_per_z = mapper
-                            .bearing_for_scaled_pixel(cu as f64, cv as f64, intr)
-                            .map(|b| b.norm())
-                            .unwrap_or(1.0);
-                        let rho_center = range_per_z * (-patch.eta).exp();
-                        compute_photo_weight(
-                            px, py, rho_center, curr_img, curr_valid, ref_img, ref_valid, mapper,
-                            intr, rel_pose,
-                        )
-                    } else {
-                        1.0_f32
-                    };
-                    let w = inv_var_w * photo_w;
-                    eta_acc += w * patch.eta as f32;
-                    w_acc += w;
-                    if (patch.status as u8) > (best_status as u8) {
-                        best_status = patch.status;
+            };
+            let patch_eta_f32 = patch.eta as f32;
+            let weighted_eta = inv_var_w * patch_eta_f32;
+
+            let py_start = iv * grid.stride;
+            let py_end = (py_start + patch_size).min(height);
+            let px_start = iu * grid.stride;
+            let px_end = (px_start + patch_size).min(width);
+
+            // Patch-centre depth for the photo-weighting warp.
+            let cu = (iu * grid.stride + grid.half) as f64;
+            let cv = (iv * grid.stride + grid.half) as f64;
+            let range_per_z = mapper
+                .bearing_for_scaled_pixel(cu, cv, intr)
+                .map(|b| b.norm())
+                .unwrap_or(1.0);
+            let rho_center = range_per_z * (-patch.eta).exp();
+
+            let affine = if patch.status == PatchStatus::PhotoRefined {
+                AffineWarp::new(cu, cv, rho_center, mapper, intr, rel_pose)
+            } else {
+                AffineWarp {
+                    cu: cu as f32,
+                    cv: cv as f32,
+                    u0: 0.0,
+                    v0: 0.0,
+                    juu: 0.0,
+                    jvu: 0.0,
+                    juv: 0.0,
+                    jvv: 0.0,
+                    valid: false,
+                }
+            };
+
+            if affine.valid {
+                for py in py_start..py_end {
+                    let coeffs = affine.row_coeffs(py);
+                    let curr_row = &curr_img.as_slice()[py * curr_img.width()..];
+                    let valid_row = curr_valid.map(|v| &v.as_slice()[py * v.width()..]);
+                    let row_off = py * width;
+
+                    let mut px = px_start;
+
+                    #[cfg(target_arch = "x86_64")]
+                    if use_avx2 {
+                        while px + 8 <= px_end {
+                            unsafe {
+                                densify_row_avx2(
+                                    &coeffs,
+                                    px,
+                                    curr_row,
+                                    valid_row,
+                                    ref_img,
+                                    ref_valid,
+                                    ref_w,
+                                    ref_h,
+                                    inv_var_w,
+                                    patch_eta_f32,
+                                    &mut eta_buf[row_off..],
+                                    &mut w_buf[row_off..],
+                                    &mut status_buf[row_off..],
+                                    PatchStatus::PhotoRefined,
+                                );
+                            }
+                            px += 8;
+                        }
+                    }
+
+                    // Scalar tail (and the whole row on non-AVX2 targets).
+                    for px in px..px_end {
+                        let (u_ref, v_ref, _z_ref) = coeffs.warp(px as f32);
+                        let i_curr = curr_row[px];
+                        let photo_w = if u_ref >= 0.0
+                            && v_ref >= 0.0
+                            && u_ref < (ref_w - 1) as f32
+                            && v_ref < (ref_h - 1) as f32
+                            && valid_row.map(|vr| vr[px] >= 0.5).unwrap_or(true)
+                        {
+                            photo_weight_inline(
+                                i_curr,
+                                ref_img,
+                                ref_valid,
+                                u_ref as f64,
+                                v_ref as f64,
+                            )
+                        } else {
+                            1.0_f32
+                        };
+                        let w = inv_var_w * photo_w;
+                        let idx = row_off + px;
+                        eta_buf[idx] += w * patch_eta_f32;
+                        w_buf[idx] += w;
+                        if (patch.status as u8) > (status_buf[idx] as u8) {
+                            status_buf[idx] = patch.status;
+                        }
+                    }
+                }
+            } else {
+                // SeedOnly, or a degenerate warp: photo_w = 1, just accumulate.
+                for py in py_start..py_end {
+                    let row_off = py * width;
+                    for px in px_start..px_end {
+                        let idx = row_off + px;
+                        eta_buf[idx] += weighted_eta;
+                        w_buf[idx] += inv_var_w;
+                        if (patch.status as u8) > (status_buf[idx] as u8) {
+                            status_buf[idx] = patch.status;
+                        }
                     }
                 }
             }
-            if w_acc > 0.0 {
-                let idx = py * width + px;
-                eta[idx] = eta_acc / w_acc;
-                eta_var[idx] = 1.0 / w_acc;
-                status[idx] = best_status;
-            }
         }
     }
+
+    let mut eta = vec![f32::NAN; n];
+    let mut eta_var = vec![f32::INFINITY; n];
+    for i in 0..n {
+        if w_buf[i] > 0.0 {
+            eta[i] = eta_buf[i] / w_buf[i];
+            eta_var[i] = 1.0 / w_buf[i];
+        }
+    }
+
     PatchDepthOutput {
         eta: DepthMap::from_vec(width, height, eta).expect("eta size"),
         eta_var: DepthMap::from_vec(width, height, eta_var).expect("eta_var size"),
-        status: DepthMap::from_vec(width, height, status).expect("status size"),
+        status: DepthMap::from_vec(width, height, status_buf).expect("status size"),
     }
 }
 
@@ -1080,6 +1258,9 @@ fn densify_pixels_generic_parallel(
     }
 }
 
+// Only the `parallel` generic densify path still uses the per-pixel exact warp;
+// the scalar path now uses the per-patch affine approximation (`AffineWarp`).
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
 #[inline]
 fn compute_photo_weight(
     px: usize,

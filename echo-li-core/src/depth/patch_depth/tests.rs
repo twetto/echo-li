@@ -58,17 +58,23 @@ fn keyframe_buffer_uses_baseline_gate() {
     }];
 
     let img = textured_image();
-    assert!(mapper
-        .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
-        .is_none());
+    assert!(
+        mapper
+            .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
+            .is_none()
+    );
     assert_eq!(mapper.keyframe_count(), 1);
-    assert!(mapper
-        .update_with_priors(frame(1, 0.001, img.clone()), &seeds, None, 0.0)
-        .is_none());
+    assert!(
+        mapper
+            .update_with_priors(frame(1, 0.001, img.clone()), &seeds, None, 0.0)
+            .is_none()
+    );
     assert_eq!(mapper.keyframe_count(), 2);
-    assert!(mapper
-        .update_with_priors(frame(2, 0.02, img), &seeds, None, 0.0)
-        .is_some());
+    assert!(
+        mapper
+            .update_with_priors(frame(2, 0.02, img), &seeds, None, 0.0)
+            .is_some()
+    );
     assert_eq!(mapper.keyframe_count(), 2);
 }
 
@@ -87,18 +93,21 @@ fn seed_priors_produce_cell_depths() {
     }];
     let img = vec![120u8; 32 * 32];
 
-    assert!(mapper
-        .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
-        .is_none());
+    assert!(
+        mapper
+            .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
+            .is_none()
+    );
     let out = mapper
         .update_with_priors(frame(1, 0.02, img), &seeds, None, 0.0)
         .unwrap();
     // Output is log-range η; seed η = ln(2) so range = exp(η) ≈ 2.0.
-    assert!(out
-        .eta
-        .data
-        .iter()
-        .any(|e| e.is_finite() && (e.exp() - 2.0).abs() < 0.1));
+    assert!(
+        out.eta
+            .data
+            .iter()
+            .any(|e| e.is_finite() && (e.exp() - 2.0).abs() < 0.1)
+    );
     assert!(out.status.data.contains(&PatchStatus::SeedOnly));
 }
 
@@ -118,9 +127,11 @@ fn bearing_lut_handles_distorted_path_for_photometric_solve() {
     }];
     let img = textured_image();
 
-    assert!(mapper
-        .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
-        .is_none());
+    assert!(
+        mapper
+            .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
+            .is_none()
+    );
     let out = mapper
         .update_with_priors(frame(1, 0.02, img), &seeds, None, 0.0)
         .unwrap();
@@ -145,9 +156,11 @@ fn fast_translation_refines_undistorted_pinhole_patches() {
     }];
     let img = textured_image();
 
-    assert!(mapper
-        .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
-        .is_none());
+    assert!(
+        mapper
+            .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
+            .is_none()
+    );
     let out = mapper
         .update_with_priors(frame(1, 0.02, img), &seeds, None, 0.0)
         .unwrap();
@@ -174,9 +187,11 @@ fn fast_translation_refines_undistorted_pinhole_4x4_patches() {
     }];
     let img = textured_image();
 
-    assert!(mapper
-        .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
-        .is_none());
+    assert!(
+        mapper
+            .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
+            .is_none()
+    );
     let out = mapper
         .update_with_priors(frame(1, 0.02, img), &seeds, None, 0.0)
         .unwrap();
@@ -217,9 +232,11 @@ fn tiled_bearing_mode_runs_tile_local_update() {
     }];
     let img = textured_image();
 
-    assert!(mapper
-        .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
-        .is_none());
+    assert!(
+        mapper
+            .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
+            .is_none()
+    );
     let out = mapper
         .update_with_priors(frame(1, 0.02, img), &seeds, None, 0.0)
         .unwrap();
@@ -316,9 +333,10 @@ fn tiled_bearing_requires_fast_translation_warp() {
         Ok(_) => panic!("tiled_bearing should reject exact warp mode"),
         Err(err) => err,
     };
-    assert!(err
-        .to_string()
-        .contains("requires warp_mode=fast_translation"));
+    assert!(
+        err.to_string()
+            .contains("requires warp_mode=fast_translation")
+    );
 }
 
 #[test]
@@ -344,9 +362,11 @@ fn tiled_bearing_mode_runs_with_two_pyramid_levels() {
     }];
     let img = textured_image();
 
-    assert!(mapper
-        .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
-        .is_none());
+    assert!(
+        mapper
+            .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
+            .is_none()
+    );
     let out = mapper
         .update_with_priors(frame(1, 0.02, img), &seeds, None, 0.0)
         .unwrap();
@@ -377,9 +397,11 @@ fn per_patch_bearing_mode_runs() {
     }];
     let img = textured_image();
 
-    assert!(mapper
-        .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
-        .is_none());
+    assert!(
+        mapper
+            .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
+            .is_none()
+    );
     let out = mapper
         .update_with_priors(frame(1, 0.02, img), &seeds, None, 0.0)
         .unwrap();
@@ -853,13 +875,141 @@ fn structure_tensor_min_eigen_active_suppresses_all_depth_output() {
         eta_var: 0.04,
     }];
     let img = textured_image();
-    assert!(mapper
-        .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
-        .is_none());
+    assert!(
+        mapper
+            .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
+            .is_none()
+    );
     let out = mapper
         .update_with_priors(frame(1, 0.02, img), &seeds, None, 0.0)
         .unwrap();
     assert!(!out.status.data.contains(&PatchStatus::PhotoRefined));
     assert!(!out.status.data.contains(&PatchStatus::SeedOnly));
     assert!(out.status.data.iter().all(|s| *s == PatchStatus::Unknown));
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn per_patch_affine_simd_matches_scalar_leaf() {
+    use super::simd::{PerPatchAffineGeom, per_patch_affine_accum_avx2_if_available};
+    use rudolf_v::image::Image;
+
+    let (w, h) = (40usize, 40usize);
+    // Distinct smooth ramps for current, reference, and the reference gradients,
+    // so the leaf exercises non-trivial residuals and Jacobians.
+    let curr: Vec<f32> = (0..w * h)
+        .map(|i| {
+            let (x, y) = ((i % w) as f32, (i / w) as f32);
+            12.0 + 1.7 * x + 0.9 * y + 0.03 * x * y
+        })
+        .collect();
+    let ref_i: Vec<f32> = (0..w * h)
+        .map(|i| {
+            let (x, y) = ((i % w) as f32, (i / w) as f32);
+            8.0 + 2.1 * x - 0.6 * y + 0.05 * x * y
+        })
+        .collect();
+    let gx: Vec<f32> = (0..w * h)
+        .map(|i| {
+            let (x, y) = ((i % w) as f32, (i / w) as f32);
+            0.4 + 0.11 * x - 0.07 * y
+        })
+        .collect();
+    let gy: Vec<f32> = (0..w * h)
+        .map(|i| {
+            let (x, y) = ((i % w) as f32, (i / w) as f32);
+            -0.3 + 0.05 * x + 0.13 * y
+        })
+        .collect();
+    let curr_img = Image::from_vec(w, h, curr.clone());
+    let ref_img = Image::from_vec(w, h, ref_i.clone());
+    let gx_img = Image::from_vec(w, h, gx.clone());
+    let gy_img = Image::from_vec(w, h, gy.clone());
+    let stride = curr_img.stride();
+
+    let side = 8usize;
+    let raw_center = [20.0f64, 20.0];
+    let raw_du = [1.02f64, 0.06];
+    let raw_dv = [0.04f64, 0.98];
+    let curr_base_u = -3.5f64;
+    let curr_base_v = -4.0;
+    let ref_base_u = -2.2;
+    let ref_base_v = -3.1;
+    let cgx = 0.7f64;
+    let cgy = -0.45;
+    let inv_sigma = 0.25f64;
+    let delta = 6.0f64;
+
+    // Scalar reference: the exact inner-loop math of the affine leaf.
+    let (mut g, mut hh, mut sa, mut nv) = (0.0f64, 0.0f64, 0.0f64, 0usize);
+    for ly in 0..side {
+        for lx in 0..side {
+            let cu = raw_center[0]
+                + raw_du[0] * (curr_base_u + lx as f64)
+                + raw_dv[0] * (curr_base_v + ly as f64);
+            let cv = raw_center[1]
+                + raw_du[1] * (curr_base_u + lx as f64)
+                + raw_dv[1] * (curr_base_v + ly as f64);
+            let ru = raw_center[0]
+                + raw_du[0] * (ref_base_u + lx as f64)
+                + raw_dv[0] * (ref_base_v + ly as f64);
+            let rv = raw_center[1]
+                + raw_du[1] * (ref_base_u + lx as f64)
+                + raw_dv[1] * (ref_base_v + ly as f64);
+            let Some(i_curr) = super::sample_bilinear_raw_nomask_slice(&curr, w, h, stride, cu, cv)
+            else {
+                continue;
+            };
+            let Some((i_ref, rgx, rgy)) = super::sample_bilinear_raw_nomask_with_grad_slice(
+                &ref_i, &gx, &gy, w, h, stride, ru, rv,
+            ) else {
+                continue;
+            };
+            let jac = rgx as f64 * cgx + rgy as f64 * cgy;
+            let residual = i_ref as f64 - i_curr as f64;
+            let ar = residual.abs();
+            let weight = if ar <= delta {
+                inv_sigma
+            } else {
+                inv_sigma * delta / ar
+            };
+            g += weight * jac * residual;
+            hh += weight * jac * jac;
+            sa += ar;
+            nv += 1;
+        }
+    }
+
+    let accum = per_patch_affine_accum_avx2_if_available(
+        &curr_img,
+        &ref_img,
+        &gx_img,
+        &gy_img,
+        side,
+        PerPatchAffineGeom {
+            raw_center: [raw_center[0] as f32, raw_center[1] as f32],
+            raw_du: [raw_du[0] as f32, raw_du[1] as f32],
+            raw_dv: [raw_dv[0] as f32, raw_dv[1] as f32],
+            curr_base_u: curr_base_u as f32,
+            curr_base_v: curr_base_v as f32,
+            ref_base_u: ref_base_u as f32,
+            ref_base_v: ref_base_v as f32,
+            cgx: cgx as f32,
+            cgy: cgy as f32,
+        },
+        inv_sigma as f32,
+        delta as f32,
+    )
+    .expect("avx2 leaf available on x86_64 test host");
+
+    assert_eq!(accum.n_valid, nv, "valid-pixel count must match scalar");
+    let rel = |a: f64, b: f64| (a - b).abs() / b.abs().max(1.0);
+    assert!(rel(accum.grad, g) < 2e-3, "grad {} vs {}", accum.grad, g);
+    assert!(rel(accum.hess, hh) < 2e-3, "hess {} vs {}", accum.hess, hh);
+    assert!(
+        rel(accum.sum_abs_res, sa) < 2e-3,
+        "sum_abs {} vs {}",
+        accum.sum_abs_res,
+        sa
+    );
 }
