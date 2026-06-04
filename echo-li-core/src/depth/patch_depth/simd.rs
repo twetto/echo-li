@@ -82,9 +82,10 @@ pub(super) struct PerPatchAffineGeom {
     pub cgy: f32,
 }
 
-/// SIMD path for the per-patch affine leaf. Only valid for constant photometric
-/// weight (`sigma_warp_sq == 0`, mirroring the FastTranslation SIMD precondition)
-/// and `side` a multiple of 8. Returns `None` to fall back to the scalar loop.
+/// SIMD path for the per-patch affine leaf. Computes the σ_eff² photometric
+/// weight (`σ_photo² + ‖∇I‖²·σ_warp²`) per lane, so it handles both constant
+/// (`sigma_warp_sq == 0`) and gradient-dependent weighting. Requires `side` a
+/// multiple of 8; returns `None` to fall back to the scalar loop.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn per_patch_affine_accum_avx2_if_available(
     curr_img: &Image<f32>,
@@ -93,7 +94,8 @@ pub(super) fn per_patch_affine_accum_avx2_if_available(
     ref_grad_y: &Image<f32>,
     side: usize,
     geom: PerPatchAffineGeom,
-    inv_sigma_photo_sq: f32,
+    sigma_photo_sq: f32,
+    sigma_warp_sq: f32,
     huber_delta: f32,
 ) -> Option<PatchAccum> {
     if side % 8 != 0 || side == 0 {
@@ -130,7 +132,8 @@ pub(super) fn per_patch_affine_accum_avx2_if_available(
             stride,
             side,
             geom,
-            inv_sigma_photo_sq,
+            sigma_photo_sq,
+            sigma_warp_sq,
             huber_delta,
         ))
     }
@@ -148,13 +151,14 @@ unsafe fn per_patch_affine_accum_avx2(
     stride: usize,
     side: usize,
     geom: PerPatchAffineGeom,
-    inv_sigma_photo_sq: f32,
+    sigma_photo_sq: f32,
+    sigma_warp_sq: f32,
     huber_delta: f32,
 ) -> PatchAccum {
     use std::arch::x86_64::{
         _CMP_LE_OQ, _mm256_add_ps, _mm256_and_ps, _mm256_andnot_ps, _mm256_blendv_ps,
-        _mm256_cmp_ps, _mm256_div_ps, _mm256_fmadd_ps, _mm256_movemask_ps, _mm256_mul_ps,
-        _mm256_set1_ps, _mm256_setr_ps, _mm256_setzero_ps, _mm256_sub_ps,
+        _mm256_cmp_ps, _mm256_div_ps, _mm256_fmadd_ps, _mm256_max_ps, _mm256_movemask_ps,
+        _mm256_mul_ps, _mm256_set1_ps, _mm256_setr_ps, _mm256_setzero_ps, _mm256_sub_ps,
     };
 
     unsafe {
@@ -165,14 +169,17 @@ unsafe fn per_patch_affine_accum_avx2(
         let v_hm1 = _mm256_set1_ps((height - 1) as f32);
         let v_xmax = _mm256_set1_ps((width - 2) as f32);
         let v_ymax = _mm256_set1_ps((height - 2) as f32);
-        let v_inv_sigma = _mm256_set1_ps(inv_sigma_photo_sq);
         let v_delta = _mm256_set1_ps(huber_delta);
-        let v_delta_inv_sigma = _mm256_set1_ps(huber_delta * inv_sigma_photo_sq);
         let v_abs_mask = _mm256_set1_ps(-0.0);
+        let v_sigma_photo = _mm256_set1_ps(sigma_photo_sq);
+        let v_sigma_warp = _mm256_set1_ps(sigma_warp_sq);
+        let v_eps = _mm256_set1_ps(1e-12);
         let v_cgx = _mm256_set1_ps(geom.cgx);
         let v_cgy = _mm256_set1_ps(geom.cgy);
         let v_rdu_u = _mm256_set1_ps(geom.raw_du[0]);
         let v_rdu_v = _mm256_set1_ps(geom.raw_du[1]);
+        let v_rdv_u = _mm256_set1_ps(geom.raw_dv[0]);
+        let v_rdv_v = _mm256_set1_ps(geom.raw_dv[1]);
 
         let curr_ptr = curr.as_ptr();
         let ref_ptr = ref_i.as_ptr();
@@ -226,14 +233,25 @@ unsafe fn per_patch_affine_accum_avx2(
                     bilinear_gather8(gy_ptr, ref_u, ref_v, stride, v_zero, v_one, v_xmax, v_ymax);
 
                 let jac = _mm256_fmadd_ps(raw_gy, v_cgy, _mm256_mul_ps(raw_gx, v_cgx));
+                // Per-lane σ_eff² = σ_photo² + ‖∇I‖²·σ_warp². ‖∇I‖² is taken in
+                // the patch tangent frame (rotate the raw gradient by the affine
+                // basis), matching the scalar `photo_inv_sigma_eff_sq`. With
+                // σ_warp²==0 this reduces exactly to the constant 1/σ_photo².
+                let gx = _mm256_fmadd_ps(raw_gy, v_rdu_v, _mm256_mul_ps(raw_gx, v_rdu_u));
+                let gy = _mm256_fmadd_ps(raw_gy, v_rdv_v, _mm256_mul_ps(raw_gx, v_rdv_u));
+                let grad_i_sq = _mm256_fmadd_ps(gy, gy, _mm256_mul_ps(gx, gx));
+                let sigma_eff_sq = _mm256_max_ps(
+                    _mm256_fmadd_ps(grad_i_sq, v_sigma_warp, v_sigma_photo),
+                    v_eps,
+                );
+                let inv_sigma_eff = _mm256_div_ps(v_one, sigma_eff_sq);
                 let residual = _mm256_sub_ps(i_ref, i_curr);
                 let abs_res = _mm256_andnot_ps(v_abs_mask, residual);
                 let huber_mask = _mm256_cmp_ps(abs_res, v_delta, _CMP_LE_OQ);
-                let robust = _mm256_blendv_ps(
-                    _mm256_div_ps(v_delta_inv_sigma, abs_res),
-                    v_inv_sigma,
-                    huber_mask,
-                );
+                // Huber factor: |r|≤δ → 1, else δ/|r|; weight = inv_sigma_eff·factor.
+                let huber_factor =
+                    _mm256_blendv_ps(_mm256_div_ps(v_delta, abs_res), v_one, huber_mask);
+                let robust = _mm256_mul_ps(inv_sigma_eff, huber_factor);
                 // Zero out the contribution of out-of-bounds lanes.
                 let valid_f = _mm256_and_ps(valid, v_one);
                 let robust = _mm256_mul_ps(robust, valid_f);

@@ -572,10 +572,10 @@ impl PatchDepthMapper {
         let ref_base_u = tile.x0 as f64 + u_ref_center - half as f64 - affine.center_u;
         let ref_base_v = tile.y0 as f64 + v_ref_center - half as f64 - affine.center_v;
 
-        // SIMD leaf: constant photometric weight only (sigma_warp_sq == 0), the
-        // same precondition as FastTranslation's AVX2 path.
+        // SIMD leaf: computes the σ_eff² weight per lane, so it serves both the
+        // constant (sigma_warp_sq == 0) and gradient-dependent cases.
         #[cfg(target_arch = "x86_64")]
-        if let Some(inv_sigma_photo_sq) = constant_inv_sigma_photo_sq {
+        {
             // The reference Jacobian raw_gx·cgx + raw_gy·cgy folds the gradient
             // rotation (raw→tangent) and the tangent→η chain into two scalars.
             let cgx = raw_du_x * du_deta + raw_dv_x * dv_deta;
@@ -597,7 +597,8 @@ impl PatchDepthMapper {
                     cgx: cgx as f32,
                     cgy: cgy as f32,
                 },
-                inv_sigma_photo_sq as f32,
+                sigma_photo_sq as f32,
+                sigma_warp_sq as f32,
                 self.settings.photo_huber_delta as f32,
             ) {
                 return (accum.grad, accum.hess, accum.sum_abs_res, accum.n_valid);

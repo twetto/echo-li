@@ -937,79 +937,111 @@ fn per_patch_affine_simd_matches_scalar_leaf() {
     let ref_base_v = -3.1;
     let cgx = 0.7f64;
     let cgy = -0.45;
-    let inv_sigma = 0.25f64;
+    let sigma_photo_sq = 4.0f64;
     let delta = 6.0f64;
 
-    // Scalar reference: the exact inner-loop math of the affine leaf.
-    let (mut g, mut hh, mut sa, mut nv) = (0.0f64, 0.0f64, 0.0f64, 0usize);
-    for ly in 0..side {
-        for lx in 0..side {
-            let cu = raw_center[0]
-                + raw_du[0] * (curr_base_u + lx as f64)
-                + raw_dv[0] * (curr_base_v + ly as f64);
-            let cv = raw_center[1]
-                + raw_du[1] * (curr_base_u + lx as f64)
-                + raw_dv[1] * (curr_base_v + ly as f64);
-            let ru = raw_center[0]
-                + raw_du[0] * (ref_base_u + lx as f64)
-                + raw_dv[0] * (ref_base_v + ly as f64);
-            let rv = raw_center[1]
-                + raw_du[1] * (ref_base_u + lx as f64)
-                + raw_dv[1] * (ref_base_v + ly as f64);
-            let Some(i_curr) = super::sample_bilinear_raw_nomask_slice(&curr, w, h, stride, cu, cv)
-            else {
-                continue;
-            };
-            let Some((i_ref, rgx, rgy)) = super::sample_bilinear_raw_nomask_with_grad_slice(
-                &ref_i, &gx, &gy, w, h, stride, ru, rv,
-            ) else {
-                continue;
-            };
-            let jac = rgx as f64 * cgx + rgy as f64 * cgy;
-            let residual = i_ref as f64 - i_curr as f64;
-            let ar = residual.abs();
-            let weight = if ar <= delta {
-                inv_sigma
-            } else {
-                inv_sigma * delta / ar
-            };
-            g += weight * jac * residual;
-            hh += weight * jac * jac;
-            sa += ar;
-            nv += 1;
+    // Scalar reference: the exact inner-loop math of the affine leaf, including
+    // the σ_eff² = σ_photo² + ‖∇I‖²·σ_warp² photometric weight.
+    let ref_accum = |sigma_warp_sq: f64| {
+        let (mut g, mut hh, mut sa, mut nv) = (0.0f64, 0.0f64, 0.0f64, 0usize);
+        for ly in 0..side {
+            for lx in 0..side {
+                let cu = raw_center[0]
+                    + raw_du[0] * (curr_base_u + lx as f64)
+                    + raw_dv[0] * (curr_base_v + ly as f64);
+                let cv = raw_center[1]
+                    + raw_du[1] * (curr_base_u + lx as f64)
+                    + raw_dv[1] * (curr_base_v + ly as f64);
+                let ru = raw_center[0]
+                    + raw_du[0] * (ref_base_u + lx as f64)
+                    + raw_dv[0] * (ref_base_v + ly as f64);
+                let rv = raw_center[1]
+                    + raw_du[1] * (ref_base_u + lx as f64)
+                    + raw_dv[1] * (ref_base_v + ly as f64);
+                let Some(i_curr) =
+                    super::sample_bilinear_raw_nomask_slice(&curr, w, h, stride, cu, cv)
+                else {
+                    continue;
+                };
+                let Some((i_ref, rgx, rgy)) = super::sample_bilinear_raw_nomask_with_grad_slice(
+                    &ref_i, &gx, &gy, w, h, stride, ru, rv,
+                ) else {
+                    continue;
+                };
+                let jac = rgx as f64 * cgx + rgy as f64 * cgy;
+                // Tangent-frame gradient (affine basis), matching the leaf.
+                let tgx = rgx as f64 * raw_du[0] + rgy as f64 * raw_du[1];
+                let tgy = rgx as f64 * raw_dv[0] + rgy as f64 * raw_dv[1];
+                let grad_i_sq = tgx * tgx + tgy * tgy;
+                let inv_sigma_eff = 1.0 / (sigma_photo_sq + grad_i_sq * sigma_warp_sq).max(1e-12);
+                let residual = i_ref as f64 - i_curr as f64;
+                let ar = residual.abs();
+                let weight = if ar <= delta {
+                    inv_sigma_eff
+                } else {
+                    inv_sigma_eff * delta / ar
+                };
+                g += weight * jac * residual;
+                hh += weight * jac * jac;
+                sa += ar;
+                nv += 1;
+            }
         }
-    }
+        (g, hh, sa, nv)
+    };
 
-    let accum = per_patch_affine_accum_avx2_if_available(
-        &curr_img,
-        &ref_img,
-        &gx_img,
-        &gy_img,
-        side,
-        PerPatchAffineGeom {
-            raw_center: [raw_center[0] as f32, raw_center[1] as f32],
-            raw_du: [raw_du[0] as f32, raw_du[1] as f32],
-            raw_dv: [raw_dv[0] as f32, raw_dv[1] as f32],
-            curr_base_u: curr_base_u as f32,
-            curr_base_v: curr_base_v as f32,
-            ref_base_u: ref_base_u as f32,
-            ref_base_v: ref_base_v as f32,
-            cgx: cgx as f32,
-            cgy: cgy as f32,
-        },
-        inv_sigma as f32,
-        delta as f32,
-    )
-    .expect("avx2 leaf available on x86_64 test host");
+    let check = |sigma_warp_sq: f64| {
+        let (g, hh, sa, nv) = ref_accum(sigma_warp_sq);
+        let accum = per_patch_affine_accum_avx2_if_available(
+            &curr_img,
+            &ref_img,
+            &gx_img,
+            &gy_img,
+            side,
+            PerPatchAffineGeom {
+                raw_center: [raw_center[0] as f32, raw_center[1] as f32],
+                raw_du: [raw_du[0] as f32, raw_du[1] as f32],
+                raw_dv: [raw_dv[0] as f32, raw_dv[1] as f32],
+                curr_base_u: curr_base_u as f32,
+                curr_base_v: curr_base_v as f32,
+                ref_base_u: ref_base_u as f32,
+                ref_base_v: ref_base_v as f32,
+                cgx: cgx as f32,
+                cgy: cgy as f32,
+            },
+            sigma_photo_sq as f32,
+            sigma_warp_sq as f32,
+            delta as f32,
+        )
+        .expect("avx2 leaf available on x86_64 test host");
 
-    assert_eq!(accum.n_valid, nv, "valid-pixel count must match scalar");
-    let rel = |a: f64, b: f64| (a - b).abs() / b.abs().max(1.0);
-    assert!(rel(accum.grad, g) < 2e-3, "grad {} vs {}", accum.grad, g);
-    assert!(rel(accum.hess, hh) < 2e-3, "hess {} vs {}", accum.hess, hh);
-    assert!(
-        rel(accum.sum_abs_res, sa) < 2e-3,
-        "sum_abs {} vs {}",
-        accum.sum_abs_res,
-        sa
-    );
+        assert_eq!(
+            accum.n_valid, nv,
+            "valid-pixel count must match scalar (sigma_warp_sq={sigma_warp_sq})"
+        );
+        let rel = |a: f64, b: f64| (a - b).abs() / b.abs().max(1.0);
+        assert!(
+            rel(accum.grad, g) < 2e-3,
+            "grad {} vs {} (sigma_warp_sq={sigma_warp_sq})",
+            accum.grad,
+            g
+        );
+        assert!(
+            rel(accum.hess, hh) < 2e-3,
+            "hess {} vs {} (sigma_warp_sq={sigma_warp_sq})",
+            accum.hess,
+            hh
+        );
+        assert!(
+            rel(accum.sum_abs_res, sa) < 2e-3,
+            "sum_abs {} vs {} (sigma_warp_sq={sigma_warp_sq})",
+            accum.sum_abs_res,
+            sa
+        );
+    };
+
+    // Constant-weight path (regression vs the original behavior) and the
+    // gradient-dependent σ_eff² path.
+    check(0.0);
+    check(0.5);
 }
