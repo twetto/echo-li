@@ -2608,6 +2608,21 @@ impl PatchDepthMapper {
         let eta_init = (seed_eta_sum / seed_weight_total).clamp(eta_min, eta_max);
         let seed_var = 1.0 / (seed_precision_sum * self.settings.lambda_seed).max(1e-12);
 
+        // Structure gate (parity with solve_one_patch): reject patches whose
+        // keyframe gradient structure tensor is too weak / ill-conditioned along
+        // the epipolar direction before paying for the GN refinement. No-op when
+        // min_structure_eigen and max_structure_condition are both ≤ 0.
+        if !self.patch_has_enough_structure(
+            cu,
+            cv,
+            eta_init,
+            ref_keyframe,
+            &intrinsics_by_level[0],
+            rel_pose,
+        ) {
+            return PatchEstimate::rejected(eta_init);
+        }
+
         // One per-patch tangent tile, centred on the patch and shared by the
         // current and keyframe rectifications. Current and reference MUST use the
         // same tangent basis — FastTranslation's translated square assumes the two
