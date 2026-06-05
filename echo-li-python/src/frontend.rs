@@ -1,5 +1,6 @@
 use echo_li_core::config::VIOConfig;
-use numpy::{PyReadonlyArray2, PyUntypedArrayMethods};
+use numpy::ndarray::Array2;
+use numpy::{PyArray2, PyReadonlyArray2, PyUntypedArrayMethods};
 use pyo3::prelude::*;
 use rudolf_v::camera::CameraIntrinsics;
 use rudolf_v::frontend::{self, Frontend, LbpPolicy};
@@ -256,6 +257,33 @@ impl PyFrontend {
             meta_list.append(dict)?;
         }
         Ok(meta_list)
+    }
+
+    fn preprocessed_image<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Option<Bound<'py, PyArray2<u8>>>> {
+        let Some(img) = self.inner.preprocessed_image() else {
+            return Ok(None);
+        };
+
+        let width = img.width();
+        let height = img.height();
+        let stride = img.stride();
+        let src = img.as_slice();
+        let data = if stride == width {
+            src[..width * height].to_vec()
+        } else {
+            let mut compact = Vec::with_capacity(width * height);
+            for y in 0..height {
+                let row = &src[y * stride..y * stride + width];
+                compact.extend_from_slice(row);
+            }
+            compact
+        };
+        let arr = Array2::from_shape_vec((height, width), data)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        Ok(Some(PyArray2::from_owned_array(py, arr)))
     }
 
     fn __repr__(&self) -> String {
