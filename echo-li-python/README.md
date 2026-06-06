@@ -25,6 +25,16 @@ For the trajectory visualizer (optional):
 pip install pyqtgraph PyQt6 PyOpenGL
 ```
 
+## Testing
+
+```bash
+pip install '.[dev]'              # builds the extension + adds pytest/scipy/matplotlib
+pytest echo-li-python/tests/     # run from the repo root, not from echo-li-python/
+```
+
+Run from the repo root so the installed wheel is imported; the flat `echo_li/`
+source dir otherwise shadows it.
+
 ## Usage
 
 ```python

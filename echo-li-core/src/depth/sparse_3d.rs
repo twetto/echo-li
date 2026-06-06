@@ -72,13 +72,20 @@ impl FeatureState3D {
         (h_range * self.covariance * h_range.transpose())[(0, 0)]
     }
 
+    /// Covariance in Euclidean camera-frame coordinates.
+    ///
+    /// The filter stores `covariance` in chart coordinates; this maps it to a
+    /// 3x3 Euclidean covariance via the chart->Euclidean Jacobian, so consumers
+    /// (e.g. NEES diagnostics) can score the estimate without reimplementing the
+    /// chart conversion.
+    pub fn covariance_euclidean(&self, chart: Sparse3DChart) -> Matrix3<f64> {
+        let j = chart_to_euc_jac(chart, &self.position);
+        j * self.covariance * j.transpose()
+    }
+
     pub fn inlier_ratio(&self) -> f64 {
         let ab = self.a + self.b;
-        if ab <= 0.0 {
-            0.0
-        } else {
-            self.a / ab
-        }
+        if ab <= 0.0 { 0.0 } else { self.a / ab }
     }
 }
 
@@ -338,6 +345,10 @@ impl Sparse3DFilter {
 
     pub fn feature_count(&self) -> usize {
         self.features.len()
+    }
+
+    pub fn chart(&self) -> Sparse3DChart {
+        self.chart
     }
 
     fn insert_feature(&mut self, feat: FeatureState3D) {

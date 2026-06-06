@@ -8,6 +8,9 @@ version = "0.1.0"
 requires-python = ">=3.9"
 dependencies = ["numpy"]
 
+[project.optional-dependencies]
+dev = ["pytest", "scipy", "matplotlib"]
+
 [tool.maturin]
 features = ["pyo3/extension-module"]
 module-name = "echo_li._echo_li"
