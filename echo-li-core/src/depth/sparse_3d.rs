@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
-use nalgebra::{Matrix2, Matrix2x3, Matrix3, Matrix4, Vector2, Vector3};
+use echo_lie::SOT3;
+use nalgebra::{Matrix2, Matrix2x3, Matrix3, Matrix4, Vector2, Vector3, Vector4};
 
+use crate::coordinate_suite::base_skew;
 use crate::coordinate_suite::invdepth::{conv_euc2ind, conv_ind2euc, point_chart_invdepth_inv};
 use crate::coordinate_suite::normal::{conv_euc2normal, conv_normal2euc, point_chart_normal_inv};
 use crate::depth::sparse_gb::SparseVogSettings;
@@ -23,12 +25,21 @@ struct PendingFeature {
 #[derive(Debug, Clone)]
 pub struct FeatureState3D {
     pub feat_id: u64,
+    // Cached estimate in the CURRENT camera frame, refreshed after every update.
+    // Kept for the public API / queries (depth_for_chart etc. read these).
     pub position: Vector3<f64>,
     pub covariance: Matrix3<f64>,
+    // --- True IEKF state (source of truth) ---
+    // Landmark fixed in its anchor camera frame; the group element x carries all
+    // refinement so the error coordinates never need re-centring (no re-anchor).
+    pub q0: Vector3<f64>,          // anchor-frame landmark (fixed origin)
+    pub x: SOT3,                   // group refinement; q_hat_anchor = x^{-1} . q0
+    pub sigma: Matrix3<f64>,       // covariance in Euclidean error coords about q0
+    pub anchor_t_wc: Matrix4<f64>, // camera->world pose at the anchor (creation) frame
+    // --- Gaussian-Beta inlier model + bookkeeping ---
     pub a: f64,
     pub b: f64,
     pub track_length: usize,
-    pub ref_t_wc: Matrix4<f64>,
     pub ref_uv: Vector2<f64>,
     pub ref_stamp: f64,
 }
@@ -149,9 +160,6 @@ impl Sparse3DFilter {
 
         let dt = (stamp - self.prev_stamp).max(0.0);
         let t_cw_curr = t_wc.try_inverse().unwrap_or_else(Matrix4::identity);
-        let t_curr_prev = t_cw_curr * prev_t_wc;
-        let r = t_curr_prev.fixed_view::<3, 3>(0, 0).into_owned();
-        let t = t_curr_prev.fixed_view::<3, 1>(0, 3).into_owned();
 
         #[cfg(feature = "parallel")]
         let reset_features: Vec<_> = {
@@ -168,10 +176,8 @@ impl Sparse3DFilter {
                         return None;
                     }
                     let uv_curr = curr_uvs.get(&fid)?;
-                    (!update_existing_feature_3d(
-                        chart, &k, &settings, feat, uv_curr, &r, &t, p_vv, dt,
-                    ))
-                    .then_some(fid)
+                    (!iekf_update_3d(chart, &k, &settings, feat, uv_curr, &t_cw_curr))
+                        .then_some(fid)
                 })
                 .collect()
         };
@@ -189,16 +195,13 @@ impl Sparse3DFilter {
                     continue;
                 };
 
-                if !update_existing_feature_3d(
+                if !iekf_update_3d(
                     self.chart,
                     &self.k,
                     &self.settings,
                     feat,
                     uv_curr,
-                    &r,
-                    &t,
-                    p_vv,
-                    dt,
+                    &t_cw_curr,
                 ) {
                     reset_features.push(fid);
                 }
@@ -253,6 +256,9 @@ impl Sparse3DFilter {
 
             let baseline_tau_sq =
                 baseline_tau(p_vv, &t_ref, (stamp - pending.ref_stamp).max(dt), dt);
+            // Anchor the landmark in the CURRENT camera frame (= anchor frame);
+            // the IEKF group element x (init identity) carries all later
+            // refinement, so we never re-anchor. q0 is the fixed origin.
             let position = position_from_depth(&self.k, &uv_curr, z_obs);
             let covariance = init_cov_3d(
                 self.chart,
@@ -263,18 +269,26 @@ impl Sparse3DFilter {
                 drive,
                 baseline_tau_sq,
             );
-            let mut feat = FeatureState3D {
+            // IEKF covariance lives in Euclidean error coords about q0. At
+            // creation x = id and the anchor frame is the current frame, so the
+            // Euclidean init cov is the chart cov mapped back through the chart
+            // Jacobian (chart_to_euc . cov . chart_to_euc^T).
+            let j_c2e = chart_to_euc_jac(self.chart, &position);
+            let sigma = j_c2e * covariance * j_c2e.transpose();
+            let feat = FeatureState3D {
                 feat_id: fid,
                 position,
                 covariance,
+                q0: position,
+                x: SOT3::identity(),
+                sigma,
+                anchor_t_wc: *t_wc,
                 a: self.settings.a_init,
                 b: self.settings.b_init,
                 track_length: 1,
-                ref_t_wc: *t_wc,
                 ref_uv: uv_curr,
                 ref_stamp: stamp,
             };
-            bearing_update_3d(self.chart, &self.k, &self.settings, &mut feat, &uv_curr);
             self.insert_feature(feat);
             self.pending.remove(&fid);
         }
@@ -401,22 +415,141 @@ fn apply_chart_delta(chart: Sparse3DChart, q: &Vector3<f64>, delta: &Vector3<f64
     }
 }
 
-fn update_existing_feature_3d(
+/// True IEKF measurement update for one landmark.
+///
+/// The landmark is static in its anchor frame; the group element `x` carries all
+/// refinement and the covariance `sigma` lives in fixed Euclidean error coords
+/// about the origin `q0` (never re-charted -> the IEKF consistency property).
+/// The known relative pose anchor->current is folded into the measurement model.
+fn iekf_update_3d(
     chart: Sparse3DChart,
     k: &Matrix3<f64>,
     settings: &SparseVogSettings,
     feat: &mut FeatureState3D,
-    uv_curr: &Vector2<f64>,
-    r: &Matrix3<f64>,
-    t: &Vector3<f64>,
-    p_vv: Option<&Matrix3<f64>>,
-    dt: f64,
+    uv_obs: &Vector2<f64>,
+    t_cw_curr: &Matrix4<f64>,
 ) -> bool {
-    predict_feature_3d(chart, settings, feat, r, t, p_vv, dt);
-    if !bearing_update_3d(chart, k, settings, feat, uv_curr) {
+    let fx = k[(0, 0)];
+    let fy = k[(1, 1)];
+    let cx = k[(0, 2)];
+    let cy = k[(1, 2)];
+
+    // Known relative pose anchor -> current camera.
+    let t_ca = t_cw_curr * feat.anchor_t_wc;
+    let r_ca = t_ca.fixed_view::<3, 3>(0, 0).into_owned();
+    let t_ca_t = t_ca.fixed_view::<3, 1>(0, 3).into_owned();
+
+    // Lift: euclid error eps(3) -> sot(3) algebra (4D = [omega(3), log-scale(1)])
+    // at the origin q0. This is the same map used for the group update below, so
+    // the (numerical) output Jacobian is guaranteed consistent with it.
+    let q0 = feat.q0;
+    let q0n2 = q0.norm_squared();
+    let m2g_top = -base_skew(&q0) / q0n2;
+    let m2g_bot = (-q0 / q0n2).transpose();
+    let lift = |g: &Vector3<f64>| {
+        let wo = m2g_top * g;
+        let ws = (m2g_bot * g)[(0, 0)];
+        Vector4::new(wo[0], wo[1], wo[2], ws)
+    };
+    let q_hat_a_of = |x: &SOT3| x.act_inverse(&q0);
+    // d q_hat_a / d eps via central differences of the actual group map.
+    let dq_hat_a = |x: &SOT3| {
+        let h = 1e-6;
+        let mut m = Matrix3::zeros();
+        for j in 0..3 {
+            let mut dg = Vector3::zeros();
+            dg[j] = h;
+            let qp = x.compose(&SOT3::exp(&lift(&dg))).act_inverse(&q0);
+            let qm = x.compose(&SOT3::exp(&lift(&(-dg)))).act_inverse(&q0);
+            m.set_column(j, &((qp - qm) / (2.0 * h)));
+        }
+        m
+    };
+
+    let q_hat_a = q_hat_a_of(&feat.x);
+    let q_hat_c = r_ca * q_hat_a + t_ca_t;
+    if q_hat_c[2] < settings.min_depth {
         return false;
     }
+    let zc = q_hat_c[2];
+    let y_pred = Vector2::new(fx * q_hat_c[0] / zc + cx, fy * q_hat_c[1] / zc + cy);
+    let innovation = uv_obs - y_pred;
+
+    // Output matrix C = d(pixel)/d eps = proj_jac(q_hat_c) . R_ca . (d q_hat_a/d eps)
+    let proj = Matrix2x3::new(
+        fx / zc,
+        0.0,
+        -fx * q_hat_c[0] / (zc * zc),
+        0.0,
+        fy / zc,
+        -fy * q_hat_c[1] / (zc * zc),
+    );
+    let c = proj * r_ca * dq_hat_a(&feat.x);
+
+    let r_meas = Matrix2::identity() * settings.sigma_pixel.powi(2);
+    let s = c * feat.sigma * c.transpose() + r_meas;
+    let Some(s_inv) = (s + Matrix2::identity() * 1e-8).try_inverse() else {
+        return true;
+    };
+    let det_s = s.determinant();
+    if det_s < 1e-30 {
+        return true;
+    }
+    let maha_sq = (innovation.transpose() * s_inv * innovation)[(0, 0)];
+    if settings.mahalanobis_reset_chi2 > 0.0 && maha_sq > settings.mahalanobis_reset_chi2 {
+        return false;
+    }
+    let gain = feat.sigma * c.transpose() * s_inv;
+
+    // Gaussian-Beta inlier weighting.
+    let gauss_pdf = (-0.5 * maha_sq).exp() / ((2.0 * std::f64::consts::PI).powi(2) * det_s).sqrt();
+    let uniform_prior = 1.0 / (fx * fy * 4.0);
+    let ab = feat.a + feat.b;
+    if ab <= 0.0 {
+        return true;
+    }
+    let c1 = (feat.a / ab) * gauss_pdf;
+    let c2 = (feat.b / ab) * uniform_prior;
+    let z_norm = c1 + c2;
+    if z_norm < 1e-30 {
+        feat.b = (feat.b + 1.0).min(settings.ab_max);
+        return true;
+    }
+    let w1 = c1 / z_norm;
+    let w2 = c2 / z_norm;
+
+    let full_delta = gain * innovation; // 3D euclid error correction
+    let gamma = w1 * full_delta;
+
+    let i_kc = Matrix3::identity() - gain * c;
+    let p_kalman = i_kc * feat.sigma * i_kc.transpose() + gain * r_meas * gain.transpose();
+    let sigma_new =
+        w1 * p_kalman + w2 * feat.sigma + w1 * w2 * (full_delta * full_delta.transpose());
+    if sigma_new
+        .symmetric_eigen()
+        .eigenvalues
+        .iter()
+        .any(|v| *v <= 0.0 || !v.is_finite())
+    {
+        return true;
+    }
+
+    // Group update: x <- x . exp(lift(gamma)). sigma stays in the fixed q0 error
+    // frame (no re-charting) -- this is what makes it a consistent IEKF.
+    feat.x = feat.x.compose(&SOT3::exp(&lift(&gamma)));
+    feat.sigma = 0.5 * (sigma_new + sigma_new.transpose());
     feat.track_length += 1;
+    update_beta(settings, feat, w1, w2);
+
+    // Refresh cached current-frame estimate + chart covariance for the API.
+    let q_hat_a2 = q_hat_a_of(&feat.x);
+    let q_hat_c2 = r_ca * q_hat_a2 + t_ca_t;
+    let j_c = r_ca * dq_hat_a(&feat.x);
+    let cov_c_euc = j_c * feat.sigma * j_c.transpose();
+    feat.position = q_hat_c2;
+    let e2c = euc_to_chart_jac(chart, &q_hat_c2);
+    let cc = e2c * cov_c_euc * e2c.transpose();
+    feat.covariance = 0.5 * (cc + cc.transpose());
     true
 }
 
@@ -453,39 +586,7 @@ fn init_cov_3d(
     cov
 }
 
-fn predict_feature_3d(
-    chart: Sparse3DChart,
-    settings: &SparseVogSettings,
-    feat: &mut FeatureState3D,
-    r: &Matrix3<f64>,
-    t: &Vector3<f64>,
-    p_vv: Option<&Matrix3<f64>>,
-    dt: f64,
-) {
-    let depth = feat.depth_for_chart(chart);
-    if depth < settings.min_depth {
-        feat.position = Vector3::zeros();
-        return;
-    }
-    let q_old = feat.position;
-    let q_new = r * q_old + t;
-    if q_new[2] < settings.min_depth {
-        feat.position = Vector3::zeros();
-        return;
-    }
-
-    let j = euc_to_chart_jac(chart, &q_new) * r * chart_to_euc_jac(chart, &q_old);
-    let mut cov_new = j * feat.covariance * j.transpose();
-    let q_euc = p_vv
-        .map(|p| p * (dt * dt))
-        .unwrap_or_else(|| Matrix3::identity() * settings.process_depth_var * dt.max(1e-3));
-    let q_chart =
-        euc_to_chart_jac(chart, &q_new) * q_euc * euc_to_chart_jac(chart, &q_new).transpose();
-    cov_new += q_chart;
-    feat.position = q_new;
-    feat.covariance = 0.5 * (cov_new + cov_new.transpose());
-}
-
+#[allow(dead_code)]
 fn bearing_update_3d(
     chart: Sparse3DChart,
     k: &Matrix3<f64>,
@@ -501,15 +602,45 @@ fn bearing_update_3d(
     let fy = k[(1, 1)];
     let cx = k[(0, 2)];
     let cy = k[(1, 2)];
-    let h_euc = Matrix2x3::new(
-        fx / q[2],
-        0.0,
-        -fx * q[0] / (q[2] * q[2]),
-        0.0,
-        fy / q[2],
-        -fy * q[1] / (q[2] * q[2]),
-    );
-    let h = h_euc * chart_to_euc_jac(chart, &q);
+    let h = if settings.use_equivariant_output {
+        // Equivariant output approximation (EqVIO). The reference defines C* in
+        // EUCLIDEAN coords as the averaged DRho skew form
+        // (EqFoutputMatrixCiStar_euclid); each chart's C* is then that Euclidean
+        // C* mapped to the chart error coords by the chart->Euclid Jacobian
+        // (invdepth uses ind2euc; polar uses conv_normal2euc). We reproduce that
+        // pattern here, re-centred at the current estimate so QHat = I:
+        //   DRho(b)  = proj_jac(b) . skew(b)               (2x3)
+        //   C*_euc   = 0.5 (DRho(yTru) + DRho(yHat)) . (-skew(q)/|q|^2)
+        //   h        = C*_euc . chart_to_euc_jac(chart, q)
+        // The averaging uses the true measurement bearing yTru, reducing output
+        // linearisation error to O(|eps|^3).
+        let proj_jac = |b: &Vector3<f64>| {
+            Matrix2x3::new(
+                fx / b[2],
+                0.0,
+                -fx * b[0] / (b[2] * b[2]),
+                0.0,
+                fy / b[2],
+                -fy * b[1] / (b[2] * b[2]),
+            )
+        };
+        let d_rho = |b: &Vector3<f64>| proj_jac(b) * base_skew(b);
+        let y_hat = q.normalize();
+        let y_tru =
+            Vector3::new((y_observed[0] - cx) / fx, (y_observed[1] - cy) / fy, 1.0).normalize();
+        let c_euc = 0.5 * (d_rho(&y_tru) + d_rho(&y_hat)) * (-base_skew(&q) / q.norm_squared());
+        c_euc * chart_to_euc_jac(chart, &q)
+    } else {
+        let h_euc = Matrix2x3::new(
+            fx / q[2],
+            0.0,
+            -fx * q[0] / (q[2] * q[2]),
+            0.0,
+            fy / q[2],
+            -fy * q[1] / (q[2] * q[2]),
+        );
+        h_euc * chart_to_euc_jac(chart, &q)
+    };
     let y_pred = Vector2::new(fx * q[0] / q[2] + cx, fy * q[1] / q[2] + cy);
     let r = Matrix2::identity() * settings.sigma_pixel.powi(2);
     let s = h * feat.covariance * h.transpose() + r;
@@ -698,10 +829,13 @@ mod tests {
             feat_id: fid,
             position: Vector3::new(0.0, 0.0, 3.0),
             covariance: Matrix3::identity(),
+            q0: Vector3::new(0.0, 0.0, 3.0),
+            x: SOT3::identity(),
+            sigma: Matrix3::identity(),
+            anchor_t_wc: Matrix4::identity(),
             a: 1.0,
             b: 1.0,
             track_length: 3,
-            ref_t_wc: Matrix4::identity(),
             ref_uv: Vector2::new(0.0, 0.0),
             ref_stamp: 0.0,
         }

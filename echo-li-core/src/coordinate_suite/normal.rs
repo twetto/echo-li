@@ -1,4 +1,4 @@
-use echo_lie::{base::LieGroup, SE23, SE3, SO3, SOT3};
+use echo_lie::{SE3, SE23, SO3, SOT3, base::LieGroup};
 use nalgebra::{DMatrix, DVector, Matrix2x3, Matrix3, Matrix3x2, Vector2, Vector3};
 
 use crate::coordinate_suite::base_skew;
@@ -376,21 +376,21 @@ impl EqFCoordinateSuite for NormalSuite {
         q0: &Vector3<f64>,
         q_hat: &SOT3,
         cam: &dyn CameraModel,
-        y: &Vector2<f64>,
+        _y: &Vector2<f64>,
     ) -> Matrix2x3<f64> {
-        // Equivariant C* for Normal chart:
-        // Average proj_jac at predicted and observed bearings, then apply
-        // the rotation and chart differential.
-        // Third column (log-depth) is zero since bearing measurements
-        // carry no direct depth information.
+        // The reference EqVIO does NOT implement the equivariant output
+        // approximation for the normal chart -- only for the euclid and
+        // invdepth charts. Here Ci* == Ci: the projection Jacobian is taken at
+        // the *predicted* bearing only and the measurement `y` is unused
+        // (cf. EqFoutputMatrixCiStar_normal in the C++ source). A previous
+        // version averaged proj_jac over the measured and predicted bearings,
+        // which is not in the reference and injects measurement noise into the
+        // output Jacobian. Third (log-depth) column is zero.
         let y0 = q0.normalize();
         let y_hat_bearing = q_hat.rotation.inverse().act(&y0);
-        let y_tru_bearing = cam.undistort(y);
-
-        let avg_proj_jac = 0.5
-            * (cam.projection_jacobian(&y_tru_bearing) + cam.projection_jacobian(&y_hat_bearing));
-        let inv_diff = sphere_chart_normal_inv_diff0(q0);
-        let block_2x2 = avg_proj_jac * q_hat.rotation.as_matrix().transpose() * inv_diff;
+        let block_2x2 = cam.projection_jacobian(&y_hat_bearing)
+            * q_hat.rotation.as_matrix().transpose()
+            * sphere_chart_normal_inv_diff0(q0);
         let mut c0i = Matrix2x3::zeros();
         c0i.fixed_view_mut::<2, 2>(0, 0).copy_from(&block_2x2);
         c0i

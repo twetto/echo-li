@@ -33,6 +33,15 @@ import pytest
 
 from echo_li import Sparse3DFilter
 
+# RETIRED: Sparse3DFilter was rewritten as a true IEKF (static-anchor SOT(3)
+# group), so it intentionally diverges from the pure-Python MEKF reference this
+# golden was generated from. Cross-language parity no longer holds by design.
+# Kept for provenance; regenerate the golden from the Rust IEKF if a
+# self-consistency regression is wanted instead. See project memory: IEKF rewrite.
+pytestmark = pytest.mark.skip(
+    reason="Sparse3D is now an IEKF; parity with the Python MEKF reference is retired"
+)
+
 FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "sparse3d_golden.npz")
 
 # Number of trailing frames over which steady-state parity is asserted.

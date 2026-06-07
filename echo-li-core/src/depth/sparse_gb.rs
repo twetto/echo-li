@@ -36,6 +36,17 @@ pub struct SparseVogSettings {
     pub min_depth: f64,
     pub max_depth: f64,
     pub reanchor_flow_px: f64,
+    /// Average the perspective output Jacobian between the predicted and the
+    /// measured normalized image coords in the 3D bearing update, à la the EqF
+    /// coordinate suite's `output_matrix_ci_star`. NOTE: experiments show this
+    /// *worsens* consistency when grafted onto `Sparse3DFilter` (a plain
+    /// chart-EKF) -- putting the measurement into H correlates it with the
+    /// measurement noise, which the EKF covariance update assumes away, so the
+    /// covariance collapses. The EqF avoids this via its equivariant error
+    /// coordinates + lifted innovation; the output approximation is not a
+    /// drop-in for a non-equivariant filter. Kept behind this flag (default
+    /// off) for experimentation. Only consumed by `Sparse3DFilter`.
+    pub use_equivariant_output: bool,
 }
 
 impl Default for SparseVogSettings {
@@ -65,6 +76,7 @@ impl Default for SparseVogSettings {
             min_depth: 0.1,
             max_depth: 100.0,
             reanchor_flow_px: 3.0,
+            use_equivariant_output: false,
         }
     }
 }
