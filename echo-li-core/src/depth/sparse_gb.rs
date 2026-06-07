@@ -47,6 +47,12 @@ pub struct SparseVogSettings {
     /// drop-in for a non-equivariant filter. Kept behind this flag (default
     /// off) for experimentation. Only consumed by `Sparse3DFilter`.
     pub use_equivariant_output: bool,
+    /// Number of measurement relinearizations in the 3D update (iterated EKF).
+    /// 1 = plain EKF (linearize once at the prior). >1 relinearizes the
+    /// projection at the posterior to cancel the bearing-only depth bias at weak
+    /// parallax (cf. ROVIO / the 1D sparse_vogiatzis iterated update). Only
+    /// consumed by `Sparse3DFilter`.
+    pub iekf_iterations: usize,
 }
 
 impl Default for SparseVogSettings {
@@ -77,6 +83,7 @@ impl Default for SparseVogSettings {
             max_depth: 100.0,
             reanchor_flow_px: 3.0,
             use_equivariant_output: false,
+            iekf_iterations: 1,
         }
     }
 }

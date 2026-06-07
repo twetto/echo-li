@@ -190,6 +190,7 @@ fn parse_settings(kwargs: Option<&Bound<'_, pyo3::types::PyDict>>) -> PyResult<S
     set!("max_depth", max_depth);
     set!("reanchor_flow_px", reanchor_flow_px);
     set!("use_equivariant_output", use_equivariant_output);
+    set!("iekf_iterations", iekf_iterations);
 
     Ok(s)
 }

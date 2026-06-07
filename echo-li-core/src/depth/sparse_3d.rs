@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use echo_lie::SOT3;
-use nalgebra::{Matrix2, Matrix2x3, Matrix3, Matrix4, Vector2, Vector3, Vector4};
+use nalgebra::{Matrix2, Matrix2x3, Matrix3, Matrix3x2, Matrix4, Vector2, Vector3, Vector4};
 
 use crate::coordinate_suite::base_skew;
 use crate::coordinate_suite::invdepth::{conv_euc2ind, conv_ind2euc, point_chart_invdepth_inv};
@@ -466,40 +466,58 @@ fn iekf_update_3d(
         m
     };
 
-    let q_hat_a = q_hat_a_of(&feat.x);
-    let q_hat_c = r_ca * q_hat_a + t_ca_t;
-    if q_hat_c[2] < settings.min_depth {
-        return false;
-    }
-    let zc = q_hat_c[2];
-    let y_pred = Vector2::new(fx * q_hat_c[0] / zc + cx, fy * q_hat_c[1] / zc + cy);
-    let innovation = uv_obs - y_pred;
-
-    // Output matrix C = d(pixel)/d eps = proj_jac(q_hat_c) . R_ca . (d q_hat_a/d eps)
-    let proj = Matrix2x3::new(
-        fx / zc,
-        0.0,
-        -fx * q_hat_c[0] / (zc * zc),
-        0.0,
-        fy / zc,
-        -fy * q_hat_c[1] / (zc * zc),
-    );
-    let c = proj * r_ca * dq_hat_a(&feat.x);
-
     let r_meas = Matrix2::identity() * settings.sigma_pixel.powi(2);
-    let s = c * feat.sigma * c.transpose() + r_meas;
-    let Some(s_inv) = (s + Matrix2::identity() * 1e-8).try_inverse() else {
-        return true;
-    };
-    let det_s = s.determinant();
-    if det_s < 1e-30 {
-        return true;
+
+    // Iterated EKF: relinearize the projection at the posterior to cancel the
+    // bearing-only depth bias at weak parallax (cf. ROVIO / the 1D
+    // sparse_vogiatzis update). delta is the total correction from the prior x,
+    // in eps coords; full_delta/c/gain are taken from the FINAL linearization;
+    // gating (maha, det_s) uses the PRIOR innovation (it == 0). iekf_iterations
+    // == 1 reduces exactly to the plain EKF (single linearize at the prior).
+    let mut delta = Vector3::zeros();
+    let mut c = Matrix2x3::<f64>::zeros();
+    let mut gain = Matrix3x2::<f64>::zeros();
+    let mut full_delta = Vector3::zeros();
+    let mut maha_sq = 0.0;
+    let mut det_s = 1.0;
+    for it in 0..settings.iekf_iterations.max(1) {
+        let x_it = feat.x.compose(&SOT3::exp(&lift(&delta)));
+        let q_a = q_hat_a_of(&x_it);
+        let q_c = r_ca * q_a + t_ca_t;
+        if q_c[2] < settings.min_depth {
+            return false;
+        }
+        let zc = q_c[2];
+        let proj = Matrix2x3::new(
+            fx / zc,
+            0.0,
+            -fx * q_c[0] / (zc * zc),
+            0.0,
+            fy / zc,
+            -fy * q_c[1] / (zc * zc),
+        );
+        c = proj * r_ca * dq_hat_a(&x_it);
+        let s = c * feat.sigma * c.transpose() + r_meas;
+        let Some(s_inv) = (s + Matrix2::identity() * 1e-8).try_inverse() else {
+            return true;
+        };
+        gain = feat.sigma * c.transpose() * s_inv;
+        let y_pred = Vector2::new(fx * q_c[0] / zc + cx, fy * q_c[1] / zc + cy);
+        let residual = uv_obs - y_pred;
+        // Gauss-Newton step from the prior: delta <- K (residual + C delta).
+        full_delta = gain * (residual + c * delta);
+        if it == 0 {
+            det_s = s.determinant();
+            if det_s < 1e-30 {
+                return true;
+            }
+            maha_sq = (residual.transpose() * s_inv * residual)[(0, 0)];
+            if settings.mahalanobis_reset_chi2 > 0.0 && maha_sq > settings.mahalanobis_reset_chi2 {
+                return false;
+            }
+        }
+        delta = full_delta;
     }
-    let maha_sq = (innovation.transpose() * s_inv * innovation)[(0, 0)];
-    if settings.mahalanobis_reset_chi2 > 0.0 && maha_sq > settings.mahalanobis_reset_chi2 {
-        return false;
-    }
-    let gain = feat.sigma * c.transpose() * s_inv;
 
     // Gaussian-Beta inlier weighting.
     let gauss_pdf = (-0.5 * maha_sq).exp() / ((2.0 * std::f64::consts::PI).powi(2) * det_s).sqrt();
@@ -518,8 +536,7 @@ fn iekf_update_3d(
     let w1 = c1 / z_norm;
     let w2 = c2 / z_norm;
 
-    let full_delta = gain * innovation; // 3D euclid error correction
-    let gamma = w1 * full_delta;
+    let gamma = w1 * full_delta; // GB-weighted iterated correction (from the loop)
 
     let i_kc = Matrix3::identity() - gain * c;
     let p_kalman = i_kc * feat.sigma * i_kc.transpose() + gain * r_meas * gain.transpose();
