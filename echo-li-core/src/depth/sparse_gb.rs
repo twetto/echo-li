@@ -10,6 +10,26 @@ pub enum DepthParametrization {
     Polar,
 }
 
+/// Second-order measurement-update mode for the 3D IEKF. Restores the dropped
+/// projective (perspective-division) curvature so the reported covariance is
+/// honest at weak parallax — "the EqF way" of fixing the NEES overconfidence.
+/// Full derivation: `ECHO-LI-notes/docs/sparse3d_secondorder_eqf_derivation.md`.
+/// Only consumed by `Sparse3DFilter`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SecondOrderMode {
+    /// First-order (iterated) EKF; `iekf_iterations` applies. Default.
+    #[default]
+    Off,
+    /// Option A — analytic second-order EqF. Adds the closed-form innovation
+    /// inflation `Λ_kl = ½ tr(H_k Σ H_l Σ)` and the `½ tr(H_m Σ)` predicted-
+    /// measurement bias correction. Supersedes `iekf_iterations` (the bias is
+    /// removed in closed form, so iterating is redundant).
+    Analytic,
+    // Option B (future) — unscented / sigma-point EqF (`2·dim+1` evaluations);
+    // second-order-exact by quadrature and folds in partial higher-order terms.
+    // Unscented,
+}
+
 #[derive(Debug, Clone)]
 pub struct SparseVogSettings {
     pub parametrization: DepthParametrization,
@@ -51,8 +71,23 @@ pub struct SparseVogSettings {
     /// 1 = plain EKF (linearize once at the prior). >1 relinearizes the
     /// projection at the posterior to cancel the bearing-only depth bias at weak
     /// parallax (cf. ROVIO / the 1D sparse_vogiatzis iterated update). Only
-    /// consumed by `Sparse3DFilter`.
+    /// consumed by `Sparse3DFilter`. Ignored when `second_order_mode` is not
+    /// `Off` (the second-order filter does the bias correction in closed form).
     pub iekf_iterations: usize,
+    /// Second-order EqF measurement-update mode (covariance inflation + bias
+    /// correction). See `SecondOrderMode`. Only consumed by `Sparse3DFilter`.
+    pub second_order_mode: SecondOrderMode,
+    /// Per-step radial (range) random-walk process noise for the 3D IEKF, as a
+    /// fraction of range² added to the landmark covariance each update
+    /// (`Σ += range_walk_var · ‖q_c‖² · r̂r̂ᵀ`, pulled back into the error chart).
+    /// The IEKF has no propagation, so without a floor the static-landmark Σ
+    /// collapses below the un-modelled triangulation/range bias and NEES grows
+    /// with depth; this floor flattens it (`≈3e-10`–`1e-8` empirically). The `²`
+    /// scaling matches the bias' `∝ depth` growth, so one constant calibrates
+    /// every depth. Default 0 (off). Distinct from `process_depth_var` (the 1D
+    /// filter's un-scaled per-step term). Only consumed by `Sparse3DFilter`.
+    /// Findings: `ECHO-LI-notes/docs/sparse3d_secondorder_eqf_derivation.md` §8.
+    pub range_walk_var: f64,
 }
 
 impl Default for SparseVogSettings {
@@ -84,6 +119,8 @@ impl Default for SparseVogSettings {
             reanchor_flow_px: 3.0,
             use_equivariant_output: false,
             iekf_iterations: 1,
+            second_order_mode: SecondOrderMode::Off,
+            range_walk_var: 0.0,
         }
     }
 }
@@ -101,7 +138,11 @@ pub struct FeatureState {
 impl FeatureState {
     pub fn inlier_ratio(&self) -> f64 {
         let ab = self.a + self.b;
-        if ab <= 0.0 { 0.0 } else { self.a / ab }
+        if ab <= 0.0 {
+            0.0
+        } else {
+            self.a / ab
+        }
     }
 }
 

@@ -4,7 +4,7 @@ use pyo3::prelude::*;
 use std::collections::HashMap;
 
 use echo_li_core::depth::sparse_3d::Sparse3DFilter;
-use echo_li_core::depth::sparse_gb::SparseVogSettings;
+use echo_li_core::depth::sparse_gb::{SecondOrderMode, SparseVogSettings};
 use echo_li_core::mathematical::vision_measurement::VisionMeasurement;
 use nalgebra::{Matrix3, Matrix4, Vector2};
 
@@ -191,6 +191,20 @@ fn parse_settings(kwargs: Option<&Bound<'_, pyo3::types::PyDict>>) -> PyResult<S
     set!("reanchor_flow_px", reanchor_flow_px);
     set!("use_equivariant_output", use_equivariant_output);
     set!("iekf_iterations", iekf_iterations);
+    set!("range_walk_var", range_walk_var);
+
+    if let Some(v) = kw.get_item("second_order_mode")? {
+        let mode: String = v.extract()?;
+        s.second_order_mode = match mode.as_str() {
+            "off" => SecondOrderMode::Off,
+            "analytic" | "second_order" => SecondOrderMode::Analytic,
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "unknown second_order_mode {other:?} (expected \"off\" or \"analytic\")"
+                )));
+            }
+        };
+    }
 
     Ok(s)
 }

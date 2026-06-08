@@ -6,7 +6,7 @@ use nalgebra::{Matrix2, Matrix2x3, Matrix3, Matrix3x2, Matrix4, Vector2, Vector3
 use crate::coordinate_suite::base_skew;
 use crate::coordinate_suite::invdepth::{conv_euc2ind, conv_ind2euc, point_chart_invdepth_inv};
 use crate::coordinate_suite::normal::{conv_euc2normal, conv_normal2euc, point_chart_normal_inv};
-use crate::depth::sparse_gb::SparseVogSettings;
+use crate::depth::sparse_gb::{SecondOrderMode, SparseVogSettings};
 use crate::mathematical::vision_measurement::VisionMeasurement;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,7 +96,11 @@ impl FeatureState3D {
 
     pub fn inlier_ratio(&self) -> f64 {
         let ab = self.a + self.b;
-        if ab <= 0.0 { 0.0 } else { self.a / ab }
+        if ab <= 0.0 {
+            0.0
+        } else {
+            self.a / ab
+        }
     }
 }
 
@@ -176,7 +180,7 @@ impl Sparse3DFilter {
                         return None;
                     }
                     let uv_curr = curr_uvs.get(&fid)?;
-                    (!iekf_update_3d(chart, &k, &settings, feat, uv_curr, &t_cw_curr))
+                    (!iekf_update_3d(chart, &k, &settings, feat, uv_curr, &t_cw_curr, p_vv, dt))
                         .then_some(fid)
                 })
                 .collect()
@@ -202,6 +206,8 @@ impl Sparse3DFilter {
                     feat,
                     uv_curr,
                     &t_cw_curr,
+                    p_vv,
+                    dt,
                 ) {
                     reset_features.push(fid);
                 }
@@ -428,6 +434,8 @@ fn iekf_update_3d(
     feat: &mut FeatureState3D,
     uv_obs: &Vector2<f64>,
     t_cw_curr: &Matrix4<f64>,
+    p_vv: Option<&Matrix3<f64>>,
+    dt: f64,
 ) -> bool {
     let fx = k[(0, 0)];
     let fy = k[(1, 1)];
@@ -466,58 +474,207 @@ fn iekf_update_3d(
         m
     };
 
+    // Per-step process noise: the IEKF has no propagation, so without this the
+    // static-landmark Σ shrinks monotonically and collapses below the
+    // accumulated relative-pose / triangulation uncertainty (the source of the
+    // depth-growing NEES). Two contributions, both formed in the CURRENT camera
+    // frame and pulled back into the fixed-q0 error coords by J_c = R_ca·G:
+    //   * p_vv·dt²            -- translation-rate (velocity) covariance,
+    //   * range_walk_var·‖q_c‖²·r̂r̂ᵀ -- a depth-scaled radial (range) random-walk
+    //     floor that stops Σ from going below the un-modelled range bias.
+    if dt > 0.0 && (p_vv.is_some() || settings.range_walk_var > 0.0) {
+        let p = q_hat_a_of(&feat.x);
+        let q_c = r_ca * p + t_ca_t;
+        if q_c[2] > settings.min_depth {
+            let j_c = r_ca * dq_hat_a(&feat.x);
+            if let Some(j_inv) = j_c.try_inverse() {
+                let mut q_cur = Matrix3::zeros();
+                if let Some(pvv) = p_vv {
+                    q_cur += pvv * (dt * dt);
+                }
+                if settings.range_walk_var > 0.0 {
+                    let r_hat = q_c / q_c.norm();
+                    q_cur +=
+                        settings.range_walk_var * q_c.norm_squared() * (r_hat * r_hat.transpose());
+                }
+                let sigma = feat.sigma + j_inv * q_cur * j_inv.transpose();
+                feat.sigma = 0.5 * (sigma + sigma.transpose());
+            }
+        }
+    }
+
     let r_meas = Matrix2::identity() * settings.sigma_pixel.powi(2);
 
-    // Iterated EKF: relinearize the projection at the posterior to cancel the
-    // bearing-only depth bias at weak parallax (cf. ROVIO / the 1D
-    // sparse_vogiatzis update). delta is the total correction from the prior x,
-    // in eps coords; full_delta/c/gain are taken from the FINAL linearization;
-    // gating (maha, det_s) uses the PRIOR innovation (it == 0). iekf_iterations
-    // == 1 reduces exactly to the plain EKF (single linearize at the prior).
-    let mut delta = Vector3::zeros();
-    let mut c = Matrix2x3::<f64>::zeros();
-    let mut gain = Matrix3x2::<f64>::zeros();
-    let mut full_delta = Vector3::zeros();
-    let mut maha_sq = 0.0;
-    let mut det_s = 1.0;
-    for it in 0..settings.iekf_iterations.max(1) {
-        let x_it = feat.x.compose(&SOT3::exp(&lift(&delta)));
-        let q_a = q_hat_a_of(&x_it);
-        let q_c = r_ca * q_a + t_ca_t;
-        if q_c[2] < settings.min_depth {
-            return false;
-        }
-        let zc = q_c[2];
-        let proj = Matrix2x3::new(
-            fx / zc,
-            0.0,
-            -fx * q_c[0] / (zc * zc),
-            0.0,
-            fy / zc,
-            -fy * q_c[1] / (zc * zc),
-        );
-        c = proj * r_ca * dq_hat_a(&x_it);
-        let s = c * feat.sigma * c.transpose() + r_meas;
-        let Some(s_inv) = (s + Matrix2::identity() * 1e-8).try_inverse() else {
-            return true;
-        };
-        gain = feat.sigma * c.transpose() * s_inv;
-        let y_pred = Vector2::new(fx * q_c[0] / zc + cx, fy * q_c[1] / zc + cy);
-        let residual = uv_obs - y_pred;
-        // Gauss-Newton step from the prior: delta <- K (residual + C delta).
-        full_delta = gain * (residual + c * delta);
-        if it == 0 {
-            det_s = s.determinant();
+    // Each branch produces the inlier-conditioned update terms shared by the
+    // Gaussian-Beta tail below: the gating Mahalanobis^2 and det(S), the full
+    // (un-weighted) state correction in eps coords, and the posterior covariance
+    // P assuming the measurement is an inlier.
+    let (maha_sq, det_s, full_delta, p_post) = match settings.second_order_mode {
+        SecondOrderMode::Analytic => {
+            // Option A -- analytic second-order EqF. Restores the dropped
+            // projective curvature: bias-corrects the prediction by ½tr(H_mΣ)
+            // and inflates S by Λ_kl = ½tr(H_kΣH_lΣ), driving NEES -> dim at
+            // weak parallax. Symbols and derivation:
+            // ECHO-LI-notes/docs/sparse3d_secondorder_eqf_derivation.md (§§3-5).
+            let p = q_hat_a_of(&feat.x); // q̂_a
+            let q_c = r_ca * p + t_ca_t;
+            if q_c[2] < settings.min_depth {
+                return false;
+            }
+            let (xc, yc, zc) = (q_c[0], q_c[1], q_c[2]);
+            let z2 = zc * zc;
+            // Projection Jacobian P (2x3) and per-channel Hessians Π_u, Π_v (eqs 10-11).
+            let proj = Matrix2x3::new(fx / zc, 0.0, -fx * xc / z2, 0.0, fy / zc, -fy * yc / z2);
+            let pi_u = Matrix3::new(
+                0.0,
+                0.0,
+                -fx / z2,
+                0.0,
+                0.0,
+                0.0,
+                -fx / z2,
+                0.0,
+                2.0 * fx * xc / (z2 * zc),
+            );
+            let pi_v = Matrix3::new(
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                -fy / z2,
+                0.0,
+                -fy / z2,
+                2.0 * fy * yc / (z2 * zc),
+            );
+            // EKF Jacobian C = P R G, G the (numeric) group Jacobian -- same map
+            // as the x <- x.exp update, so C is convention-consistent (eq 9 linear).
+            let g = dq_hat_a(&feat.x);
+            let c = proj * r_ca * g;
+            let rg = r_ca * g;
+            let pr = proj * r_ca; // (PR)_m weights the action-curvature term
+            let pr_u = pr.row(0).transpose();
+            let pr_v = pr.row(1).transpose();
+            // Cholesky Σ = L Lᵀ; the columns ℓ_j whiten the directional Hessian.
+            let Some(chol) = feat.sigma.cholesky() else {
+                return true;
+            };
+            let l = chol.l();
+            let mut omega = [Vector3::zeros(); 3];
+            let mut alpha = [0.0f64; 3];
+            let mut wxp = [Vector3::zeros(); 3]; // ω_j × p
+            let mut b = [Vector3::zeros(); 3]; // R G ℓ_j
+            for j in 0..3 {
+                let lj = l.column(j).into_owned();
+                let oj = m2g_top * lj;
+                omega[j] = oj;
+                alpha[j] = (m2g_bot * lj)[(0, 0)];
+                wxp[j] = oj.cross(&p);
+                b[j] = rg * lj;
+            }
+            // Whitened output Hessians H̃_u, H̃_v (symmetric 3x3, eq 9 + eq 13):
+            //   (H̃_m)_{ij} = b_iᵀ Π_m b_j + (PR)_m · B(ℓ_i, ℓ_j),
+            // B the polarization of the SOT(3) action's quadratic term q_a^{(2)}.
+            let mut ht_u = Matrix3::zeros();
+            let mut ht_v = Matrix3::zeros();
+            for i in 0..3 {
+                for j in i..3 {
+                    let b_act = 0.5 * (omega[i].dot(&p) * omega[j] + omega[j].dot(&p) * omega[i])
+                        - omega[i].dot(&omega[j]) * p
+                        + alpha[i] * wxp[j]
+                        + alpha[j] * wxp[i]
+                        + alpha[i] * alpha[j] * p;
+                    let hu = b[i].dot(&(pi_u * b[j])) + pr_u.dot(&b_act);
+                    let hv = b[i].dot(&(pi_v * b[j])) + pr_v.dot(&b_act);
+                    ht_u[(i, j)] = hu;
+                    ht_u[(j, i)] = hu;
+                    ht_v[(i, j)] = hv;
+                    ht_v[(j, i)] = hv;
+                }
+            }
+            // Bias-corrected prediction ŷ_m = h_m(0) + ½ tr(H̃_m) (eq 5).
+            let y_pred = Vector2::new(fx * xc / zc + cx, fy * yc / zc + cy);
+            let y_hat = y_pred + 0.5 * Vector2::new(ht_u.trace(), ht_v.trace());
+            // Inflation Λ_kl = ½ tr(H̃_k H̃_l) = ½ <H̃_k, H̃_l>_F  (Gram, PSD) (eq 6).
+            let lam_uv = 0.5 * ht_u.dot(&ht_v);
+            let lambda = Matrix2::new(0.5 * ht_u.dot(&ht_u), lam_uv, lam_uv, 0.5 * ht_v.dot(&ht_v));
+            let s = c * feat.sigma * c.transpose() + r_meas + lambda;
+            let Some(s_inv) = (s + Matrix2::identity() * 1e-8).try_inverse() else {
+                return true;
+            };
+            let det_s = s.determinant();
             if det_s < 1e-30 {
                 return true;
             }
-            maha_sq = (residual.transpose() * s_inv * residual)[(0, 0)];
+            let residual = uv_obs - y_hat;
+            let maha_sq = (residual.transpose() * s_inv * residual)[(0, 0)];
             if settings.mahalanobis_reset_chi2 > 0.0 && maha_sq > settings.mahalanobis_reset_chi2 {
                 return false;
             }
+            // Cross-cov is Σ Cᵀ to this order, so the gain keeps the EKF shape (eq 7-8).
+            let gain = feat.sigma * c.transpose() * s_inv;
+            let full_delta = gain * residual;
+            let p_post = feat.sigma - gain * s * gain.transpose();
+            (maha_sq, det_s, full_delta, p_post)
         }
-        delta = full_delta;
-    }
+        SecondOrderMode::Off => {
+            // Iterated EKF: relinearize the projection at the posterior to cancel
+            // the bearing-only depth bias at weak parallax (cf. ROVIO / the 1D
+            // sparse_vogiatzis update). delta is the total correction from the
+            // prior x, in eps coords; full_delta/c/gain are taken from the FINAL
+            // linearization; gating (maha, det_s) uses the PRIOR innovation
+            // (it == 0). iekf_iterations == 1 reduces exactly to the plain EKF.
+            let mut delta = Vector3::zeros();
+            let mut c = Matrix2x3::<f64>::zeros();
+            let mut gain = Matrix3x2::<f64>::zeros();
+            let mut full_delta = Vector3::zeros();
+            let mut maha_sq = 0.0;
+            let mut det_s = 1.0;
+            for it in 0..settings.iekf_iterations.max(1) {
+                let x_it = feat.x.compose(&SOT3::exp(&lift(&delta)));
+                let q_a = q_hat_a_of(&x_it);
+                let q_c = r_ca * q_a + t_ca_t;
+                if q_c[2] < settings.min_depth {
+                    return false;
+                }
+                let zc = q_c[2];
+                let proj = Matrix2x3::new(
+                    fx / zc,
+                    0.0,
+                    -fx * q_c[0] / (zc * zc),
+                    0.0,
+                    fy / zc,
+                    -fy * q_c[1] / (zc * zc),
+                );
+                c = proj * r_ca * dq_hat_a(&x_it);
+                let s = c * feat.sigma * c.transpose() + r_meas;
+                let Some(s_inv) = (s + Matrix2::identity() * 1e-8).try_inverse() else {
+                    return true;
+                };
+                gain = feat.sigma * c.transpose() * s_inv;
+                let y_pred = Vector2::new(fx * q_c[0] / zc + cx, fy * q_c[1] / zc + cy);
+                let residual = uv_obs - y_pred;
+                // Gauss-Newton step from the prior: delta <- K (residual + C delta).
+                full_delta = gain * (residual + c * delta);
+                if it == 0 {
+                    det_s = s.determinant();
+                    if det_s < 1e-30 {
+                        return true;
+                    }
+                    maha_sq = (residual.transpose() * s_inv * residual)[(0, 0)];
+                    if settings.mahalanobis_reset_chi2 > 0.0
+                        && maha_sq > settings.mahalanobis_reset_chi2
+                    {
+                        return false;
+                    }
+                }
+                delta = full_delta;
+            }
+            let i_kc = Matrix3::identity() - gain * c;
+            let p_kalman = i_kc * feat.sigma * i_kc.transpose() + gain * r_meas * gain.transpose();
+            (maha_sq, det_s, full_delta, p_kalman)
+        }
+    };
 
     // Gaussian-Beta inlier weighting.
     let gauss_pdf = (-0.5 * maha_sq).exp() / ((2.0 * std::f64::consts::PI).powi(2) * det_s).sqrt();
@@ -536,12 +693,9 @@ fn iekf_update_3d(
     let w1 = c1 / z_norm;
     let w2 = c2 / z_norm;
 
-    let gamma = w1 * full_delta; // GB-weighted iterated correction (from the loop)
+    let gamma = w1 * full_delta; // GB-weighted correction (from the chosen update)
 
-    let i_kc = Matrix3::identity() - gain * c;
-    let p_kalman = i_kc * feat.sigma * i_kc.transpose() + gain * r_meas * gain.transpose();
-    let sigma_new =
-        w1 * p_kalman + w2 * feat.sigma + w1 * w2 * (full_delta * full_delta.transpose());
+    let sigma_new = w1 * p_post + w2 * feat.sigma + w1 * w2 * (full_delta * full_delta.transpose());
     if sigma_new
         .symmetric_eigen()
         .eigenvalues
@@ -910,6 +1064,23 @@ mod tests {
         let (depth, var) = filter.query(42);
         assert!(depth > 0.0, "depth should be queryable, got {depth}");
         assert!(var.is_finite());
+    }
+
+    #[test]
+    fn second_order_analytic_initializes_and_tracks() {
+        let mut s = settings();
+        s.second_order_mode = SecondOrderMode::Analytic;
+        let mut filter = Sparse3DFilter::polar3d(k(), s);
+        let point = Vector3::new(1.0, 0.5, 3.0);
+        for i in 0..8 {
+            update_with_point(&mut filter, i, point);
+        }
+        let feat = filter.feature(42).expect("feature should initialize");
+        assert!(feat.position[2] > 2.5 && feat.position[2] < 3.5);
+        assert!(feat.covariance.iter().all(|v| v.is_finite()));
+        let (depth, var) = filter.query(42);
+        assert!(depth > 0.0, "depth should be queryable, got {depth}");
+        assert!(var.is_finite() && var > 0.0);
     }
 
     #[test]
