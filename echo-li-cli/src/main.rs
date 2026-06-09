@@ -16,7 +16,7 @@ use echo_li_core::{LandmarkDepthPrior, VIOFilter, VIOFilterSettings};
 use nalgebra::{Matrix3, Matrix4, Vector2};
 use rudolf_v::camera::CameraIntrinsics as RudolfCameraIntrinsics;
 use rudolf_v::camera::StereoRig;
-use rudolf_v::frontend::{Frontend, FrontendConfig, LbpPolicy};
+use rudolf_v::frontend::{DetectorType, Frontend, FrontendConfig, LbpPolicy};
 use rudolf_v::image::Image as RudolfImage;
 use rudolf_v::klt::LkMethod;
 use rudolf_v::rigid_ransac::{Correspondence3d, Rigid3dRansacConfig};
@@ -671,6 +671,26 @@ fn build_frontend(
         if let Some(fast_threshold) = conf.rudolf_v.fast_threshold {
             config.fast_threshold = fast_threshold;
         }
+        if let Some(detector) = &conf.rudolf_v.detector {
+            config.detector = match detector.to_ascii_lowercase().as_str() {
+                "fast" => DetectorType::Fast,
+                "harris" => DetectorType::Harris,
+                "shi_tomasi" | "shitomasi" | "shi-tomasi" => DetectorType::ShiTomasi,
+                _ => {
+                    return Err(format!(
+                        "unsupported RudolfV.detector '{}'; expected fast, harris, or shi_tomasi",
+                        detector
+                    )
+                    .into());
+                }
+            };
+        }
+        if let Some(v) = conf.rudolf_v.shi_tomasi_threshold {
+            config.shi_tomasi_threshold = v;
+        }
+        if let Some(v) = conf.rudolf_v.shi_tomasi_block_size {
+            config.shi_tomasi_block_size = v;
+        }
         if conf.rudolf_v.equalise_image_histogram {
             config.histeq = rudolf_v::histeq::HistEqMethod::Global;
         }
@@ -695,7 +715,10 @@ fn build_frontend(
     }
     config.klt_method = LkMethod::InverseCompositional;
     let tracker_max_features = config.max_features;
-    println!("Tracker: Rudolf-V, max_features={}", tracker_max_features);
+    println!(
+        "Tracker: Rudolf-V, detector={:?}, max_features={}",
+        config.detector, tracker_max_features
+    );
     Ok((Frontend::new(config, img_w, img_h), tracker_max_features))
 }
 

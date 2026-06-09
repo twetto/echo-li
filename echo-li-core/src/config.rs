@@ -14,6 +14,15 @@ pub struct RudolfVConfig {
     pub feature_search_threshold: f64,
     #[serde(default)]
     pub fast_threshold: Option<u8>,
+    /// Corner detector: "fast" (default), "harris", or "shi_tomasi".
+    #[serde(default)]
+    pub detector: Option<String>,
+    /// Shi-Tomasi minimum-eigenvalue floor (only used when detector == shi_tomasi).
+    #[serde(default)]
+    pub shi_tomasi_threshold: Option<f32>,
+    /// Shi-Tomasi structure-tensor block size (only used when detector == shi_tomasi).
+    #[serde(default)]
+    pub shi_tomasi_block_size: Option<usize>,
     #[serde(default)]
     pub lbp_policy: Option<String>,
     pub max_features: usize,
