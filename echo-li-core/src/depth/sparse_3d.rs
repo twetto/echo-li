@@ -11,8 +11,15 @@ use crate::mathematical::vision_measurement::VisionMeasurement;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sparse3DChart {
+    /// Static-anchor SOT(3) IEKF, range carried multiplicatively (log-depth).
     Polar,
+    /// Same SOT(3) IEKF, inverse-depth *reporting* chart (a relabel of `Polar`;
+    /// the update is identical — see the consistency docs).
     InvDepth,
+    /// ρ-first: a genuinely *additive* inverse-depth EKF. State is
+    /// `(alpha, beta, rho)` in the anchor camera frame (no group, no log-depth),
+    /// which removes the sequential-linearisation overconfidence of `Polar`.
+    InvDepthAdditive,
 }
 
 #[derive(Debug, Clone)]
@@ -32,9 +39,17 @@ pub struct FeatureState3D {
     // --- True IEKF state (source of truth) ---
     // Landmark fixed in its anchor camera frame; the group element x carries all
     // refinement so the error coordinates never need re-centring (no re-anchor).
-    pub q0: Vector3<f64>,          // anchor-frame landmark (fixed origin)
-    pub x: SOT3,                   // group refinement; q_hat_anchor = x^{-1} . q0
-    pub sigma: Matrix3<f64>,       // covariance in Euclidean error coords about q0
+    pub q0: Vector3<f64>, // anchor-frame landmark (fixed origin)  [Polar/InvDepth]
+    pub x: SOT3,          // group refinement; q_hat_anchor = x^{-1} . q0  [Polar/InvDepth]
+    pub sigma: Matrix3<f64>, // covariance in Euclidean error coords about q0  [Polar/InvDepth]
+    // ρ-first additive inverse-depth state [InvDepthAdditive only]: s = (alpha,
+    // beta, rho) = (X/Z, Y/Z, 1/Z) of the landmark in the ANCHOR camera frame,
+    // with covariance inv_p in those coords. Plain additive EKF, no group / no
+    // re-charting. The SOT(3) fields above are unused in this chart (and vice
+    // versa). Cached `covariance` for this chart is the current-frame Euclidean
+    // covariance directly (chart_to_euc_jac == I for InvDepthAdditive).
+    pub inv_s: Vector3<f64>,
+    pub inv_p: Matrix3<f64>,
     pub anchor_t_wc: Matrix4<f64>, // camera->world pose at the anchor (creation) frame
     // --- Gaussian-Beta inlier model + bookkeeping ---
     pub a: f64,
@@ -48,7 +63,7 @@ impl FeatureState3D {
     pub fn depth_for_chart(&self, chart: Sparse3DChart) -> f64 {
         match chart {
             Sparse3DChart::Polar => self.position.norm(),
-            Sparse3DChart::InvDepth => self.position[2],
+            Sparse3DChart::InvDepth | Sparse3DChart::InvDepthAdditive => self.position[2],
         }
     }
 
@@ -69,6 +84,14 @@ impl FeatureState3D {
                     let h_z =
                         Vector3::new(0.0, 0.0, 1.0).transpose() * conv_ind2euc(&self.position);
                     (h_z * self.covariance * h_z.transpose())[(0, 0)]
+                }
+            }
+            // Cached covariance is already Euclidean (current frame) here.
+            Sparse3DChart::InvDepthAdditive => {
+                if self.position[2] < 1e-6 {
+                    f64::INFINITY
+                } else {
+                    self.covariance[(2, 2)]
                 }
             }
         }
@@ -96,11 +119,7 @@ impl FeatureState3D {
 
     pub fn inlier_ratio(&self) -> f64 {
         let ab = self.a + self.b;
-        if ab <= 0.0 {
-            0.0
-        } else {
-            self.a / ab
-        }
+        if ab <= 0.0 { 0.0 } else { self.a / ab }
     }
 }
 
@@ -142,6 +161,11 @@ impl Sparse3DFilter {
         Self::new(k, Sparse3DChart::InvDepth, settings)
     }
 
+    /// ρ-first: additive inverse-depth EKF (see `Sparse3DChart::InvDepthAdditive`).
+    pub fn invdepth_additive3d(k: Matrix3<f64>, settings: SparseVogSettings) -> Self {
+        Self::new(k, Sparse3DChart::InvDepthAdditive, settings)
+    }
+
     pub fn update(
         &mut self,
         measurement: &VisionMeasurement,
@@ -180,7 +204,7 @@ impl Sparse3DFilter {
                         return None;
                     }
                     let uv_curr = curr_uvs.get(&fid)?;
-                    (!iekf_update_3d(chart, &k, &settings, feat, uv_curr, &t_cw_curr, p_vv, dt))
+                    (!update_feature_3d(chart, &k, &settings, feat, uv_curr, &t_cw_curr, p_vv, dt))
                         .then_some(fid)
                 })
                 .collect()
@@ -199,7 +223,7 @@ impl Sparse3DFilter {
                     continue;
                 };
 
-                if !iekf_update_3d(
+                if !update_feature_3d(
                     self.chart,
                     &self.k,
                     &self.settings,
@@ -281,6 +305,22 @@ impl Sparse3DFilter {
             // Jacobian (chart_to_euc . cov . chart_to_euc^T).
             let j_c2e = chart_to_euc_jac(self.chart, &position);
             let sigma = j_c2e * covariance * j_c2e.transpose();
+            // ρ-first additive state: anchor-frame (alpha,beta,rho) and its cov.
+            // For InvDepthAdditive, `covariance` (from init_cov_3d) is already the
+            // Euclidean init cov (euc_to_chart_jac == I), which is what we cache;
+            // map it to (alpha,beta,rho) coords for inv_p via the euclid->invdepth
+            // point Jacobian.
+            let (inv_s, inv_p) = if self.chart == Sparse3DChart::InvDepthAdditive {
+                let s = Vector3::new(
+                    position[0] / position[2],
+                    position[1] / position[2],
+                    1.0 / position[2],
+                );
+                let j_e2i = conv_euc2ind(&position);
+                (s, j_e2i * covariance * j_e2i.transpose())
+            } else {
+                (Vector3::zeros(), Matrix3::zeros())
+            };
             let feat = FeatureState3D {
                 feat_id: fid,
                 position,
@@ -288,6 +328,8 @@ impl Sparse3DFilter {
                 q0: position,
                 x: SOT3::identity(),
                 sigma,
+                inv_s,
+                inv_p,
                 anchor_t_wc: *t_wc,
                 a: self.settings.a_init,
                 b: self.settings.b_init,
@@ -404,6 +446,8 @@ fn chart_to_euc_jac(chart: Sparse3DChart, q: &Vector3<f64>) -> Matrix3<f64> {
     match chart {
         Sparse3DChart::Polar => conv_normal2euc(q),
         Sparse3DChart::InvDepth => conv_ind2euc(q),
+        // The additive chart caches `covariance` already in Euclidean coords.
+        Sparse3DChart::InvDepthAdditive => Matrix3::identity(),
     }
 }
 
@@ -411,6 +455,7 @@ fn euc_to_chart_jac(chart: Sparse3DChart, q: &Vector3<f64>) -> Matrix3<f64> {
     match chart {
         Sparse3DChart::Polar => conv_euc2normal(q),
         Sparse3DChart::InvDepth => conv_euc2ind(q),
+        Sparse3DChart::InvDepthAdditive => Matrix3::identity(),
     }
 }
 
@@ -418,7 +463,169 @@ fn apply_chart_delta(chart: Sparse3DChart, q: &Vector3<f64>, delta: &Vector3<f64
     match chart {
         Sparse3DChart::Polar => point_chart_normal_inv(delta, q),
         Sparse3DChart::InvDepth => point_chart_invdepth_inv(delta, q),
+        // additive chart applies the delta in (alpha,beta,rho); not used via this
+        // helper (the additive update is self-contained), but keep the match total.
+        Sparse3DChart::InvDepthAdditive => q + delta,
     }
+}
+
+/// Per-landmark measurement update, dispatched by chart: the SOT(3) IEKF for
+/// `Polar`/`InvDepth`, the additive inverse-depth EKF for `InvDepthAdditive`.
+fn update_feature_3d(
+    chart: Sparse3DChart,
+    k: &Matrix3<f64>,
+    settings: &SparseVogSettings,
+    feat: &mut FeatureState3D,
+    uv_obs: &Vector2<f64>,
+    t_cw_curr: &Matrix4<f64>,
+    p_vv: Option<&Matrix3<f64>>,
+    dt: f64,
+) -> bool {
+    match chart {
+        Sparse3DChart::InvDepthAdditive => {
+            invdepth_additive_update_3d(k, settings, feat, uv_obs, t_cw_curr, p_vv, dt)
+        }
+        _ => iekf_update_3d(chart, k, settings, feat, uv_obs, t_cw_curr, p_vv, dt),
+    }
+}
+
+/// ρ-first additive inverse-depth EKF update for one landmark.
+///
+/// State `s = (alpha, beta, rho) = (X/Z, Y/Z, 1/Z)` of the landmark in the anchor
+/// camera frame, covariance `feat.inv_p` in those coords. The known relative pose
+/// anchor->current is folded into the pinhole measurement; the update is a plain
+/// EKF (the inverse-depth refinement group is abelian / flat — `s <- s + gamma`),
+/// with the same Gaussian-Beta inlier weighting and optional process-noise floor
+/// as the SOT(3) path. No log-depth, no re-charting -> no sequential-linearisation
+/// overconfidence (see docs/sparse3d_invdepth_rewrite.md).
+fn invdepth_additive_update_3d(
+    k: &Matrix3<f64>,
+    settings: &SparseVogSettings,
+    feat: &mut FeatureState3D,
+    uv_obs: &Vector2<f64>,
+    t_cw_curr: &Matrix4<f64>,
+    p_vv: Option<&Matrix3<f64>>,
+    dt: f64,
+) -> bool {
+    let fx = k[(0, 0)];
+    let fy = k[(1, 1)];
+    let cx = k[(0, 2)];
+    let cy = k[(1, 2)];
+
+    let t_ca = t_cw_curr * feat.anchor_t_wc;
+    let r_ca = t_ca.fixed_view::<3, 3>(0, 0).into_owned();
+    let t_ca_t = t_ca.fixed_view::<3, 1>(0, 3).into_owned();
+
+    // anchor-frame point P_anchor(s) and its Jacobian dP_anchor/ds.
+    let pa_of = |s: &Vector3<f64>| Vector3::new(s[0] / s[2], s[1] / s[2], 1.0 / s[2]);
+    let jpa_of = |s: &Vector3<f64>| {
+        let (a, b, r) = (s[0], s[1], s[2]);
+        let r2 = r * r;
+        Matrix3::new(
+            1.0 / r,
+            0.0,
+            -a / r2,
+            0.0,
+            1.0 / r,
+            -b / r2,
+            0.0,
+            0.0,
+            -1.0 / r2,
+        )
+    };
+
+    // Optional per-step process-noise floor (same intent as the SOT(3) path),
+    // formed in the current camera frame and pulled into (alpha,beta,rho) coords
+    // by J_g^{-1}, J_g = R_ca . dP_anchor/ds.
+    if dt > 0.0 && (p_vv.is_some() || settings.range_walk_var > 0.0) {
+        let q_c = r_ca * pa_of(&feat.inv_s) + t_ca_t;
+        if q_c[2] > settings.min_depth {
+            let j_g = r_ca * jpa_of(&feat.inv_s);
+            if let Some(j_inv) = j_g.try_inverse() {
+                let mut q_cur = Matrix3::zeros();
+                if let Some(pvv) = p_vv {
+                    q_cur += pvv * (dt * dt);
+                }
+                if settings.range_walk_var > 0.0 {
+                    let r_hat = q_c / q_c.norm();
+                    q_cur +=
+                        settings.range_walk_var * q_c.norm_squared() * (r_hat * r_hat.transpose());
+                }
+                let p = feat.inv_p + j_inv * q_cur * j_inv.transpose();
+                feat.inv_p = 0.5 * (p + p.transpose());
+            }
+        }
+    }
+
+    let r_meas = Matrix2::identity() * settings.sigma_pixel.powi(2);
+
+    let q_c = r_ca * pa_of(&feat.inv_s) + t_ca_t;
+    if q_c[2] < settings.min_depth {
+        return false;
+    }
+    let (xc, yc, zc) = (q_c[0], q_c[1], q_c[2]);
+    let z2 = zc * zc;
+    let proj = Matrix2x3::new(fx / zc, 0.0, -fx * xc / z2, 0.0, fy / zc, -fy * yc / z2);
+    let c = proj * r_ca * jpa_of(&feat.inv_s); // dh/ds (2x3)
+    let s_mat = c * feat.inv_p * c.transpose() + r_meas;
+    let Some(s_inv) = (s_mat + Matrix2::identity() * 1e-8).try_inverse() else {
+        return true;
+    };
+    let det_s = s_mat.determinant();
+    if det_s < 1e-30 {
+        return true;
+    }
+    let y_pred = Vector2::new(fx * xc / zc + cx, fy * yc / zc + cy);
+    let residual = uv_obs - y_pred;
+    let maha_sq = (residual.transpose() * s_inv * residual)[(0, 0)];
+    if settings.mahalanobis_reset_chi2 > 0.0 && maha_sq > settings.mahalanobis_reset_chi2 {
+        return false;
+    }
+    let gain = feat.inv_p * c.transpose() * s_inv; // 3x2
+    let full_delta = gain * residual;
+    let i_kc = Matrix3::identity() - gain * c;
+    let p_post = i_kc * feat.inv_p * i_kc.transpose() + gain * r_meas * gain.transpose();
+
+    // Gaussian-Beta inlier weighting (mirrors iekf_update_3d).
+    let gauss_pdf = (-0.5 * maha_sq).exp() / ((2.0 * std::f64::consts::PI).powi(2) * det_s).sqrt();
+    let uniform_prior = 1.0 / (fx * fy * 4.0);
+    let ab = feat.a + feat.b;
+    if ab <= 0.0 {
+        return true;
+    }
+    let c1 = (feat.a / ab) * gauss_pdf;
+    let c2 = (feat.b / ab) * uniform_prior;
+    let z_norm = c1 + c2;
+    if z_norm < 1e-30 {
+        feat.b = (feat.b + 1.0).min(settings.ab_max);
+        return true;
+    }
+    let w1 = c1 / z_norm;
+    let w2 = c2 / z_norm;
+
+    let gamma = w1 * full_delta;
+    let p_new = w1 * p_post + w2 * feat.inv_p + w1 * w2 * (full_delta * full_delta.transpose());
+    if p_new
+        .symmetric_eigen()
+        .eigenvalues
+        .iter()
+        .any(|v| *v <= 0.0 || !v.is_finite())
+    {
+        return true;
+    }
+
+    // Additive state update (abelian / flat): s <- s + gamma. No re-charting.
+    feat.inv_s += gamma;
+    feat.inv_p = 0.5 * (p_new + p_new.transpose());
+    feat.track_length += 1;
+    update_beta(settings, feat, w1, w2);
+
+    // Refresh cached current-frame estimate + Euclidean covariance for the API.
+    let j_g = r_ca * jpa_of(&feat.inv_s); // dP_cur/ds
+    feat.position = r_ca * pa_of(&feat.inv_s) + t_ca_t;
+    let cov_euc = j_g * feat.inv_p * j_g.transpose();
+    feat.covariance = 0.5 * (cov_euc + cov_euc.transpose());
+    true
 }
 
 /// True IEKF measurement update for one landmark.
@@ -1003,6 +1210,8 @@ mod tests {
             q0: Vector3::new(0.0, 0.0, 3.0),
             x: SOT3::identity(),
             sigma: Matrix3::identity(),
+            inv_s: Vector3::zeros(),
+            inv_p: Matrix3::zeros(),
             anchor_t_wc: Matrix4::identity(),
             a: 1.0,
             b: 1.0,
@@ -1064,6 +1273,21 @@ mod tests {
         let (depth, var) = filter.query(42);
         assert!(depth > 0.0, "depth should be queryable, got {depth}");
         assert!(var.is_finite());
+    }
+
+    #[test]
+    fn invdepth_additive_initializes_and_tracks() {
+        let mut filter = Sparse3DFilter::invdepth_additive3d(k(), settings());
+        let point = Vector3::new(1.0, 0.5, 3.0);
+        for i in 0..8 {
+            update_with_point(&mut filter, i, point);
+        }
+        let feat = filter.feature(42).expect("feature should initialize");
+        assert!(feat.position[2] > 2.5 && feat.position[2] < 3.5);
+        assert!(feat.covariance.iter().all(|v| v.is_finite()));
+        let (depth, var) = filter.query(42);
+        assert!(depth > 0.0, "depth should be queryable, got {depth}");
+        assert!(var.is_finite() && var > 0.0);
     }
 
     #[test]

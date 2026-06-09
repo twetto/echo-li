@@ -47,6 +47,22 @@ impl PySparse3DFilter {
         })
     }
 
+    #[staticmethod]
+    #[pyo3(signature = (fx, fy, cx, cy, **kwargs))]
+    fn invdepth_additive3d(
+        fx: f64,
+        fy: f64,
+        cx: f64,
+        cy: f64,
+        kwargs: Option<&Bound<'_, pyo3::types::PyDict>>,
+    ) -> PyResult<Self> {
+        let k = intrinsics_matrix(fx, fy, cx, cy);
+        let settings = parse_settings(kwargs)?;
+        Ok(Self {
+            inner: Sparse3DFilter::invdepth_additive3d(k, settings),
+        })
+    }
+
     #[pyo3(signature = (stamp, feature_uvs, t_wc, p_vv=None))]
     fn update(
         &mut self,
