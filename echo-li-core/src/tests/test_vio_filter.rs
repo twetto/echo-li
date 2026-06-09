@@ -1,7 +1,11 @@
 use approx::assert_abs_diff_eq;
 use echo_lie::{SE3, SO3};
 use nalgebra::{DMatrix, DVector, SMatrix, Vector2, Vector3, Vector6};
+use rand::rngs::StdRng;
+use rand::SeedableRng;
+use rand_distr::{Distribution, Normal};
 use std::collections::HashMap;
+use std::time::Instant;
 
 use crate::coordinate_suite::euclid::EuclideanSuite;
 use crate::coordinate_suite::invdepth::InvDepthSuite;
@@ -1494,4 +1498,531 @@ fn test_faster_multi_sample_well_formed() {
         max_dev > 0.0,
         "Faster should not be identical to Fast over 10 samples"
     );
+}
+
+#[test]
+#[ignore = "diagnostic Monte Carlo; run with --ignored --nocapture"]
+fn diag_eqvio_far_landmark_nees_depth_sweep() {
+    let depths = [320.0, 640.0, 1280.0];
+    let n_mc = 8;
+    let n_steps = 120;
+    let n_landmarks = 40;
+    let dt = 0.2;
+    let sigma_px = 0.5;
+
+    println!("EqVIO Normal/SOT-style far-landmark diagnostic");
+    println!("known constant lateral motion, 40 in-state landmarks, noisy pixels");
+    println!("variant, depth_m, valid_trials, finite_landmarks, mean_nees, median_nees, mean_range_rel_err, nonfinite_sigma, nan_sigma, inf_sigma, prop_fail, vision_fail, min_fail_step, median_fail_step, non_spd_sigma, spd_prop_fail, spd_vision_fail, min_spd_step, median_spd_step, min_diag_at_spd_fail, max_asym_at_spd_fail, nonpos_alpha, min_alpha, min_alpha_at_spd_fail, nonfinite_chart, singular_cov, no_finite_landmarks");
+    for use_faster in [false, true] {
+        let variant = if use_faster { "faster" } else { "fast" };
+        for depth in depths {
+            let progress_label = format!("{variant} depth={depth:.0}");
+            let stats = eqvio_far_landmark_nees_for_depth(
+                depth,
+                n_mc,
+                n_steps,
+                n_landmarks,
+                dt,
+                sigma_px,
+                use_faster,
+                &progress_label,
+            );
+            println!(
+                "{variant}, {depth:.0}, {}/{}, {}, {:.3}, {:.3}, {:.4e}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {:.4e}, {:.4e}, {}, {:.4e}, {:.4e}, {}, {}, {}",
+                stats.valid_trials,
+                stats.total_trials,
+                stats.finite_landmarks,
+                stats.mean_nees,
+                stats.median_nees,
+                stats.mean_range_rel_err,
+                stats.nonfinite_sigma_trials,
+                stats.nan_sigma_trials,
+                stats.inf_sigma_trials,
+                stats.propagation_sigma_failures,
+                stats.vision_sigma_failures,
+                stats.min_sigma_failure_step
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+                stats.median_sigma_failure_step
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+                stats.non_spd_sigma_trials,
+                stats.propagation_spd_failures,
+                stats.vision_spd_failures,
+                stats.min_spd_failure_step
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+                stats.median_spd_failure_step
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+                stats.min_diag_at_first_spd_failure,
+                stats.max_asym_at_first_spd_failure,
+                stats.nonpositive_alpha_trials,
+                stats.min_alpha,
+                stats.min_alpha_at_first_spd_failure,
+                stats.nonfinite_chart_trials,
+                stats.singular_cov_trials,
+                stats.no_finite_landmark_trials
+            );
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EqvioFarLandmarkStats {
+    valid_trials: usize,
+    total_trials: usize,
+    finite_landmarks: usize,
+    mean_nees: f64,
+    median_nees: f64,
+    mean_range_rel_err: f64,
+    nonfinite_sigma_trials: usize,
+    nan_sigma_trials: usize,
+    inf_sigma_trials: usize,
+    propagation_sigma_failures: usize,
+    vision_sigma_failures: usize,
+    min_sigma_failure_step: Option<usize>,
+    median_sigma_failure_step: Option<usize>,
+    non_spd_sigma_trials: usize,
+    propagation_spd_failures: usize,
+    vision_spd_failures: usize,
+    min_spd_failure_step: Option<usize>,
+    median_spd_failure_step: Option<usize>,
+    min_diag_at_first_spd_failure: f64,
+    max_asym_at_first_spd_failure: f64,
+    nonpositive_alpha_trials: usize,
+    min_alpha: f64,
+    min_alpha_at_first_spd_failure: f64,
+    nonfinite_chart_trials: usize,
+    singular_cov_trials: usize,
+    no_finite_landmark_trials: usize,
+}
+
+fn eqvio_far_landmark_nees_for_depth(
+    depth: f64,
+    n_mc: usize,
+    n_steps: usize,
+    n_landmarks: usize,
+    dt: f64,
+    sigma_px: f64,
+    use_faster_riccati: bool,
+    progress_label: &str,
+) -> EqvioFarLandmarkStats {
+    let suite = NormalSuite::new();
+    let cam = make_pinhole();
+    let s = VIOSensorState::CDIM;
+    let mut rng = StdRng::seed_from_u64(0xE0F0_0000_u64 ^ depth.to_bits());
+    let pixel_noise = Normal::new(0.0, sigma_px).unwrap();
+    let init_bearing_noise = Normal::new(0.0, 0.0005).unwrap();
+    let init_log_range_noise = Normal::new(0.0, 0.002).unwrap();
+    let init_lm_cov = Vector3::new(0.0005_f64.powi(2), 0.0005_f64.powi(2), 0.002_f64.powi(2));
+    let imu = IMUVelocity::new(
+        0.0,
+        Vector3::zeros(),
+        Vector3::new(0.0, 0.0, GRAVITY_CONSTANT),
+    );
+    let settings = VIOFilterSettings::default();
+    let input_gain = SMatrix::<f64, 12, 12>::zeros();
+    let output_gain = DMatrix::<f64>::identity(2 * n_landmarks, 2 * n_landmarks) * sigma_px.powi(2);
+
+    let mut nees = Vec::with_capacity(n_mc);
+    let mut range_rel_err = Vec::with_capacity(n_mc);
+    let mut valid_trials = 0;
+    let mut nonfinite_sigma_trials = 0;
+    let mut nonfinite_chart_trials = 0;
+    let mut singular_cov_trials = 0;
+    let mut no_finite_landmark_trials = 0;
+    let mut propagation_sigma_failures = 0;
+    let mut vision_sigma_failures = 0;
+    let mut nan_sigma_trials = 0;
+    let mut inf_sigma_trials = 0;
+    let mut sigma_failure_steps = Vec::new();
+    let mut non_spd_sigma_trials = 0;
+    let mut propagation_spd_failures = 0;
+    let mut vision_spd_failures = 0;
+    let mut spd_failure_steps = Vec::new();
+    let mut min_diag_at_spd_failures = Vec::new();
+    let mut max_asym_at_spd_failures = Vec::new();
+    let mut nonpositive_alpha_trials = 0;
+    let mut min_alphas = Vec::new();
+    let mut min_alphas_at_spd_failures = Vec::new();
+    let row_start = Instant::now();
+    for trial_idx in 0..n_mc {
+        let mut landmarks = Vec::with_capacity(n_landmarks);
+        for i in 0..n_landmarks {
+            let col = (i % 10) as f64;
+            let row = (i / 10) as f64;
+            let x_frac = 0.055 + 0.010 * col;
+            let y_frac = -0.045 + 0.030 * row;
+            landmarks.push(Landmark {
+                p: Vector3::new(x_frac * depth, y_frac * depth, depth),
+                id: i as u64,
+            });
+        }
+        let truth0 = VIOState::new(
+            VIOSensorState {
+                input_bias: Vector6::zeros(),
+                pose: SE3::identity(),
+                velocity: Vector3::new(1.0, 0.0, 0.0),
+                camera_offset: SE3::identity(),
+            },
+            landmarks,
+        );
+
+        let mut init_eps = DVector::<f64>::zeros(truth0.dim());
+        for i in 0..n_landmarks {
+            init_eps[s + 3 * i] = init_bearing_noise.sample(&mut rng);
+            init_eps[s + 3 * i + 1] = init_bearing_noise.sample(&mut rng);
+            init_eps[s + 3 * i + 2] = init_log_range_noise.sample(&mut rng);
+        }
+        let xi0_est = suite.state_chart_inv(&init_eps, &truth0);
+
+        let mut init_cov = DMatrix::<f64>::zeros(truth0.dim(), truth0.dim());
+        for i in 0..n_landmarks {
+            for k in 0..3 {
+                init_cov[(s + 3 * i + k, s + 3 * i + k)] = init_lm_cov[k];
+            }
+        }
+        let mut eqf = VIOEqF::new(xi0_est, &init_cov);
+        let state_gain = settings.state_gain_matrix(truth0.camera_landmarks.len());
+        let mut truth = truth0;
+        let mut sigma_failure: Option<(usize, &'static str, &'static str)> = None;
+        let mut spd_failure: Option<(usize, &'static str, SigmaSpdFailure)> = None;
+        let mut alpha_failure = false;
+
+        for step in 0..n_steps {
+            truth = crate::mathematical::vio_state::integrate_system_function(&truth, &imu, dt);
+            eqf.integrate_observer_state(&imu, dt, true);
+            if use_faster_riccati {
+                eqf.accumulate_transition(&suite, &imu, dt);
+                eqf.flush_riccati(&input_gain, &state_gain);
+            } else {
+                eqf.integrate_riccati_fast(&suite, &imu, dt, &input_gain, &state_gain);
+            }
+            if let Some(kind) = sigma_nonfinite_kind(&eqf.sigma) {
+                sigma_failure = Some((step + 1, "propagation", kind));
+                break;
+            }
+            if spd_failure.is_none() {
+                if let Some(health) = sigma_spd_failure(&eqf.sigma) {
+                    spd_failure = Some((step + 1, "propagation", health));
+                }
+            }
+
+            let mut y_ids = Vec::with_capacity(n_landmarks);
+            let mut y_coords = HashMap::with_capacity(n_landmarks);
+            for lm in &truth.camera_landmarks {
+                if lm.p[2] <= 1e-6 {
+                    continue;
+                }
+                let mut uv = cam.project(&lm.p);
+                uv[0] += pixel_noise.sample(&mut rng);
+                uv[1] += pixel_noise.sample(&mut rng);
+                y_ids.push(lm.id);
+                y_coords.insert(lm.id, uv);
+            }
+            let ct =
+                suite.output_matrix_C(&eqf.xi0, &eqf.x, &y_ids, &y_coords, &cam, true);
+            let alpha_health = scalar_update_alpha_health(&ct, &output_gain, &eqf.sigma);
+            if let Some(alpha) = alpha_health.min_alpha {
+                min_alphas.push(alpha);
+                if spd_failure.is_none() && alpha_health.first_nonpositive_row.is_some() {
+                    alpha_failure = true;
+                }
+            }
+            eqf.perform_vision_update(&suite, &y_ids, &y_coords, &cam, &output_gain, true, false);
+            if let Some(kind) = sigma_nonfinite_kind(&eqf.sigma) {
+                sigma_failure = Some((step + 1, "vision", kind));
+                break;
+            }
+            if spd_failure.is_none() {
+                if let Some(health) = sigma_spd_failure(&eqf.sigma) {
+                    spd_failure = Some((step + 1, "vision", health));
+                    if let Some(alpha) = alpha_health.min_alpha {
+                        min_alphas_at_spd_failures.push(alpha);
+                    }
+                }
+            }
+        }
+
+        if alpha_failure {
+            nonpositive_alpha_trials += 1;
+        }
+        if let Some((step, phase, health)) = spd_failure {
+            non_spd_sigma_trials += 1;
+            spd_failure_steps.push(step);
+            min_diag_at_spd_failures.push(health.min_diag);
+            max_asym_at_spd_failures.push(health.max_asym);
+            match phase {
+                "propagation" => propagation_spd_failures += 1,
+                "vision" => vision_spd_failures += 1,
+                _ => {}
+            }
+        }
+        if let Some((step, phase, kind)) = sigma_failure {
+            nonfinite_sigma_trials += 1;
+            sigma_failure_steps.push(step);
+            match kind {
+                "nan" => nan_sigma_trials += 1,
+                "inf" => inf_sigma_trials += 1,
+                _ => {}
+            }
+            match phase {
+                "propagation" => propagation_sigma_failures += 1,
+                "vision" => vision_sigma_failures += 1,
+                _ => {}
+            }
+            print_diag_progress(progress_label, trial_idx + 1, n_mc, row_start);
+            continue;
+        }
+        let err_state = state_group_action(&eqf.x.inverse(), &truth);
+        let eps = suite.state_chart(&err_state, &eqf.xi0);
+        if !eps.iter().all(|v| v.is_finite()) {
+            nonfinite_chart_trials += 1;
+            print_diag_progress(progress_label, trial_idx + 1, n_mc, row_start);
+            continue;
+        }
+        let est = eqf.state_estimate();
+        let mut trial_finite_landmarks = 0;
+        let mut trial_singular_cov = false;
+        for (i, lm_true) in truth.camera_landmarks.iter().enumerate() {
+            let e_lm = eps.fixed_rows::<3>(s + 3 * i).into_owned();
+            let Some(p_lm) = eqf.get_landmark_cov_by_id(lm_true.id) else {
+                continue;
+            };
+            if !p_lm.iter().all(|v| v.is_finite()) || !e_lm.iter().all(|v| v.is_finite()) {
+                continue;
+            }
+            let Some(p_lm_inv) =
+                (p_lm + SMatrix::<f64, 3, 3>::identity() * 1e-10).try_inverse()
+            else {
+                trial_singular_cov = true;
+                continue;
+            };
+            let trial_nees = (e_lm.transpose() * p_lm_inv * e_lm)[(0, 0)];
+            if trial_nees.is_finite() {
+                nees.push(trial_nees);
+                trial_finite_landmarks += 1;
+            }
+
+            let true_range = lm_true.p.norm();
+            let est_range = est.camera_landmarks[i].p.norm();
+            let rel_err = (est_range - true_range).abs() / true_range.max(1e-12);
+            if rel_err.is_finite() {
+                range_rel_err.push(rel_err);
+            }
+        }
+        if trial_finite_landmarks == 0 {
+            if trial_singular_cov {
+                singular_cov_trials += 1;
+            } else {
+                no_finite_landmark_trials += 1;
+            }
+        } else {
+            valid_trials += 1;
+        }
+        print_diag_progress(progress_label, trial_idx + 1, n_mc, row_start);
+    }
+
+    if nees.is_empty() || range_rel_err.is_empty() {
+        return EqvioFarLandmarkStats {
+            valid_trials,
+            total_trials: n_mc,
+            finite_landmarks: nees.len(),
+            mean_nees: f64::NAN,
+            median_nees: f64::NAN,
+            mean_range_rel_err: f64::NAN,
+            nonfinite_sigma_trials,
+            nan_sigma_trials,
+            inf_sigma_trials,
+            propagation_sigma_failures,
+            vision_sigma_failures,
+            min_sigma_failure_step: min_step(&sigma_failure_steps),
+            median_sigma_failure_step: median_step(&mut sigma_failure_steps),
+            non_spd_sigma_trials,
+            propagation_spd_failures,
+            vision_spd_failures,
+            min_spd_failure_step: min_step(&spd_failure_steps),
+            median_spd_failure_step: median_step(&mut spd_failure_steps),
+            min_diag_at_first_spd_failure: min_finite(&min_diag_at_spd_failures),
+            max_asym_at_first_spd_failure: max_finite(&max_asym_at_spd_failures),
+            nonpositive_alpha_trials,
+            min_alpha: min_finite(&min_alphas),
+            min_alpha_at_first_spd_failure: min_finite(&min_alphas_at_spd_failures),
+            nonfinite_chart_trials,
+            singular_cov_trials,
+            no_finite_landmark_trials,
+        };
+    }
+    nees.sort_by(|a, b| a.total_cmp(b));
+    let mean_nees = nees.iter().sum::<f64>() / nees.len() as f64;
+    let median_nees = nees[nees.len() / 2];
+    let mean_range_rel_err = range_rel_err.iter().sum::<f64>() / range_rel_err.len() as f64;
+    EqvioFarLandmarkStats {
+        valid_trials,
+        total_trials: n_mc,
+        finite_landmarks: nees.len(),
+        mean_nees,
+        median_nees,
+        mean_range_rel_err,
+        nonfinite_sigma_trials,
+        nan_sigma_trials,
+        inf_sigma_trials,
+        propagation_sigma_failures,
+        vision_sigma_failures,
+        min_sigma_failure_step: min_step(&sigma_failure_steps),
+        median_sigma_failure_step: median_step(&mut sigma_failure_steps),
+        non_spd_sigma_trials,
+        propagation_spd_failures,
+        vision_spd_failures,
+        min_spd_failure_step: min_step(&spd_failure_steps),
+        median_spd_failure_step: median_step(&mut spd_failure_steps),
+        min_diag_at_first_spd_failure: min_finite(&min_diag_at_spd_failures),
+        max_asym_at_first_spd_failure: max_finite(&max_asym_at_spd_failures),
+        nonpositive_alpha_trials,
+        min_alpha: min_finite(&min_alphas),
+        min_alpha_at_first_spd_failure: min_finite(&min_alphas_at_spd_failures),
+        nonfinite_chart_trials,
+        singular_cov_trials,
+        no_finite_landmark_trials,
+    }
+}
+
+fn sigma_nonfinite_kind(sigma: &DMatrix<f64>) -> Option<&'static str> {
+    if sigma.iter().any(|v| v.is_nan()) {
+        Some("nan")
+    } else if sigma.iter().any(|v| v.is_infinite()) {
+        Some("inf")
+    } else {
+        None
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SigmaSpdFailure {
+    min_diag: f64,
+    max_asym: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScalarUpdateAlphaHealth {
+    min_alpha: Option<f64>,
+    first_nonpositive_row: Option<usize>,
+}
+
+fn scalar_update_alpha_health(
+    c_star: &DMatrix<f64>,
+    r_noise: &DMatrix<f64>,
+    sigma: &DMatrix<f64>,
+) -> ScalarUpdateAlphaHealth {
+    let n = sigma.nrows();
+    let mut sigma_seq = sigma.clone();
+    let mut min_alpha = None;
+    let mut first_nonpositive_row = None;
+
+    for j in 0..c_star.nrows() {
+        let r_j = r_noise[(j, j)];
+        let mut v = DVector::<f64>::zeros(n);
+        for col in 0..n {
+            let c_jc = c_star[(j, col)];
+            if c_jc != 0.0 {
+                v.axpy(c_jc, &sigma_seq.column(col), 1.0);
+            }
+        }
+
+        let mut alpha = r_j;
+        for col in 0..n {
+            let c_jc = c_star[(j, col)];
+            if c_jc != 0.0 {
+                alpha += c_jc * v[col];
+            }
+        }
+
+        if alpha.is_finite() {
+            min_alpha = Some(min_alpha.map_or(alpha, |current: f64| current.min(alpha)));
+        }
+        if first_nonpositive_row.is_none() && (!alpha.is_finite() || alpha <= 0.0) {
+            first_nonpositive_row = Some(j);
+            break;
+        }
+        if alpha.abs() < 1e-30 {
+            continue;
+        }
+        sigma_seq.ger(-1.0 / alpha, &v, &v, 1.0);
+    }
+
+    ScalarUpdateAlphaHealth {
+        min_alpha,
+        first_nonpositive_row,
+    }
+}
+
+fn sigma_spd_failure(sigma: &DMatrix<f64>) -> Option<SigmaSpdFailure> {
+    if sigma_nonfinite_kind(sigma).is_some() {
+        return None;
+    }
+
+    let mut min_diag = f64::INFINITY;
+    let mut max_asym = 0.0_f64;
+    for i in 0..sigma.nrows() {
+        min_diag = min_diag.min(sigma[(i, i)]);
+        for j in (i + 1)..sigma.ncols() {
+            max_asym = max_asym.max((sigma[(i, j)] - sigma[(j, i)]).abs());
+        }
+    }
+
+    let sym_sigma = (sigma.clone() + sigma.transpose()) * 0.5;
+    if sym_sigma.cholesky().is_some() {
+        None
+    } else {
+        Some(SigmaSpdFailure { min_diag, max_asym })
+    }
+}
+
+fn min_step(steps: &[usize]) -> Option<usize> {
+    steps.iter().copied().min()
+}
+
+fn median_step(steps: &mut [usize]) -> Option<usize> {
+    if steps.is_empty() {
+        return None;
+    }
+    steps.sort_unstable();
+    Some(steps[steps.len() / 2])
+}
+
+fn min_finite(values: &[f64]) -> f64 {
+    values
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite())
+        .reduce(f64::min)
+        .unwrap_or(f64::NAN)
+}
+
+fn max_finite(values: &[f64]) -> f64 {
+    values
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite())
+        .reduce(f64::max)
+        .unwrap_or(f64::NAN)
+}
+
+fn print_diag_progress(label: &str, done: usize, total: usize, start: Instant) {
+    let elapsed = start.elapsed().as_secs_f64();
+    let per_trial = elapsed / done.max(1) as f64;
+    let eta = per_trial * total.saturating_sub(done) as f64;
+    eprintln!(
+        "progress: {label} trial {done}/{total} elapsed={} eta={}",
+        format_seconds(elapsed),
+        format_seconds(eta)
+    );
+}
+
+fn format_seconds(seconds: f64) -> String {
+    let seconds = seconds.max(0.0).round() as u64;
+    let minutes = seconds / 60;
+    let seconds = seconds % 60;
+    format!("{minutes}m{seconds:02}s")
 }
