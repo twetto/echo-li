@@ -54,7 +54,7 @@ struct Args {
     #[arg(long, default_value_t = true)]
     sparse: bool,
 
-    /// Sparse filter chart: polar3d or invdepth3d.
+    /// Sparse filter chart: polar3d, invdepth3d, or invdepth_additive3d (ρ-first).
     #[arg(long, default_value = "polar3d")]
     sparse_chart: String,
 
@@ -150,6 +150,9 @@ fn write_trajectory_metrics(
 
 fn parse_sparse_chart(name: &str) -> Sparse3DChart {
     match name.to_ascii_lowercase().as_str() {
+        "invdepth_additive3d" | "invdepth-additive" | "rho3d" | "rho" | "additive" => {
+            Sparse3DChart::InvDepthAdditive
+        }
         "invdepth" | "invdepth3d" | "inverse-depth" => Sparse3DChart::InvDepth,
         _ => Sparse3DChart::Polar,
     }

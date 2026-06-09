@@ -80,7 +80,7 @@ SparseVog:
   # parametrization: euclidean, invdepth, polar (1D scalar)
   #                  invdepth3d, polar3d (3D static-anchor SOT(3) IEKF)
   #                  invdepth_additive3d (ρ-first additive inverse-depth EKF)
-  parametrization: invdepth3d
+  parametrization: invdepth_additive3d
   max_pool_size: 1410
   # max_pool_size: 40
   # max_pool_size: 500
