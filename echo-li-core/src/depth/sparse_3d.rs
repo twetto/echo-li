@@ -259,6 +259,45 @@ impl Sparse3DFilter {
                 continue;
             }
 
+            // ρ-first (InvDepthAdditive): Civera-style diffuse init on first sight.
+            // Inverse-depth can represent "depth unknown" as a finite prior, so we
+            // anchor immediately (no triangulation, no parallax gate) and let later
+            // frames resolve rho. Centre the prior at the scene's geometric-mean
+            // depth (small rho => z=1/rho keeps depth honestly uncertain) with a
+            // ~100%-relative spread covering [~mean/2, inf). The feature stays
+            // (honestly) non-converged until parallax shrinks var_rho.
+            if self.chart == Sparse3DChart::InvDepthAdditive {
+                let fx = self.k[(0, 0)];
+                let fy = self.k[(1, 1)];
+                let cx = self.k[(0, 2)];
+                let cy = self.k[(1, 2)];
+                let rho0 = 1.0 / (self.settings.min_depth * self.settings.max_depth).sqrt();
+                let s = Vector3::new((uv_curr[0] - cx) / fx, (uv_curr[1] - cy) / fy, rho0);
+                let sn = self.sigma_norm_sq;
+                let inv_p = Matrix3::from_diagonal(&Vector3::new(sn, sn, rho0 * rho0));
+                let position = Vector3::new(s[0] / rho0, s[1] / rho0, 1.0 / rho0);
+                let j_i2e = conv_ind2euc(&position);
+                let covariance = j_i2e * inv_p * j_i2e.transpose();
+                self.insert_feature(FeatureState3D {
+                    feat_id: fid,
+                    position,
+                    covariance,
+                    q0: position,
+                    x: SOT3::identity(),
+                    sigma: Matrix3::zeros(),
+                    inv_s: s,
+                    inv_p,
+                    anchor_t_wc: *t_wc,
+                    a: self.settings.a_init,
+                    b: self.settings.b_init,
+                    track_length: 1,
+                    ref_uv: uv_curr,
+                    ref_stamp: stamp,
+                });
+                self.pending.remove(&fid);
+                continue;
+            }
+
             let pending = self
                 .pending
                 .entry(fid)
@@ -305,22 +344,8 @@ impl Sparse3DFilter {
             // Jacobian (chart_to_euc . cov . chart_to_euc^T).
             let j_c2e = chart_to_euc_jac(self.chart, &position);
             let sigma = j_c2e * covariance * j_c2e.transpose();
-            // ρ-first additive state: anchor-frame (alpha,beta,rho) and its cov.
-            // For InvDepthAdditive, `covariance` (from init_cov_3d) is already the
-            // Euclidean init cov (euc_to_chart_jac == I), which is what we cache;
-            // map it to (alpha,beta,rho) coords for inv_p via the euclid->invdepth
-            // point Jacobian.
-            let (inv_s, inv_p) = if self.chart == Sparse3DChart::InvDepthAdditive {
-                let s = Vector3::new(
-                    position[0] / position[2],
-                    position[1] / position[2],
-                    1.0 / position[2],
-                );
-                let j_e2i = conv_euc2ind(&position);
-                (s, j_e2i * covariance * j_e2i.transpose())
-            } else {
-                (Vector3::zeros(), Matrix3::zeros())
-            };
+            // Only the SOT(3) charts (Polar / InvDepth) reach the triangulate-then-
+            // anchor path; InvDepthAdditive is created diffuse-on-first-sight above.
             let feat = FeatureState3D {
                 feat_id: fid,
                 position,
@@ -328,8 +353,8 @@ impl Sparse3DFilter {
                 q0: position,
                 x: SOT3::identity(),
                 sigma,
-                inv_s,
-                inv_p,
+                inv_s: Vector3::zeros(),
+                inv_p: Matrix3::zeros(),
                 anchor_t_wc: *t_wc,
                 a: self.settings.a_init,
                 b: self.settings.b_init,
