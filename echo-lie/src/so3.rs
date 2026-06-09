@@ -1,7 +1,7 @@
 use nalgebra::{Matrix3, UnitQuaternion, Quaternion, Vector3, Vector4, U3};
 use rand::Rng;
 
-use crate::base::{skew, vex, LieGroup};
+use crate::base::{LieGroup, skew, vex};
 
 /// SO(3) — Special Orthogonal Group in 3D (rotations).
 ///
@@ -223,7 +223,7 @@ impl SO3 {
     #[inline]
     pub fn compose(&self, other: &SO3) -> SO3 {
         SO3 {
-            q: self.q * other.q,
+            q: UnitQuaternion::new_normalize((self.q * other.q).into_inner()),
         }
     }
 
@@ -308,6 +308,21 @@ mod tests {
     fn identity() {
         let id = SO3::identity();
         assert_abs_diff_eq!(id.as_matrix(), Matrix3::identity(), epsilon = 1e-15);
+    }
+
+    #[test]
+    fn compose_renormalizes_drifted_quaternion() {
+        // Regression: compose must restore unit length even if an operand has
+        // drifted off the unit sphere (it can, via repeated unchecked products).
+        // Without renormalisation a non-unit operand propagates: as_matrix()
+        // scales by ||q||^2, which detonated the EqVIO far-landmark covariance.
+        let drifted = SO3::from_quaternion(UnitQuaternion::new_unchecked(Quaternion::new(
+            1.2, 0.0, 0.0, 0.0,
+        ))); // ||q|| = 1.2
+        let out = drifted.compose(&SO3::identity());
+        assert_abs_diff_eq!(out.q.norm(), 1.0, epsilon = 1e-12);
+        // and the resulting rotation matrix is a proper rotation (||R||_F = sqrt(3))
+        assert_abs_diff_eq!(out.as_matrix().norm(), 3.0_f64.sqrt(), epsilon = 1e-12);
     }
 
     #[test]

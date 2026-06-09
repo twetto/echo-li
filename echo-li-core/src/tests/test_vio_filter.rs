@@ -1,8 +1,8 @@
 use approx::assert_abs_diff_eq;
 use echo_lie::{SE3, SO3};
 use nalgebra::{DMatrix, DVector, SMatrix, Vector2, Vector3, Vector6};
-use rand::rngs::StdRng;
 use rand::SeedableRng;
+use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal};
 use std::collections::HashMap;
 use std::time::Instant;
@@ -16,9 +16,9 @@ use crate::mathematical::eqf_matrices::EqFCoordinateSuite;
 use crate::mathematical::imu_velocity::IMUVelocity;
 use crate::mathematical::vio_eqf::VIOEqF;
 use crate::mathematical::vio_group::{
-    lift_velocity, state_group_action, vio_exp_with_bias_group, VIOGroup,
+    VIOGroup, lift_velocity, state_group_action, vio_exp_with_bias_group,
 };
-use crate::mathematical::vio_state::{Landmark, VIOSensorState, VIOState, GRAVITY_CONSTANT};
+use crate::mathematical::vio_state::{GRAVITY_CONSTANT, Landmark, VIOSensorState, VIOState};
 use crate::mathematical::vision_measurement::VisionMeasurement;
 use crate::tests::testing_utilities::*;
 use crate::{ImuBiasGroup, LandmarkDepthPrior, VIOFilter, VIOFilterSettings};
@@ -287,10 +287,7 @@ fn nontrivial_semi_direct_group(ids: &[u64]) -> VIOGroup {
     x
 }
 
-fn assert_semi_direct_a0t_matches_finite_difference<S: EqFCoordinateSuite>(
-    suite: &S,
-    name: &str,
-) {
+fn assert_semi_direct_a0t_matches_finite_difference<S: EqFCoordinateSuite>(suite: &S, name: &str) {
     let xi0 = make_xi0_with_landmarks(2);
     let mut x_hat = VIOGroup::identity_with_bias_group(&xi0.get_ids(), ImuBiasGroup::SemiDirect);
     x_hat.beta = Vector6::new(0.1, -0.2, 0.05, 0.3, -0.1, 0.2);
@@ -441,8 +438,7 @@ fn assert_semi_direct_fast_and_faster_riccati_match_zero_noise<S: EqFCoordinateS
     let mut rng = rand::rng();
     let xi0 = reasonable_state_element(2, &mut rng);
     let init_cov = DMatrix::<f64>::identity(xi0.dim(), xi0.dim()) * 0.01;
-    let mut fast =
-        VIOEqF::new_with_bias_group(xi0.clone(), &init_cov, ImuBiasGroup::SemiDirect);
+    let mut fast = VIOEqF::new_with_bias_group(xi0.clone(), &init_cov, ImuBiasGroup::SemiDirect);
     let mut faster = VIOEqF::new_with_bias_group(xi0.clone(), &init_cov, ImuBiasGroup::SemiDirect);
     fast.x = nontrivial_semi_direct_group(&xi0.get_ids());
     faster.x = fast.x.clone();
@@ -1501,6 +1497,57 @@ fn test_faster_multi_sample_well_formed() {
 }
 
 #[test]
+#[ignore = "analytic-vs-numerical A under x.b (offset-gauge) drift; run with --ignored --nocapture"]
+fn diag_eqvio_state_matrix_a_gauge_drift() {
+    // The reference computes A by finite-differencing the true lifted map (whose
+    // core conjugation X·Λ·X^{-1} cancels the gauge), so A is gauge-invariant and
+    // bounded. Our analytic state_matrix_a uses a bare x.b.inverse().adjoint().
+    // If the analytic rewrite is faithful, both should stay equal and bounded as
+    // x.b (the camera-offset gauge) drifts; if the analytic broke the
+    // cancellation, analytic ∝ ‖x.b‖ while numerical stays flat.
+    let suite = EuclideanSuite;
+    let xi0 = make_xi0_with_landmarks(3);
+    let imu = IMUVelocity::new(
+        0.0,
+        Vector3::new(0.1, -0.2, 0.3),
+        Vector3::new(0.4, -0.1, 9.7),
+    );
+    // Which gauge directions make ||A|| grow? offset (x.b translation), global
+    // position (x.a translation), global yaw (x.a rotation about gravity/z).
+    let norm_a = |x: &VIOGroup| suite.state_matrix_a(x, &xi0, &imu).norm();
+    let base = || {
+        let mut x = VIOGroup::identity_with_bias_group(&xi0.get_ids(), ImuBiasGroup::SemiDirect);
+        x.a = SE3::new(
+            SO3::exp(&Vector3::new(0.12, -0.05, 0.03)),
+            Vector3::new(0.2, -0.1, 0.05),
+        );
+        x
+    };
+    println!("magnitude  offset(x.b t)  position(x.a t)  yaw(x.a Rz)  bias(x.beta)");
+    for m in [0.0_f64, 1.0, 1e2, 1e4, 1e6] {
+        let mut xb = base();
+        xb.b = SE3::new(SO3::identity(), Vector3::new(m, 0.0, 0.0));
+        let mut xp = base();
+        xp.a = SE3::new(xp.a.rotation.clone(), Vector3::new(m, 0.0, 0.0));
+        let mut xy = base();
+        let yaw = (m).min(3.0); // rad about gravity z, capped to stay a rotation
+        xy.a = SE3::new(
+            SO3::exp(&Vector3::new(0.0, 0.0, yaw)),
+            Vector3::new(0.2, -0.1, 0.05),
+        );
+        let mut xbias = base();
+        xbias.beta = Vector6::new(m, 0.0, 0.0, 0.0, 0.0, 0.0);
+        println!(
+            "{m:8.0e}    {:.3e}      {:.3e}        {:.3e}    {:.3e}",
+            norm_a(&xb),
+            norm_a(&xp),
+            norm_a(&xy),
+            norm_a(&xbias)
+        );
+    }
+}
+
+#[test]
 #[ignore = "single-trial covariance-growth trace; run with --ignored --nocapture"]
 fn diag_eqvio_far_landmark_cov_trace() {
     // One trial, NormalSuite, depth 640. Print per-step covariance health to see
@@ -1573,7 +1620,11 @@ fn diag_eqvio_far_landmark_cov_trace() {
     let input_gain = SMatrix::<f64, 12, 12>::zeros();
     let state_gain = settings.state_gain_matrix(truth0.camera_landmarks.len());
     let output_gain = DMatrix::<f64>::identity(2 * n_landmarks, 2 * n_landmarks) * sigma_px.powi(2);
-    let imu = IMUVelocity::new(0.0, Vector3::zeros(), Vector3::new(0.0, 0.0, GRAVITY_CONSTANT));
+    let imu = IMUVelocity::new(
+        0.0,
+        Vector3::zeros(),
+        Vector3::new(0.0, 0.0, GRAVITY_CONSTANT),
+    );
     let mut truth = truth0;
 
     let block_stats = |sigma: &DMatrix<f64>, lo: usize, hi: usize| -> (f64, f64, usize) {
@@ -1636,20 +1687,34 @@ fn diag_eqvio_far_landmark_cov_trace() {
             .iter()
             .map(|q| q.scale.abs())
             .fold(f64::MAX, f64::min);
-        let adj_b = eqf.x.b.adjoint().norm();
+        // gauge coordinates: offset (x.b), bias (x.beta), position (x.a.t)
+        let xb_t = eqf.x.b.translation.norm();
+        let xb_r = eqf.x.b.rotation.as_matrix().norm(); // valid rotation => sqrt(3)=1.73
+        let xb_q = eqf.x.b.rotation.q.norm(); // unit quaternion => 1.0
+        let beta_n = eqf.x.beta.norm();
+        let xa_t = eqf.x.a.translation.norm();
         let me_pre = min_eig(&eqf.sigma);
         let cond = block_stats(&eqf.sigma, 0, eqf.sigma.nrows()).0 / me_pre.abs().max(1e-300);
         eqf.integrate_riccati_fast(&suite, &imu, dt, &input_gain, &state_gain);
-        let (lmax, _, larg) = block_stats(&eqf.sigma, s, eqf.sigma.nrows());
         let me_prop = if eqf.sigma.iter().all(|v| v.is_finite()) {
             min_eig(&eqf.sigma)
         } else {
             f64::NAN
         };
         println!(
-            "{step:3} prop  | est[min_z={min_lm_z:.2e} |v|={vel:.2e}] grp[scale {min_scale:.2e}..{max_scale:.2e} adjB={adj_b:.1e}] maxA[lmlm={max_a_lmlm:.1e} lms={max_a_lms:.1e}] -> lm[{lmax:.2e}] min_eig={me_prop:.3e}",
+            "{step:3} | xb[t={xb_t:.2e} R={xb_r:.3e} q={xb_q:.4e}] bias={beta_n:.2e} pos_t={xa_t:.2e} maxA[lms={max_a_lms:.1e}] min_eig={me_prop:.3e}",
         );
-        let _ = (max_a_ss, me_pre, min_lm_norm, larg, cond);
+        let _ = (
+            max_a_ss,
+            max_a_lmlm,
+            me_pre,
+            min_lm_norm,
+            min_scale,
+            max_scale,
+            cond,
+            min_lm_z,
+            vel,
+        );
 
         let mut y_ids = Vec::with_capacity(n_landmarks);
         let mut y_coords = HashMap::with_capacity(n_landmarks);
@@ -1704,7 +1769,9 @@ fn diag_eqvio_far_landmark_nees_depth_sweep() {
 
     println!("EqVIO coordinate-suite far-landmark SPD/NEES diagnostic");
     println!("known constant lateral motion, 40 in-state landmarks, noisy pixels");
-    println!("suite, variant, depth_m, valid_trials, finite_landmarks, mean_nees, median_nees, mean_range_rel_err, nonfinite_sigma, nan_sigma, inf_sigma, prop_fail, vision_fail, min_fail_step, median_fail_step, non_spd_sigma, spd_prop_fail, spd_vision_fail, min_spd_step, median_spd_step, min_diag_at_spd_fail, max_asym_at_spd_fail, nonpos_alpha, min_alpha, min_alpha_at_spd_fail, nonfinite_chart, singular_cov, no_finite_landmarks");
+    println!(
+        "suite, variant, depth_m, valid_trials, finite_landmarks, mean_nees, median_nees, mean_range_rel_err, nonfinite_sigma, nan_sigma, inf_sigma, prop_fail, vision_fail, min_fail_step, median_fail_step, non_spd_sigma, spd_prop_fail, spd_vision_fail, min_spd_step, median_spd_step, min_diag_at_spd_fail, max_asym_at_spd_fail, nonpos_alpha, min_alpha, min_alpha_at_spd_fail, nonfinite_chart, singular_cov, no_finite_landmarks"
+    );
 
     let total_rows = suites.len() * 2 * depths.len();
     let sweep_start = Instant::now();
@@ -1750,39 +1817,43 @@ fn diag_eqvio_far_landmark_nees_depth_sweep() {
                 println!(
                     "{suite_name}, {variant}, {depth:.0}, {}/{}, {}, {:.3}, {:.3}, {:.4e}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {:.4e}, {:.4e}, {}, {:.4e}, {:.4e}, {}, {}, {}",
                     stats.valid_trials,
-                stats.total_trials,
-                stats.finite_landmarks,
-                stats.mean_nees,
-                stats.median_nees,
-                stats.mean_range_rel_err,
-                stats.nonfinite_sigma_trials,
-                stats.nan_sigma_trials,
-                stats.inf_sigma_trials,
-                stats.propagation_sigma_failures,
-                stats.vision_sigma_failures,
-                stats.min_sigma_failure_step
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "none".to_string()),
-                stats.median_sigma_failure_step
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "none".to_string()),
-                stats.non_spd_sigma_trials,
-                stats.propagation_spd_failures,
-                stats.vision_spd_failures,
-                stats.min_spd_failure_step
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "none".to_string()),
-                stats.median_spd_failure_step
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "none".to_string()),
-                stats.min_diag_at_first_spd_failure,
-                stats.max_asym_at_first_spd_failure,
-                stats.nonpositive_alpha_trials,
-                stats.min_alpha,
-                stats.min_alpha_at_first_spd_failure,
-                stats.nonfinite_chart_trials,
-                stats.singular_cov_trials,
-                stats.no_finite_landmark_trials
+                    stats.total_trials,
+                    stats.finite_landmarks,
+                    stats.mean_nees,
+                    stats.median_nees,
+                    stats.mean_range_rel_err,
+                    stats.nonfinite_sigma_trials,
+                    stats.nan_sigma_trials,
+                    stats.inf_sigma_trials,
+                    stats.propagation_sigma_failures,
+                    stats.vision_sigma_failures,
+                    stats
+                        .min_sigma_failure_step
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "none".to_string()),
+                    stats
+                        .median_sigma_failure_step
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "none".to_string()),
+                    stats.non_spd_sigma_trials,
+                    stats.propagation_spd_failures,
+                    stats.vision_spd_failures,
+                    stats
+                        .min_spd_failure_step
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "none".to_string()),
+                    stats
+                        .median_spd_failure_step
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "none".to_string()),
+                    stats.min_diag_at_first_spd_failure,
+                    stats.max_asym_at_first_spd_failure,
+                    stats.nonpositive_alpha_trials,
+                    stats.min_alpha,
+                    stats.min_alpha_at_first_spd_failure,
+                    stats.nonfinite_chart_trials,
+                    stats.singular_cov_trials,
+                    stats.no_finite_landmark_trials
                 );
             }
         }
@@ -1952,8 +2023,7 @@ fn eqvio_far_landmark_nees_for_depth(
                 y_ids.push(lm.id);
                 y_coords.insert(lm.id, uv);
             }
-            let ct =
-                suite.output_matrix_C(&eqf.xi0, &eqf.x, &y_ids, &y_coords, &cam, true);
+            let ct = suite.output_matrix_C(&eqf.xi0, &eqf.x, &y_ids, &y_coords, &cam, true);
             let alpha_health = scalar_update_alpha_health(&ct, &output_gain, &eqf.sigma);
             if let Some(alpha) = alpha_health.min_alpha {
                 min_alphas.push(alpha);
@@ -2024,8 +2094,7 @@ fn eqvio_far_landmark_nees_for_depth(
             if !p_lm.iter().all(|v| v.is_finite()) || !e_lm.iter().all(|v| v.is_finite()) {
                 continue;
             }
-            let Some(p_lm_inv) =
-                (p_lm + SMatrix::<f64, 3, 3>::identity() * 1e-10).try_inverse()
+            let Some(p_lm_inv) = (p_lm + SMatrix::<f64, 3, 3>::identity() * 1e-10).try_inverse()
             else {
                 trial_singular_cov = true;
                 continue;
