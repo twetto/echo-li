@@ -20,6 +20,10 @@ pub struct LocalOccupancySettings {
     pub log_odds_max: f32,
     pub occupied_threshold: f32,
     pub free_threshold: f32,
+    /// Vertical extent of the (ego-centric) 3D grid, **relative to the camera**:
+    /// the grid spans `cam_z + [min_obstacle_height, max_obstacle_height]`,
+    /// discretised into `round((max - min) / resolution)` z-layers. The map is a
+    /// true 3D voxel grid; these two fields only size its vertical extent.
     pub min_obstacle_height: f64,
     pub max_obstacle_height: f64,
 }
@@ -66,19 +70,27 @@ pub struct OccupancyUpdateStats {
 pub struct OccupancyGridSnapshot {
     pub width: usize,
     pub height: usize,
+    pub depth: usize,
     pub resolution: f64,
     pub origin_x: f64,
     pub origin_y: f64,
+    pub origin_z: f64,
     pub log_odds: Vec<f32>,
 }
 
+/// Ego-centric, scrolling **3D** log-odds occupancy grid fed by dense
+/// patch-depth rays. Free space is carved along each ray with a 3D
+/// Amanatides–Woo traversal; the ray endpoint marks an occupied voxel.
 #[derive(Debug, Clone)]
 pub struct LocalOccupancyMap {
     settings: LocalOccupancySettings,
+    depth_cells: usize,
     origin_x: f64,
     origin_y: f64,
+    origin_z: f64,
     center_ix: i64,
     center_iy: i64,
+    center_iz: i64,
     log_odds: Vec<f32>,
 }
 
@@ -100,15 +112,29 @@ impl LocalOccupancyMap {
             settings.max_range > settings.min_range,
             "occupancy max_range must be greater than min_range"
         );
-        let n = settings.width_cells * settings.height_cells;
-        let origin_x = -(settings.width_cells as f64) * 0.5 * settings.resolution;
-        let origin_y = -(settings.height_cells as f64) * 0.5 * settings.resolution;
+        anyhow::ensure!(
+            settings.max_obstacle_height > settings.min_obstacle_height,
+            "occupancy vertical extent (max_obstacle_height - min_obstacle_height) must be positive"
+        );
+        let depth_cells = (((settings.max_obstacle_height - settings.min_obstacle_height)
+            / settings.resolution)
+            .round() as usize)
+            .max(1);
+        let w = settings.width_cells;
+        let h = settings.height_cells;
+        let n = w * h * depth_cells;
+        let origin_x = -(w as f64) * 0.5 * settings.resolution;
+        let origin_y = -(h as f64) * 0.5 * settings.resolution;
+        let origin_z = -(depth_cells as f64) * 0.5 * settings.resolution;
         Ok(Self {
             settings,
+            depth_cells,
             origin_x,
             origin_y,
+            origin_z,
             center_ix: 0,
             center_iy: 0,
+            center_iz: 0,
             log_odds: vec![0.0; n],
         })
     }
@@ -117,22 +143,37 @@ impl LocalOccupancyMap {
         &self.settings
     }
 
+    /// Number of vertical (z) layers in the grid.
+    pub fn depth_cells(&self) -> usize {
+        self.depth_cells
+    }
+
     pub fn snapshot(&self) -> OccupancyGridSnapshot {
         OccupancyGridSnapshot {
             width: self.settings.width_cells,
             height: self.settings.height_cells,
+            depth: self.depth_cells,
             resolution: self.settings.resolution,
             origin_x: self.origin_x,
             origin_y: self.origin_y,
+            origin_z: self.origin_z,
             log_odds: self.log_odds.clone(),
         }
     }
 
-    pub fn cell_state(&self, x: usize, y: usize) -> Option<OccupancyCell> {
-        if x >= self.settings.width_cells || y >= self.settings.height_cells {
+    #[inline]
+    fn index(&self, x: usize, y: usize, z: usize) -> usize {
+        (z * self.settings.height_cells + y) * self.settings.width_cells + x
+    }
+
+    pub fn cell_state(&self, x: usize, y: usize, z: usize) -> Option<OccupancyCell> {
+        if x >= self.settings.width_cells
+            || y >= self.settings.height_cells
+            || z >= self.depth_cells
+        {
             return None;
         }
-        let value = self.log_odds[y * self.settings.width_cells + x];
+        let value = self.log_odds[self.index(x, y, z)];
         Some(if value >= self.settings.occupied_threshold {
             OccupancyCell::Occupied
         } else if value <= self.settings.free_threshold {
@@ -142,6 +183,7 @@ impl LocalOccupancyMap {
         })
     }
 
+    /// Returns `(unknown, free, occupied)` voxel counts.
     pub fn counts(&self) -> (usize, usize, usize) {
         let mut unknown = 0;
         let mut free = 0;
@@ -168,7 +210,7 @@ impl LocalOccupancyMap {
         image_height: usize,
         t_wc: &Matrix4<f64>,
     ) -> OccupancyUpdateStats {
-        self.recenter(t_wc[(0, 3)], t_wc[(1, 3)]);
+        self.recenter(t_wc[(0, 3)], t_wc[(1, 3)], t_wc[(2, 3)]);
 
         let mut stats = OccupancyUpdateStats::default();
         if output.eta.width == 0 || output.eta.height == 0 || image_width == 0 || image_height == 0
@@ -176,8 +218,7 @@ impl LocalOccupancyMap {
             return stats;
         }
 
-        let cam_origin = Vector2::new(t_wc[(0, 3)], t_wc[(1, 3)]);
-        let cam_z = t_wc[(2, 3)];
+        let cam_origin = Vector3::new(t_wc[(0, 3)], t_wc[(1, 3)], t_wc[(2, 3)]);
         let sx = image_width as f64 / output.eta.width as f64;
         let sy = image_height as f64 / output.eta.height as f64;
 
@@ -213,14 +254,8 @@ impl LocalOccupancyMap {
                 }
                 let p_c = bearing_c * range;
                 let p_w_h = t_wc * Vector4::new(p_c[0], p_c[1], p_c[2], 1.0);
-                let height = p_w_h[2] - cam_z;
-                if height < self.settings.min_obstacle_height
-                    || height > self.settings.max_obstacle_height
-                {
-                    continue;
-                }
+                let endpoint = Vector3::new(p_w_h[0], p_w_h[1], p_w_h[2]);
 
-                let endpoint = Vector2::new(p_w_h[0], p_w_h[1]);
                 stats.rays_integrated += 1;
                 self.integrate_ray(cam_origin, endpoint, &mut stats);
             }
@@ -228,110 +263,150 @@ impl LocalOccupancyMap {
         stats
     }
 
-    fn recenter(&mut self, center_x: f64, center_y: f64) {
-        let new_center_ix = (center_x / self.settings.resolution).floor() as i64;
-        let new_center_iy = (center_y / self.settings.resolution).floor() as i64;
+    fn recenter(&mut self, center_x: f64, center_y: f64, center_z: f64) {
+        let res = self.settings.resolution;
+        let new_center_ix = (center_x / res).floor() as i64;
+        let new_center_iy = (center_y / res).floor() as i64;
+        let new_center_iz = (center_z / res).floor() as i64;
         let dx = new_center_ix - self.center_ix;
         let dy = new_center_iy - self.center_iy;
-        if dx == 0 && dy == 0 {
+        let dz = new_center_iz - self.center_iz;
+        if dx == 0 && dy == 0 && dz == 0 {
             return;
         }
 
         let w = self.settings.width_cells;
         let h = self.settings.height_cells;
+        let d = self.depth_cells;
         let mut shifted = vec![0.0; self.log_odds.len()];
-        for y in 0..h {
-            for x in 0..w {
-                let src_x = x as i64 + dx;
-                let src_y = y as i64 + dy;
-                if src_x >= 0 && src_x < w as i64 && src_y >= 0 && src_y < h as i64 {
-                    shifted[y * w + x] = self.log_odds[src_y as usize * w + src_x as usize];
+        for z in 0..d {
+            for y in 0..h {
+                for x in 0..w {
+                    let src_x = x as i64 + dx;
+                    let src_y = y as i64 + dy;
+                    let src_z = z as i64 + dz;
+                    if src_x >= 0
+                        && src_x < w as i64
+                        && src_y >= 0
+                        && src_y < h as i64
+                        && src_z >= 0
+                        && src_z < d as i64
+                    {
+                        shifted[self.index(x, y, z)] = self.log_odds
+                            [self.index(src_x as usize, src_y as usize, src_z as usize)];
+                    }
                 }
             }
         }
         self.log_odds = shifted;
         self.center_ix = new_center_ix;
         self.center_iy = new_center_iy;
-        self.origin_x = (self.center_ix as f64 - w as f64 * 0.5) * self.settings.resolution;
-        self.origin_y = (self.center_iy as f64 - h as f64 * 0.5) * self.settings.resolution;
+        self.center_iz = new_center_iz;
+        self.origin_x = (self.center_ix as f64 - w as f64 * 0.5) * res;
+        self.origin_y = (self.center_iy as f64 - h as f64 * 0.5) * res;
+        self.origin_z = (self.center_iz as f64 - d as f64 * 0.5) * res;
     }
 
+    /// 3D Amanatides–Woo voxel traversal from the camera to the ray endpoint.
+    /// Carves free space for every in-bounds voxel up to the boundary, and marks
+    /// the endpoint occupied only if it is itself in bounds (clip-and-carve: an
+    /// off-grid endpoint still contributes its near free space).
     fn integrate_ray(
         &mut self,
-        origin: Vector2<f64>,
-        endpoint: Vector2<f64>,
+        origin: Vector3<f64>,
+        endpoint: Vector3<f64>,
         stats: &mut OccupancyUpdateStats,
     ) {
-        // Cell coordinates may lie outside the grid (e.g. an endpoint beyond
-        // `max_range` for the ego-centric extent). We walk the *whole* ray and
-        // clip per-cell: carve free space for every in-bounds traversed cell up to
-        // the boundary, and mark the endpoint occupied only if it is itself
-        // in bounds. A ray whose endpoint is off-map thus still contributes its
-        // near free space (the obstacle is simply "beyond the map / unknown").
-        let (x0, y0) = self.world_to_cell_raw(origin);
-        let (x1, y1) = self.world_to_cell_raw(endpoint);
-        let endpoint_in_bounds = self.cell_in_bounds(x1, y1);
+        let res = self.settings.resolution;
+        // Continuous voxel-space coordinates of the ray.
+        let p0 = [
+            (origin.x - self.origin_x) / res,
+            (origin.y - self.origin_y) / res,
+            (origin.z - self.origin_z) / res,
+        ];
+        let p1 = [
+            (endpoint.x - self.origin_x) / res,
+            (endpoint.y - self.origin_y) / res,
+            (endpoint.z - self.origin_z) / res,
+        ];
+        let dir = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
 
-        let mut x = x0;
-        let mut y = y0;
-        let dx = (x1 - x0).abs();
-        let dy = -(y1 - y0).abs();
-        let sx = if x0 < x1 { 1 } else { -1 };
-        let sy = if y0 < y1 { 1 } else { -1 };
-        let mut err = dx + dy;
+        let mut cell = [
+            p0[0].floor() as i64,
+            p0[1].floor() as i64,
+            p0[2].floor() as i64,
+        ];
+        let end = [
+            p1[0].floor() as i64,
+            p1[1].floor() as i64,
+            p1[2].floor() as i64,
+        ];
+        let endpoint_in_bounds = self.cell_in_bounds(end[0], end[1], end[2]);
+
+        // Per-axis Amanatides–Woo: (step, t to first boundary, t to cross a voxel).
+        let setup = |d: f64, i: i64, p: f64| -> (i64, f64, f64) {
+            if d > 0.0 {
+                (1, ((i + 1) as f64 - p) / d, 1.0 / d)
+            } else if d < 0.0 {
+                (-1, (i as f64 - p) / d, -1.0 / d)
+            } else {
+                (0, f64::INFINITY, f64::INFINITY)
+            }
+        };
+        let (step_x, mut tmax_x, tdelta_x) = setup(dir[0], cell[0], p0[0]);
+        let (step_y, mut tmax_y, tdelta_y) = setup(dir[1], cell[1], p0[1]);
+        let (step_z, mut tmax_z, tdelta_z) = setup(dir[2], cell[2], p0[2]);
+
         let mut entered = false;
-
         loop {
-            if x == x1 && y == y1 {
+            if cell == end {
                 if endpoint_in_bounds {
-                    self.add_log_odds(x, y, self.settings.log_odds_hit);
+                    self.add_log_odds(cell[0], cell[1], cell[2], self.settings.log_odds_hit);
                     stats.occupied_updates += 1;
                 }
                 break;
             }
-            if self.cell_in_bounds(x, y) {
-                self.add_log_odds(x, y, self.settings.log_odds_miss);
+            if self.cell_in_bounds(cell[0], cell[1], cell[2]) {
+                self.add_log_odds(cell[0], cell[1], cell[2], self.settings.log_odds_miss);
                 stats.free_updates += 1;
                 entered = true;
             } else if entered {
-                // We were inside the grid and have now crossed the boundary; a
-                // straight ray will not re-enter, so stop (don't walk the off-map
-                // tail toward a far endpoint).
+                // Left the grid; a straight ray will not re-enter.
                 break;
             }
-            let e2 = 2 * err;
-            if e2 >= dy {
-                err += dy;
-                x += sx;
+            // Safety: stop once the next crossing is past the endpoint (t > 1).
+            if tmax_x.min(tmax_y).min(tmax_z) > 1.0 {
+                break;
             }
-            if e2 <= dx {
-                err += dx;
-                y += sy;
+            if tmax_x <= tmax_y && tmax_x <= tmax_z {
+                cell[0] += step_x;
+                tmax_x += tdelta_x;
+            } else if tmax_y <= tmax_z {
+                cell[1] += step_y;
+                tmax_y += tdelta_y;
+            } else {
+                cell[2] += step_z;
+                tmax_z += tdelta_z;
             }
         }
     }
 
-    fn add_log_odds(&mut self, x: i64, y: i64, delta: f32) {
-        if !self.cell_in_bounds(x, y) {
+    fn add_log_odds(&mut self, x: i64, y: i64, z: i64, delta: f32) {
+        if !self.cell_in_bounds(x, y, z) {
             return;
         }
-        let idx = y as usize * self.settings.width_cells + x as usize;
+        let idx = self.index(x as usize, y as usize, z as usize);
         self.log_odds[idx] = (self.log_odds[idx] + delta)
             .clamp(self.settings.log_odds_min, self.settings.log_odds_max);
     }
 
-    /// Cell index for a world point, without bounds checking (may be off-grid).
-    fn world_to_cell_raw(&self, p: Vector2<f64>) -> (i64, i64) {
-        let x = ((p[0] - self.origin_x) / self.settings.resolution).floor() as i64;
-        let y = ((p[1] - self.origin_y) / self.settings.resolution).floor() as i64;
-        (x, y)
-    }
-
-    fn cell_in_bounds(&self, x: i64, y: i64) -> bool {
+    fn cell_in_bounds(&self, x: i64, y: i64, z: i64) -> bool {
         x >= 0
             && x < self.settings.width_cells as i64
             && y >= 0
             && y < self.settings.height_cells as i64
+            && z >= 0
+            && z < self.depth_cells as i64
     }
 }
 
@@ -362,6 +437,18 @@ mod tests {
         }
     }
 
+    // Camera looking along +Y_world in a planar (z=0) configuration. With
+    // min/max_obstacle_height = -1/1 and resolution 1, the grid has 2 z-layers
+    // and the z=0 plane falls in layer kz=1.
+    fn y_forward_pose() -> Matrix4<f64> {
+        let mut pose = Matrix4::identity();
+        pose[(1, 1)] = 0.0;
+        pose[(1, 2)] = 1.0;
+        pose[(2, 1)] = 1.0;
+        pose[(2, 2)] = 0.0;
+        pose
+    }
+
     #[test]
     fn integrates_endpoint_and_free_space() {
         let settings = LocalOccupancySettings {
@@ -383,12 +470,7 @@ mod tests {
             cx: 0.0,
             cy: 0.0,
         };
-        let mut pose = Matrix4::identity();
-        pose[(1, 1)] = 0.0;
-        pose[(1, 2)] = 1.0;
-        pose[(2, 1)] = 1.0;
-        pose[(2, 2)] = 0.0;
-
+        let pose = y_forward_pose();
         let intrinsics = CameraIntrinsics::new(1.0, 1.0, 0.0, 0.0);
         let stats = map.update_from_patch_depth(
             &single_depth_output(3.0),
@@ -401,8 +483,8 @@ mod tests {
         );
 
         assert_eq!(stats.rays_integrated, 1);
-        assert_eq!(map.cell_state(5, 5), Some(OccupancyCell::Free));
-        assert_eq!(map.cell_state(5, 8), Some(OccupancyCell::Occupied));
+        assert_eq!(map.cell_state(5, 5, 1), Some(OccupancyCell::Free));
+        assert_eq!(map.cell_state(5, 8, 1), Some(OccupancyCell::Occupied));
     }
 
     #[test]
@@ -429,14 +511,10 @@ mod tests {
             cx: 0.0,
             cy: 0.0,
         };
-        let mut pose = Matrix4::identity();
-        pose[(1, 1)] = 0.0;
-        pose[(1, 2)] = 1.0;
-        pose[(2, 1)] = 1.0;
-        pose[(2, 2)] = 0.0;
+        let pose = y_forward_pose();
         let intrinsics = CameraIntrinsics::new(1.0, 1.0, 0.0, 0.0);
 
-        // range 8 -> endpoint cell (5, 13), outside the 11x11 grid (max index 10).
+        // range 8 -> endpoint cell (5, 13, 1), outside the 11x11 grid (max idx 10).
         let stats = map.update_from_patch_depth(
             &single_depth_output(8.0),
             &camera,
@@ -456,8 +534,8 @@ mod tests {
             stats.free_updates > 0,
             "should still carve free space up to the boundary"
         );
-        assert_eq!(map.cell_state(5, 5), Some(OccupancyCell::Free)); // camera cell
-        assert_eq!(map.cell_state(5, 10), Some(OccupancyCell::Free)); // last in-bounds cell
+        assert_eq!(map.cell_state(5, 5, 1), Some(OccupancyCell::Free)); // camera cell
+        assert_eq!(map.cell_state(5, 10, 1), Some(OccupancyCell::Free)); // last in-bounds cell
     }
 
     #[test]
@@ -473,12 +551,26 @@ mod tests {
             ..Default::default()
         };
         let mut map = LocalOccupancyMap::new(settings).unwrap();
-        map.add_log_odds(4, 3, 1.0);
+        map.add_log_odds(4, 3, 1, 1.0);
 
-        let mut pose = Matrix4::identity();
-        pose[(0, 3)] = 1.0;
-        map.recenter(pose[(0, 3)], pose[(1, 3)]);
+        map.recenter(1.0, 0.0, 0.0);
 
-        assert_eq!(map.cell_state(3, 3), Some(OccupancyCell::Occupied));
+        assert_eq!(map.cell_state(3, 3, 1), Some(OccupancyCell::Occupied));
+    }
+
+    #[test]
+    fn vertical_extent_resolves_into_layers() {
+        // 4 m vertical extent at 1 m resolution -> 4 z-layers (true 3D, not BEV).
+        let settings = LocalOccupancySettings {
+            resolution: 1.0,
+            width_cells: 11,
+            height_cells: 11,
+            min_obstacle_height: -2.0,
+            max_obstacle_height: 2.0,
+            ..Default::default()
+        };
+        let map = LocalOccupancyMap::new(settings).unwrap();
+        assert_eq!(map.depth_cells(), 4);
+        assert_eq!(map.snapshot().log_odds.len(), 11 * 11 * 4);
     }
 }

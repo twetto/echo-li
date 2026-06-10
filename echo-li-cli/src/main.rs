@@ -464,6 +464,50 @@ fn sparse_points_for_vis(
     (image_points, image_colors, world_points, world_colors)
 }
 
+/// Occupied / free voxel centres of the local 3D map as world points for Rerun.
+/// Occupied voxels are returned in full; free voxels are decimated by
+/// `FREE_VIS_STRIDE` per axis (the free volume is otherwise far too many cells to
+/// stream/draw). Unknown voxels are omitted.
+#[cfg(feature = "rerun")]
+fn occupancy_cells_for_vis(map: &LocalOccupancyMap) -> (Vec<[f32; 3]>, Vec<[f32; 3]>) {
+    // Free thinning: keep every Nth voxel per axis (2 -> 1/8 the count).
+    const FREE_VIS_STRIDE: usize = 2;
+    let snap = map.snapshot();
+    let occ_thr = map.settings().occupied_threshold;
+    let free_thr = map.settings().free_threshold;
+    let r = snap.resolution;
+    let (mut occupied, mut free) = (Vec::new(), Vec::new());
+    for cz in 0..snap.depth {
+        for cy in 0..snap.height {
+            for cx in 0..snap.width {
+                let l = snap.log_odds[(cz * snap.height + cy) * snap.width + cx];
+                let occupied_cell = l >= occ_thr;
+                if !occupied_cell && l > free_thr {
+                    continue; // unknown
+                }
+                if !occupied_cell
+                    && (cx % FREE_VIS_STRIDE != 0
+                        || cy % FREE_VIS_STRIDE != 0
+                        || cz % FREE_VIS_STRIDE != 0)
+                {
+                    continue; // thinned-out free voxel
+                }
+                let p = [
+                    (snap.origin_x + (cx as f64 + 0.5) * r) as f32,
+                    (snap.origin_y + (cy as f64 + 0.5) * r) as f32,
+                    (snap.origin_z + (cz as f64 + 0.5) * r) as f32,
+                ];
+                if occupied_cell {
+                    occupied.push(p);
+                } else {
+                    free.push(p);
+                }
+            }
+        }
+    }
+    (occupied, free)
+}
+
 #[cfg(feature = "rerun")]
 fn send_rerun_blueprint(
     rec: &rerun::RecordingStream,
@@ -896,16 +940,20 @@ fn build_local_occupancy_map(
         return Ok(None);
     }
 
+    let map = LocalOccupancyMap::new(settings.clone())?;
     println!(
-        "Local occupancy: enabled {}x{} cells @ {:.3}m, range=[{:.2}, {:.2}]m, stride={}",
+        "Local occupancy: enabled {}x{}x{} voxels @ {:.3}m (z extent [{:.2}, {:.2}]m), range=[{:.2}, {:.2}]m, stride={}",
         settings.width_cells,
         settings.height_cells,
+        map.depth_cells(),
         settings.resolution,
+        settings.min_obstacle_height,
+        settings.max_obstacle_height,
         settings.min_range,
         settings.max_range,
         settings.sample_stride
     );
-    Ok(Some(LocalOccupancyMap::new(settings)?))
+    Ok(Some(map))
 }
 
 fn write_outputs(
@@ -1074,15 +1122,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize Rerun visualization
     #[cfg(feature = "rerun")]
     let rec: Option<rerun::RecordingStream> = if args.vis {
-        match rerun::RecordingStreamBuilder::new("echo-li").spawn() {
+        // Three sinks, by env:
+        //   ECHO_LI_RERUN_URL=rerun+http://<host>:9876/proxy  -> stream to an
+        //     already-running viewer (e.g. native Rerun on Windows = hardware GPU);
+        //   ECHO_LI_RRD=<path>  -> record to a file (headless);
+        //   otherwise spawn a local (WSL software) viewer.
+        let builder = rerun::RecordingStreamBuilder::new("echo-li");
+        let built = if let Ok(url) = std::env::var("ECHO_LI_RERUN_URL") {
+            println!("Rerun: connecting to viewer at {url}");
+            builder.connect_grpc_opts(url)
+        } else if let Ok(path) = std::env::var("ECHO_LI_RRD") {
+            builder.save(&path)
+        } else {
+            builder.spawn()
+        };
+        match built {
             Ok(r) => {
-                println!("Rerun viewer connected");
+                println!("Rerun stream ready");
                 send_rerun_blueprint(&r, img_w, img_h).ok();
 
                 Some(r)
             }
             Err(e) => {
-                eprintln!("Warning: could not spawn Rerun viewer: {e}");
+                eprintln!("Warning: could not start Rerun stream: {e}");
                 None
             }
         }
@@ -1642,6 +1704,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     .with_radii([0.015f32]),
                             )
                             .ok();
+                        }
+
+                        // Local 3D occupancy map, both as solid voxel cubes:
+                        // occupied = opaque red, free = translucent green. NB: use
+                        // 2-level entity paths (siblings of world/landmarks) and
+                        // FillMode::Solid — 3-level paths don't render in the 3D
+                        // view, and the default Boxes3D fill is invisible wireframe.
+                        // Unlike Points3D (which ignore colour alpha), solid Boxes3D
+                        // DO blend: a colour with alpha < 0xFF becomes the mesh
+                        // additive_tint and is routed to rerun's premultiplied-alpha
+                        // transparent pass — so the free voxels are genuinely
+                        // see-through (lower the alpha byte for more transparency).
+                        if let Some(occ_map) = local_occupancy.as_ref() {
+                            let hx = (occ_map.settings().resolution * 0.5) as f32;
+                            let (occ_pts, free_pts) = occupancy_cells_for_vis(occ_map);
+                            if !occ_pts.is_empty() {
+                                let occ_half = vec![[hx, hx, hx]; occ_pts.len()];
+                                rec.log(
+                                    "world/occupied_cells",
+                                    &rerun::Boxes3D::from_centers_and_half_sizes(occ_pts, occ_half)
+                                        .with_fill_mode(rerun::FillMode::Solid)
+                                        .with_colors([0xFF0000FFu32]),
+                                )
+                                .ok();
+                            }
+                            if !free_pts.is_empty() {
+                                let free_half = vec![[hx, hx, hx]; free_pts.len()];
+                                rec.log(
+                                    "world/free_cells",
+                                    &rerun::Boxes3D::from_centers_and_half_sizes(
+                                        free_pts, free_half,
+                                    )
+                                    .with_fill_mode(rerun::FillMode::Solid)
+                                    .with_colors([0x33C03301u32]),
+                                )
+                                .ok();
+                            }
                         }
 
                         // Camera pose as RGB arrows (X=red, Y=green, Z=blue)

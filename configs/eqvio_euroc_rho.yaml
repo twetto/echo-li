@@ -158,7 +158,7 @@ PatchDepth:
   cov_vis_min: 0.0
   cov_vis_max: 0.5
 LocalOccupancy:
-  enabled: false
+  enabled: true
   resolution: 0.10
   width_cells: 160
   height_cells: 160
