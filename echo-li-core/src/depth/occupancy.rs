@@ -262,12 +262,15 @@ impl LocalOccupancyMap {
         endpoint: Vector2<f64>,
         stats: &mut OccupancyUpdateStats,
     ) {
-        let Some((x0, y0)) = self.world_to_cell(origin) else {
-            return;
-        };
-        let Some((x1, y1)) = self.world_to_cell(endpoint) else {
-            return;
-        };
+        // Cell coordinates may lie outside the grid (e.g. an endpoint beyond
+        // `max_range` for the ego-centric extent). We walk the *whole* ray and
+        // clip per-cell: carve free space for every in-bounds traversed cell up to
+        // the boundary, and mark the endpoint occupied only if it is itself
+        // in bounds. A ray whose endpoint is off-map thus still contributes its
+        // near free space (the obstacle is simply "beyond the map / unknown").
+        let (x0, y0) = self.world_to_cell_raw(origin);
+        let (x1, y1) = self.world_to_cell_raw(endpoint);
+        let endpoint_in_bounds = self.cell_in_bounds(x1, y1);
 
         let mut x = x0;
         let mut y = y0;
@@ -276,15 +279,26 @@ impl LocalOccupancyMap {
         let sx = if x0 < x1 { 1 } else { -1 };
         let sy = if y0 < y1 { 1 } else { -1 };
         let mut err = dx + dy;
+        let mut entered = false;
 
         loop {
             if x == x1 && y == y1 {
-                self.add_log_odds(x, y, self.settings.log_odds_hit);
-                stats.occupied_updates += 1;
+                if endpoint_in_bounds {
+                    self.add_log_odds(x, y, self.settings.log_odds_hit);
+                    stats.occupied_updates += 1;
+                }
                 break;
             }
-            self.add_log_odds(x, y, self.settings.log_odds_miss);
-            stats.free_updates += 1;
+            if self.cell_in_bounds(x, y) {
+                self.add_log_odds(x, y, self.settings.log_odds_miss);
+                stats.free_updates += 1;
+                entered = true;
+            } else if entered {
+                // We were inside the grid and have now crossed the boundary; a
+                // straight ray will not re-enter, so stop (don't walk the off-map
+                // tail toward a far endpoint).
+                break;
+            }
             let e2 = 2 * err;
             if e2 >= dy {
                 err += dy;
@@ -293,9 +307,6 @@ impl LocalOccupancyMap {
             if e2 <= dx {
                 err += dx;
                 y += sy;
-            }
-            if !self.cell_in_bounds(x, y) {
-                break;
             }
         }
     }
@@ -309,10 +320,11 @@ impl LocalOccupancyMap {
             .clamp(self.settings.log_odds_min, self.settings.log_odds_max);
     }
 
-    fn world_to_cell(&self, p: Vector2<f64>) -> Option<(i64, i64)> {
+    /// Cell index for a world point, without bounds checking (may be off-grid).
+    fn world_to_cell_raw(&self, p: Vector2<f64>) -> (i64, i64) {
         let x = ((p[0] - self.origin_x) / self.settings.resolution).floor() as i64;
         let y = ((p[1] - self.origin_y) / self.settings.resolution).floor() as i64;
-        self.cell_in_bounds(x, y).then_some((x, y))
+        (x, y)
     }
 
     fn cell_in_bounds(&self, x: i64, y: i64) -> bool {
@@ -391,6 +403,61 @@ mod tests {
         assert_eq!(stats.rays_integrated, 1);
         assert_eq!(map.cell_state(5, 5), Some(OccupancyCell::Free));
         assert_eq!(map.cell_state(5, 8), Some(OccupancyCell::Occupied));
+    }
+
+    #[test]
+    fn off_grid_endpoint_carves_free_without_hit() {
+        // Endpoint beyond the grid extent: the ray must still carve free space up
+        // to the boundary and mark NO occupied cell (the obstacle is off-map).
+        let settings = LocalOccupancySettings {
+            enabled: true,
+            resolution: 1.0,
+            width_cells: 11,
+            height_cells: 11,
+            sample_stride: 1,
+            log_odds_hit: 1.0,
+            log_odds_miss: -1.0,
+            occupied_threshold: 0.5,
+            free_threshold: -0.5,
+            max_range: 20.0, // let the 8 m range pass the range gate
+            ..Default::default()
+        };
+        let mut map = LocalOccupancyMap::new(settings).unwrap();
+        let camera = PinholeModel {
+            fx: 1.0,
+            fy: 1.0,
+            cx: 0.0,
+            cy: 0.0,
+        };
+        let mut pose = Matrix4::identity();
+        pose[(1, 1)] = 0.0;
+        pose[(1, 2)] = 1.0;
+        pose[(2, 1)] = 1.0;
+        pose[(2, 2)] = 0.0;
+        let intrinsics = CameraIntrinsics::new(1.0, 1.0, 0.0, 0.0);
+
+        // range 8 -> endpoint cell (5, 13), outside the 11x11 grid (max index 10).
+        let stats = map.update_from_patch_depth(
+            &single_depth_output(8.0),
+            &camera,
+            intrinsics,
+            PatchDepthSeedCoordinates::UndistortedPinhole,
+            1,
+            1,
+            &pose,
+        );
+
+        assert_eq!(stats.rays_integrated, 1);
+        assert_eq!(
+            stats.occupied_updates, 0,
+            "off-grid endpoint must not mark a hit"
+        );
+        assert!(
+            stats.free_updates > 0,
+            "should still carve free space up to the boundary"
+        );
+        assert_eq!(map.cell_state(5, 5), Some(OccupancyCell::Free)); // camera cell
+        assert_eq!(map.cell_state(5, 10), Some(OccupancyCell::Free)); // last in-bounds cell
     }
 
     #[test]
