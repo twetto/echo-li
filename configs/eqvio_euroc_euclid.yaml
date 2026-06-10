@@ -155,3 +155,14 @@ PatchDepth:
   n_search_candidates: 1
   cov_vis_min: 0.0
   cov_vis_max: 0.5
+LocalOccupancy:
+  enabled: false
+  resolution: 0.10
+  width_cells: 160
+  height_cells: 160
+  sample_stride: 4
+  min_range: 0.25
+  max_range: 12.0
+  max_eta_std: 0.5
+  min_obstacle_height: -1.0
+  max_obstacle_height: 1.0

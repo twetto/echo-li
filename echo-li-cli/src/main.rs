@@ -2,6 +2,7 @@ use clap::Parser;
 use echo_li_core::config::VIOConfig;
 use echo_li_core::core_types::CameraIntrinsics;
 use echo_li_core::dataserver::ASLDatasetReader;
+use echo_li_core::depth::occupancy::{LocalOccupancyMap, LocalOccupancySettings};
 use echo_li_core::depth::patch_depth::{
     FrameProducts, PatchDepthCameraMode, PatchDepthMapper, PatchDepthOutput,
     PatchDepthSeedCoordinates, PatchDepthSettings, PatchStatus,
@@ -69,6 +70,10 @@ struct Args {
     /// Enable stereo matching for EqF landmark depth initialization (requires cam1).
     #[arg(long, default_value_t = false)]
     stereo: bool,
+
+    /// Build a rolling local occupancy map from patch-depth rays.
+    #[arg(long, default_value_t = false)]
+    occupancy_map: bool,
 }
 
 fn write_trajectory(path: &std::path::Path, entries: &[(f64, VIOState)]) -> std::io::Result<()> {
@@ -871,6 +876,38 @@ fn build_sparse_filter(
     None
 }
 
+fn build_local_occupancy_map(
+    args: &Args,
+    vio_config: Option<&VIOConfig>,
+    patch_depth_enabled: bool,
+) -> Result<Option<LocalOccupancyMap>, Box<dyn std::error::Error>> {
+    let mut settings = vio_config
+        .and_then(|conf| conf.local_occupancy.as_ref())
+        .map(|conf| conf.to_local_occupancy_settings())
+        .unwrap_or_else(LocalOccupancySettings::default);
+    settings.enabled |= args.occupancy_map;
+
+    if !settings.enabled {
+        println!("Local occupancy: disabled");
+        return Ok(None);
+    }
+    if !patch_depth_enabled {
+        println!("Local occupancy: disabled (requires patch depth)");
+        return Ok(None);
+    }
+
+    println!(
+        "Local occupancy: enabled {}x{} cells @ {:.3}m, range=[{:.2}, {:.2}]m, stride={}",
+        settings.width_cells,
+        settings.height_cells,
+        settings.resolution,
+        settings.min_range,
+        settings.max_range,
+        settings.sample_stride
+    );
+    Ok(Some(LocalOccupancyMap::new(settings)?))
+}
+
 fn write_outputs(
     output_dir: &std::path::Path,
     states_out: &[(f64, VIOState)],
@@ -972,8 +1009,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (cam_model, k_matrix, img_w, img_h) = build_camera_model(&reader);
 
+    let occupancy_requested = args.occupancy_map
+        || vio_config
+            .as_ref()
+            .and_then(|conf| conf.local_occupancy.as_ref())
+            .map(|conf| conf.enabled)
+            .unwrap_or(false);
     let patch_depth_enabled = !args.no_patch_depth
         && (args.patch_depth
+            || occupancy_requested
             || vio_config
                 .as_ref()
                 .and_then(|conf| conf.patch_depth.as_ref())
@@ -1095,6 +1139,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         img_h,
         stereo_matcher.as_ref(),
     )?;
+    let mut local_occupancy =
+        build_local_occupancy_map(&args, vio_config.as_ref(), patch_depth_mapper.is_some())?;
+    let occupancy_intrinsics = CameraIntrinsics::from_matrix(&k_matrix);
     #[cfg(feature = "rerun")]
     if patch_depth_mapper.is_some() {
         println!(
@@ -1114,6 +1161,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut prev_stereo_3d: HashMap<u64, [f64; 3]> = HashMap::new();
     let stereo_ransac_cfg = Rigid3dRansacConfig::default();
     let mut last_patch_depth_counts: Option<(usize, usize, usize, usize)> = None;
+    let mut last_occupancy_counts: Option<(usize, usize, usize)> = None;
     #[cfg(feature = "rerun")]
     let mut last_patch_depth_output: Option<PatchDepthOutput> = None;
     let trace_determinism = std::env::var_os("ECHO_LI_TRACE_DETERMINISM").is_some();
@@ -1378,6 +1426,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     };
                                 last_patch_depth_counts =
                                     patch_output.as_ref().map(patch_depth_status_counts);
+                                if let (Some(output), Some(occupancy)) =
+                                    (patch_output.as_ref(), local_occupancy.as_mut())
+                                {
+                                    occupancy.update_from_patch_depth(
+                                        output,
+                                        cam_model.as_ref(),
+                                        occupancy_intrinsics,
+                                        patch_seed_coordinates,
+                                        img_w,
+                                        img_h,
+                                        &t_wc,
+                                    );
+                                    last_occupancy_counts = Some(occupancy.counts());
+                                }
                                 #[cfg(feature = "rerun")]
                                 {
                                     last_patch_depth_output = patch_output;
@@ -1618,9 +1680,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if vision_count % 100 == 0 || vision_count <= 5 {
                         let pos = states_out.last().unwrap().1.sensor.pose.translation;
                         let vel = states_out.last().unwrap().1.sensor.velocity;
+                        let occ_suffix = last_occupancy_counts
+                            .map(|(unk, free, occ)| {
+                                format!("  occ=(occ:{} free:{} unk:{})", occ, free, unk)
+                            })
+                            .unwrap_or_default();
                         if let Some((unk, seed, photo, rej)) = last_patch_depth_counts {
                             println!(
-                                "  [{:4}] t={:.3}  pos=({:+.2}, {:+.2}, {:+.2})  vel=({:+.3}, {:+.3}, {:+.3})  lm={}  patch=(photo:{} seed:{} unk:{} rej:{})",
+                                "  [{:4}] t={:.3}  pos=({:+.2}, {:+.2}, {:+.2})  vel=({:+.3}, {:+.3}, {:+.3})  lm={}  patch=(photo:{} seed:{} unk:{} rej:{}){}",
                                 vision_count,
                                 img_data.stamp,
                                 pos[0],
@@ -1633,11 +1700,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 photo,
                                 seed,
                                 unk,
-                                rej
+                                rej,
+                                occ_suffix
                             );
                         } else {
                             println!(
-                                "  [{:4}] t={:.3}  pos=({:+.2}, {:+.2}, {:+.2})  vel=({:+.3}, {:+.3}, {:+.3})  lm={}",
+                                "  [{:4}] t={:.3}  pos=({:+.2}, {:+.2}, {:+.2})  vel=({:+.3}, {:+.3}, {:+.3})  lm={}{}",
                                 vision_count,
                                 img_data.stamp,
                                 pos[0],
@@ -1646,7 +1714,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 vel[0],
                                 vel[1],
                                 vel[2],
-                                feat_global.len()
+                                feat_global.len(),
+                                occ_suffix
                             );
                         }
                     }
@@ -1662,6 +1731,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "\nProcessed {} IMU + {} vision in {:.2}s",
         imu_count, vision_count, elapsed
     );
+    if let Some(occupancy) = &local_occupancy {
+        let (unknown, free, occupied) = occupancy.counts();
+        println!(
+            "Local occupancy final: occupied={} free={} unknown={}",
+            occupied, free, unknown
+        );
+    }
 
     let dataset_name = PathBuf::from(&args.dataset)
         .file_name()

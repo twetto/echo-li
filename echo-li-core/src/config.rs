@@ -2,9 +2,10 @@ use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::path::Path;
 
-use crate::ImuBiasGroup;
+use crate::depth::occupancy::LocalOccupancySettings;
 use crate::depth::patch_depth::{PatchDepthCameraMode, PatchDepthSettings, PatchDepthWarpMode};
 use crate::depth::sparse_gb::{DepthParametrization, SparseVogSettings};
+use crate::ImuBiasGroup;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -446,6 +447,95 @@ impl PatchDepthConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LocalOccupancyConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub resolution: Option<f64>,
+    #[serde(default)]
+    pub width_cells: Option<usize>,
+    #[serde(default)]
+    pub height_cells: Option<usize>,
+    #[serde(default)]
+    pub sample_stride: Option<usize>,
+    #[serde(default)]
+    pub min_range: Option<f64>,
+    #[serde(default)]
+    pub max_range: Option<f64>,
+    #[serde(default)]
+    pub max_eta_std: Option<f64>,
+    #[serde(default)]
+    pub log_odds_hit: Option<f32>,
+    #[serde(default)]
+    pub log_odds_miss: Option<f32>,
+    #[serde(default)]
+    pub log_odds_min: Option<f32>,
+    #[serde(default)]
+    pub log_odds_max: Option<f32>,
+    #[serde(default)]
+    pub occupied_threshold: Option<f32>,
+    #[serde(default)]
+    pub free_threshold: Option<f32>,
+    #[serde(default)]
+    pub min_obstacle_height: Option<f64>,
+    #[serde(default)]
+    pub max_obstacle_height: Option<f64>,
+}
+
+impl LocalOccupancyConfig {
+    pub fn to_local_occupancy_settings(&self) -> LocalOccupancySettings {
+        let mut settings = LocalOccupancySettings::default();
+        settings.enabled = self.enabled;
+        if let Some(v) = self.resolution {
+            settings.resolution = v;
+        }
+        if let Some(v) = self.width_cells {
+            settings.width_cells = v;
+        }
+        if let Some(v) = self.height_cells {
+            settings.height_cells = v;
+        }
+        if let Some(v) = self.sample_stride {
+            settings.sample_stride = v;
+        }
+        if let Some(v) = self.min_range {
+            settings.min_range = v;
+        }
+        if let Some(v) = self.max_range {
+            settings.max_range = v;
+        }
+        if let Some(v) = self.max_eta_std {
+            settings.max_eta_std = v;
+        }
+        if let Some(v) = self.log_odds_hit {
+            settings.log_odds_hit = v;
+        }
+        if let Some(v) = self.log_odds_miss {
+            settings.log_odds_miss = v;
+        }
+        if let Some(v) = self.log_odds_min {
+            settings.log_odds_min = v;
+        }
+        if let Some(v) = self.log_odds_max {
+            settings.log_odds_max = v;
+        }
+        if let Some(v) = self.occupied_threshold {
+            settings.occupied_threshold = v;
+        }
+        if let Some(v) = self.free_threshold {
+            settings.free_threshold = v;
+        }
+        if let Some(v) = self.min_obstacle_height {
+            settings.min_obstacle_height = v;
+        }
+        if let Some(v) = self.max_obstacle_height {
+            settings.max_obstacle_height = v;
+        }
+        settings
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct StereoConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -481,6 +571,8 @@ pub struct VIOConfig {
     pub sparse_vog: Option<SparseVogConfig>,
     #[serde(rename = "PatchDepth", default)]
     pub patch_depth: Option<PatchDepthConfig>,
+    #[serde(rename = "LocalOccupancy", default)]
+    pub local_occupancy: Option<LocalOccupancyConfig>,
     #[serde(rename = "Stereo", default)]
     pub stereo: Option<StereoConfig>,
     pub eqf: EqfConfig,
