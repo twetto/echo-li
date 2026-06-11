@@ -166,5 +166,11 @@ LocalOccupancy:
   min_range: 0.25
   max_range: 12.0
   max_eta_std: 0.5
+  # v1 uncertainty-aware update: σ_m = range·sqrt(var(η)) shapes the log-odds
+  # (Gaussian occupied bump + confidence-weighted carve). Set to "fixed" for v0.
+  update_mode: uncertainty_aware
+  band_k: 2.0
+  sigma_floor_factor: 0.5
+  min_confidence_weight: 0.1
   min_obstacle_height: -1.0
   max_obstacle_height: 1.0

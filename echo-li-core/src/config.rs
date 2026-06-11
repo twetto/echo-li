@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::path::Path;
 
-use crate::depth::occupancy::LocalOccupancySettings;
+use crate::depth::occupancy::{LocalOccupancySettings, OccupancyUpdateMode};
 use crate::depth::patch_depth::{PatchDepthCameraMode, PatchDepthSettings, PatchDepthWarpMode};
 use crate::depth::sparse_gb::{DepthParametrization, SparseVogSettings};
 use crate::ImuBiasGroup;
@@ -476,6 +476,15 @@ pub struct LocalOccupancyConfig {
     pub occupied_threshold: Option<f32>,
     #[serde(default)]
     pub free_threshold: Option<f32>,
+    /// "fixed" / "fixed_increment" (v0) or "uncertainty_aware" / "sigma" (v1).
+    #[serde(default)]
+    pub update_mode: Option<String>,
+    #[serde(default)]
+    pub band_k: Option<f64>,
+    #[serde(default)]
+    pub sigma_floor_factor: Option<f64>,
+    #[serde(default)]
+    pub min_confidence_weight: Option<f64>,
     #[serde(default)]
     pub min_obstacle_height: Option<f64>,
     #[serde(default)]
@@ -524,6 +533,27 @@ impl LocalOccupancyConfig {
         }
         if let Some(v) = self.free_threshold {
             settings.free_threshold = v;
+        }
+        if let Some(v) = &self.update_mode {
+            settings.update_mode = match v.as_str() {
+                "fixed" | "fixed_increment" | "v0" => OccupancyUpdateMode::FixedIncrement,
+                "uncertainty_aware" | "sigma" | "v1" => OccupancyUpdateMode::UncertaintyAware,
+                other => {
+                    eprintln!(
+                        "LocalOccupancy.update_mode {other:?} unrecognised; using fixed_increment (v0)"
+                    );
+                    OccupancyUpdateMode::FixedIncrement
+                }
+            };
+        }
+        if let Some(v) = self.band_k {
+            settings.band_k = v;
+        }
+        if let Some(v) = self.sigma_floor_factor {
+            settings.sigma_floor_factor = v;
+        }
+        if let Some(v) = self.min_confidence_weight {
+            settings.min_confidence_weight = v;
         }
         if let Some(v) = self.min_obstacle_height {
             settings.min_obstacle_height = v;

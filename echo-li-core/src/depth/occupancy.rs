@@ -4,6 +4,22 @@ use crate::core_types::CameraIntrinsics;
 use crate::depth::patch_depth::{PatchDepthOutput, PatchDepthSeedCoordinates, PatchStatus};
 use crate::mathematical::camera::CameraModel;
 
+/// How a ray writes evidence into the grid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OccupancyUpdateMode {
+    /// **v0** — fixed `log_odds_hit`/`log_odds_miss` per voxel; `var(η)` is used
+    /// only as a gate. Robust and calibration-independent.
+    #[default]
+    FixedIncrement,
+    /// **v1** — σ-shaped inverse sensor model. The metric band
+    /// `σ_m = range·sqrt(var(η))` sets the width of a Gaussian occupied bump
+    /// centred at the measured range, with confidence-weighted carve/hit
+    /// magnitudes, so uncertain rays smear weak evidence and confident rays
+    /// write a sharp surface. Uses the *absolute* scale of `var(η)` as a metric
+    /// σ (see docs/3d_mapping_for_navigation.md §"Uncertainty-aware update").
+    UncertaintyAware,
+}
+
 #[derive(Debug, Clone)]
 pub struct LocalOccupancySettings {
     pub enabled: bool,
@@ -20,6 +36,20 @@ pub struct LocalOccupancySettings {
     pub log_odds_max: f32,
     pub occupied_threshold: f32,
     pub free_threshold: f32,
+    /// Fixed-increment (v0) vs σ-shaped (v1) ray integration.
+    pub update_mode: OccupancyUpdateMode,
+    /// v1 only — band half-width in units of σ_m. The occupied bump spans
+    /// `range ± band_k·σ_m`; beyond it the ray is treated as occluded (no
+    /// update), before it as free.
+    pub band_k: f64,
+    /// v1 only — σ floor as a fraction of `resolution`. Caps how sharp the
+    /// surface can get: `σ_m = max(range·sqrt(var(η)), sigma_floor_factor·res)`.
+    /// Below the floor the bump would collapse to sub-voxel and is meaningless.
+    pub sigma_floor_factor: f64,
+    /// v1 only — lower clamp on the confidence weight `w = sigma_floor/σ_m ∈
+    /// (0,1]` that scales both carve and hit magnitudes, so a very uncertain ray
+    /// still contributes a little rather than nothing.
+    pub min_confidence_weight: f64,
     /// Vertical extent of the (ego-centric) 3D grid, **relative to the camera**:
     /// the grid spans `cam_z + [min_obstacle_height, max_obstacle_height]`,
     /// discretised into `round((max - min) / resolution)` z-layers. The map is a
@@ -45,6 +75,10 @@ impl Default for LocalOccupancySettings {
             log_odds_max: 4.0,
             occupied_threshold: 0.8,
             free_threshold: -0.8,
+            update_mode: OccupancyUpdateMode::FixedIncrement,
+            band_k: 2.0,
+            sigma_floor_factor: 0.5,
+            min_confidence_weight: 0.1,
             min_obstacle_height: -1.0,
             max_obstacle_height: 1.0,
         }
@@ -234,11 +268,13 @@ impl LocalOccupancyMap {
                 }
                 let eta = output.eta.data[idx];
                 let eta_var = output.eta_var.data[idx];
-                if !eta.is_finite()
-                    || !eta_var.is_finite()
-                    || eta_var < 0.0
-                    || (eta_var as f64).sqrt() > self.settings.max_eta_std
-                {
+                if !eta.is_finite() || !eta_var.is_finite() || eta_var < 0.0 {
+                    continue;
+                }
+                // sqrt(var(η)) ≈ σ_range/range is the relative range std. v0 uses
+                // it as a gate only; v1 turns it into the metric band σ_m below.
+                let rel_std = (eta_var as f64).sqrt();
+                if rel_std > self.settings.max_eta_std {
                     continue;
                 }
 
@@ -257,7 +293,14 @@ impl LocalOccupancyMap {
                 let endpoint = Vector3::new(p_w_h[0], p_w_h[1], p_w_h[2]);
 
                 stats.rays_integrated += 1;
-                self.integrate_ray(cam_origin, endpoint, &mut stats);
+                match self.settings.update_mode {
+                    OccupancyUpdateMode::FixedIncrement => {
+                        self.integrate_ray(cam_origin, endpoint, &mut stats);
+                    }
+                    OccupancyUpdateMode::UncertaintyAware => {
+                        self.integrate_ray_sigma(cam_origin, endpoint, rel_std, &mut stats);
+                    }
+                }
             }
         }
         stats
@@ -391,6 +434,124 @@ impl LocalOccupancyMap {
         }
     }
 
+    /// **v1** σ-shaped integration. Walks the ray with the same 3D
+    /// Amanatides–Woo traversal as [`integrate_ray`], but the per-voxel
+    /// increment is an inverse sensor model shaped by the calibrated metric band
+    /// `σ_m = range·sqrt(var(η))` rather than a fixed hit/miss:
+    ///
+    /// * `d < range − band_k·σ_m` → free: `log_odds_miss · w`
+    /// * `|d − range| ≤ band_k·σ_m` → occupied: `log_odds_hit · w · exp(−½(z/σ_m)²)`
+    /// * `d > range + band_k·σ_m` → occluded: no update
+    ///
+    /// where `d` is the along-ray distance to the voxel centre, `z = d − range`,
+    /// and `w = clamp(sigma_floor/σ_m, min_confidence_weight, 1)` is the
+    /// confidence weight (1 for a depth at the σ floor, shrinking as the band
+    /// widens). The traversal is extended to `range + band_k·σ_m` so the far
+    /// half of the occupied bump is written.
+    fn integrate_ray_sigma(
+        &mut self,
+        origin: Vector3<f64>,
+        endpoint: Vector3<f64>,
+        rel_std: f64,
+        stats: &mut OccupancyUpdateStats,
+    ) {
+        let res = self.settings.resolution;
+        let diff = endpoint - origin;
+        let range = diff.norm();
+        if range <= 0.0 {
+            return;
+        }
+        let unit = diff / range;
+        let sigma_floor = res * self.settings.sigma_floor_factor;
+        let sigma_m = (range * rel_std).max(sigma_floor);
+        let half_band = self.settings.band_k * sigma_m;
+        let w = (sigma_floor / sigma_m).clamp(self.settings.min_confidence_weight, 1.0);
+        // Traverse up to the far edge of the occupied band so both sides of the
+        // Gaussian bump are written; beyond it the ray is occluded.
+        let far = origin + unit * (range + half_band);
+
+        let to_voxel = |p: &Vector3<f64>| {
+            [
+                (p.x - self.origin_x) / res,
+                (p.y - self.origin_y) / res,
+                (p.z - self.origin_z) / res,
+            ]
+        };
+        let p0 = to_voxel(&origin);
+        let p1 = to_voxel(&far);
+        let dir = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
+
+        let mut cell = [
+            p0[0].floor() as i64,
+            p0[1].floor() as i64,
+            p0[2].floor() as i64,
+        ];
+        let end = [
+            p1[0].floor() as i64,
+            p1[1].floor() as i64,
+            p1[2].floor() as i64,
+        ];
+
+        let setup = |d: f64, i: i64, p: f64| -> (i64, f64, f64) {
+            if d > 0.0 {
+                (1, ((i + 1) as f64 - p) / d, 1.0 / d)
+            } else if d < 0.0 {
+                (-1, (i as f64 - p) / d, -1.0 / d)
+            } else {
+                (0, f64::INFINITY, f64::INFINITY)
+            }
+        };
+        let (step_x, mut tmax_x, tdelta_x) = setup(dir[0], cell[0], p0[0]);
+        let (step_y, mut tmax_y, tdelta_y) = setup(dir[1], cell[1], p0[1]);
+        let (step_z, mut tmax_z, tdelta_z) = setup(dir[2], cell[2], p0[2]);
+
+        let mut entered = false;
+        loop {
+            if self.cell_in_bounds(cell[0], cell[1], cell[2]) {
+                let center = Vector3::new(
+                    self.origin_x + (cell[0] as f64 + 0.5) * res,
+                    self.origin_y + (cell[1] as f64 + 0.5) * res,
+                    self.origin_z + (cell[2] as f64 + 0.5) * res,
+                );
+                let d = (center - origin).dot(&unit);
+                let z = d - range;
+                if z <= half_band {
+                    let delta = if z < -half_band {
+                        self.settings.log_odds_miss as f64 * w
+                    } else {
+                        let g = (-0.5 * (z / sigma_m).powi(2)).exp();
+                        self.settings.log_odds_hit as f64 * w * g
+                    };
+                    self.add_log_odds(cell[0], cell[1], cell[2], delta as f32);
+                    if z < -half_band {
+                        stats.free_updates += 1;
+                    } else {
+                        stats.occupied_updates += 1;
+                    }
+                }
+                entered = true;
+            } else if entered {
+                break;
+            }
+            if cell == end {
+                break;
+            }
+            if tmax_x.min(tmax_y).min(tmax_z) > 1.0 {
+                break;
+            }
+            if tmax_x <= tmax_y && tmax_x <= tmax_z {
+                cell[0] += step_x;
+                tmax_x += tdelta_x;
+            } else if tmax_y <= tmax_z {
+                cell[1] += step_y;
+                tmax_y += tdelta_y;
+            } else {
+                cell[2] += step_z;
+                tmax_z += tdelta_z;
+            }
+        }
+    }
+
     fn add_log_odds(&mut self, x: i64, y: i64, z: i64, delta: f32) {
         if !self.cell_in_bounds(x, y, z) {
             return;
@@ -430,9 +591,13 @@ mod tests {
     use crate::mathematical::camera::PinholeModel;
 
     fn single_depth_output(range: f32) -> PatchDepthOutput {
+        single_depth_output_var(range, 0.01)
+    }
+
+    fn single_depth_output_var(range: f32, eta_var: f32) -> PatchDepthOutput {
         PatchDepthOutput {
             eta: DepthMap::from_vec(1, 1, vec![range.ln()]).unwrap(),
-            eta_var: DepthMap::from_vec(1, 1, vec![0.01]).unwrap(),
+            eta_var: DepthMap::from_vec(1, 1, vec![eta_var]).unwrap(),
             status: DepthMap::from_vec(1, 1, vec![PatchStatus::PhotoRefined]).unwrap(),
         }
     }
@@ -556,6 +721,91 @@ mod tests {
         map.recenter(1.0, 0.0, 0.0);
 
         assert_eq!(map.cell_state(3, 3, 1), Some(OccupancyCell::Occupied));
+    }
+
+    fn v1_settings() -> LocalOccupancySettings {
+        LocalOccupancySettings {
+            enabled: true,
+            resolution: 1.0,
+            width_cells: 11,
+            height_cells: 11,
+            sample_stride: 1,
+            update_mode: OccupancyUpdateMode::UncertaintyAware,
+            band_k: 2.0,
+            sigma_floor_factor: 0.5,
+            min_confidence_weight: 0.1,
+            max_eta_std: 1.0,
+            log_odds_hit: 2.0,
+            log_odds_miss: -2.0,
+            occupied_threshold: 0.5,
+            free_threshold: -0.5,
+            ..Default::default()
+        }
+    }
+
+    fn run_single_ray(
+        map: &mut LocalOccupancyMap,
+        output: &PatchDepthOutput,
+    ) -> OccupancyUpdateStats {
+        let camera = PinholeModel {
+            fx: 1.0,
+            fy: 1.0,
+            cx: 0.0,
+            cy: 0.0,
+        };
+        let intrinsics = CameraIntrinsics::new(1.0, 1.0, 0.0, 0.0);
+        map.update_from_patch_depth(
+            output,
+            &camera,
+            intrinsics,
+            PatchDepthSeedCoordinates::UndistortedPinhole,
+            1,
+            1,
+            &y_forward_pose(),
+        )
+    }
+
+    #[test]
+    fn v1_marks_surface_band_and_carves_free() {
+        // Confident depth (rel_std 0.1): σ_m floors at 0.5 m, band ±1 m about the
+        // range-3 surface. The surface voxel is occupied; the camera voxel is free.
+        let mut map = LocalOccupancyMap::new(v1_settings()).unwrap();
+        let stats = run_single_ray(&mut map, &single_depth_output(3.0));
+
+        assert_eq!(stats.rays_integrated, 1);
+        assert!(stats.occupied_updates > 0 && stats.free_updates > 0);
+        assert_eq!(map.cell_state(5, 8, 1), Some(OccupancyCell::Occupied)); // surface
+        assert_eq!(map.cell_state(5, 5, 1), Some(OccupancyCell::Free)); // camera
+    }
+
+    #[test]
+    fn v1_uncertain_ray_writes_weaker_and_more_spread_occupied() {
+        // The v1 ablation claim: an uncertain depth writes a *weaker* peak at the
+        // surface (fewer false-confident occupied cells) but spreads more evidence
+        // into neighbouring cells than a confident depth of the same range.
+        let surface = 214; // index(5, 8, 1)
+        let beyond = 225; // index(5, 9, 1), one voxel past the surface
+
+        let mut confident = LocalOccupancyMap::new(v1_settings()).unwrap();
+        run_single_ray(&mut confident, &single_depth_output_var(3.0, 0.0001));
+        let conf = confident.snapshot().log_odds;
+
+        let mut uncertain = LocalOccupancyMap::new(v1_settings()).unwrap();
+        run_single_ray(&mut uncertain, &single_depth_output_var(3.0, 0.25)); // rel_std 0.5
+        let unc = uncertain.snapshot().log_odds;
+
+        assert!(
+            conf[surface] > unc[surface],
+            "confident depth must write a stronger surface peak ({} vs {})",
+            conf[surface],
+            unc[surface]
+        );
+        assert!(
+            unc[beyond] > conf[beyond],
+            "uncertain depth must spread more evidence past the surface ({} vs {})",
+            unc[beyond],
+            conf[beyond]
+        );
     }
 
     #[test]
