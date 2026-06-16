@@ -11,8 +11,8 @@ RudolfV:
   # shiTomasiBlockSize: 3        # structure-tensor block size
   # maxError: 50.0
   # maxFeatures: 40  # LK tracker pool (feeds sparse_vog). EqF cap is --max-features.
-  maxFeatures: 1410
-  # maxFeatures: 500
+  # maxFeatures: 1410
+  maxFeatures: 300
   maxLevel: 3
   lbpPolicy: HardReject
   # lbpPolicy: SoftPenalty
@@ -85,9 +85,9 @@ SparseVog:
   #                  invdepth3d, polar3d (3D static-anchor SOT(3) IEKF)
   #                  invdepth_additive3d (ρ-first additive inverse-depth EKF)
   parametrization: invdepth_additive3d
-  max_pool_size: 1410
+  # max_pool_size: 1410
   # max_pool_size: 40
-  # max_pool_size: 500
+  max_pool_size: 300
   min_track_length: 5
   # conv_variance_threshold: 0.02 # var(z) gate for query()
   conv_variance_threshold: 2.0 # var(z) gate for query()
