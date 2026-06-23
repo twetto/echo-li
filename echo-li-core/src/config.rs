@@ -2,9 +2,9 @@ use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::path::Path;
 
-use crate::ImuBiasGroup;
 use crate::depth::patch_depth::{PatchDepthCameraMode, PatchDepthSettings, PatchDepthWarpMode};
 use crate::depth::sparse_gb::{DepthParametrization, SparseVogSettings};
+use crate::ImuBiasGroup;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -278,6 +278,8 @@ pub struct PatchDepthConfig {
     #[serde(default)]
     pub sigma_photo: Option<f64>,
     #[serde(default)]
+    pub pose_angular_velocity_var: Option<f64>,
+    #[serde(default)]
     pub n_gn_iters: Option<usize>,
     #[serde(default)]
     pub gn_eta_convergence_tol: Option<f64>,
@@ -371,6 +373,9 @@ impl PatchDepthConfig {
         }
         if let Some(v) = self.sigma_photo {
             settings.sigma_photo = v;
+        }
+        if let Some(v) = self.pose_angular_velocity_var {
+            settings.pose_angular_velocity_var = v;
         }
         if let Some(v) = self.n_gn_iters {
             settings.n_gn_iters = v;

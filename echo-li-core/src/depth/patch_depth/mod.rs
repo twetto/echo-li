@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use nalgebra::{Matrix3, Matrix4, Vector2, Vector3};
+use nalgebra::{Matrix2, Matrix3, Matrix4, Vector2, Vector3};
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use rudolf_v::image::Image;
@@ -29,9 +29,9 @@ mod tiled_bearing;
 pub(in crate::depth::patch_depth) use geometry::*;
 pub(in crate::depth::patch_depth) use tiled_bearing::*;
 
-use fuse::PatchGrid;
 #[cfg(not(feature = "parallel"))]
 use fuse::densify_pixels;
+use fuse::PatchGrid;
 #[cfg(feature = "parallel")]
 use fuse::{densify_pixels_parallel, patch_centers};
 use image_ops::{
@@ -40,11 +40,11 @@ use image_ops::{
     sample_bilinear_valid, sample_bilinear_valid_with_grad, sample_nearest, sample_valid_nearest,
     scaled_intrinsics, undistort_level_specs,
 };
-use seeds::{SeedGrid, median_seed_depth, nearby_seed_weights, scale_seeds};
+use seeds::{median_seed_depth, nearby_seed_weights, scale_seeds, SeedGrid};
 #[cfg(target_arch = "x86_64")]
 use simd::{
-    PerPatchAffineGeom, fast_translation_accum_avx2_if_available,
-    per_patch_affine_accum_avx2_if_available,
+    fast_translation_accum_avx2_if_available, per_patch_affine_accum_avx2_if_available,
+    PerPatchAffineGeom,
 };
 #[cfg(target_arch = "aarch64")]
 use simd_neon::fast_translation_accum_neon_if_available;
@@ -89,6 +89,11 @@ pub struct PatchDepthSettings {
     pub max_depth: f64,
     pub photo_huber_delta: f64,
     pub sigma_photo: f64,
+    /// Isotropic angular velocity variance `(rad/s)^2` used by the
+    /// per-patch-bearing photometric uncertainty model. Translation covariance
+    /// comes from the EqF `P_vv` input; this field lets synthetic dense-depth
+    /// calibration inject `P_ww` before an EqF accessor exists.
+    pub pose_angular_velocity_var: f64,
     pub n_gn_iters: usize,
     /// Gauss-Newton early-exit tolerance on `|Δη|` (per-patch-bearing solve).
     pub gn_eta_convergence_tol: f64,
@@ -124,6 +129,7 @@ impl Default for PatchDepthSettings {
             min_depth: 0.1,
             photo_huber_delta: 5.0,
             sigma_photo: 5.0,
+            pose_angular_velocity_var: 0.0,
             n_gn_iters: 5,
             gn_eta_convergence_tol: GN_ETA_CONVERGENCE_TOL,
             fd_eps: 1e-3,
@@ -221,6 +227,58 @@ impl RelativePose {
             t: t_ref_curr.fixed_view::<3, 1>(0, 3).into_owned(),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct WarpUncertainty {
+    pub(super) scalar_sq: f64,
+    translation_dt2: Option<Matrix3<f64>>,
+    angular_dt2: Option<Matrix3<f64>>,
+}
+
+impl WarpUncertainty {
+    fn scalar(scalar_sq: f64) -> Self {
+        Self {
+            scalar_sq,
+            translation_dt2: None,
+            angular_dt2: None,
+        }
+    }
+
+    fn patch_pixel_cov(
+        &self,
+        tile: &TiledBearingTile,
+        x_ref: &Vector3<f64>,
+        rel_pose: &RelativePose,
+    ) -> Option<[f64; 3]> {
+        if self.translation_dt2.is_none() && self.angular_dt2.is_none() {
+            return None;
+        }
+
+        let du_dxref = tile.projection_jacobian(x_ref)?;
+        let mut cov = Matrix2::zeros();
+        if let Some(sigma_t) = self.translation_dt2.as_ref() {
+            cov += du_dxref * sigma_t * du_dxref.transpose();
+        }
+        if let Some(sigma_w) = self.angular_dt2.as_ref() {
+            let x_ref_minus_t = x_ref - rel_pose.t;
+            let j_rot = du_dxref * -skew(&x_ref_minus_t);
+            cov += j_rot * sigma_w * j_rot.transpose();
+        }
+        if !cov.iter().all(|v| v.is_finite()) {
+            return None;
+        }
+
+        let a = cov[(0, 0)].max(0.0);
+        let b = cov[(0, 1)];
+        let c = cov[(1, 1)].max(0.0);
+        (a > 0.0 || b != 0.0 || c > 0.0).then_some([a, b, c])
+    }
+}
+
+#[inline]
+fn skew(v: &Vector3<f64>) -> Matrix3<f64> {
+    Matrix3::new(0.0, -v[2], v[1], v[2], 0.0, -v[0], -v[1], v[0], 0.0)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -963,6 +1021,33 @@ fn compute_sigma_warp_sq(
     (f / median_depth).powi(2) * var_t_mag
 }
 
+fn compute_warp_uncertainty(
+    intrinsics: &CameraIntrinsics,
+    t_ref_curr: &Matrix4<f64>,
+    p_vv: Option<&Matrix3<f64>>,
+    p_ww: Option<&Matrix3<f64>>,
+    angular_velocity_var: f64,
+    dt: f64,
+    median_depth: f64,
+) -> WarpUncertainty {
+    let scalar_sq = compute_sigma_warp_sq(intrinsics, t_ref_curr, p_vv, dt, median_depth);
+    if dt <= 0.0 {
+        return WarpUncertainty::scalar(scalar_sq);
+    }
+
+    let dt2 = dt * dt;
+    let translation_dt2 = p_vv.map(|p| p * dt2);
+    let angular_dt2 = p_ww.map(|p| p * dt2).or_else(|| {
+        (angular_velocity_var > 0.0).then(|| Matrix3::identity() * angular_velocity_var * dt2)
+    });
+
+    WarpUncertainty {
+        scalar_sq,
+        translation_dt2,
+        angular_dt2,
+    }
+}
+
 #[inline(always)]
 fn huber_cost(residual: f64, delta: f64) -> f64 {
     let ar = residual.abs();
@@ -996,6 +1081,31 @@ fn photo_inv_sigma_eff_sq(
         let grad_i_sq = gx as f64 * gx as f64 + gy as f64 * gy as f64;
         let sigma_eff_sq = sigma_photo_sq + grad_i_sq * sigma_warp_sq;
         1.0 / sigma_eff_sq.max(1e-12)
+    }
+}
+
+#[inline(always)]
+fn photo_inv_sigma_eff_sq_anisotropic(
+    gx: f32,
+    gy: f32,
+    sigma_photo_sq: f64,
+    sigma_warp_sq: f64,
+    warp_cov: Option<[f64; 3]>,
+    constant_inv_sigma_photo_sq: Option<f64>,
+) -> f64 {
+    if let Some([a, b, c]) = warp_cov {
+        let gx = gx as f64;
+        let gy = gy as f64;
+        let sigma_warp = (gx * gx * a + 2.0 * gx * gy * b + gy * gy * c).max(0.0);
+        1.0 / (sigma_photo_sq + sigma_warp).max(1e-12)
+    } else {
+        photo_inv_sigma_eff_sq(
+            gx,
+            gy,
+            sigma_photo_sq,
+            sigma_warp_sq,
+            constant_inv_sigma_photo_sq,
+        )
     }
 }
 
