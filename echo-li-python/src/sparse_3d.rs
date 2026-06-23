@@ -63,13 +63,14 @@ impl PySparse3DFilter {
         })
     }
 
-    #[pyo3(signature = (stamp, feature_uvs, t_wc, p_vv=None))]
+    #[pyo3(signature = (stamp, feature_uvs, t_wc, p_vv=None, p_ww=None))]
     fn update(
         &mut self,
         stamp: f64,
         feature_uvs: HashMap<u64, [f32; 2]>,
         t_wc: [[f64; 4]; 4],
         p_vv: Option<[[f64; 3]; 3]>,
+        p_ww: Option<[[f64; 3]; 3]>,
     ) {
         let cam_coords: HashMap<u64, Vector2<f32>> = feature_uvs
             .into_iter()
@@ -77,11 +78,10 @@ impl PySparse3DFilter {
             .collect();
         let measurement = VisionMeasurement::new(stamp, cam_coords);
         let t = array_to_matrix4(&t_wc);
-        // p_vv is the 3x3 velocity (translation-rate) covariance consumed by the
-        // core as process noise (q_euc = p_vv * dt^2). Rotation is not yet
-        // ingested; a 6x6 pose covariance would be added as a separate kwarg.
         let p_vv_mat = p_vv.map(|m| array_to_matrix3(&m));
-        self.inner.update(&measurement, &t, p_vv_mat.as_ref());
+        let p_ww_mat = p_ww.map(|m| array_to_matrix3(&m));
+        self.inner
+            .update(&measurement, &t, p_vv_mat.as_ref(), p_ww_mat.as_ref());
     }
 
     fn query(&self, feature_id: u64) -> (f64, f64) {

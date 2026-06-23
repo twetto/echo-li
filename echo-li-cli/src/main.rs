@@ -1441,7 +1441,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let state_hash = trace_determinism.then(|| hash_state(&state));
                     let t_wc = camera_pose_matrix(&state);
                     if let Some(sparse) = &mut sparse_filter {
-                        sparse.update(&sparse_measurement, &t_wc, None);
+                        sparse.update(&sparse_measurement, &t_wc, None, None);
                         if let Some(mapper) = &mut patch_depth_mapper {
                             if !patch_gray_data.is_empty() {
                                 let frame = FrameProducts {
