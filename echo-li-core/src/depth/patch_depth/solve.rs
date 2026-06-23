@@ -7,7 +7,7 @@ impl PatchDepthMapper {
         ref_keyframe: &DepthKeyframe,
         t_ref_curr: &Matrix4<f64>,
         seeds: &[SparseDepthPrior],
-        sigma_warp_sq: f64,
+        warp_uncertainty: WarpUncertainty,
     ) -> PatchDepthOutput {
         let curr_pyramid = depth_frame.pyramid.as_ref();
         let curr_valid_pyramid = depth_frame.valid_pyramid.as_ref().map(|p| p.as_slice());
@@ -52,7 +52,7 @@ impl PatchDepthMapper {
                         &scaled_intrinsics,
                         t_ref_curr,
                         &rel_pose,
-                        sigma_warp_sq,
+                        &warp_uncertainty,
                     );
                     (u, v, estimate)
                 })
@@ -90,7 +90,7 @@ impl PatchDepthMapper {
                         &scaled_intrinsics,
                         t_ref_curr,
                         &rel_pose,
-                        sigma_warp_sq,
+                        &warp_uncertainty,
                     );
                     grid.set(u, v, estimate);
                 }
@@ -523,7 +523,7 @@ impl PatchDepthMapper {
         intrinsics_by_level: &[ScaledIntrinsics],
         t_ref_curr: &Matrix4<f64>,
         rel_pose: &RelativePose,
-        sigma_warp_sq: f64,
+        warp_uncertainty: &WarpUncertainty,
     ) -> PatchEstimate {
         if self.camera_mode == PatchDepthCameraMode::PerPatchBearing {
             self.solve_one_per_patch_bearing(
@@ -536,7 +536,7 @@ impl PatchDepthMapper {
                 ref_keyframe,
                 intrinsics_by_level,
                 rel_pose,
-                sigma_warp_sq,
+                warp_uncertainty,
             )
         } else {
             self.solve_one_patch(
@@ -549,7 +549,7 @@ impl PatchDepthMapper {
                 ref_keyframe,
                 intrinsics_by_level,
                 t_ref_curr,
-                sigma_warp_sq,
+                warp_uncertainty.scalar_sq,
             )
         }
     }
@@ -701,7 +701,7 @@ impl PatchDepthMapper {
         ref_keyframe: &DepthKeyframe,
         intrinsics_by_level: &[ScaledIntrinsics],
         rel_pose: &RelativePose,
-        sigma_warp_sq: f64,
+        warp_uncertainty: &WarpUncertainty,
     ) -> PatchEstimate {
         let nearby = nearby_seed_weights(cu, cv, seeds, seed_grid, &self.settings);
         if nearby.is_empty() {
@@ -824,7 +824,7 @@ impl PatchDepthMapper {
                     &ref_keyframe.grad_x_pyramid[0],
                     &ref_keyframe.grad_y_pyramid[0],
                     rel_pose,
-                    sigma_warp_sq,
+                    warp_uncertainty,
                 );
             if valid_n == 0 {
                 break;
