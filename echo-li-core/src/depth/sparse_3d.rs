@@ -171,6 +171,7 @@ impl Sparse3DFilter {
         measurement: &VisionMeasurement,
         t_wc: &Matrix4<f64>,
         p_vv: Option<&Matrix3<f64>>,
+        p_ww: Option<&Matrix3<f64>>,
     ) {
         let stamp = measurement.stamp;
         let curr_uvs: HashMap<u64, Vector2<f64>> = measurement
@@ -204,7 +205,7 @@ impl Sparse3DFilter {
                         return None;
                     }
                     let uv_curr = curr_uvs.get(&fid)?;
-                    (!update_feature_3d(chart, &k, &settings, feat, uv_curr, &t_cw_curr, p_vv, dt))
+                    (!update_feature_3d(chart, &k, &settings, feat, uv_curr, &t_cw_curr, p_vv, p_ww, dt))
                         .then_some(fid)
                 })
                 .collect()
@@ -231,6 +232,7 @@ impl Sparse3DFilter {
                     uv_curr,
                     &t_cw_curr,
                     p_vv,
+                    p_ww,
                     dt,
                 ) {
                     reset_features.push(fid);
@@ -479,13 +481,14 @@ fn update_feature_3d(
     uv_obs: &Vector2<f64>,
     t_cw_curr: &Matrix4<f64>,
     p_vv: Option<&Matrix3<f64>>,
+    p_ww: Option<&Matrix3<f64>>,
     dt: f64,
 ) -> bool {
     match chart {
         Sparse3DChart::InvDepthAdditive => {
-            invdepth_additive_update_3d(k, settings, feat, uv_obs, t_cw_curr, p_vv, dt)
+            invdepth_additive_update_3d(k, settings, feat, uv_obs, t_cw_curr, p_vv, p_ww, dt)
         }
-        _ => iekf_update_3d(chart, k, settings, feat, uv_obs, t_cw_curr, p_vv, dt),
+        _ => iekf_update_3d(chart, k, settings, feat, uv_obs, t_cw_curr, p_vv, p_ww, dt),
     }
 }
 
@@ -505,6 +508,7 @@ fn invdepth_additive_update_3d(
     uv_obs: &Vector2<f64>,
     t_cw_curr: &Matrix4<f64>,
     p_vv: Option<&Matrix3<f64>>,
+    p_ww: Option<&Matrix3<f64>>,
     dt: f64,
 ) -> bool {
     let fx = k[(0, 0)];
@@ -534,17 +538,19 @@ fn invdepth_additive_update_3d(
         )
     };
 
-    // Optional per-step process-noise floor (same intent as the SOT(3) path),
-    // formed in the current camera frame and pulled into (alpha,beta,rho) coords
-    // by J_g^{-1}, J_g = R_ca . dP_anchor/ds.
-    if dt > 0.0 && (p_vv.is_some() || settings.range_walk_var > 0.0) {
+    if dt > 0.0 && (p_vv.is_some() || p_ww.is_some() || settings.range_walk_var > 0.0) {
         let q_c = r_ca * pa_of(&feat.inv_s) + t_ca_t;
         if q_c[2] > settings.min_depth {
             let j_g = r_ca * jpa_of(&feat.inv_s);
             if let Some(j_inv) = j_g.try_inverse() {
+                let dt2 = dt * dt;
                 let mut q_cur = Matrix3::zeros();
                 if let Some(pvv) = p_vv {
-                    q_cur += pvv * (dt * dt);
+                    q_cur += pvv * dt2;
+                }
+                if let Some(pww) = p_ww {
+                    let qx = base_skew(&q_c);
+                    q_cur += qx * pww * qx.transpose() * dt2;
                 }
                 if settings.range_walk_var > 0.0 {
                     let r_hat = q_c / q_c.norm();
@@ -642,6 +648,7 @@ fn iekf_update_3d(
     uv_obs: &Vector2<f64>,
     t_cw_curr: &Matrix4<f64>,
     p_vv: Option<&Matrix3<f64>>,
+    p_ww: Option<&Matrix3<f64>>,
     dt: f64,
 ) -> bool {
     let fx = k[(0, 0)];
@@ -689,15 +696,20 @@ fn iekf_update_3d(
     //   * p_vv·dt²            -- translation-rate (velocity) covariance,
     //   * range_walk_var·‖q_c‖²·r̂r̂ᵀ -- a depth-scaled radial (range) random-walk
     //     floor that stops Σ from going below the un-modelled range bias.
-    if dt > 0.0 && (p_vv.is_some() || settings.range_walk_var > 0.0) {
+    if dt > 0.0 && (p_vv.is_some() || p_ww.is_some() || settings.range_walk_var > 0.0) {
         let p = q_hat_a_of(&feat.x);
         let q_c = r_ca * p + t_ca_t;
         if q_c[2] > settings.min_depth {
             let j_c = r_ca * dq_hat_a(&feat.x);
             if let Some(j_inv) = j_c.try_inverse() {
+                let dt2 = dt * dt;
                 let mut q_cur = Matrix3::zeros();
                 if let Some(pvv) = p_vv {
-                    q_cur += pvv * (dt * dt);
+                    q_cur += pvv * dt2;
+                }
+                if let Some(pww) = p_ww {
+                    let qx = base_skew(&q_c);
+                    q_cur += qx * pww * qx.transpose() * dt2;
                 }
                 if settings.range_walk_var > 0.0 {
                     let r_hat = q_c / q_c.norm();
@@ -1199,6 +1211,7 @@ mod tests {
             &VisionMeasurement::new(i as f64 * 0.05, coords),
             &t_wc,
             None,
+            None,
         );
     }
 
@@ -1342,7 +1355,7 @@ mod tests {
         let t_wc = pose(8.0 * 0.05);
         let mut coords = HashMap::new();
         coords.insert(42, Vector2::new(10_000.0, 10_000.0));
-        filter.update(&VisionMeasurement::new(8.0 * 0.05, coords), &t_wc, None);
+        filter.update(&VisionMeasurement::new(8.0 * 0.05, coords), &t_wc, None, None);
 
         assert!(
             filter.feature(42).is_none(),

@@ -49,7 +49,11 @@ DIM = 3
 SIGMA_PX = 0.5
 SIGMA_T = 0.01     # translation pose-noise std [m] per frame
 SIGMA_PHI = 0.0015  # rotation pose-noise std [rad] per frame
-P_VV_T = (2.0 * SIGMA_T**2 / DT**2) * np.eye(3)  # rel-motion translation cov / dt^2
+P_VV_SCALE = 2.0  # 2x because the original test over-inflated; kept for parity
+P_VV_T = (P_VV_SCALE * SIGMA_T**2 / DT**2) * np.eye(3)
+P_WW_T = (P_VV_SCALE * SIGMA_PHI**2 / DT**2) * np.eye(3)
+P_VV_T1 = (SIGMA_T**2 / DT**2) * np.eye(3)  # factor-1 variants
+P_WW_T1 = (SIGMA_PHI**2 / DT**2) * np.eye(3)
 
 SETTINGS = dict(
     sigma_pixel=SIGMA_PX,
@@ -63,11 +67,13 @@ SETTINGS = dict(
 P_W = np.array([(U0 - CX) / FX * Z_TRUE, (V0 - CY) / FY * Z_TRUE, Z_TRUE])
 
 
-def run_trial(rng, pose_noise, p_vv):
+def run_trial(rng, pose_noise, p_vv, p_ww=None, chart="polar3d"):
     """One MC trial -> per-step NEES (NaN where no live feature)."""
-    filt = Sparse3DFilter.polar3d(FX, FY, CX, CY, **SETTINGS)
+    ctor = getattr(Sparse3DFilter, chart)
+    filt = ctor(FX, FY, CX, CY, **SETTINGS)
     nees = np.full(N, np.nan)
     p_vv_arg = None if p_vv is None else p_vv.tolist()
+    p_ww_arg = None if p_ww is None else p_ww.tolist()
 
     for i in range(N):
         t_true = np.eye(4)
@@ -83,7 +89,7 @@ def run_trial(rng, pose_noise, p_vv):
         xi = pose_noise(rng)
         t_fed = t_true @ exp_se3(xi)
 
-        filt.update(i * DT, {42: uv}, t_fed.tolist(), p_vv_arg)
+        filt.update(i * DT, {42: uv}, t_fed.tolist(), p_vv_arg, p_ww_arg)
 
         feats = filt.get_features()
         if 42 not in feats:
@@ -114,12 +120,36 @@ def rot_noise(rng):
     return np.concatenate([np.zeros(3), rng.normal(0, SIGMA_PHI, 3)])
 
 
+def trans_rot_noise(rng):
+    return np.concatenate([rng.normal(0, SIGMA_T, 3), rng.normal(0, SIGMA_PHI, 3)])
+
+
+SIGMA_PHI_SMALL = 0.0003  # 5x smaller rotation noise
+
+def rot_noise_small(rng):
+    return np.concatenate([np.zeros(3), rng.normal(0, SIGMA_PHI_SMALL, 3)])
+
+P_WW_SMALL = (SIGMA_PHI_SMALL**2 / DT**2) * np.eye(3)
+
+# (label, noise_fn, p_vv, p_ww, chart, color)
 ARMS = [
-    ("A: no pose noise", no_noise, None, "tab:green"),
-    ("B: translation noise, naive", trans_noise, None, "tab:orange"),
-    ("C: translation noise, p_vv-aware", trans_noise, P_VV_T, "tab:blue"),
-    ("D: rotation noise, naive", rot_noise, None, "tab:red"),
-    ("E: rotation noise, p_vv (3x3) applied", rot_noise, P_VV_T, "tab:purple"),
+    # Baselines
+    ("A: no noise (polar3d)", no_noise, None, None, "polar3d", "tab:green"),
+    ("A2: no noise (inv_add)", no_noise, None, None, "invdepth_additive3d", "limegreen"),
+    # Translation calibration
+    ("B: trans, naive", trans_noise, None, None, "polar3d", "tab:orange"),
+    ("C: trans, p_vv (polar3d)", trans_noise, P_VV_T1, None, "polar3d", "tab:blue"),
+    # Rotation — polar3d (SOT(3) IEKF breaks with rotation process noise)
+    ("D: rot, naive (polar3d)", rot_noise, None, None, "polar3d", "tab:red"),
+    ("E: rot, p_ww (polar3d)", rot_noise, None, P_WW_T1, "polar3d", "tab:purple"),
+    # Rotation — invdepth_additive (well-behaved chart)
+    ("F: rot, naive (inv_add)", rot_noise, None, None, "invdepth_additive3d", "salmon"),
+    ("G: rot, p_ww (inv_add)", rot_noise, None, P_WW_T1, "invdepth_additive3d", "darkviolet"),
+    # Small rotation — verifies linearized model is correct
+    ("H: rot_small, naive (inv_add)", rot_noise_small, None, None, "invdepth_additive3d", "gold"),
+    ("I: rot_small, p_ww (inv_add)", rot_noise_small, None, P_WW_SMALL, "invdepth_additive3d", "darkgoldenrod"),
+    # Joint noise
+    ("J: trans+rot, p_vv+p_ww (inv_add)", trans_rot_noise, P_VV_T1, P_WW_T1, "invdepth_additive3d", "tab:cyan"),
 ]
 
 
@@ -127,10 +157,10 @@ def main():
     steps = np.arange(N)
     fig, ax = plt.subplots(figsize=(11, 6))
     print(f"pose-noise NEES (dim={DIM}, N_MC={N_MC}, Z={Z_TRUE}m)")
-    for label, noise, p_vv, color in ARMS:
+    for label, noise, p_vv, p_ww, chart, color in ARMS:
         alln = np.full((N_MC, N), np.nan)
         for mc in range(N_MC):
-            alln[mc] = run_trial(np.random.default_rng(7000 + mc), noise, p_vv)
+            alln[mc] = run_trial(np.random.default_rng(7000 + mc), noise, p_vv, p_ww, chart)
         mean_nees = np.nanmean(alln, axis=0)
         ax.plot(steps, mean_nees, color=color, lw=1.6, label=label)
         settled = np.nanmean(mean_nees[N // 2:])

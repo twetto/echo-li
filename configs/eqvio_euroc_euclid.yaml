@@ -139,6 +139,7 @@ PatchDepth:
   # GN early-exit: stop refining a patch once |Δη| (log-range step) drops below
   # this. Larger = fewer iterations (faster) but coarser depth; default 1e-3.
   gn_eta_convergence_tol: 0.001
+  pose_angular_velocity_var: 0.0
   # tiled_tile_size: 96
   tiled_tile_size: 64
   tiled_tile_overlap: 4

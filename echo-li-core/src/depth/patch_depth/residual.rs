@@ -520,7 +520,7 @@ impl PatchDepthMapper {
         ref_grad_x: &Image<f32>,
         ref_grad_y: &Image<f32>,
         rel_pose: &RelativePose,
-        sigma_warp_sq: f64,
+        warp_uncertainty: &WarpUncertainty,
     ) -> (f64, f64, f64, usize) {
         let Some((u_ref_center, v_ref_center, x_ref_center, _unit_b)) =
             warp_tiled_local_pixel_eta(tile, tile, cu, cv, eta, rel_pose)
@@ -539,8 +539,10 @@ impl PatchDepthMapper {
         let half = self.settings.patch_size / 2;
         let side = self.settings.patch_size;
         let sigma_photo_sq = self.settings.sigma_photo * self.settings.sigma_photo;
-        let constant_inv_sigma_photo_sq =
-            (sigma_warp_sq <= 1e-18).then_some(1.0 / sigma_photo_sq.max(1e-12));
+        let sigma_warp_sq = warp_uncertainty.scalar_sq;
+        let pixel_cov = warp_uncertainty.patch_pixel_cov(tile, &x_ref_center, rel_pose);
+        let constant_inv_sigma_photo_sq = (pixel_cov.is_none() && sigma_warp_sq <= 1e-18)
+            .then_some(1.0 / sigma_photo_sq.max(1e-12));
         let mut grad = 0.0;
         let mut hess = 0.0;
         let mut sum_abs_res = 0.0;
@@ -572,36 +574,38 @@ impl PatchDepthMapper {
         let ref_base_u = tile.x0 as f64 + u_ref_center - half as f64 - affine.center_u;
         let ref_base_v = tile.y0 as f64 + v_ref_center - half as f64 - affine.center_v;
 
-        // SIMD leaf: computes the σ_eff² weight per lane, so it serves both the
-        // constant (sigma_warp_sq == 0) and gradient-dependent cases.
+        // SIMD leaf: computes the scalar σ_eff² weight per lane. The anisotropic
+        // 2x2 pose covariance falls back to the scalar loop below.
         #[cfg(target_arch = "x86_64")]
         {
-            // The reference Jacobian raw_gx·cgx + raw_gy·cgy folds the gradient
-            // rotation (raw→tangent) and the tangent→η chain into two scalars.
-            let cgx = raw_du_x * du_deta + raw_dv_x * dv_deta;
-            let cgy = raw_du_y * du_deta + raw_dv_y * dv_deta;
-            if let Some(accum) = per_patch_affine_accum_avx2_if_available(
-                curr_img,
-                ref_img,
-                ref_grad_x,
-                ref_grad_y,
-                side,
-                PerPatchAffineGeom {
-                    raw_center: [affine.raw_center[0] as f32, affine.raw_center[1] as f32],
-                    raw_du: [raw_du_x as f32, raw_du_y as f32],
-                    raw_dv: [raw_dv_x as f32, raw_dv_y as f32],
-                    curr_base_u: curr_base_u as f32,
-                    curr_base_v: curr_base_v as f32,
-                    ref_base_u: ref_base_u as f32,
-                    ref_base_v: ref_base_v as f32,
-                    cgx: cgx as f32,
-                    cgy: cgy as f32,
-                },
-                sigma_photo_sq as f32,
-                sigma_warp_sq as f32,
-                self.settings.photo_huber_delta as f32,
-            ) {
-                return (accum.grad, accum.hess, accum.sum_abs_res, accum.n_valid);
+            if pixel_cov.is_none() {
+                // The reference Jacobian raw_gx·cgx + raw_gy·cgy folds the gradient
+                // rotation (raw→tangent) and the tangent→η chain into two scalars.
+                let cgx = raw_du_x * du_deta + raw_dv_x * dv_deta;
+                let cgy = raw_du_y * du_deta + raw_dv_y * dv_deta;
+                if let Some(accum) = per_patch_affine_accum_avx2_if_available(
+                    curr_img,
+                    ref_img,
+                    ref_grad_x,
+                    ref_grad_y,
+                    side,
+                    PerPatchAffineGeom {
+                        raw_center: [affine.raw_center[0] as f32, affine.raw_center[1] as f32],
+                        raw_du: [raw_du_x as f32, raw_du_y as f32],
+                        raw_dv: [raw_dv_x as f32, raw_dv_y as f32],
+                        curr_base_u: curr_base_u as f32,
+                        curr_base_v: curr_base_v as f32,
+                        ref_base_u: ref_base_u as f32,
+                        ref_base_v: ref_base_v as f32,
+                        cgx: cgx as f32,
+                        cgy: cgy as f32,
+                    },
+                    sigma_photo_sq as f32,
+                    sigma_warp_sq as f32,
+                    self.settings.photo_huber_delta as f32,
+                ) {
+                    return (accum.grad, accum.hess, accum.sum_abs_res, accum.n_valid);
+                }
             }
         }
 
@@ -645,11 +649,12 @@ impl PatchDepthMapper {
                 let jac = gx as f64 * du_deta + gy as f64 * dv_deta;
                 let residual = i_ref as f64 - i_curr as f64;
                 let ar = residual.abs();
-                let inv_sigma_eff_sq = photo_inv_sigma_eff_sq(
+                let inv_sigma_eff_sq = photo_inv_sigma_eff_sq_anisotropic(
                     gx,
                     gy,
                     sigma_photo_sq,
                     sigma_warp_sq,
+                    pixel_cov,
                     constant_inv_sigma_photo_sq,
                 );
                 let weight = huber_weight_from_abs_res(
