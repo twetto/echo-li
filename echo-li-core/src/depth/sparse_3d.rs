@@ -205,8 +205,10 @@ impl Sparse3DFilter {
                         return None;
                     }
                     let uv_curr = curr_uvs.get(&fid)?;
-                    (!update_feature_3d(chart, &k, &settings, feat, uv_curr, &t_cw_curr, p_vv, p_ww, dt))
-                        .then_some(fid)
+                    (!update_feature_3d(
+                        chart, &k, &settings, feat, uv_curr, &t_cw_curr, p_vv, p_ww, dt,
+                    ))
+                    .then_some(fid)
                 })
                 .collect()
         };
@@ -501,6 +503,56 @@ fn update_feature_3d(
 /// with the same Gaussian-Beta inlier weighting and optional process-noise floor
 /// as the SOT(3) path. No log-depth, no re-charting -> no sequential-linearisation
 /// overconfidence (see docs/sparse3d_invdepth_rewrite.md).
+/// Anchor-frame inverse-depth chart of a 3-point: (X/Z, Y/Z, 1/Z). Involution
+/// (its own inverse), so it maps both P_anchor -> s and back.
+fn pa_chart(p: &Vector3<f64>) -> Vector3<f64> {
+    Vector3::new(p[0] / p[2], p[1] / p[2], 1.0 / p[2])
+}
+
+/// Sigma-point (unscented) propagation of the rotation process noise `p_ww`
+/// through the full `exp(-[δφ]×)·q_c -> inverse-depth-chart` map, with
+/// `δφ ~ N(0, P_ww·dt²)`. Returns the added chart-space covariance and the
+/// 2nd-order mean (bias) shift the first-order `[q_c]× P_ww [q_c]×ᵀ` term drops.
+/// 6 symmetric points, κ=0 (n+λ=n ⇒ scale √3, weight 1/6).
+fn unscented_rotation_chart(
+    p_ww: &Matrix3<f64>,
+    dt2: f64,
+    q_c: &Vector3<f64>,
+    r_ca: &Matrix3<f64>,
+    t_ca_t: &Vector3<f64>,
+) -> Option<(Matrix3<f64>, Vector3<f64>)> {
+    let chol = (p_ww * dt2).cholesky()?;
+    let l = chol.l();
+    let scale = 3.0_f64.sqrt();
+    let r_inv = r_ca.transpose();
+    let s0 = pa_chart(&(r_inv * (q_c - t_ca_t))); // == nominal inv_s
+    let map = |dphi: Vector3<f64>| {
+        let rot = nalgebra::Rotation3::from_scaled_axis(-dphi).into_inner();
+        pa_chart(&(r_inv * (rot * q_c - t_ca_t)))
+    };
+    let mut sp = [Vector3::<f64>::zeros(); 6];
+    for i in 0..3 {
+        let col: Vector3<f64> = l.column(i).into_owned() * scale;
+        sp[2 * i] = map(col);
+        sp[2 * i + 1] = map(-col);
+    }
+    let mut mean = Vector3::zeros();
+    for s in &sp {
+        mean += s;
+    }
+    mean /= 6.0;
+    let mut q_chart = Matrix3::zeros();
+    for s in &sp {
+        let d = s - mean;
+        q_chart += d * d.transpose();
+    }
+    q_chart /= 6.0;
+    if !q_chart.iter().all(|x| x.is_finite()) || !mean.iter().all(|x| x.is_finite()) {
+        return None;
+    }
+    Some((q_chart, mean - s0))
+}
+
 fn invdepth_additive_update_3d(
     k: &Matrix3<f64>,
     settings: &SparseVogSettings,
@@ -544,26 +596,44 @@ fn invdepth_additive_update_3d(
             let j_g = r_ca * jpa_of(&feat.inv_s);
             if let Some(j_inv) = j_g.try_inverse() {
                 let dt2 = dt * dt;
+                // Linear (translation + radial floor) terms, pulled back into the
+                // chart by J_inv. Both are exact (translation is additive in q_c;
+                // the floor is a heuristic).
+                // When pose_measurement is set, the fed-pose terms (p_vv, p_ww) are
+                // folded into R below instead — only the radial floor stays here.
                 let mut q_cur = Matrix3::zeros();
-                if let Some(pvv) = p_vv {
+                if let Some(pvv) = p_vv.filter(|_| !settings.pose_measurement) {
                     q_cur += pvv * dt2;
-                }
-                if let Some(pww) = p_ww {
-                    let qx = base_skew(&q_c);
-                    q_cur += qx * pww * qx.transpose() * dt2;
                 }
                 if settings.range_walk_var > 0.0 {
                     let r_hat = q_c / q_c.norm();
                     q_cur +=
                         settings.range_walk_var * q_c.norm_squared() * (r_hat * r_hat.transpose());
                 }
-                let p = feat.inv_p + j_inv * q_cur * j_inv.transpose();
-                feat.inv_p = 0.5 * (p + p.transpose());
+                let mut sigma = feat.inv_p + j_inv * q_cur * j_inv.transpose();
+                // Rotation term: unscented (2nd-order: variance + mean bias) or
+                // the first-order [q_c]× P_ww [q_c]×ᵀ linearisation.
+                let mut inv_s_shift = Vector3::zeros();
+                if let Some(pww) = p_ww.filter(|_| !settings.pose_measurement) {
+                    if settings.rotation_unscented {
+                        if let Some((q_chart, bias)) =
+                            unscented_rotation_chart(pww, dt2, &q_c, &r_ca, &t_ca_t)
+                        {
+                            sigma += q_chart;
+                            inv_s_shift = bias;
+                        }
+                    } else {
+                        let qx = base_skew(&q_c);
+                        sigma += j_inv * (qx * pww * qx.transpose() * dt2) * j_inv.transpose();
+                    }
+                }
+                feat.inv_p = 0.5 * (sigma + sigma.transpose());
+                feat.inv_s += inv_s_shift;
             }
         }
     }
 
-    let r_meas = Matrix2::identity() * settings.sigma_pixel.powi(2);
+    let mut r_meas = Matrix2::identity() * settings.sigma_pixel.powi(2);
 
     let q_c = r_ca * pa_of(&feat.inv_s) + t_ca_t;
     if q_c[2] < settings.min_depth {
@@ -572,6 +642,35 @@ fn invdepth_additive_update_3d(
     let (xc, yc, zc) = (q_c[0], q_c[1], q_c[2]);
     let z2 = zc * zc;
     let proj = Matrix2x3::new(fx / zc, 0.0, -fx * xc / z2, 0.0, fy / zc, -fy * yc / z2);
+    // Measurement-side pose uncertainty (the "consider"/Schmidt treatment of the
+    // fed pose): the pixel comes from the true pose but the filter is fed a noisy
+    // pose, so pose error is a *measurement* discrepancy, folded into R so it
+    // enters both S and the Joseph posterior K·R·Kᵀ. Geometrically self-scaling:
+    //   translation  J_t = ∂pixel/∂ρ = -proj        -> proj·P_vv·dt²·projᵀ  (∝1/Z²)
+    //   rotation     J_φ = ∂pixel/∂φ = proj·[q_c]×   -> J_φ·P_ww·dt²·J_φᵀ    (depth-indep)
+    if settings.pose_measurement && dt > 0.0 {
+        let dt2 = dt * dt;
+        if let Some(pvv) = p_vv {
+            r_meas += proj * (pvv * dt2) * proj.transpose();
+        }
+        if let Some(pww) = p_ww {
+            let jphi = proj * base_skew(&q_c);
+            r_meas += jphi * (pww * dt2) * jphi.transpose();
+        }
+        // Anchor-pose uncertainty: the anchor frame (T_wc_anchor) was itself set
+        // from a noisy pose at init; that error is fixed for the landmark's life.
+        // J_a = proj·R_ca·[-[P_anchor]× | I]  (P_anchor = anchor-frame point).
+        if settings.anchor_measurement {
+            let rca_proj = proj * r_ca; // = J_a translation block (2x3)
+            if let Some(pvv) = p_vv {
+                r_meas += rca_proj * (pvv * dt2) * rca_proj.transpose();
+            }
+            if let Some(pww) = p_ww {
+                let j_a = rca_proj * (-base_skew(&pa_of(&feat.inv_s)));
+                r_meas += j_a * (pww * dt2) * j_a.transpose();
+            }
+        }
+    }
     let c = proj * r_ca * jpa_of(&feat.inv_s); // dh/ds (2x3)
     let s_mat = c * feat.inv_p * c.transpose() + r_meas;
     let Some(s_inv) = (s_mat + Matrix2::identity() * 1e-8).try_inverse() else {
@@ -1355,7 +1454,12 @@ mod tests {
         let t_wc = pose(8.0 * 0.05);
         let mut coords = HashMap::new();
         coords.insert(42, Vector2::new(10_000.0, 10_000.0));
-        filter.update(&VisionMeasurement::new(8.0 * 0.05, coords), &t_wc, None, None);
+        filter.update(
+            &VisionMeasurement::new(8.0 * 0.05, coords),
+            &t_wc,
+            None,
+            None,
+        );
 
         assert!(
             filter.feature(42).is_none(),

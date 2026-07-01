@@ -88,6 +88,29 @@ pub struct SparseVogSettings {
     /// filter's un-scaled per-step term). Only consumed by `Sparse3DFilter`.
     /// Findings: `ECHO-LI-notes/docs/sparse3d_secondorder_eqf_derivation.md` §8.
     pub range_walk_var: f64,
+    /// Propagate the rotation process noise `p_ww` through the full nonlinear
+    /// `exp(-[δφ]×)·q_c -> chart` map with sigma points (unscented), instead of
+    /// the first-order `[q_c]× P_ww [q_c]×ᵀ` linearisation. Captures the
+    /// 2nd-order variance inflation AND the mean (bias) shift the linear term
+    /// drops — the residual that keeps NEES > 3 under full rotation noise at
+    /// depth. Invdepth-additive chart only. Default false. `Sparse3DFilter` only.
+    pub rotation_unscented: bool,
+    /// Treat the full fed-pose uncertainty (`p_vv` translation + `p_ww` rotation)
+    /// as a *measurement* error — fold it into R so it enters both the innovation
+    /// S and the Joseph posterior — rather than as landmark process noise. The fed
+    /// pose is a measurement input (the pixel comes from the true pose), so its
+    /// error is a measurement discrepancy, not a landmark disturbance; the process
+    /// channel diverges over long tracks (update-count overconfidence) while this
+    /// stays calibrated. `R += proj·P_vv·dt²·projᵀ + (proj·[q_c]×)·P_ww·dt²·(…)ᵀ`,
+    /// geometrically self-scaling (translation ∝1/Z², rotation depth-independent).
+    /// Skips the process-side `p_vv`/`p_ww` injection. Invdepth-additive chart
+    /// only. Default false. `Sparse3DFilter` only.
+    pub pose_measurement: bool,
+    /// Also add the *anchor* pose's uncertainty to R (the anchor frame was set
+    /// from a noisy pose at init; that error is fixed for the landmark's life and
+    /// floors its covariance). `J_a = proj·R_ca·[-[P_anchor]× | I]`. Requires
+    /// `pose_measurement`. Default false. `Sparse3DFilter` only.
+    pub anchor_measurement: bool,
 }
 
 impl Default for SparseVogSettings {
@@ -121,6 +144,9 @@ impl Default for SparseVogSettings {
             iekf_iterations: 1,
             second_order_mode: SecondOrderMode::Off,
             range_walk_var: 0.0,
+            rotation_unscented: false,
+            pose_measurement: false,
+            anchor_measurement: false,
         }
     }
 }
@@ -138,11 +164,7 @@ pub struct FeatureState {
 impl FeatureState {
     pub fn inlier_ratio(&self) -> f64 {
         let ab = self.a + self.b;
-        if ab <= 0.0 {
-            0.0
-        } else {
-            self.a / ab
-        }
+        if ab <= 0.0 { 0.0 } else { self.a / ab }
     }
 }
 

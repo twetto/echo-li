@@ -208,6 +208,9 @@ fn parse_settings(kwargs: Option<&Bound<'_, pyo3::types::PyDict>>) -> PyResult<S
     set!("use_equivariant_output", use_equivariant_output);
     set!("iekf_iterations", iekf_iterations);
     set!("range_walk_var", range_walk_var);
+    set!("rotation_unscented", rotation_unscented);
+    set!("pose_measurement", pose_measurement);
+    set!("anchor_measurement", anchor_measurement);
 
     if let Some(v) = kw.get_item("second_order_mode")? {
         let mode: String = v.extract()?;
