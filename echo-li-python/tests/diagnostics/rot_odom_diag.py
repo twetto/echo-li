@@ -61,6 +61,60 @@ def umeyama_se3(src, dst):
     return R, t, scale, aligned
 
 
+class OpenCVTracker:
+    """Drop-in for echo_li.Frontend: OpenCV pyramidal LK + goodFeaturesToTrack
+    refill + matched CLAHE. Mirrors .process()/.track_meta() so the VIO loop is
+    unchanged. Lets us A/B the frontend against Rudolf-V at the VIO/ATE level."""
+    def __init__(self, w, h, n=300, min_dist=16, win=21, levels=3, fb=False, fb_thresh=1.0):
+        self.w, self.h, self.n, self.min_dist = w, h, n, min_dist
+        self.fb, self.fb_thresh = fb, fb_thresh
+        self.ce = cv2.createCLAHE(4.0, (8, 8))   # matches Rudolf-V internal clahe params
+        self.lk = dict(winSize=(win, win), maxLevel=levels,
+                       criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
+        self.prev = None
+        self.pts = np.empty((0, 1, 2), np.float32)
+        self.ids = np.empty(0, int); self.ages = np.empty(0, int); self.nid = 0
+        self._lost = self._rej = self._newdet = 0
+
+    def process(self, gray):
+        img = self.ce.apply(gray)
+        self._lost = self._rej = self._newdet = 0
+        if self.prev is not None and len(self.pts) > 0:
+            new, st, _ = cv2.calcOpticalFlowPyrLK(self.prev, img, self.pts, None, **self.lk)
+            st = st.reshape(-1).astype(bool)
+            self._lost = int((~st).sum())
+            keep = st.copy()
+            if self.fb:
+                back, _, _ = cv2.calcOpticalFlowPyrLK(img, self.prev, new, None, **self.lk)
+                fberr = np.linalg.norm((back - self.pts).reshape(-1, 2), axis=1)
+                keep &= fberr < self.fb_thresh
+            nn = new.reshape(-1, 2)
+            keep &= (nn[:, 0] >= 1) & (nn[:, 0] < self.w-1) & (nn[:, 1] >= 1) & (nn[:, 1] < self.h-1)
+            self._rej = int((st & ~keep).sum())
+            self.pts = new[keep]; self.ids = self.ids[keep]; self.ages = self.ages[keep] + 1
+        need = self.n - len(self.pts)
+        if need > 0:
+            mask = np.full((self.h, self.w), 255, np.uint8)
+            for q in self.pts.reshape(-1, 2):
+                cv2.circle(mask, (int(q[0]), int(q[1])), self.min_dist, 0, -1)
+            det = cv2.goodFeaturesToTrack(img, need, 0.01, self.min_dist, mask=mask)
+            if det is not None:
+                k = len(det); self._newdet = k
+                self.pts = np.vstack([self.pts, det]) if len(self.pts) else det
+                self.ids = np.concatenate([self.ids, np.arange(self.nid, self.nid+k)])
+                self.ages = np.concatenate([self.ages, np.ones(k, int)]); self.nid += k
+        self.prev = img
+        feats = [{"id": int(i), "x": float(p[0]), "y": float(p[1])}
+                 for i, p in zip(self.ids, self.pts.reshape(-1, 2))]
+        stats = {"tracked": len(self.pts), "total": len(self.pts), "lost": self._lost,
+                 "rejected": self._rej, "new_detections": self._newdet}
+        return feats, stats
+
+    def track_meta(self):
+        return [{"age": int(a), "id": int(i), "klt_quality": 1.0}
+                for a, i in zip(self.ages, self.ids)]
+
+
 def plot_rpe_intervals(out, tr, est, est_R, gtp, gt_R, ratio, rpe_t, rpe_r, m, kf):
     """Teach RPE: for contrasting Δ-intervals, draw GT vs est sub-trajectory in the
     body-i frame (common origin). Endpoint gap = the RPE translation error."""
@@ -107,6 +161,8 @@ def main():
                     default=str(repo_root/"configs"/"eqvio_euroc_rho.yaml"))
     ap.add_argument("--out", default="rot_odom_diag.png")
     ap.add_argument("--rpe-dt", type=float, default=RPE_DT, help="RPE interval [s]")
+    ap.add_argument("--frontend", choices=["rudolf", "opencv"], default="rudolf")
+    ap.add_argument("--fb", action="store_true", help="OpenCV frontend: forward-backward check")
     args = ap.parse_args()
     rpe_dt = args.rpe_dt
 
@@ -123,9 +179,14 @@ def main():
     t_bs = np.array(cfg["T_BS"]["data"], float).reshape(4, 4) if "T_BS" in cfg else None
     print(f"cam {w}x{h} f=({fx:.1f},{fy:.1f}) c=({cx:.1f},{cy:.1f}) dist={dist_model}")
 
-    fcfg = echo_li.FrontendConfig.from_yaml(args.config)
-    fcfg.set_camera(fx, fy, cx, cy, w, h, dcoef if dcoef else [])
-    tracker = echo_li.Frontend(fcfg, w, h)
+    if args.frontend == "opencv":
+        tracker = OpenCVTracker(w, h, win=21, fb=args.fb)
+        print(f"frontend: OpenCV LK (win21, fb={int(args.fb)}, CLAHE 4.0/8)")
+    else:
+        fcfg = echo_li.FrontendConfig.from_yaml(args.config)
+        fcfg.set_camera(fx, fy, cx, cy, w, h, dcoef if dcoef else [])
+        tracker = echo_li.Frontend(fcfg, w, h)
+        print("frontend: Rudolf-V")
     cam = (echo_li.RadTanCamera(fx, fy, cx, cy, *dcoef[:4])
            if "radial" in dist_model.lower() else echo_li.PinholeCamera(fx, fy, cx, cy))
     vio = echo_li.VIOFilter(args.config, cam)
@@ -171,10 +232,15 @@ def main():
             vio.process_vision(stamp, {f["id"]: (f["x"], f["y"]) for f in feats})
             pos, quat = vio.get_pose(); est = np.array(pos); estq = np.array(quat)
             lm_ids = tuple(int(k) for k in vio.get_landmarks().keys())
-        ages = [m["age"] for m in tracker.track_meta()]
+        meta = tracker.track_meta()
+        ages = [m["age"] for m in meta]
+        quals = [m["klt_quality"] for m in meta]
         med_age = float(np.median(ages)) if ages else 0.0
+        med_qual = float(np.median(quals)) if quals else 1.0
         rec.append(dict(t=stamp-t0, p=est, q=estq, tracked=stats["tracked"],
-                        total=stats["total"], age=med_age, ids=lm_ids))
+                        total=stats["total"], age=med_age, qual=med_qual, ids=lm_ids,
+                        lost=stats["lost"], rejected=stats["rejected"],
+                        new_det=stats["new_detections"]))
         if n_img % 200 == 0:
             print(f"  [{n_img}] t={stamp-t0:5.1f}s tracked={stats['tracked']:3d} "
                   f"lm={len(lm_ids):2d} med_age={med_age:4.0f} "
@@ -191,6 +257,9 @@ def main():
     ratio = (gsp / Z_SCENE) / np.maximum(gtw, 1e-3)      # parallax/rotation, <<1 = rot-dom
     gt_R = slerp(np.clip(tr+t0, gt_t[0], gt_t[-1])).as_matrix()
     tracked = np.array([r["tracked"] for r in rec]); med_age = np.array([r["age"] for r in rec])
+    med_qual = np.array([r["qual"] for r in rec])
+    lost = np.array([r["lost"] for r in rec]); rejected = np.array([r["rejected"] for r in rec])
+    new_det = np.array([r["new_det"] for r in rec])
 
     m = have & np.isfinite(est).all(1)
     R, t, sc, al = umeyama_se3(est[m], gtp[m])
@@ -232,6 +301,17 @@ def main():
     print(f"  RPE RMS  last-15s {np.sqrt(np.nanmean(rpe_t[late]**2))*100:.1f} cm  "
           f"vs  earlier {np.sqrt(np.nanmean(rpe_t[~late]**2))*100:.1f} cm")
 
+    # --- churn source: where do tracks die? (KLT lost / RANSAC+LBP rejected / OOB) ---
+    print(f"\nchurn source (per-frame means): lost {lost.mean():.1f}  rejected "
+          f"{rejected.mean():.1f}  new_det {new_det.mean():.1f}  tracked {tracked.mean():.0f}")
+    print(f"  correlations with GT |w|:  lost {np.corrcoef(lost, gtw)[0,1]:+.2f}  "
+          f"rejected {np.corrcoef(rejected, gtw)[0,1]:+.2f}  "
+          f"new_det {np.corrcoef(new_det, gtw)[0,1]:+.2f}")
+    rot = gtw > np.percentile(gtw, 75)
+    print(f"  high-rotation frames (top-25% |w|): lost {lost[rot].mean():.1f} vs "
+          f"calm {lost[~rot].mean():.1f}   rejected {rejected[rot].mean():.1f} vs "
+          f"{rejected[~rot].mean():.1f}   new_det {new_det[rot].mean():.1f} vs {new_det[~rot].mean():.1f}")
+
     # --- whole-sequence correlations: does local drift track parallax starvation? ---
     def corr(x, y, label):
         g = np.isfinite(x) & np.isfinite(y)
@@ -242,6 +322,10 @@ def main():
     corr(rpe_t, med_age, "median track age")
     corr(rpe_t, surv, "landmark survival")
     corr(rpe_t, gtw, "GT |w|")
+    corr(rpe_t, med_qual, "median klt quality")
+    print(f"  [klt_quality: median {np.nanmedian(med_qual):.3f}, "
+          f"p10 {np.nanpercentile(med_qual,10):.3f}, "
+          f"frac<0.99 {np.mean(med_qual < 0.99):.2f}]  (const 1.0 == residual off)")
 
     # --- churn-controlled: does rotation act THROUGH churn or directly? ---
     g2 = np.isfinite(rpe_t) & np.isfinite(gtw) & np.isfinite(med_age) & np.isfinite(surv)

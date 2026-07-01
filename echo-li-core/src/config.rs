@@ -26,6 +26,16 @@ pub struct RudolfVConfig {
     pub shi_tomasi_block_size: Option<usize>,
     #[serde(default)]
     pub lbp_policy: Option<String>,
+    /// Compute the level-0 patch residual per track to feed the KLT quality
+    /// term in the reservoir score (extra patch pass; off by default).
+    #[serde(default)]
+    pub klt_residual: bool,
+    /// Run the frontend essential-matrix RANSAC geometric verification. On by
+    /// default, but it degenerates under rotation-dominant motion (translation
+    /// ~0 => E ill-posed) and falsely rejects good tracks. Off => let the EqF's
+    /// soft outlier model handle outliers instead.
+    #[serde(default = "default_true")]
+    pub enable_ransac: bool,
     pub max_features: usize,
     pub max_level: usize,
 }

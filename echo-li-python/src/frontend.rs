@@ -24,6 +24,10 @@ pub struct FrontendConfig {
     #[pyo3(get, set)]
     pub klt_max_iter: usize,
     #[pyo3(get, set)]
+    pub klt_residual: bool,
+    #[pyo3(get, set)]
+    pub enable_ransac: bool,
+    #[pyo3(get, set)]
     pub lbp_verification: bool,
     #[pyo3(get, set)]
     pub lbp_policy: String,
@@ -42,6 +46,8 @@ impl FrontendConfig {
         cell_size = 64,
         klt_window = 21,
         klt_max_iter = 30,
+        klt_residual = false,
+        enable_ransac = true,
         lbp_verification = true,
         lbp_policy = "soft".to_string(),
         histeq = "global".to_string(),
@@ -53,6 +59,8 @@ impl FrontendConfig {
         cell_size: usize,
         klt_window: usize,
         klt_max_iter: usize,
+        klt_residual: bool,
+        enable_ransac: bool,
         lbp_verification: bool,
         lbp_policy: String,
         histeq: String,
@@ -64,6 +72,8 @@ impl FrontendConfig {
             cell_size,
             klt_window,
             klt_max_iter,
+            klt_residual,
+            enable_ransac,
             lbp_verification,
             lbp_policy,
             histeq,
@@ -91,6 +101,8 @@ impl FrontendConfig {
             cell_size: rv.feature_dist as usize,
             klt_window: defaults.klt_window,
             klt_max_iter: defaults.klt_max_iter,
+            klt_residual: rv.klt_residual,
+            enable_ransac: rv.enable_ransac,
             lbp_verification: defaults.lbp_verification_enabled,
             lbp_policy,
             histeq,
@@ -133,6 +145,8 @@ impl FrontendConfig {
         cfg.cell_size = self.cell_size;
         cfg.klt_window = self.klt_window;
         cfg.klt_max_iter = self.klt_max_iter;
+        cfg.klt_residual_enabled = self.klt_residual;
+        cfg.enable_internal_ransac = self.enable_ransac;
         cfg.lbp_verification_enabled = self.lbp_verification;
         cfg.lbp_policy = match self.lbp_policy.to_ascii_lowercase().as_str() {
             "hardreject" | "hard_reject" | "hard-reject" | "hard" => LbpPolicy::HardReject,
