@@ -1,5 +1,10 @@
 RudolfV:
+  # Legacy bool (true => global histeq) — overridden by `histeq` when set.
   equaliseImageHistogram: true
+  # histeq: none | global | clahe. CLAHE knobs below apply to "clahe" only.
+  # histeq: clahe
+  # claheTileSize: 256     # tile size in pixels
+  # claheClipLimit: 4.0
   # useFastFeatures: false
   # featureDist: 64.0
   featureDist: 16.0
@@ -100,6 +105,23 @@ eqf:
 main:
   writeState: true
   cameraLag: 0.00
+Rerun:
+  # Per-entity toggles for --vis (all default true when omitted).
+  # histeqImage: show the tracker's preprocessed (histogram-equalised) frame
+  # in camera/image instead of the raw one.
+  histeqImage: true
+  # image: true
+  # features: true
+  # sparseImage: true
+  # patchDepth: true
+  # patchDepthCov: true
+  # trajectory: true
+  # groundtruth: true
+  # landmarks: true
+  # sparseWorld: true
+  # cameraAxes: true
+  occupiedCells: false
+  freeCells: false
 SparseVog:
   # Per-feature Vogiatzis filter.
   # parametrization: euclidean, invdepth, polar (1D scalar)

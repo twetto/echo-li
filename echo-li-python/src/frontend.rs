@@ -41,6 +41,10 @@ pub struct FrontendConfig {
     pub lbp_policy: String,
     #[pyo3(get, set)]
     pub histeq: String,
+    #[pyo3(get, set)]
+    pub clahe_tile_size: usize,
+    #[pyo3(get, set)]
+    pub clahe_clip_limit: f32,
     intrinsics: Option<(f64, f64, f64, f64, usize, usize, Vec<f64>)>,
 }
 
@@ -63,6 +67,8 @@ impl FrontendConfig {
         lbp_verification = true,
         lbp_policy = "soft".to_string(),
         histeq = "global".to_string(),
+        clahe_tile_size = 256,
+        clahe_clip_limit = 4.0,
     ))]
     fn new(
         max_features: usize,
@@ -80,6 +86,8 @@ impl FrontendConfig {
         lbp_verification: bool,
         lbp_policy: String,
         histeq: String,
+        clahe_tile_size: usize,
+        clahe_clip_limit: f32,
     ) -> Self {
         Self {
             max_features,
@@ -97,6 +105,8 @@ impl FrontendConfig {
             lbp_verification,
             lbp_policy,
             histeq,
+            clahe_tile_size,
+            clahe_clip_limit,
             intrinsics: None,
         }
     }
@@ -107,11 +117,13 @@ impl FrontendConfig {
             pyo3::exceptions::PyIOError::new_err(format!("Failed to load config: {e}"))
         })?;
         let rv = &vio_config.rudolf_v;
-        let histeq = if rv.equalise_image_histogram {
-            "global".to_string()
-        } else {
-            "none".to_string()
-        };
+        let histeq = rv.histeq.clone().unwrap_or_else(|| {
+            if rv.equalise_image_histogram {
+                "global".to_string()
+            } else {
+                "none".to_string()
+            }
+        });
         let lbp_policy = rv.lbp_policy.as_deref().unwrap_or("soft").to_string();
         let defaults = frontend::FrontendConfig::default();
         Ok(Self {
@@ -130,6 +142,8 @@ impl FrontendConfig {
             lbp_verification: defaults.lbp_verification_enabled,
             lbp_policy,
             histeq,
+            clahe_tile_size: rv.clahe_tile_size,
+            clahe_clip_limit: rv.clahe_clip_limit,
             intrinsics: None,
         })
     }
@@ -190,8 +204,8 @@ impl FrontendConfig {
         cfg.histeq = match self.histeq.to_ascii_lowercase().as_str() {
             "global" => HistEqMethod::Global,
             "clahe" => HistEqMethod::Clahe {
-                tile_size: 8,
-                clip_limit: 4.0,
+                tile_size: self.clahe_tile_size,
+                clip_limit: self.clahe_clip_limit,
             },
             _ => HistEqMethod::None,
         };

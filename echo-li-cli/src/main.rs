@@ -750,9 +750,25 @@ fn build_frontend(
         if let Some(v) = conf.rudolf_v.shi_tomasi_block_size {
             config.shi_tomasi_block_size = v;
         }
-        if conf.rudolf_v.equalise_image_histogram {
-            config.histeq = rudolf_v::histeq::HistEqMethod::Global;
-        }
+        config.histeq = match conf.rudolf_v.histeq.as_deref() {
+            Some("none") => rudolf_v::histeq::HistEqMethod::None,
+            Some("global") => rudolf_v::histeq::HistEqMethod::Global,
+            Some("clahe") => rudolf_v::histeq::HistEqMethod::Clahe {
+                tile_size: conf.rudolf_v.clahe_tile_size,
+                clip_limit: conf.rudolf_v.clahe_clip_limit,
+            },
+            Some(other) => {
+                return Err(format!(
+                    "unsupported RudolfV.histeq '{other}'; expected none, global, or clahe"
+                )
+                .into());
+            }
+            // Legacy fallback: the equaliseImageHistogram bool.
+            None if conf.rudolf_v.equalise_image_histogram => {
+                rudolf_v::histeq::HistEqMethod::Global
+            }
+            None => rudolf_v::histeq::HistEqMethod::None,
+        };
         config.cell_size = conf.rudolf_v.feature_dist as usize;
         if let Some(policy) = &conf.rudolf_v.lbp_policy {
             config.lbp_policy = match policy.to_ascii_lowercase().as_str() {
@@ -1271,6 +1287,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gt_poses_vis = reader.groundtruth();
     #[cfg(feature = "rerun")]
     let mut gt_align: Option<echo_lie::SE3> = None;
+    #[cfg(feature = "rerun")]
+    let vis_cfg = vio_config
+        .as_ref()
+        .map(|c| c.rerun.clone())
+        .unwrap_or_default();
 
     println!("\nRunning filter...");
 
@@ -1300,8 +1321,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let gray_data = gray_img.into_raw();
 
                 // Clone raw pixels for Rerun before consuming into Rudolf-V
+                // (fallback when the preprocessed/histeq image is unavailable).
                 #[cfg(feature = "rerun")]
-                let rerun_gray_data = if rec.is_some() {
+                let rerun_gray_data = if rec.is_some() && vis_cfg.image {
                     gray_data.clone()
                 } else {
                     vec![]
@@ -1601,38 +1623,67 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         use std::time::Duration;
                         rec.set_time("log_time", Duration::from_secs_f64(img_data.stamp));
 
-                        // Camera image (grayscale)
-                        rec.log(
-                            "camera/image",
-                            &rerun::Image::from_l8(rerun_gray_data, [img_w as u32, img_h as u32]),
-                        )
-                        .ok();
+                        // Camera image (grayscale) — the tracker's preprocessed
+                        // (histeq'd) frame when enabled/available, else raw.
+                        if vis_cfg.image {
+                            let l8: Vec<u8> = match frontend
+                                .preprocessed_image()
+                                .filter(|_| vis_cfg.histeq_image)
+                            {
+                                Some(img) => {
+                                    let (w, h, stride) = (img.width(), img.height(), img.stride());
+                                    let src = img.as_slice();
+                                    if stride == w {
+                                        src[..w * h].to_vec()
+                                    } else {
+                                        let mut out = Vec::with_capacity(w * h);
+                                        for y in 0..h {
+                                            out.extend_from_slice(&src[y * stride..y * stride + w]);
+                                        }
+                                        out
+                                    }
+                                }
+                                None => rerun_gray_data,
+                            };
+                            rec.log(
+                                "camera/image",
+                                &rerun::Image::from_l8(l8, [img_w as u32, img_h as u32]),
+                            )
+                            .ok();
+                        }
 
                         if let Some(output) = &last_patch_depth_output {
-                            let rgb = patch_depth_rgb_for_vis(
-                                output,
-                                img_w,
-                                img_h,
-                                patch_depth_vis_min_depth,
-                                patch_depth_vis_max_depth,
-                            );
-                            rec.log(
-                                "patch_depth/image",
-                                &rerun::Image::from_rgb24(rgb, [img_w as u32, img_h as u32]),
-                            )
-                            .ok();
-                            let cov_rgb = patch_depth_cov_rgb_for_vis(
-                                output,
-                                img_w,
-                                img_h,
-                                patch_depth_cov_vis_min,
-                                patch_depth_cov_vis_max,
-                            );
-                            rec.log(
-                                "patch_depth_cov/image",
-                                &rerun::Image::from_rgb24(cov_rgb, [img_w as u32, img_h as u32]),
-                            )
-                            .ok();
+                            if vis_cfg.patch_depth {
+                                let rgb = patch_depth_rgb_for_vis(
+                                    output,
+                                    img_w,
+                                    img_h,
+                                    patch_depth_vis_min_depth,
+                                    patch_depth_vis_max_depth,
+                                );
+                                rec.log(
+                                    "patch_depth/image",
+                                    &rerun::Image::from_rgb24(rgb, [img_w as u32, img_h as u32]),
+                                )
+                                .ok();
+                            }
+                            if vis_cfg.patch_depth_cov {
+                                let cov_rgb = patch_depth_cov_rgb_for_vis(
+                                    output,
+                                    img_w,
+                                    img_h,
+                                    patch_depth_cov_vis_min,
+                                    patch_depth_cov_vis_max,
+                                );
+                                rec.log(
+                                    "patch_depth_cov/image",
+                                    &rerun::Image::from_rgb24(
+                                        cov_rgb,
+                                        [img_w as u32, img_h as u32],
+                                    ),
+                                )
+                                .ok();
+                            }
                             if !patch_depth_vis_announced {
                                 println!(
                                     "Patch depth Rerun entities: patch_depth/image, \
@@ -1643,7 +1694,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
 
                         // Tracked features on image
-                        if !tracker_points.is_empty() {
+                        if vis_cfg.features && !tracker_points.is_empty() {
                             rec.log(
                                 "camera/image/features",
                                 &rerun::Points2D::new(tracker_points)
@@ -1672,7 +1723,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         } else {
                             (Vec::new(), Vec::new(), Vec::new(), Vec::new())
                         };
-                        if !sparse_img_pts.is_empty() {
+                        if vis_cfg.sparse_image && !sparse_img_pts.is_empty() {
                             rec.log(
                                 "camera/image/sparse_out_of_state",
                                 &rerun::Points2D::new(sparse_img_pts)
@@ -1686,7 +1737,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         trajectory_vis.push(p_cam);
 
                         // 3D trajectory line
-                        if trajectory_vis.len() >= 2 {
+                        if vis_cfg.trajectory && trajectory_vis.len() >= 2 {
                             let strip: Vec<[f32; 3]> = trajectory_vis
                                 .iter()
                                 .map(|p| [p[0] as f32, p[1] as f32, p[2] as f32])
@@ -1718,7 +1769,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 &gt_poses_vis,
                             ));
                         }
-                        if let Some(align) = &gt_align {
+                        if vis_cfg.groundtruth
+                            && let Some(align) = &gt_align
+                        {
                             let inv = align.inverse();
                             let gt_strip: Vec<[f32; 3]> = gt_poses_vis
                                 .iter()
@@ -1745,7 +1798,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .values()
                             .map(|p| (p[0] as f32, p[1] as f32, p[2] as f32))
                             .collect();
-                        if !lm_pts.is_empty() {
+                        if vis_cfg.landmarks && !lm_pts.is_empty() {
                             rec.log(
                                 "world/landmarks",
                                 &rerun::Points3D::new(lm_pts)
@@ -1755,7 +1808,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .ok();
                         }
 
-                        if !sparse_world_pts.is_empty() {
+                        if vis_cfg.sparse_world && !sparse_world_pts.is_empty() {
                             rec.log(
                                 "world/sparse_out_of_state",
                                 &rerun::Points3D::new(sparse_world_pts)
@@ -1778,7 +1831,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if let Some(occ_map) = local_occupancy.as_ref() {
                             let hx = (occ_map.settings().resolution * 0.5) as f32;
                             let (occ_pts, free_pts) = occupancy_cells_for_vis(occ_map);
-                            if !occ_pts.is_empty() {
+                            if vis_cfg.occupied_cells && !occ_pts.is_empty() {
                                 let occ_half = vec![[hx, hx, hx]; occ_pts.len()];
                                 rec.log(
                                     "world/occupied_cells",
@@ -1788,7 +1841,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 )
                                 .ok();
                             }
-                            if !free_pts.is_empty() {
+                            if vis_cfg.free_cells && !free_pts.is_empty() {
                                 let free_half = vec![[hx, hx, hx]; free_pts.len()];
                                 rec.log(
                                     "world/free_cells",
@@ -1803,36 +1856,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
 
                         // Camera pose as RGB arrows (X=red, Y=green, Z=blue)
-                        let origin = [p_cam[0] as f32, p_cam[1] as f32, p_cam[2] as f32];
-                        let r = r_cam.as_matrix();
-                        let scale = 0.1f32;
-                        rec.log(
-                            "world/camera_axes",
-                            &rerun::Arrows3D::from_vectors([
-                                [
-                                    r[(0, 0)] as f32 * scale,
-                                    r[(1, 0)] as f32 * scale,
-                                    r[(2, 0)] as f32 * scale,
-                                ],
-                                [
-                                    r[(0, 1)] as f32 * scale,
-                                    r[(1, 1)] as f32 * scale,
-                                    r[(2, 1)] as f32 * scale,
-                                ],
-                                [
-                                    r[(0, 2)] as f32 * scale,
-                                    r[(1, 2)] as f32 * scale,
-                                    r[(2, 2)] as f32 * scale,
-                                ],
-                            ])
-                            .with_origins([origin, origin, origin])
-                            .with_colors([
-                                0xFF0000FFu32,
-                                0x00FF00FFu32,
-                                0x0000FFFFu32,
-                            ]),
-                        )
-                        .ok();
+                        if vis_cfg.camera_axes {
+                            let origin = [p_cam[0] as f32, p_cam[1] as f32, p_cam[2] as f32];
+                            let r = r_cam.as_matrix();
+                            let scale = 0.1f32;
+                            rec.log(
+                                "world/camera_axes",
+                                &rerun::Arrows3D::from_vectors([
+                                    [
+                                        r[(0, 0)] as f32 * scale,
+                                        r[(1, 0)] as f32 * scale,
+                                        r[(2, 0)] as f32 * scale,
+                                    ],
+                                    [
+                                        r[(0, 1)] as f32 * scale,
+                                        r[(1, 1)] as f32 * scale,
+                                        r[(2, 1)] as f32 * scale,
+                                    ],
+                                    [
+                                        r[(0, 2)] as f32 * scale,
+                                        r[(1, 2)] as f32 * scale,
+                                        r[(2, 2)] as f32 * scale,
+                                    ],
+                                ])
+                                .with_origins([origin, origin, origin])
+                                .with_colors([
+                                    0xFF0000FFu32,
+                                    0x00FF00FFu32,
+                                    0x0000FFFFu32,
+                                ]),
+                            )
+                            .ok();
+                        }
                     }
 
                     if vision_count % 100 == 0 || vision_count <= 5 {

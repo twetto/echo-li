@@ -11,6 +11,16 @@ use crate::depth::sparse_gb::{DepthParametrization, SparseVogSettings};
 #[serde(rename_all = "camelCase")]
 pub struct RudolfVConfig {
     pub equalise_image_histogram: bool,
+    /// Histogram equalisation method: "none", "global", or "clahe". When
+    /// absent, falls back to `equaliseImageHistogram` (true => global).
+    #[serde(default)]
+    pub histeq: Option<String>,
+    /// CLAHE tile size in pixels (used when histeq == "clahe").
+    #[serde(default = "default_clahe_tile_size")]
+    pub clahe_tile_size: usize,
+    /// CLAHE clip limit (used when histeq == "clahe").
+    #[serde(default = "default_clahe_clip_limit")]
+    pub clahe_clip_limit: f32,
     pub feature_dist: f64,
     pub feature_search_threshold: f64,
     #[serde(default)]
@@ -59,6 +69,14 @@ pub struct RudolfVConfig {
 
 fn default_epipolar_min_baseline() -> f64 {
     1e-3
+}
+
+fn default_clahe_tile_size() -> usize {
+    256
+}
+
+fn default_clahe_clip_limit() -> f32 {
+    4.0
 }
 
 fn default_epipolar_max_reject_frac() -> f64 {
@@ -645,8 +663,52 @@ pub struct VIOConfig {
     pub local_occupancy: Option<LocalOccupancyConfig>,
     #[serde(rename = "Stereo", default)]
     pub stereo: Option<StereoConfig>,
+    #[serde(rename = "Rerun", default)]
+    pub rerun: RerunVisConfig,
     pub eqf: EqfConfig,
     pub main: MainConfig,
+}
+
+/// Per-entity toggles for the Rerun visualisation (`--vis`). Everything
+/// defaults to on; set an entry to false in the YAML `Rerun:` section to hide
+/// it. `histeq_image` shows the tracker's preprocessed (histogram-equalised)
+/// image instead of the raw frame when available.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RerunVisConfig {
+    pub image: bool,
+    pub histeq_image: bool,
+    pub features: bool,
+    pub sparse_image: bool,
+    pub patch_depth: bool,
+    pub patch_depth_cov: bool,
+    pub trajectory: bool,
+    pub groundtruth: bool,
+    pub landmarks: bool,
+    pub sparse_world: bool,
+    pub occupied_cells: bool,
+    pub free_cells: bool,
+    pub camera_axes: bool,
+}
+
+impl Default for RerunVisConfig {
+    fn default() -> Self {
+        Self {
+            image: true,
+            histeq_image: true,
+            features: true,
+            sparse_image: true,
+            patch_depth: true,
+            patch_depth_cov: true,
+            trajectory: true,
+            groundtruth: true,
+            landmarks: true,
+            sparse_world: true,
+            occupied_cells: true,
+            free_cells: true,
+            camera_axes: true,
+        }
+    }
 }
 
 impl VIOConfig {
