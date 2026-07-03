@@ -131,7 +131,13 @@ impl FrontendConfig {
         };
         format!(
             "FrontendConfig(max_features={}, fast_threshold={}, pyramid_levels={}, cell_size={}, lbp={}, histeq={}, {})",
-            self.max_features, self.fast_threshold, self.pyramid_levels, self.cell_size, self.lbp_policy, self.histeq, cam
+            self.max_features,
+            self.fast_threshold,
+            self.pyramid_levels,
+            self.cell_size,
+            self.lbp_policy,
+            self.histeq,
+            cam
         )
     }
 }
@@ -266,6 +272,7 @@ impl PyFrontend {
             dict.set_item("id", m.id)?;
             dict.set_item("age", m.age)?;
             dict.set_item("klt_quality", m.klt_quality)?;
+            dict.set_item("lbp_distance", m.lbp_distance)?;
             dict.set_item("reservoir_score", m.reservoir_score)?;
             dict.set_item("is_ekf_landmark", m.is_ekf_landmark)?;
             meta_list.append(dict)?;

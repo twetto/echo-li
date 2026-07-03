@@ -47,20 +47,34 @@ def load_cloud(ply_path):
     return data
 
 
-def gt_depth_at(cloud_c, uvs, fx, fy, cx, cy, w, h, cell=4):
-    """Z-buffer the camera-frame cloud on a cell-px grid; return GT depth at each
-    (undistorted-pixel) uv, NaN where no scan point lands in the cell."""
-    z = cloud_c[:, 2]
-    front = z > 0.1
-    pc = cloud_c[front]
-    u = fx * pc[:, 0] / pc[:, 2] + cx
-    v = fy * pc[:, 1] / pc[:, 2] + cy
-    inb = (u >= 0) & (u < w) & (v >= 0) & (v < h)
-    u, v, z = u[inb], v[inb], pc[inb, 2]
+def build_zbuf(cloud, t_cw, fx, fy, cx, cy, w, h, cell=4):
+    """Full-resolution z-buffer of the (world-frame f32) cloud for one camera
+    pose, on a cell-px grid. f32 throughout (no f64 promotion) and copy-free:
+    behind-camera / out-of-view points are routed to a dummy bin instead of
+    boolean-index copies (those dominated the runtime on the 3.2M-pt scan)."""
+    r = t_cw[:3, :3].astype(np.float32)
+    t = t_cw[:3, 3].astype(np.float32)
+    cc = cloud @ r.T + t
+    x, y, z = cc[:, 0], cc[:, 1], cc[:, 2]
+    zs = np.where(z > np.float32(0.1), z, np.float32(np.inf))
+    inv = np.float32(1.0) / zs
+    u = np.float32(fx) * x * inv + np.float32(cx)
+    v = np.float32(fy) * y * inv + np.float32(cy)
     gw, gh = w // cell + 1, h // cell + 1
-    zbuf = np.full(gw * gh, np.inf, np.float32)
-    idx = (v / cell).astype(np.int32) * gw + (u / cell).astype(np.int32)
-    np.minimum.at(zbuf, idx, z.astype(np.float32))
+    dummy = gw * gh
+    iu = (u * np.float32(1.0 / cell)).astype(np.int32)
+    iv = (v * np.float32(1.0 / cell)).astype(np.int32)
+    idx = iv * gw + iu
+    bad = (u < 0) | (u >= w) | (v < 0) | (v >= h)
+    idx[bad] = dummy
+    zbuf = np.full(dummy + 1, np.inf, np.float32)
+    np.minimum.at(zbuf, idx, zs)
+    return zbuf[:dummy]
+
+
+def zbuf_lookup(zbuf, uvs, w, h, cell=4):
+    """GT depth at each (undistorted-pixel) uv; NaN where no scan point landed."""
+    gw = w // cell + 1
     out = np.full(len(uvs), np.nan)
     for k, (uu, vv) in enumerate(uvs):
         if 0 <= uu < w and 0 <= vv < h:
@@ -68,6 +82,39 @@ def gt_depth_at(cloud_c, uvs, fx, fy, cx, cy, w, h, cell=4):
             if np.isfinite(d):
                 out[k] = d
     return out
+
+
+def gt_depth_at(cloud_c, uvs, fx, fy, cx, cy, w, h, cell=4):
+    """Back-compat wrapper: camera-frame cloud -> depths at uvs (one shot)."""
+    return zbuf_lookup(
+        build_zbuf(cloud_c, np.eye(4), fx, fy, cx, cy, w, h, cell), uvs, w, h, cell
+    )
+
+
+def zbuf_cache(root, frames, cam_pose, fx, fy, cx, cy, w, h, cell=4):
+    """Per-dataset cache of full-resolution z-buffers for every frame stamp.
+    Built once (~3 min for V1_03), memmapped thereafter -- later runs never even
+    load the point cloud. Invalidated if the frame stamp list changes."""
+    import time as _time
+    gw, gh = w // cell + 1, h // cell + 1
+    zpath = root / "pointcloud0" / f"zbuf_c{cell}.npy"
+    spath = root / "pointcloud0" / f"zbuf_c{cell}.stamps.npy"
+    stamps = np.array([t for t, _ in frames])
+    if zpath.exists() and spath.exists() and np.array_equal(np.load(spath), stamps):
+        return np.load(zpath, mmap_mode="r")
+    cloud = load_cloud(root / "pointcloud0" / "data.ply")
+    print(f"building z-buffer cache: {len(frames)} frames x {gh}x{gw} cells "
+          f"(full {len(cloud)}-pt resolution, once)...")
+    mm = np.lib.format.open_memmap(zpath, mode="w+", dtype=np.float32,
+                                   shape=(len(frames), gh * gw))
+    t0 = _time.time()
+    for i, (t, _) in enumerate(frames):
+        mm[i] = build_zbuf(cloud, np.linalg.inv(cam_pose(t)), fx, fy, cx, cy, w, h, cell)
+        if i % 200 == 0:
+            print(f"  [{i}/{len(frames)}] {i / max(_time.time() - t0, 1e-9):.0f} fps")
+    mm.flush()
+    np.save(spath, stamps)
+    return np.load(zpath, mmap_mode="r")
 
 
 def main():
