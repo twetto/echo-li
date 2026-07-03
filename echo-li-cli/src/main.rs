@@ -1193,21 +1193,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // replay; no dropping of early images.
     // ------------------------------------------------------------------
     let initial_imu: Vec<IMUVelocity> = (&mut raw_imu_it).take(100).collect();
-    let init_pose = if check_stationary(&initial_imu, 100, 0.1, 0.5) {
-        let pose = estimate_initial_pose(&initial_imu, 100);
-        let r = pose.rotation.as_matrix();
+    // Gravity-align from the FIRST accel reading, unconditionally. The old
+    // stationarity gate fell back to identity attitude when the start was in
+    // motion, which diverges immediately (gravity integrates as phantom
+    // acceleration; EuRoC MH_01/V2_03). Even an in-flight accel sample is
+    // within ~10-15 deg of gravity — inside the filter's initial attitude
+    // sigma — whereas identity can be 180 deg off. Moving starts additionally
+    // need a loose eqf initialVariance.velocity (the old 9e-8 asserts v=0).
+    let stationary = check_stationary(&initial_imu, 100, 0.1, 0.5);
+    let init_pose = estimate_initial_pose(&initial_imu, 1);
+    {
+        let r = init_pose.rotation.as_matrix();
         let pitch_deg = (-r[(2, 0)]).clamp(-1.0, 1.0).asin().to_degrees();
         let roll_deg = r[(2, 1)].atan2(r[(2, 2)]).to_degrees();
         let t0 = initial_imu.first().map(|imu| imu.stamp).unwrap_or(0.0);
         println!(
-            "Static IMU initialization at t={:.3}: roll={:.1}° pitch={:.1}°",
-            t0, roll_deg, pitch_deg
+            "IMU gravity-align at t={:.3} (first sample, stationary={}): roll={:.1}° pitch={:.1}°",
+            t0, stationary, roll_deg, pitch_deg
         );
-        pose
-    } else {
-        println!("WARNING: Platform not stationary at start, using identity pose");
-        echo_lie::SE3::identity()
-    };
+    }
 
     let mut xi0 = VIOState::new(VIOSensorState::identity(), Vec::new());
     xi0.sensor.pose = init_pose;

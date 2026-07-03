@@ -56,7 +56,9 @@ eqf:
     cameraPosition: 0.023501400846134893
     point: 129.90415638150924
     position: 0.1
-    velocity: 8.974852995731e-08
+    # velocity: 8.974852995731e-08  # asserts v=0 (std 0.3 mm/s); only valid
+    # with a certified-stationary start. Loose value tolerates moving starts.
+    velocity: 1.0
   measurementNoise:
     feature: 2.0
     featureOutlierAbs: 5.0
