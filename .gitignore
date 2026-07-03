@@ -21,6 +21,7 @@ cross_compile.sh
 rot_odom_*.png
 rot_segment_*.png
 tracker_viz_*.png
+flow_gt_*.png
 tracker_viz_*.mp4
 tracker_viz_*.avi
 *_cache.npz

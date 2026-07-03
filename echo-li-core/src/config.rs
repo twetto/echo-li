@@ -2,10 +2,10 @@ use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::path::Path;
 
+use crate::ImuBiasGroup;
 use crate::depth::occupancy::{LocalOccupancySettings, OccupancyUpdateMode};
 use crate::depth::patch_depth::{PatchDepthCameraMode, PatchDepthSettings, PatchDepthWarpMode};
 use crate::depth::sparse_gb::{DepthParametrization, SparseVogSettings};
-use crate::ImuBiasGroup;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -554,7 +554,7 @@ impl LocalOccupancyConfig {
                 "fixed" | "fixed_increment" | "v0" => OccupancyUpdateMode::FixedIncrement,
                 "uncertainty_aware" | "sigma" | "v1" => OccupancyUpdateMode::UncertaintyAware,
                 other => {
-                    eprintln!(
+                    log::warn!(
                         "LocalOccupancy.update_mode {other:?} unrecognised; using fixed_increment (v0)"
                     );
                     OccupancyUpdateMode::FixedIncrement

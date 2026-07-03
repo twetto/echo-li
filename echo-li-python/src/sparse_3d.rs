@@ -139,6 +139,7 @@ impl PySparse3DFilter {
             )?;
             feat_dict.set_item("track_length", feat.track_length)?;
             feat_dict.set_item("inlier_ratio", feat.inlier_ratio())?;
+            feat_dict.set_item("nis", feat.last_nis)?;
             dict.set_item(feat.feat_id, feat_dict)?;
         }
         Ok(dict)

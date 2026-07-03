@@ -57,6 +57,10 @@ pub struct FeatureState3D {
     pub track_length: usize,
     pub ref_uv: Vector2<f64>,
     pub ref_stamp: f64,
+    /// Last update's normalized innovation squared (NIS = the gating
+    /// Mahalanobis²). Should be ~χ²(2) when the filter is consistent — the
+    /// GT-free online consistency check. NaN before the first update.
+    pub last_nis: f64,
 }
 
 impl FeatureState3D {
@@ -340,6 +344,7 @@ impl Sparse3DFilter {
                 track_length: 1,
                 ref_uv: uv_curr,
                 ref_stamp: stamp,
+                last_nis: f64::NAN,
             };
             self.insert_feature(feat);
             self.pending.remove(&fid);
@@ -683,6 +688,7 @@ fn invdepth_additive_update_3d(
     let y_pred = Vector2::new(fx * xc / zc + cx, fy * yc / zc + cy);
     let residual = uv_obs - y_pred;
     let maha_sq = (residual.transpose() * s_inv * residual)[(0, 0)];
+    feat.last_nis = maha_sq;
     if settings.mahalanobis_reset_chi2 > 0.0 && maha_sq > settings.mahalanobis_reset_chi2 {
         return false;
     }
@@ -993,6 +999,7 @@ fn iekf_update_3d(
             (maha_sq, det_s, full_delta, p_kalman)
         }
     };
+    feat.last_nis = maha_sq;
 
     // Gaussian-Beta inlier weighting.
     let gauss_pdf = (-0.5 * maha_sq).exp() / ((2.0 * std::f64::consts::PI).powi(2) * det_s).sqrt();
@@ -1330,6 +1337,7 @@ mod tests {
             track_length: 3,
             ref_uv: Vector2::new(0.0, 0.0),
             ref_stamp: 0.0,
+            last_nis: f64::NAN,
         }
     }
 

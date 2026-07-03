@@ -11,6 +11,7 @@ echo-lie.workspace = true
 rudolf-v.workspace = true
 nalgebra.workspace = true
 anyhow.workspace = true
+log.workspace = true
 rand.workspace = true
 rand_distr.workspace = true
 serde.workspace = true

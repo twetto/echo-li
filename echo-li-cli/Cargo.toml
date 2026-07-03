@@ -17,4 +17,5 @@ serde.workspace = true
 serde_yaml.workspace = true
 image.workspace = true
 rand.workspace = true
+env_logger.workspace = true
 rerun = { workspace = true, optional = true }

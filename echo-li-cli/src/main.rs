@@ -1018,6 +1018,9 @@ fn write_outputs(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // RUST_LOG controls core telemetry (e.g. RUST_LOG=echo_li_core=debug for the
+    // landmark-init dump); default shows warnings and up.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     let args = Args::parse();
 
     println!("Loading dataset: {}", args.dataset);

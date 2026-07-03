@@ -2700,6 +2700,7 @@ dependencies = [
  "clap",
  "echo-li-core",
  "echo-lie",
+ "env_logger",
  "image",
  "nalgebra",
  "rand 0.9.4",
@@ -2718,6 +2719,7 @@ dependencies = [
  "csv",
  "echo-lie",
  "image",
+ "log",
  "nalgebra",
  "rand 0.9.4",
  "rand_distr",
@@ -3114,6 +3116,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32e90c2accc4b07a8456ea0debdc2e7587bdd890680d71173a15d4ae604f6eef"
 dependencies = [
  "log",
+ "regex",
 ]
 
 [[package]]

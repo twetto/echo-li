@@ -440,30 +440,28 @@ impl VIOFilter {
                 .filter(|prior| valid_depth_prior(prior));
             let range = prior.map(|prior| prior.range).unwrap_or(fallback_range);
             let p = bearing * range;
-            if std::env::var_os("ECHO_LI_DEBUG_LANDMARK_INIT").is_some() {
-                let source = if prior.is_some() {
+            // Enable with RUST_LOG=echo_li_core=debug (needs a logger installed,
+            // e.g. env_logger in the CLI). Replaces ECHO_LI_DEBUG_LANDMARK_INIT.
+            log::debug!(
+                "eqf landmark init id={} source={} uv=({:.2},{:.2}) bearing=({:.6},{:.6},{:.6}) range={:.6} range_var={:.6e} p=({:.6},{:.6},{:.6}) fallback_range={:.6}",
+                id,
+                if prior.is_some() {
                     "sparse_range"
                 } else {
                     "fallback_scene_depth"
-                };
-                let range_var = prior.map(|prior| prior.range_var).unwrap_or(f64::INFINITY);
-                eprintln!(
-                    "eqf landmark init id={} source={} uv=({:.2},{:.2}) bearing=({:.6},{:.6},{:.6}) range={:.6} range_var={:.6e} p=({:.6},{:.6},{:.6}) fallback_range={:.6}",
-                    id,
-                    source,
-                    uv[0],
-                    uv[1],
-                    bearing[0],
-                    bearing[1],
-                    bearing[2],
-                    range,
-                    range_var,
-                    p[0],
-                    p[1],
-                    p[2],
-                    fallback_range,
-                );
-            }
+                },
+                uv[0],
+                uv[1],
+                bearing[0],
+                bearing[1],
+                bearing[2],
+                range,
+                prior.map(|prior| prior.range_var).unwrap_or(f64::INFINITY),
+                p[0],
+                p[1],
+                p[2],
+                fallback_range,
+            );
             new_landmarks.push(Landmark { p, id });
         }
 
@@ -784,8 +782,14 @@ mod landmark_init_selection_tests {
         coords.insert(2, uv(80.0, 50.0));
 
         let deferred = HashSet::from([1]);
-        let selected =
-            select_new_landmark_ids(&coords, &HashSet::new(), &HashMap::new(), &deferred, true, 2);
+        let selected = select_new_landmark_ids(
+            &coords,
+            &HashSet::new(),
+            &HashMap::new(),
+            &deferred,
+            true,
+            2,
+        );
 
         assert_eq!(selected, vec![2]);
     }
@@ -843,14 +847,8 @@ mod landmark_init_selection_tests {
             },
         );
 
-        let selected = select_new_landmark_ids(
-            &coords,
-            &HashSet::new(),
-            &priors,
-            &HashSet::new(),
-            false,
-            1,
-        );
+        let selected =
+            select_new_landmark_ids(&coords, &HashSet::new(), &priors, &HashSet::new(), false, 1);
 
         assert_eq!(selected, vec![1]);
     }
