@@ -27,6 +27,15 @@ RudolfV:
   # on V1_03 — ATE got WORSE (28.4->33.0 cm) and it was only ~10 rejects/frame,
   # not the churn bulk. Hard outlier rejection helps ATE; keep on.
   enableRansac: true
+  # Pose-prior epipolar gate: squared-Sampson threshold in normalized coords
+  # (like ransacParams.inlierThreshold; 1e-5 ~ 1.45 px). Gates tracks against
+  # the EqF's IMU-predicted essential matrix, replacing RANSAC on frames with a
+  # prior. V1_03: ATE 21.2 -> 18.1 cm, scale drift 3.4% -> 0.7%, outlier tail
+  # 11.8% -> 5.2%. Set 0 to disable.
+  epipolarGateThreshold: 1.0e-5
+  # epipolarRefine: guarded eight-point refit of the prior gate. Measured
+  # slightly WORSE (tail 5.9% vs 5.2%); keep off.
+  epipolarRefine: false
   ransacParams:
     inlierThreshold: 0.00001
     maxIterations: 200

@@ -36,8 +36,33 @@ pub struct RudolfVConfig {
     /// soft outlier model handle outliers instead.
     #[serde(default = "default_true")]
     pub enable_ransac: bool,
+    /// Squared-Sampson threshold (normalized coords, like ransacParams.
+    /// inlierThreshold) for the pose-prior epipolar gate. Active only on
+    /// frames where a relative-pose prior is supplied (Frontend::
+    /// set_pose_prior); replaces RANSAC there. 0 disables.
+    #[serde(default)]
+    pub epipolar_gate_threshold: f64,
+    /// Consensus refit of the prior gate (kept only if it increases inliers).
+    #[serde(default)]
+    pub epipolar_refine: bool,
+    /// Skip the gate below this inter-frame baseline [m]: near-zero translation
+    /// makes the prior's E pure noise (detonated MH_02's slow segments).
+    #[serde(default = "default_epipolar_min_baseline")]
+    pub epipolar_min_baseline: f64,
+    /// Distrust the prior when it would reject more than this fraction of
+    /// tracks (breaks the reject->starve->diverge feedback loop).
+    #[serde(default = "default_epipolar_max_reject_frac")]
+    pub epipolar_max_reject_frac: f64,
     pub max_features: usize,
     pub max_level: usize,
+}
+
+fn default_epipolar_min_baseline() -> f64 {
+    1e-3
+}
+
+fn default_epipolar_max_reject_frac() -> f64 {
+    0.5
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

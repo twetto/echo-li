@@ -9448,7 +9448,7 @@ checksum = "6c20b6793b5c2fa6553b250154b78d6d0db37e72700ae35fad9387a46f487c97"
 [[package]]
 name = "rudolf-v"
 version = "0.1.0"
-source = "git+https://github.com/twetto/Rudolf-V#9e8ad8ccbb4d0e601ccb76c22ce9a6eb00b46e10"
+source = "git+https://github.com/twetto/Rudolf-V#39d12ea10e1481b80708463c9ec401b615ab5c31"
 dependencies = [
  "bytemuck",
  "image",

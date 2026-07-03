@@ -162,6 +162,8 @@ def main():
     ap.add_argument("--out", default="rot_odom_diag.png")
     ap.add_argument("--rpe-dt", type=float, default=RPE_DT, help="RPE interval [s]")
     ap.add_argument("--frontend", choices=["rudolf", "opencv"], default="rudolf")
+    ap.add_argument("--gate", choices=["off", "prior", "refine"], default="off",
+                    help="pose-prior epipolar gate (rudolf frontend only)")
     ap.add_argument("--fb", action="store_true", help="OpenCV frontend: forward-backward check")
     args = ap.parse_args()
     rpe_dt = args.rpe_dt
@@ -184,9 +186,12 @@ def main():
         print(f"frontend: OpenCV LK (win21, fb={int(args.fb)}, CLAHE 4.0/8)")
     else:
         fcfg = echo_li.FrontendConfig.from_yaml(args.config)
+        if args.gate != "off":
+            fcfg.epipolar_gate_threshold = 1e-5
+            fcfg.epipolar_refine = args.gate == "refine"
         fcfg.set_camera(fx, fy, cx, cy, w, h, dcoef if dcoef else [])
         tracker = echo_li.Frontend(fcfg, w, h)
-        print("frontend: Rudolf-V")
+        print(f"frontend: Rudolf-V (gate={args.gate})")
     cam = (echo_li.RadTanCamera(fx, fy, cx, cy, *dcoef[:4])
            if "radial" in dist_model.lower() else echo_li.PinholeCamera(fx, fy, cx, cy))
     vio = echo_li.VIOFilter(args.config, cam)
@@ -212,6 +217,7 @@ def main():
     events = sorted(imu_ev+img_ev, key=lambda e: e[0])
     print(f"{len(imu_ev)} imu, {len(img_ev)} images; duration {gt_t[-1]-t0:.1f}s")
 
+    vio_cam_prev = None
     rec = []   # per image frame: dict(t,p,q,tracked,total,age,ids)
     tstart = time.time()
     n_img = 0
@@ -225,12 +231,24 @@ def main():
         gray = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
         if gray is None:
             continue
+        if args.gate != "off" and vio.is_initialized and hasattr(tracker, "set_pose_prior"):
+            pos_p, quat_p = vio.get_pose()   # IMU-propagated prediction
+            t_wb_p = np.eye(4)
+            t_wb_p[:3, :3] = Rot.from_quat(np.asarray(quat_p)).as_matrix()
+            t_wb_p[:3, 3] = np.asarray(pos_p)
+            vio_cam = t_wb_p @ t_bs
+            if vio_cam_prev is not None:
+                tracker.set_pose_prior(np.linalg.inv(vio_cam) @ vio_cam_prev)
         feats, stats = tracker.process(gray)
         n_img += 1
         est = estq = None; lm_ids = ()
         if vio.is_initialized:
             vio.process_vision(stamp, {f["id"]: (f["x"], f["y"]) for f in feats})
             pos, quat = vio.get_pose(); est = np.array(pos); estq = np.array(quat)
+            t_wb_c = np.eye(4)
+            t_wb_c[:3, :3] = Rot.from_quat(estq).as_matrix()
+            t_wb_c[:3, 3] = est
+            vio_cam_prev = t_wb_c @ t_bs
             lm_ids = tuple(int(k) for k in vio.get_landmarks().keys())
         meta = tracker.track_meta()
         ages = [m["age"] for m in meta]

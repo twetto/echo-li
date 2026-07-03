@@ -712,10 +712,20 @@ fn build_frontend(
     vio_config: Option<&VIOConfig>,
     img_w: usize,
     img_h: usize,
+    camera: Option<RudolfCameraIntrinsics>,
 ) -> Result<(Frontend, usize), Box<dyn std::error::Error>> {
     let mut config = FrontendConfig::default();
+    // Intrinsics enable the geometric-verification paths (pose-prior epipolar
+    // gate / internal RANSAC); without them both are inert.
+    config.camera = camera;
     if let Some(conf) = vio_config {
         config.max_features = conf.rudolf_v.max_features;
+        config.klt_residual_enabled = conf.rudolf_v.klt_residual;
+        config.enable_internal_ransac = conf.rudolf_v.enable_ransac;
+        config.epipolar_gate_threshold = conf.rudolf_v.epipolar_gate_threshold;
+        config.epipolar_refine = conf.rudolf_v.epipolar_refine;
+        config.epipolar_min_baseline = conf.rudolf_v.epipolar_min_baseline;
+        config.epipolar_max_reject_frac = conf.rudolf_v.epipolar_max_reject_frac;
         config.pyramid_levels = conf.rudolf_v.max_level;
         if let Some(fast_threshold) = conf.rudolf_v.fast_threshold {
             config.fast_threshold = fast_threshold;
@@ -1112,7 +1122,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .unwrap_or((0.1, 5.0));
 
-    let (mut frontend, tracker_max_features) = build_frontend(vio_config.as_ref(), img_w, img_h)?;
+    let frontend_cam = reader
+        .intrinsics
+        .as_ref()
+        .map(|intr| RudolfCameraIntrinsics {
+            fx: intr.fx,
+            fy: intr.fy,
+            cx: intr.cx,
+            cy: intr.cy,
+            resolution: [intr.width, intr.height],
+            distortion: intr
+                .distortion_coefficients
+                .as_deref()
+                .unwrap_or_default()
+                .to_vec(),
+        });
+    let (mut frontend, tracker_max_features) =
+        build_frontend(vio_config.as_ref(), img_w, img_h, frontend_cam)?;
 
     let mut stereo_matcher =
         build_stereo_matcher(&args, vio_config.as_ref(), &reader, img_w, img_h);
@@ -1244,6 +1270,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\nRunning filter...");
 
+    // Previous frame's post-update camera pose, for the epipolar-gate prior.
+    let use_pose_prior = vio_config
+        .as_ref()
+        .is_some_and(|c| c.rudolf_v.epipolar_gate_threshold > 0.0);
+    let mut prev_cam_pose: Option<Matrix4<f64>> = None;
+
     loop {
         if let Some(next_img) = image_it.peek() {
             while let Some(imu) = imu_it.peek() {
@@ -1272,6 +1304,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
 
                 let rudolf_img = RudolfImage::from_vec(img_w, img_h, gray_data);
+
+                // Epipolar-gate prior: relative camera motion prev -> curr from
+                // the IMU-propagated (pre-vision) EqF prediction.
+                if use_pose_prior {
+                    if let (Some(f), Some(prev)) = (&filter, &prev_cam_pose) {
+                        let pred = camera_pose_matrix(&f.eqf.state_estimate());
+                        if let Some(pred_inv) = pred.try_inverse() {
+                            let t_rel = pred_inv * prev;
+                            let mut r = [[0.0f64; 3]; 3];
+                            for (i, row) in r.iter_mut().enumerate() {
+                                for (j, v) in row.iter_mut().enumerate() {
+                                    *v = t_rel[(i, j)];
+                                }
+                            }
+                            frontend
+                                .set_pose_prior(r, [t_rel[(0, 3)], t_rel[(1, 3)], t_rel[(2, 3)]]);
+                        }
+                    }
+                }
 
                 let (features_ref, stats) = frontend.process(&rudolf_img);
                 let features: Vec<rudolf_v::fast::Feature> = features_ref.to_vec();
@@ -1443,6 +1494,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let state = f.eqf.state_estimate();
                     let state_hash = trace_determinism.then(|| hash_state(&state));
                     let t_wc = camera_pose_matrix(&state);
+                    prev_cam_pose = Some(t_wc);
                     if let Some(sparse) = &mut sparse_filter {
                         sparse.update(&sparse_measurement, &t_wc, None, None);
                         if let Some(mapper) = &mut patch_depth_mapper {

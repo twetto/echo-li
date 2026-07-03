@@ -28,6 +28,14 @@ pub struct FrontendConfig {
     #[pyo3(get, set)]
     pub enable_ransac: bool,
     #[pyo3(get, set)]
+    pub epipolar_gate_threshold: f64,
+    #[pyo3(get, set)]
+    pub epipolar_refine: bool,
+    #[pyo3(get, set)]
+    pub epipolar_min_baseline: f64,
+    #[pyo3(get, set)]
+    pub epipolar_max_reject_frac: f64,
+    #[pyo3(get, set)]
     pub lbp_verification: bool,
     #[pyo3(get, set)]
     pub lbp_policy: String,
@@ -48,6 +56,10 @@ impl FrontendConfig {
         klt_max_iter = 30,
         klt_residual = false,
         enable_ransac = true,
+        epipolar_gate_threshold = 0.0,
+        epipolar_refine = false,
+        epipolar_min_baseline = 1e-3,
+        epipolar_max_reject_frac = 0.5,
         lbp_verification = true,
         lbp_policy = "soft".to_string(),
         histeq = "global".to_string(),
@@ -61,6 +73,10 @@ impl FrontendConfig {
         klt_max_iter: usize,
         klt_residual: bool,
         enable_ransac: bool,
+        epipolar_gate_threshold: f64,
+        epipolar_refine: bool,
+        epipolar_min_baseline: f64,
+        epipolar_max_reject_frac: f64,
         lbp_verification: bool,
         lbp_policy: String,
         histeq: String,
@@ -74,6 +90,10 @@ impl FrontendConfig {
             klt_max_iter,
             klt_residual,
             enable_ransac,
+            epipolar_gate_threshold,
+            epipolar_refine,
+            epipolar_min_baseline,
+            epipolar_max_reject_frac,
             lbp_verification,
             lbp_policy,
             histeq,
@@ -103,6 +123,10 @@ impl FrontendConfig {
             klt_max_iter: defaults.klt_max_iter,
             klt_residual: rv.klt_residual,
             enable_ransac: rv.enable_ransac,
+            epipolar_gate_threshold: rv.epipolar_gate_threshold,
+            epipolar_refine: rv.epipolar_refine,
+            epipolar_min_baseline: rv.epipolar_min_baseline,
+            epipolar_max_reject_frac: rv.epipolar_max_reject_frac,
             lbp_verification: defaults.lbp_verification_enabled,
             lbp_policy,
             histeq,
@@ -153,6 +177,10 @@ impl FrontendConfig {
         cfg.klt_max_iter = self.klt_max_iter;
         cfg.klt_residual_enabled = self.klt_residual;
         cfg.enable_internal_ransac = self.enable_ransac;
+        cfg.epipolar_gate_threshold = self.epipolar_gate_threshold;
+        cfg.epipolar_refine = self.epipolar_refine;
+        cfg.epipolar_min_baseline = self.epipolar_min_baseline;
+        cfg.epipolar_max_reject_frac = self.epipolar_max_reject_frac;
         cfg.lbp_verification_enabled = self.lbp_verification;
         cfg.lbp_policy = match self.lbp_policy.to_ascii_lowercase().as_str() {
             "hardreject" | "hard_reject" | "hard-reject" | "hard" => LbpPolicy::HardReject,
@@ -245,6 +273,26 @@ impl PyFrontend {
 
     fn drop_tracks(&mut self, ids: Vec<u64>) -> usize {
         self.inner.drop_tracks(&ids)
+    }
+
+    /// Relative-pose prior for the NEXT process() call: 4x4 T (prev camera ->
+    /// current camera, i.e. x_curr ~ R x_prev + t). Enables the epipolar gate
+    /// when epipolar_gate_threshold > 0.
+    fn set_pose_prior(&mut self, t_rel: PyReadonlyArray2<'_, f64>) -> PyResult<()> {
+        let a = t_rel.as_array();
+        if a.shape() != [4, 4] {
+            return Err(pyo3::exceptions::PyValueError::new_err("t_rel must be 4x4"));
+        }
+        let mut r = [[0.0f64; 3]; 3];
+        let mut t = [0.0f64; 3];
+        for i in 0..3 {
+            for j in 0..3 {
+                r[i][j] = a[[i, j]];
+            }
+            t[i] = a[[i, 3]];
+        }
+        self.inner.set_pose_prior(r, t);
+        Ok(())
     }
 
     fn reset(&mut self) {

@@ -21,7 +21,7 @@ import cv2, yaml
 from scipy.spatial.transform import Rotation as Rot, Slerp
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from real_depth_eval import load_csv, load_cloud, gt_depth_at  # noqa: E402
+from real_depth_eval import load_csv, zbuf_cache, zbuf_lookup  # noqa: E402
 import echo_li  # noqa: E402
 
 
@@ -43,6 +43,11 @@ def main():
     ap.add_argument("--config", default=str(repo/"configs"/"eqvio_euroc_rho.yaml"))
     ap.add_argument("--every", type=int, default=5, help="evaluate every K frame-pairs")
     ap.add_argument("--out", default="flow_gt_hist.png")
+    ap.add_argument("--gate", choices=["off", "prior", "refine"], default="off",
+                    help="pose-prior epipolar gate: VIO IMU-predicted E, "
+                         "optionally with guarded eight-point refit")
+    ap.add_argument("--gate-threshold", type=float, default=1e-5,
+                    help="squared-Sampson threshold, normalized coords")
     args = ap.parse_args()
     root = Path(args.dataset)
     if (root/"mav0").exists():
@@ -58,11 +63,20 @@ def main():
     gt_t = gt[:, 0]*1e-9; gt_p = gt[:, 1:4]
     slerp = Slerp(gt_t, Rot.from_quat(gt[:, 4:8][:, [1, 2, 3, 0]]))
     gt_w = quat_ang_rate(gt_t, gt[:, 4:8])
-    cloud = load_cloud(root/"pointcloud0"/"data.ply")
 
     fcfg = echo_li.FrontendConfig.from_yaml(args.config)
+    if args.gate != "off":
+        fcfg.epipolar_gate_threshold = args.gate_threshold
+        fcfg.epipolar_refine = args.gate == "refine"
     fcfg.set_camera(fx, fy, cx, cy, w, h, dcoef.tolist())
     tracker = echo_li.Frontend(fcfg, w, h)
+    vio = None
+    if args.gate != "off":
+        cam = echo_li.RadTanCamera(fx, fy, cx, cy, *dcoef[:4])
+        vio = echo_li.VIOFilter(args.config, cam)
+        vio.set_camera_extrinsics(t_bs)
+        imu = load_csv(root/"imu0"/"data.csv")
+        imu_ev = [(r[0]*1e-9, r[1:4].tolist(), r[4:7].tolist()) for r in imu]
 
     def cam_pose(t):
         t_wb = np.eye(4)
@@ -76,26 +90,51 @@ def main():
         frames = [(int(r[0])*1e-9, idir/r[1].strip()) for r in rd if r]
     frames = [(t, p) for t, p in frames if gt_t[0] <= t <= gt_t[-1]]
 
-    prev = None   # (t, {fid: und_uv})
+    zbufs = zbuf_cache(root, frames, cam_pose, fx, fy, cx, cy, w, h)
+    prev = None   # (i, t, {fid: und_uv})
     errs, werrs = [], []   # flow error [px], |w| at that time
+    imu_i = 0
+    vio_cam_prev = None
     tstart = time.time()
     for i, (t, p) in enumerate(frames):
         img = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
         if img is None:
             continue
+        if vio is not None:
+            while imu_i < len(imu_ev) and imu_ev[imu_i][0] <= t:
+                vio.process_imu(*imu_ev[imu_i])
+                imu_i += 1
+            if vio.is_initialized:
+                # IMU-predicted pose at this stamp (before the vision update):
+                # relative prev->curr camera motion for the epipolar gate.
+                pos, quat = vio.get_pose()
+                t_wb = np.eye(4)
+                t_wb[:3, :3] = Rot.from_quat(np.asarray(quat)).as_matrix()
+                t_wb[:3, 3] = np.asarray(pos)
+                vio_cam = t_wb @ t_bs
+                if vio_cam_prev is not None:
+                    tracker.set_pose_prior(np.linalg.inv(vio_cam) @ vio_cam_prev)
         feats, _ = tracker.process(img)
+        if vio is not None and vio.is_initialized:
+            vio.process_vision(t, {f["id"]: (f["x"], f["y"]) for f in feats})
+            pos, quat = vio.get_pose()
+            t_wb = np.eye(4)
+            t_wb[:3, :3] = Rot.from_quat(np.asarray(quat)).as_matrix()
+            t_wb[:3, 3] = np.asarray(pos)
+            vio_cam_prev = t_wb @ t_bs
+        elif vio is not None:
+            vio.process_vision(t, {f["id"]: (f["x"], f["y"]) for f in feats})
         px = np.array([[f["x"], f["y"]] for f in feats], np.float64).reshape(-1, 1, 2)
         und = cv2.undistortPoints(px, K, dcoef[:4], P=K).reshape(-1, 2) if len(feats) else np.zeros((0, 2))
         cur = {int(f["id"]): uv for f, uv in zip(feats, und)}
 
         if prev is not None and i % args.every == 0 and cur:
-            t0, uv0 = prev
+            i0, t0, uv0 = prev
             common = [fid for fid in cur if fid in uv0]
             if common:
-                t_wc0 = cam_pose(t0); t_cw0 = np.linalg.inv(t_wc0)
-                cloud_c = cloud @ t_cw0[:3, :3].T + t_cw0[:3, 3]
+                t_wc0 = cam_pose(t0)
                 p0 = [uv0[fid] for fid in common]
-                d0 = gt_depth_at(cloud_c, p0, fx, fy, cx, cy, w, h)
+                d0 = zbuf_lookup(zbufs[i0], p0, w, h)
                 t_cw1 = np.linalg.inv(cam_pose(t))
                 wmag = float(np.interp(t, gt_t, gt_w))
                 for fid, (u0, v0), d in zip(common, p0, d0):
@@ -111,7 +150,7 @@ def main():
                     u1, v1 = cur[fid]
                     errs.append(np.hypot(u1-ugt, v1-vgt))
                     werrs.append(wmag)
-        prev = (t, cur)
+        prev = (i, t, cur)
         if i % 400 == 0:
             print(f"  [{i}/{len(frames)}] scored={len(errs)} "
                   f"{i/max(time.time()-tstart,1e-9):.0f}fps")
