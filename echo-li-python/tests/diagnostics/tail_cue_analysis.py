@@ -61,6 +61,7 @@ def main():
     repo = Path(__file__).resolve().parents[3]
     ap.add_argument("dataset")
     ap.add_argument("--config", default=str(repo/"configs"/"eqvio_euroc_rho.yaml"))
+    ap.add_argument("--dump", default=None, help="save the cue matrix (npz) for pooling")
     args = ap.parse_args()
     root = Path(args.dataset)
     if (root/"mav0").exists():
@@ -78,6 +79,7 @@ def main():
 
     fcfg = echo_li.FrontendConfig.from_yaml(args.config)
     fcfg.klt_residual = True   # make klt_quality live for this analysis
+    fcfg.epipolar_gate_threshold = 0.0  # rank signals on the UNGATED tracker
     fcfg.set_camera(fx, fy, cx, cy, w, h, dcoef.tolist())
     tracker = echo_li.Frontend(fcfg, w, h)
     # full VIO alongside: the runtime-realistic pose source for the epipolar cue
@@ -202,6 +204,8 @@ def main():
                   f"{i/max(time.time()-tstart,1e-9):.0f}fps")
 
     d = np.array(rows)
+    if args.dump:
+        np.savez(args.dump, d=d, cols=np.array(cols))
     err = d[:, 0]
     out = err > OUTLIER_PX
     print(f"\n=== tail cue ranking ({len(d)} pairs, outliers {100*out.mean():.1f}% "
