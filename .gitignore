@@ -25,5 +25,10 @@ flow_gt_*.png
 flow_gt_*.mp4
 tracker_viz_*.mp4
 tracker_viz_*.avi
+patch_status*.mp4
+patch_status*.png
 *_cache.npz
 cue_dumps/
+# maturin/pip build artifacts dropped into the source package
+*.pyd
+*.pdb
