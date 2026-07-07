@@ -511,18 +511,37 @@ fn occupancy_cells_for_vis(map: &LocalOccupancyMap) -> (Vec<[f32; 3]>, Vec<[f32;
 #[cfg(feature = "rerun")]
 fn send_rerun_blueprint(
     rec: &rerun::RecordingStream,
+    k_matrix: &Matrix3<f64>,
     img_w: usize,
     img_h: usize,
 ) -> rerun::RecordingStreamResult<()> {
     use rerun::external::re_log_types::{BlueprintActivationCommand, LogMsg, RecordingId};
     use rerun::external::re_sdk_types::blueprint::archetypes::{
-        ContainerBlueprint, ViewBlueprint, ViewContents, ViewportBlueprint, VisualBounds2D,
+        ContainerBlueprint, EyeControls3D, ViewBlueprint, ViewContents, ViewportBlueprint,
+        VisualBounds2D,
     };
     use rerun::external::re_sdk_types::blueprint::components::{
         AutoLayout, AutoViews, ContainerKind, IncludedContent, RootContainer, ViewOrigin,
     };
     use rerun::external::re_sdk_types::components::{Name, Visible};
     use rerun::external::re_sdk_types::datatypes::{Bool, EntityPath, Range2D, Uuid};
+
+    let pinhole = || {
+        rerun::Pinhole::from_focal_length_and_resolution(
+            [k_matrix[(0, 0)] as f32, k_matrix[(1, 1)] as f32],
+            [img_w as f32, img_h as f32],
+        )
+        .with_principal_point([k_matrix[(0, 2)] as f32, k_matrix[(1, 2)] as f32])
+        // CamerasVisualizer registers the camera for tracking before drawing
+        // its frustum. Degenerate, transparent drawing properties therefore
+        // hide the helper without removing it from the tracking camera list.
+        .with_image_plane_distance(0.0)
+        .with_line_width(0.0)
+        .with_color(rerun::Color::TRANSPARENT)
+    };
+    // Only the virtual camera needs pinhole semantics: that makes Rerun adopt
+    // its full pose when tracking it. The physical pose remains a transform.
+    rec.log_static("world/view_camera", &pinhole())?;
 
     let app_id = rec
         .store_info()
@@ -615,6 +634,10 @@ fn send_rerun_blueprint(
     bp.log(
         format!("{world_view_path}/ViewContents"),
         &ViewContents::new(["world/**"]),
+    )?;
+    bp.log(
+        format!("{world_view_path}/EyeControls3D"),
+        &EyeControls3D::default().with_tracking_entity("world/view_camera"),
     )?;
 
     bp.log(
@@ -1184,7 +1207,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match built {
             Ok(r) => {
                 println!("Rerun stream ready");
-                send_rerun_blueprint(&r, img_w, img_h).ok();
+                send_rerun_blueprint(&r, &k_matrix, img_w, img_h).ok();
 
                 Some(r)
             }
@@ -1855,31 +1878,68 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
 
+                        // Build the third-person pose from the estimated
+                        // world-from-camera pose. Mat3x3 values are columns.
+                        let camera_origin = [p_cam[0] as f32, p_cam[1] as f32, p_cam[2] as f32];
+                        let camera_rotation = r_cam.as_matrix();
+                        let camera_rotation_cols = [
+                            [
+                                camera_rotation[(0, 0)] as f32,
+                                camera_rotation[(1, 0)] as f32,
+                                camera_rotation[(2, 0)] as f32,
+                            ],
+                            [
+                                camera_rotation[(0, 1)] as f32,
+                                camera_rotation[(1, 1)] as f32,
+                                camera_rotation[(2, 1)] as f32,
+                            ],
+                            [
+                                camera_rotation[(0, 2)] as f32,
+                                camera_rotation[(1, 2)] as f32,
+                                camera_rotation[(2, 2)] as f32,
+                            ],
+                        ];
+                        // Camera coordinates are RDF, so -Y is above and -Z is
+                        // behind. Keep the chase eye above and behind the camera.
+                        const VIEW_ABOVE_M: f32 = 0.5;
+                        const VIEW_BEHIND_M: f32 = 2.0;
+                        let view_origin = std::array::from_fn(|i| {
+                            camera_origin[i]
+                                - VIEW_ABOVE_M * camera_rotation_cols[1][i]
+                                - VIEW_BEHIND_M * camera_rotation_cols[2][i]
+                        });
+                        rec.log(
+                            "world/view_camera",
+                            &rerun::Transform3D::from_translation_mat3x3(
+                                view_origin,
+                                camera_rotation_cols,
+                            ),
+                        )
+                        .ok();
+
                         // Camera pose as RGB arrows (X=red, Y=green, Z=blue)
                         if vis_cfg.camera_axes {
-                            let origin = [p_cam[0] as f32, p_cam[1] as f32, p_cam[2] as f32];
-                            let r = r_cam.as_matrix();
                             let scale = 0.1f32;
                             rec.log(
                                 "world/camera_axes",
                                 &rerun::Arrows3D::from_vectors([
                                     [
-                                        r[(0, 0)] as f32 * scale,
-                                        r[(1, 0)] as f32 * scale,
-                                        r[(2, 0)] as f32 * scale,
+                                        camera_rotation[(0, 0)] as f32 * scale,
+                                        camera_rotation[(1, 0)] as f32 * scale,
+                                        camera_rotation[(2, 0)] as f32 * scale,
                                     ],
                                     [
-                                        r[(0, 1)] as f32 * scale,
-                                        r[(1, 1)] as f32 * scale,
-                                        r[(2, 1)] as f32 * scale,
+                                        camera_rotation[(0, 1)] as f32 * scale,
+                                        camera_rotation[(1, 1)] as f32 * scale,
+                                        camera_rotation[(2, 1)] as f32 * scale,
                                     ],
                                     [
-                                        r[(0, 2)] as f32 * scale,
-                                        r[(1, 2)] as f32 * scale,
-                                        r[(2, 2)] as f32 * scale,
+                                        camera_rotation[(0, 2)] as f32 * scale,
+                                        camera_rotation[(1, 2)] as f32 * scale,
+                                        camera_rotation[(2, 2)] as f32 * scale,
                                     ],
                                 ])
-                                .with_origins([origin, origin, origin])
+                                .with_origins([camera_origin, camera_origin, camera_origin])
                                 .with_colors([
                                     0xFF0000FFu32,
                                     0x00FF00FFu32,

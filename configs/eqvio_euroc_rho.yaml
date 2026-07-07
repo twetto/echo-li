@@ -120,7 +120,7 @@ Rerun:
   # landmarks: true
   # sparseWorld: true
   # cameraAxes: true
-  occupiedCells: false
+  # occupiedCells: true
   freeCells: false
 SparseVog:
   # Per-feature Vogiatzis filter.
