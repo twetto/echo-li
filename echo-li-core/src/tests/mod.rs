@@ -1,16 +1,17 @@
-pub mod testing_utilities;
+pub mod test_source_text;
 pub mod test_vio_filter;
+pub mod testing_utilities;
 
-use approx::{assert_abs_diff_eq};
-use nalgebra::{DVector, Vector2, Vector3, Matrix3, Matrix4};
-use echo_lie::SO3;
-use crate::mathematical::*;
-use crate::mathematical::camera::CameraModel;
 use crate::coordinate_suite::euclid::EuclideanSuite;
-use crate::coordinate_suite::normal::NormalSuite;
 use crate::coordinate_suite::invdepth::InvDepthSuite;
+use crate::coordinate_suite::normal::NormalSuite;
 use crate::depth::sparse_gb::{SparseGBFilter, SparseVogSettings};
+use crate::mathematical::camera::CameraModel;
+use crate::mathematical::*;
 use crate::tests::testing_utilities::*;
+use approx::assert_abs_diff_eq;
+use echo_lie::SO3;
+use nalgebra::{DVector, Matrix3, Matrix4, Vector2, Vector3};
 use rand::Rng;
 use std::collections::HashMap;
 
@@ -62,7 +63,7 @@ fn test_identity_is_neutral() {
     for _ in 0..TEST_REPS {
         let x = random_group_element(ids.len(), &mut rng);
         let i = VIOGroup::identity(&ids);
-        
+
         assert!(log_norm(&i) < NEAR_ZERO);
         assert!(log_norm(&i.compose(&x).compose(&x.inverse())) < NEAR_ZERO);
         assert!(log_norm(&x.inverse().compose(&x.compose(&i))) < NEAR_ZERO);
@@ -148,8 +149,11 @@ macro_rules! test_a0t {
                 let a_numerical = numerical_jacobian(a0, &zero, 1e-6);
 
                 let diff = (&a_analytical - &a_numerical).norm();
-                assert!(diff < 1e-4 * (dim as f64),
-                    "A0t Jacobian mismatch: ||A - A_num|| = {:.2e}", diff);
+                assert!(
+                    diff < 1e-4 * (dim as f64),
+                    "A0t Jacobian mismatch: ||A - A_num|| = {:.2e}",
+                    diff
+                );
             }
         }
     };
@@ -178,7 +182,8 @@ macro_rules! test_bt {
                     vel_perturbed.gyr += nu.fixed_rows::<3>(0);
                     vel_perturbed.acc += nu.fixed_rows::<3>(3);
 
-                    let mut lambda_tilde = &lift_velocity(&xi_hat, &vel_perturbed) - &lift_velocity(&xi_hat, &vel);
+                    let mut lambda_tilde =
+                        &lift_velocity(&xi_hat, &vel_perturbed) - &lift_velocity(&xi_hat, &vel);
                     lambda_tilde.u_beta += nu.fixed_rows::<6>(6);
 
                     let xi_hat_next = state_group_action(&vio_exp(&lambda_tilde), &xi_hat);
@@ -194,8 +199,11 @@ macro_rules! test_bt {
                 let b_numerical = numerical_jacobian(b0, &zero_nu, 1e-6);
 
                 let diff = (&b_analytical - &b_numerical).norm();
-                assert!(diff < 1e-4 * (dim as f64),
-                    "Bt Jacobian mismatch: ||B - B_num|| = {:.2e}", diff);
+                assert!(
+                    diff < 1e-4 * (dim as f64),
+                    "Bt Jacobian mismatch: ||B - B_num|| = {:.2e}",
+                    diff
+                );
             }
         }
     };
@@ -213,7 +221,12 @@ macro_rules! test_ct {
 
             let mut rng = rand::rng();
             let suite = $suite;
-            let cam = PinholeModel { fx: 458.654, fy: 457.296, cx: 367.215, cy: 248.375 };
+            let cam = PinholeModel {
+                fx: 458.654,
+                fy: 457.296,
+                cx: 367.215,
+                cy: 248.375,
+            };
 
             for _ in 0..TEST_REPS {
                 let xi0 = reasonable_state_element(5, &mut rng);
@@ -223,7 +236,9 @@ macro_rules! test_ct {
                 let y_hat = measure_system_state(&xi_hat, &cam);
                 let mut y_ids: Vec<u64> = y_hat.keys().cloned().collect();
                 y_ids.sort();
-                if y_ids.is_empty() { continue; }
+                if y_ids.is_empty() {
+                    continue;
+                }
 
                 let n_obs = y_ids.len();
 
@@ -239,7 +254,7 @@ macro_rules! test_ct {
                     let mut y_tilde = DVector::<f64>::zeros(2 * n_obs);
                     for (j, &id) in y_ids.iter().enumerate() {
                         if let (Some(y_obs), Some(y_pred)) = (y.get(&id), y_hat.get(&id)) {
-                            y_tilde[2 * j]     = y_obs[0] - y_pred[0];
+                            y_tilde[2 * j] = y_obs[0] - y_pred[0];
                             y_tilde[2 * j + 1] = y_obs[1] - y_pred[1];
                         }
                     }
@@ -254,8 +269,11 @@ macro_rules! test_ct {
                 let ct_numerical = numerical_jacobian(ct, &zero, step);
 
                 let diff = (&Ct_star - &ct_numerical).norm();
-                assert!(diff < 1e-3,
-                    "Ct Jacobian mismatch: ||Ct - Ct_numerical|| = {:.2e}", diff);
+                assert!(
+                    diff < 1e-3,
+                    "Ct Jacobian mismatch: ||Ct - Ct_numerical|| = {:.2e}",
+                    diff
+                );
             }
         }
     };
@@ -276,7 +294,12 @@ fn test_ct_equivariant_at_prediction() {
 
     let mut rng = rand::rng();
     let suite = EuclideanSuite;
-    let cam = PinholeModel { fx: 458.654, fy: 457.296, cx: 367.215, cy: 248.375 };
+    let cam = PinholeModel {
+        fx: 458.654,
+        fy: 457.296,
+        cx: 367.215,
+        cy: 248.375,
+    };
 
     for _ in 0..TEST_REPS {
         let xi0 = reasonable_state_element(5, &mut rng);
@@ -286,7 +309,9 @@ fn test_ct_equivariant_at_prediction() {
         let y_hat = measure_system_state(&xi_hat, &cam);
         let mut y_ids: Vec<u64> = y_hat.keys().cloned().collect();
         y_ids.sort();
-        if y_ids.is_empty() { continue; }
+        if y_ids.is_empty() {
+            continue;
+        }
 
         #[allow(non_snake_case)]
         let Ct_star = suite.output_matrix_C(&xi0, &x_hat, &y_ids, &y_hat, &cam, true);
@@ -294,8 +319,11 @@ fn test_ct_equivariant_at_prediction() {
         let Ct_noneq = suite.output_matrix_C(&xi0, &x_hat, &y_ids, &y_hat, &cam, false);
 
         let ct_diff = (&Ct_star - &Ct_noneq).norm();
-        assert!(ct_diff < 1e-8,
-            "C*_t and Ct should be equal at predicted measurement, diff={:.2e}", ct_diff);
+        assert!(
+            ct_diff < 1e-8,
+            "C*_t and Ct should be equal at predicted measurement, diff={:.2e}",
+            ct_diff
+        );
     }
 }
 
@@ -306,11 +334,22 @@ fn test_ct_equivariant_at_prediction_normal_invdepth() {
     use crate::mathematical::camera::PinholeModel;
 
     let mut rng = rand::rng();
-    let cam = PinholeModel { fx: 458.654, fy: 457.296, cx: 367.215, cy: 248.375 };
+    let cam = PinholeModel {
+        fx: 458.654,
+        fy: 457.296,
+        cx: 367.215,
+        cy: 248.375,
+    };
 
     for (name, suite) in [
-        ("Normal", Box::new(NormalSuite::new()) as Box<dyn EqFCoordinateSuite>),
-        ("InvDepth", Box::new(InvDepthSuite::new()) as Box<dyn EqFCoordinateSuite>),
+        (
+            "Normal",
+            Box::new(NormalSuite::new()) as Box<dyn EqFCoordinateSuite>,
+        ),
+        (
+            "InvDepth",
+            Box::new(InvDepthSuite::new()) as Box<dyn EqFCoordinateSuite>,
+        ),
     ] {
         for _ in 0..TEST_REPS {
             let xi0 = reasonable_state_element(5, &mut rng);
@@ -320,7 +359,9 @@ fn test_ct_equivariant_at_prediction_normal_invdepth() {
             let y_hat = measure_system_state(&xi_hat, &cam);
             let mut y_ids: Vec<u64> = y_hat.keys().cloned().collect();
             y_ids.sort();
-            if y_ids.is_empty() { continue; }
+            if y_ids.is_empty() {
+                continue;
+            }
 
             #[allow(non_snake_case)]
             let C_eq = suite.output_matrix_C(&xi0, &x_hat, &y_ids, &y_hat, &cam, true);
@@ -328,8 +369,12 @@ fn test_ct_equivariant_at_prediction_normal_invdepth() {
             let C_noneq = suite.output_matrix_C(&xi0, &x_hat, &y_ids, &y_hat, &cam, false);
 
             let diff = (&C_eq - &C_noneq).norm();
-            assert!(diff < 1e-8,
-                "{}: C* and C should be equal at predicted measurement, diff={:.2e}", name, diff);
+            assert!(
+                diff < 1e-8,
+                "{}: C* and C should be equal at predicted measurement, diff={:.2e}",
+                name,
+                diff
+            );
         }
     }
 }
@@ -339,13 +384,18 @@ fn test_ct_equivariant_at_prediction_normal_invdepth() {
 // 0.5*(A+B)*M == 0.5*(A*M + B*M). This test confirms it numerically.
 #[test]
 fn test_invdepth_cstar_avg_map_commutativity() {
-    use crate::mathematical::camera::PinholeModel;
     use crate::coordinate_suite::invdepth::conv_ind2euc;
+    use crate::mathematical::camera::PinholeModel;
 
     let mut rng = rand::rng();
     let euclid_suite = EuclideanSuite;
     let invdepth_suite = InvDepthSuite::new();
-    let cam = PinholeModel { fx: 458.654, fy: 457.296, cx: 367.215, cy: 248.375 };
+    let cam = PinholeModel {
+        fx: 458.654,
+        fy: 457.296,
+        cx: 367.215,
+        cy: 248.375,
+    };
 
     for _ in 0..TEST_REPS {
         let xi0 = reasonable_state_element(5, &mut rng);
@@ -355,7 +405,9 @@ fn test_invdepth_cstar_avg_map_commutativity() {
         let y_hat = measure_system_state(&xi_hat, &cam);
         let mut y_ids: Vec<u64> = y_hat.keys().cloned().collect();
         y_ids.sort();
-        if y_ids.is_empty() { continue; }
+        if y_ids.is_empty() {
+            continue;
+        }
 
         // Method 1 (current): C*_invdepth via invdepth suite
         // Internally does: C*_euclid(avg of y_tru, y_hat) * ind2euc
@@ -379,26 +431,33 @@ fn test_invdepth_cstar_avg_map_commutativity() {
 
         // Per-landmark check: compare ci_star results
         for &id in &y_ids {
-            let lm_idx = xi0.camera_landmarks.iter().position(|l| l.id == id).unwrap();
+            let lm_idx = xi0
+                .camera_landmarks
+                .iter()
+                .position(|l| l.id == id)
+                .unwrap();
             let q0 = xi0.camera_landmarks[lm_idx].p;
             let qi = &x_hat.q[lm_idx];
 
             // Current: avg in euclid, then map
-            let ci_avg_then_map = invdepth_suite.output_matrix_ci_star(
-                &q0, qi, &cam, y_hat.get(&id).unwrap());
+            let ci_avg_then_map =
+                invdepth_suite.output_matrix_ci_star(&q0, qi, &cam, y_hat.get(&id).unwrap());
 
             // Alternative: map each D_rho term, then average
             // = C_euclid(y_tru) * ind2euc  averaged with  C_euclid(y_hat) * ind2euc
             // Since output_matrix_ci_star with equivariant=true already averages,
             // we verify by computing: euclid_ci_star * ind2euc
-            let ci_euclid = euclid_suite.output_matrix_ci_star(
-                &q0, qi, &cam, y_hat.get(&id).unwrap());
+            let ci_euclid =
+                euclid_suite.output_matrix_ci_star(&q0, qi, &cam, y_hat.get(&id).unwrap());
             let ind2euc = conv_ind2euc(&q0);
             let ci_map_then_avg = ci_euclid * ind2euc;
 
             let diff = (ci_avg_then_map - ci_map_then_avg).norm();
-            assert!(diff < 1e-12,
-                "avg->map vs map->avg should be identical, diff={:.2e}", diff);
+            assert!(
+                diff < 1e-12,
+                "avg->map vs map->avg should be identical, diff={:.2e}",
+                diff
+            );
         }
 
         // Also verify the full stacked C matrix matches
@@ -412,19 +471,28 @@ fn test_invdepth_cstar_avg_map_commutativity() {
         let mut c_manual = C_euclid.clone();
         for (j, &id) in y_ids.iter().enumerate() {
             let _ = j; // used implicitly via the loop
-            let lm_idx = xi0.camera_landmarks.iter().position(|l| l.id == id).unwrap();
+            let lm_idx = xi0
+                .camera_landmarks
+                .iter()
+                .position(|l| l.id == id)
+                .unwrap();
             let q0 = xi0.camera_landmarks[lm_idx].p;
             let ind2euc = conv_ind2euc(&q0);
 
             let col_start = s + 3 * lm_idx;
             let block = C_euclid.view((0, col_start), (2 * n_obs, 3)).into_owned();
             let mapped = block * ind2euc;
-            c_manual.view_mut((0, col_start), (2 * n_obs, 3)).copy_from(&mapped);
+            c_manual
+                .view_mut((0, col_start), (2 * n_obs, 3))
+                .copy_from(&mapped);
         }
 
         let full_diff = (&C_current - &c_manual).norm();
-        assert!(full_diff < 1e-10,
-            "Full C* invdepth: avg->map vs map->avg should match, diff={:.2e}", full_diff);
+        assert!(
+            full_diff < 1e-10,
+            "Full C* invdepth: avg->map vs map->avg should match, diff={:.2e}",
+            full_diff
+        );
     }
 }
 
@@ -432,13 +500,18 @@ fn test_invdepth_cstar_avg_map_commutativity() {
 // If they differ, the custom formula is wrong and should be replaced.
 #[test]
 fn test_normal_cstar_vs_euc_composed() {
-    use crate::mathematical::camera::PinholeModel;
     use crate::coordinate_suite::normal::conv_normal2euc;
+    use crate::mathematical::camera::PinholeModel;
 
     let mut rng = rand::rng();
     let euclid_suite = EuclideanSuite;
     let normal_suite = NormalSuite::new();
-    let cam = PinholeModel { fx: 458.654, fy: 457.296, cx: 367.215, cy: 248.375 };
+    let cam = PinholeModel {
+        fx: 458.654,
+        fy: 457.296,
+        cx: 367.215,
+        cy: 248.375,
+    };
 
     for _ in 0..TEST_REPS {
         let xi0 = reasonable_state_element(5, &mut rng);
@@ -448,10 +521,16 @@ fn test_normal_cstar_vs_euc_composed() {
         let y_hat = measure_system_state(&xi_hat, &cam);
         let mut y_ids: Vec<u64> = y_hat.keys().cloned().collect();
         y_ids.sort();
-        if y_ids.is_empty() { continue; }
+        if y_ids.is_empty() {
+            continue;
+        }
 
         for &id in &y_ids {
-            let lm_idx = xi0.camera_landmarks.iter().position(|l| l.id == id).unwrap();
+            let lm_idx = xi0
+                .camera_landmarks
+                .iter()
+                .position(|l| l.id == id)
+                .unwrap();
             let q0 = xi0.camera_landmarks[lm_idx].p;
             let qi = &x_hat.q[lm_idx];
             let y_obs = y_hat.get(&id).unwrap();
@@ -466,9 +545,12 @@ fn test_normal_cstar_vs_euc_composed() {
 
             let diff = (ci_normal - ci_composed).norm();
             let scale = ci_composed.norm().max(1e-10);
-            assert!(diff / scale < 1e-6,
+            assert!(
+                diff / scale < 1e-6,
                 "Normal C*_i differs from C*_euc * normal2euc: diff={:.2e}, rel={:.2e}",
-                diff, diff / scale);
+                diff,
+                diff / scale
+            );
         }
     }
 }
@@ -522,7 +604,10 @@ macro_rules! test_innovation_lift {
 
 test_innovation_lift!(test_innovation_lift_roundtrip, EuclideanSuite);
 test_innovation_lift!(test_innovation_lift_roundtrip_normal, NormalSuite::new());
-test_innovation_lift!(test_innovation_lift_roundtrip_invdepth, InvDepthSuite::new());
+test_innovation_lift!(
+    test_innovation_lift_roundtrip_invdepth,
+    InvDepthSuite::new()
+);
 
 // ---------------------------------------------------------------------------
 // 5. Coordinate Chart Axioms (test_coordinate_charts.py)
@@ -545,21 +630,45 @@ macro_rules! test_vio_chart {
 
                 assert_abs_diff_eq!(xi1.sensor.input_bias, xi2.sensor.input_bias, epsilon = 1e-8);
                 assert_rotation_eq(&xi1.sensor.pose.rotation, &xi2.sensor.pose.rotation, 1e-8);
-                assert_abs_diff_eq!(xi1.sensor.pose.translation, xi2.sensor.pose.translation, epsilon = 1e-8);
+                assert_abs_diff_eq!(
+                    xi1.sensor.pose.translation,
+                    xi2.sensor.pose.translation,
+                    epsilon = 1e-8
+                );
                 assert_abs_diff_eq!(xi1.sensor.velocity, xi2.sensor.velocity, epsilon = 1e-8);
-                assert_rotation_eq(&xi1.sensor.camera_offset.rotation, &xi2.sensor.camera_offset.rotation, 1e-8);
-                assert_abs_diff_eq!(xi1.sensor.camera_offset.translation, xi2.sensor.camera_offset.translation, epsilon = 1e-8);
+                assert_rotation_eq(
+                    &xi1.sensor.camera_offset.rotation,
+                    &xi2.sensor.camera_offset.rotation,
+                    1e-8,
+                );
+                assert_abs_diff_eq!(
+                    xi1.sensor.camera_offset.translation,
+                    xi2.sensor.camera_offset.translation,
+                    epsilon = 1e-8
+                );
 
                 for i in 0..n_landmarks {
-                    assert_abs_diff_eq!(xi1.camera_landmarks[i].p, xi2.camera_landmarks[i].p, epsilon = 1e-8);
+                    assert_abs_diff_eq!(
+                        xi1.camera_landmarks[i].p,
+                        xi2.camera_landmarks[i].p,
+                        epsilon = 1e-8
+                    );
                 }
 
                 let eps_zero = suite.state_chart(&xi0, &xi0);
                 assert_abs_diff_eq!(eps_zero.norm(), 0.0, epsilon = 1e-10);
 
                 let xi_zero = suite.state_chart_inv(&DVector::zeros(xi0.dim()), &xi0);
-                assert_rotation_eq(&xi0.sensor.pose.rotation, &xi_zero.sensor.pose.rotation, 1e-10);
-                assert_abs_diff_eq!(xi0.sensor.pose.translation, xi_zero.sensor.pose.translation, epsilon = 1e-10);
+                assert_rotation_eq(
+                    &xi0.sensor.pose.rotation,
+                    &xi_zero.sensor.pose.rotation,
+                    1e-10,
+                );
+                assert_abs_diff_eq!(
+                    xi0.sensor.pose.translation,
+                    xi_zero.sensor.pose.translation,
+                    epsilon = 1e-10
+                );
             }
         }
     };
@@ -587,17 +696,17 @@ fn test_depth_filter_convergence() {
         let cam_pos = Vector3::new(i as f64 * baseline, 0.0, 0.0);
         let mut t_wc = Matrix4::identity();
         t_wc.fixed_view_mut::<3, 1>(0, 3).copy_from(&cam_pos);
-        
+
         let p_cam = p_world - cam_pos;
         let uv = Vector2::new(
             fx * p_cam[0] / p_cam[2] + 376.0 + rng.random_range(-0.1..0.1),
-            fx * p_cam[1] / p_cam[2] + 240.0 + rng.random_range(-0.1..0.1)
+            fx * p_cam[1] / p_cam[2] + 240.0 + rng.random_range(-0.1..0.1),
         );
 
         let mut cam_coords = HashMap::new();
         cam_coords.insert(fid as u64, Vector2::new(uv[0] as f32, uv[1] as f32));
         let meas = VisionMeasurement::new(i as f64 * 0.05, cam_coords);
-        
+
         filt.update(&meas, &t_wc, None);
     }
 

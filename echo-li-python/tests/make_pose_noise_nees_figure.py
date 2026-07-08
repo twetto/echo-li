@@ -9,7 +9,7 @@ so no chart math is reimplemented and no eqvio dependency is needed.
 Four arms tell the story:
   A no pose noise            -> calibrated baseline (NEES ~ dim = 3)
   B translation noise, naive -> overconfident (no pose term in the model)
-  C translation noise, p_vv  -> the 3x3 velocity cov recovers calibration
+  C translation noise, p_vv  -> the 3x3 translation covariance recovers calibration
   D rotation noise, naive    -> overconfident, and NO 3x3 p_vv can fix it
                                 (motivates the 6x6 pose covariance)
 
@@ -55,10 +55,10 @@ SIGMA_PX = 0.5
 SIGMA_T = 0.01     # translation pose-noise std [m] per frame
 SIGMA_PHI = 0.0015  # rotation pose-noise std [rad] per frame
 P_VV_SCALE = 2.0  # 2x because the original test over-inflated; kept for parity
-P_VV_T = (P_VV_SCALE * SIGMA_T**2 / DT**2) * np.eye(3)
-P_WW_T = (P_VV_SCALE * SIGMA_PHI**2 / DT**2) * np.eye(3)
-P_VV_T1 = (SIGMA_T**2 / DT**2) * np.eye(3)  # factor-1 variants
-P_WW_T1 = (SIGMA_PHI**2 / DT**2) * np.eye(3)
+P_VV_T = (P_VV_SCALE * SIGMA_T**2) * np.eye(3)
+P_WW_T = (P_VV_SCALE * SIGMA_PHI**2) * np.eye(3)
+P_VV_T1 = (SIGMA_T**2) * np.eye(3)  # factor-1 variants
+P_WW_T1 = (SIGMA_PHI**2) * np.eye(3)
 
 SETTINGS = dict(
     # filter's assumed pixel noise; decoupled from the injected SIGMA_PX so we can
@@ -68,15 +68,14 @@ SETTINGS = dict(
     init_depth_var=0.01,
     max_depth=float(os.environ.get("MAX_DEPTH", "150.0")),
     mahalanobis_reset_chi2=1e9,  # disable resets so we see pure (over)confidence
-    process_depth_var=0.0,  # no fallback process noise: the ONLY pose term is p_vv
-    anchor_measurement=os.environ.get("ANCHOR", "0") == "1",  # add anchor-pose to R
+    process_depth_var=0.0,
 )
 
 P_W = np.array([(U0 - CX) / FX * Z_TRUE, (V0 - CY) / FY * Z_TRUE, Z_TRUE])
 
 
 def run_trial(rng, pose_noise, p_vv, p_ww=None, chart="polar3d", unscented=False,
-              measurement=False, range_walk=0.0, gate_px_mult=0.0):
+              range_walk=0.0, gate_px_mult=0.0):
     """One MC trial -> per-step NEES (NaN where no live feature).
 
     gate_px_mult>0: measurement decimation -- only fuse a frame when the tracked
@@ -84,7 +83,6 @@ def run_trial(rng, pose_noise, p_vv, p_ww=None, chart="polar3d", unscented=False
     stronger-parallax updates -> fewer sequential linearisations)."""
     ctor = getattr(Sparse3DFilter, chart)
     filt = ctor(FX, FY, CX, CY, **{**SETTINGS, "rotation_unscented": unscented,
-                                   "pose_measurement": measurement,
                                    "range_walk_var": range_walk})
     nees = np.full(N, np.nan)
     errm = np.full(N, np.nan)   # actual position error [m]
@@ -154,7 +152,7 @@ SIGMA_PHI_SMALL = 0.0003  # 5x smaller rotation noise
 def rot_noise_small(rng):
     return np.concatenate([np.zeros(3), rng.normal(0, SIGMA_PHI_SMALL, 3)])
 
-P_WW_SMALL = (SIGMA_PHI_SMALL**2 / DT**2) * np.eye(3)
+P_WW_SMALL = (SIGMA_PHI_SMALL**2) * np.eye(3)
 
 # (label, noise_fn, p_vv, p_ww, chart, color)
 ARMS = [
@@ -164,26 +162,26 @@ ARMS = [
     # Translation calibration
     ("B: trans, naive", trans_noise, None, None, "polar3d", "tab:orange"),
     ("C: trans, p_vv (polar3d)", trans_noise, P_VV_T1, None, "polar3d", "tab:blue"),
-    # Rotation — polar3d (SOT(3) IEKF breaks with rotation process noise)
+    # Rotation -- polar3d (SOT(3) IEKF breaks with rotation covariance)
     ("D: rot, naive (polar3d)", rot_noise, None, None, "polar3d", "tab:red"),
     ("E: rot, p_ww (polar3d)", rot_noise, None, P_WW_T1, "polar3d", "tab:purple"),
-    # Rotation — invdepth_additive (well-behaved chart)
+    # Rotation -- invdepth_additive (well-behaved chart)
     ("F: rot, naive (inv_add)", rot_noise, None, None, "invdepth_additive3d", "salmon"),
     ("G: rot, p_ww 1st-order (inv_add)", rot_noise, None, P_WW_T1, "invdepth_additive3d", "darkviolet"),
     ("G2: rot, p_ww UNSCENTED (inv_add)", rot_noise, None, P_WW_T1, "invdepth_additive3d", "black", True),
-    ("G3: rot, p_ww MEASUREMENT (inv_add)", rot_noise, None, P_WW_T1, "invdepth_additive3d", "magenta", False, True),
-    ("G4: rot, MEASUREMENT + range_walk floor", rot_noise, None, P_WW_T1, "invdepth_additive3d", "teal", False, True, 1e-8),
-    ("G0: rot, range_walk floor only (no rot model)", rot_noise, None, None, "invdepth_additive3d", "silver", False, False, 1e-8),
-    # Small rotation — verifies linearized model is correct
+    ("G3: rot, p_ww repeat (inv_add)", rot_noise, None, P_WW_T1, "invdepth_additive3d", "magenta"),
+    ("G4: rot, p_ww + range_walk floor", rot_noise, None, P_WW_T1, "invdepth_additive3d", "teal", False, 1e-8),
+    ("G0: rot, range_walk floor only (no rot model)", rot_noise, None, None, "invdepth_additive3d", "silver", False, 1e-8),
+    # Small rotation -- verifies linearized model is correct
     ("H: rot_small, naive (inv_add)", rot_noise_small, None, None, "invdepth_additive3d", "gold"),
     ("I: rot_small, p_ww (inv_add)", rot_noise_small, None, P_WW_SMALL, "invdepth_additive3d", "darkgoldenrod"),
     # Joint noise
     ("J: trans+rot, p_vv+p_ww (inv_add)", trans_rot_noise, P_VV_T1, P_WW_T1, "invdepth_additive3d", "tab:cyan"),
     ("J2: trans+rot UNSCENTED (inv_add)", trans_rot_noise, P_VV_T1, P_WW_T1, "invdepth_additive3d", "tab:brown", True),
-    ("J3: FULL POSE measurement p_vv+p_ww->R", trans_rot_noise, P_VV_T1, P_WW_T1, "invdepth_additive3d", "olive", False, True),
+    ("J3: FULL POSE p_vv+p_ww", trans_rot_noise, P_VV_T1, P_WW_T1, "invdepth_additive3d", "olive"),
     ("J0: trans p_vv only, rot UNMODELED (inv_add)", trans_rot_noise, P_VV_T1, None, "invdepth_additive3d", "lightblue"),
-    ("J0g2: J0 + parallax gate 2*sig_px", trans_rot_noise, P_VV_T1, None, "invdepth_additive3d", "tab:pink", False, False, 0.0, 2.0),
-    ("J0g5: J0 + parallax gate 5*sig_px", trans_rot_noise, P_VV_T1, None, "invdepth_additive3d", "tab:gray", False, False, 0.0, 5.0),
+    ("J0g2: J0 + parallax gate 2*sig_px", trans_rot_noise, P_VV_T1, None, "invdepth_additive3d", "tab:pink", False, 0.0, 2.0),
+    ("J0g5: J0 + parallax gate 5*sig_px", trans_rot_noise, P_VV_T1, None, "invdepth_additive3d", "tab:gray", False, 0.0, 5.0),
 ]
 
 
@@ -197,19 +195,24 @@ def main():
     bin_edges = list(range(0, N, 50))
     print("  " + "arm".ljust(36) + "".join(f"{s+50:>7}" for s in bin_edges)
           + "     (mean NEES per 50 steps, ideal 3)")
-    for arm in ARMS:
+    # TALK=1 -> keep the J-family pose-covariance comparison.
+    talk_keep = {"J0: trans p_vv only, rot UNMODELED (inv_add)",
+                 "J: trans+rot, p_vv+p_ww (inv_add)",
+                 "J2: trans+rot UNSCENTED (inv_add)",
+                 "J3: FULL POSE p_vv+p_ww"}
+    arms = [a for a in ARMS if os.environ.get("TALK") != "1" or a[0] in talk_keep]
+    for arm in arms:
         label, noise, p_vv, p_ww, chart, color = arm[:6]
         unscented = arm[6] if len(arm) > 6 else False
-        measurement = arm[7] if len(arm) > 7 else False
-        range_walk = arm[8] if len(arm) > 8 else 0.0
-        gate = arm[9] if len(arm) > 9 else 0.0
+        range_walk = arm[7] if len(arm) > 7 else 0.0
+        gate = arm[8] if len(arm) > 8 else 0.0
         alln = np.full((N_MC, N), np.nan)
         alle = np.full((N_MC, N), np.nan)
         alls = np.full((N_MC, N), np.nan)
         for mc in range(N_MC):
             alln[mc], alle[mc], alls[mc] = run_trial(
                 np.random.default_rng(7000 + mc), noise, p_vv, p_ww,
-                chart, unscented, measurement, range_walk, gate)
+                chart, unscented, range_walk, gate)
         mean_nees = np.nanmean(alln, axis=0)
         mean_err = np.nanmean(alle, axis=0)
         mean_sig = np.nanmean(alls, axis=0)

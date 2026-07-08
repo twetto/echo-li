@@ -1292,6 +1292,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut states_out: Vec<(f64, VIOState)> = Vec::new();
     let mut imu_count: usize = 0;
     let mut vision_count: usize = 0;
+    let mut sparse_pose_cov_count: usize = 0;
+    let mut sparse_pose_cov_missing_count: usize = 0;
     let mut prev_stereo_3d: HashMap<u64, [f64; 3]> = HashMap::new();
     let stereo_ransac_cfg = Rigid3dRansacConfig::default();
     let mut last_patch_depth_counts: Option<(usize, usize, usize, usize)> = None;
@@ -1528,7 +1530,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         } else {
                             (HashMap::new(), HashSet::new())
                         };
-                    // Stereo priors override SparseVog (known baseline → tighter variance).
+                    // Stereo priors override SparseVog (known baseline, tighter variance).
                     depth_priors.extend(stereo_depth_priors.iter().map(|(&id, p)| (id, *p)));
                     let depth_prior_hash =
                         trace_determinism.then(|| hash_depth_priors(&depth_priors));
@@ -1543,9 +1545,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let state = f.eqf.state_estimate();
                     let state_hash = trace_determinism.then(|| hash_state(&state));
                     let t_wc = camera_pose_matrix(&state);
+                    let sparse_pose_cov = f.sparse_camera_pose_covariances();
                     prev_cam_pose = Some(t_wc);
                     if let Some(sparse) = &mut sparse_filter {
-                        sparse.update(&sparse_measurement, &t_wc, None, None);
+                        if sparse_pose_cov.is_some() {
+                            sparse_pose_cov_count += 1;
+                        } else {
+                            sparse_pose_cov_missing_count += 1;
+                        }
+                        let (p_vv, p_ww) = sparse_pose_cov
+                            .as_ref()
+                            .map(|(p_vv, p_ww)| (Some(p_vv), Some(p_ww)))
+                            .unwrap_or((None, None));
+                        sparse.update(&sparse_measurement, &t_wc, p_vv, p_ww);
                         if let Some(mapper) = &mut patch_depth_mapper {
                             if !patch_gray_data.is_empty() {
                                 let frame = FrameProducts {
@@ -2004,6 +2016,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "\nProcessed {} IMU + {} vision in {:.2}s",
         imu_count, vision_count, elapsed
     );
+    if sparse_filter.is_some() {
+        println!(
+            "Sparse pose covariance supplied: {} frames, missing/non-finite: {} frames",
+            sparse_pose_cov_count, sparse_pose_cov_missing_count
+        );
+    }
     if let Some(occupancy) = &local_occupancy {
         let (unknown, free, occupied) = occupancy.counts();
         println!(

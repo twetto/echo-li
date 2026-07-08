@@ -10,23 +10,20 @@ pub enum DepthParametrization {
     Polar,
 }
 
-/// Second-order measurement-update mode for the 3D IEKF. Restores the dropped
-/// projective (perspective-division) curvature so the reported covariance is
-/// honest at weak parallax — "the EqF way" of fixing the NEES overconfidence.
-/// Full derivation: `ECHO-LI-notes/docs/sparse3d_secondorder_eqf_derivation.md`.
-/// Only consumed by `Sparse3DFilter`.
+/// Second-order measurement-update mode for the 3D IEKF.
+///
+/// Restores the dropped projective curvature so the reported covariance is
+/// honest at weak parallax. See
+/// `ECHO-LI-notes/docs/sparse3d_secondorder_eqf_derivation.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SecondOrderMode {
     /// First-order (iterated) EKF; `iekf_iterations` applies. Default.
     #[default]
     Off,
-    /// Option A — analytic second-order EqF. Adds the closed-form innovation
-    /// inflation `Λ_kl = ½ tr(H_k Σ H_l Σ)` and the `½ tr(H_m Σ)` predicted-
-    /// measurement bias correction. Supersedes `iekf_iterations` (the bias is
-    /// removed in closed form, so iterating is redundant).
+    /// Analytic second-order EqF. Adds closed-form innovation inflation and
+    /// predicted-measurement bias correction.
     Analytic,
-    // Option B (future) — unscented / sigma-point EqF (`2·dim+1` evaluations);
-    // second-order-exact by quadrature and folds in partial higher-order terms.
+    // Option B (future): unscented / sigma-point EqF.
     // Unscented,
 }
 
@@ -57,7 +54,7 @@ pub struct SparseVogSettings {
     pub max_depth: f64,
     pub reanchor_flow_px: f64,
     /// Average the perspective output Jacobian between the predicted and the
-    /// measured normalized image coords in the 3D bearing update, à la the EqF
+    /// measured normalized image coords in the 3D bearing update, like the EqF
     /// coordinate suite's `output_matrix_ci_star`. NOTE: experiments show this
     /// *worsens* consistency when grafted onto `Sparse3DFilter` (a plain
     /// chart-EKF) -- putting the measurement into H correlates it with the
@@ -77,40 +74,16 @@ pub struct SparseVogSettings {
     /// Second-order EqF measurement-update mode (covariance inflation + bias
     /// correction). See `SecondOrderMode`. Only consumed by `Sparse3DFilter`.
     pub second_order_mode: SecondOrderMode,
-    /// Per-step radial (range) random-walk process noise for the 3D IEKF, as a
-    /// fraction of range² added to the landmark covariance each update
-    /// (`Σ += range_walk_var · ‖q_c‖² · r̂r̂ᵀ`, pulled back into the error chart).
-    /// The IEKF has no propagation, so without a floor the static-landmark Σ
+    /// Per-step radial random-walk process noise for the 3D IEKF, as a fraction
+    /// of range squared added to the landmark covariance each update.
+    /// The IEKF has no propagation, so without a floor the static-landmark covariance
     /// collapses below the un-modelled triangulation/range bias and NEES grows
-    /// with depth; this floor flattens it (`≈3e-10`–`1e-8` empirically). The `²`
-    /// scaling matches the bias' `∝ depth` growth, so one constant calibrates
-    /// every depth. Default 0 (off). Distinct from `process_depth_var` (the 1D
+    /// with depth. Default 0 (off). Distinct from `process_depth_var` (the 1D
     /// filter's un-scaled per-step term). Only consumed by `Sparse3DFilter`.
-    /// Findings: `ECHO-LI-notes/docs/sparse3d_secondorder_eqf_derivation.md` §8.
+    /// Findings: `ECHO-LI-notes/docs/sparse3d_secondorder_eqf_derivation.md`.
     pub range_walk_var: f64,
-    /// Propagate the rotation process noise `p_ww` through the full nonlinear
-    /// `exp(-[δφ]×)·q_c -> chart` map with sigma points (unscented), instead of
-    /// the first-order `[q_c]× P_ww [q_c]×ᵀ` linearisation. Captures the
-    /// 2nd-order variance inflation AND the mean (bias) shift the linear term
-    /// drops — the residual that keeps NEES > 3 under full rotation noise at
-    /// depth. Invdepth-additive chart only. Default false. `Sparse3DFilter` only.
+    /// Experimental sigma-point rotation propagation for the additive chart.
     pub rotation_unscented: bool,
-    /// Treat the full fed-pose uncertainty (`p_vv` translation + `p_ww` rotation)
-    /// as a *measurement* error — fold it into R so it enters both the innovation
-    /// S and the Joseph posterior — rather than as landmark process noise. The fed
-    /// pose is a measurement input (the pixel comes from the true pose), so its
-    /// error is a measurement discrepancy, not a landmark disturbance; the process
-    /// channel diverges over long tracks (update-count overconfidence) while this
-    /// stays calibrated. `R += proj·P_vv·dt²·projᵀ + (proj·[q_c]×)·P_ww·dt²·(…)ᵀ`,
-    /// geometrically self-scaling (translation ∝1/Z², rotation depth-independent).
-    /// Skips the process-side `p_vv`/`p_ww` injection. Invdepth-additive chart
-    /// only. Default false. `Sparse3DFilter` only.
-    pub pose_measurement: bool,
-    /// Also add the *anchor* pose's uncertainty to R (the anchor frame was set
-    /// from a noisy pose at init; that error is fixed for the landmark's life and
-    /// floors its covariance). `J_a = proj·R_ca·[-[P_anchor]× | I]`. Requires
-    /// `pose_measurement`. Default false. `Sparse3DFilter` only.
-    pub anchor_measurement: bool,
 }
 
 impl Default for SparseVogSettings {
@@ -145,8 +118,6 @@ impl Default for SparseVogSettings {
             second_order_mode: SecondOrderMode::Off,
             range_walk_var: 0.0,
             rotation_unscented: false,
-            pose_measurement: false,
-            anchor_measurement: false,
         }
     }
 }

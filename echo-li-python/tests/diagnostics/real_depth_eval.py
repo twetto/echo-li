@@ -8,8 +8,7 @@ filter's own NIS (GT-free online consistency; ideal chi2(2)).
 
 The filter is fed **GT poses** so the scorecard isolates the sparse filter's
 real-data calibration (tracker noise, real texture, real geometry) from VIO pose
-error. Optional --sigma-t/--sigma-phi feed a constant p_vv/p_ww and
---pose-measurement/--anchor exercise the consider-R treatment.
+error. Optional --sigma-t/--sigma-phi feed constant p_vv/p_ww covariances.
 
   .venv/Scripts/python.exe echo-li-python/tests/diagnostics/real_depth_eval.py \
       ~/Downloads/vicon_room1/vicon_room1/V1_03_difficult [--every 10]
@@ -125,10 +124,8 @@ def main():
     ap.add_argument("--every", type=int, default=10, help="GT-render every K frames")
     ap.add_argument("--min-track", type=int, default=10,
                     help="score only features with track_length >= this")
-    ap.add_argument("--sigma-t", type=float, default=0.0, help="constant p_vv = (s/dt)^2 I")
-    ap.add_argument("--sigma-phi", type=float, default=0.0, help="constant p_ww = (s/dt)^2 I")
-    ap.add_argument("--pose-measurement", action="store_true")
-    ap.add_argument("--anchor", action="store_true")
+    ap.add_argument("--sigma-t", type=float, default=0.0, help="constant p_vv = s^2 I")
+    ap.add_argument("--sigma-phi", type=float, default=0.0, help="constant p_ww = s^2 I")
     args = ap.parse_args()
     root = Path(args.dataset)
     if (root/"mav0").exists():
@@ -150,13 +147,10 @@ def main():
     fcfg.set_camera(fx, fy, cx, cy, w, h, dcoef.tolist())
     tracker = echo_li.Frontend(fcfg, w, h)
 
-    sf_kwargs = dict(sigma_pixel=0.5, min_track_length=1,
-                     pose_measurement=args.pose_measurement,
-                     anchor_measurement=args.anchor)
+    sf_kwargs = dict(sigma_pixel=0.5, min_track_length=1)
     filt = echo_li.Sparse3DFilter.invdepth_additive3d(fx, fy, cx, cy, **sf_kwargs)
-    DT = 0.05
-    p_vv = ((args.sigma_t / DT) ** 2 * np.eye(3)).tolist() if args.sigma_t > 0 else None
-    p_ww = ((args.sigma_phi / DT) ** 2 * np.eye(3)).tolist() if args.sigma_phi > 0 else None
+    p_vv = ((args.sigma_t) ** 2 * np.eye(3)).tolist() if args.sigma_t > 0 else None
+    p_ww = ((args.sigma_phi) ** 2 * np.eye(3)).tolist() if args.sigma_phi > 0 else None
 
     idir = root/"cam0"/"data"
     with open(root/"cam0"/"data.csv") as f:
@@ -221,8 +215,7 @@ def main():
     z = np.array(zscores); rel = np.array(relerrs); nis = np.array(nises)
     print(f"\n=== depth scorecard (GT poses, track>={args.min_track}, "
           f"{n_eval} eval frames, {len(z)} feature-obs) ===")
-    print(f"config: pose_measurement={args.pose_measurement} anchor={args.anchor} "
-          f"sigma_t={args.sigma_t} sigma_phi={args.sigma_phi}")
+    print(f"config: sigma_t={args.sigma_t} sigma_phi={args.sigma_phi}")
     if len(z):
         print(f"depth NEES-1D (mean z^2): {np.mean(z**2):7.2f}   (ideal 1)")
         print(f"|z|<1 / <2 / <3:          {np.mean(np.abs(z)<1)*100:5.1f}% / "

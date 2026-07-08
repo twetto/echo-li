@@ -14,11 +14,13 @@ pub enum Sparse3DChart {
     /// Static-anchor SOT(3) IEKF, range carried multiplicatively (log-depth).
     Polar,
     /// Same SOT(3) IEKF, inverse-depth *reporting* chart (a relabel of `Polar`;
-    /// the update is identical — see the consistency docs).
+    /// the update is identical; see the consistency docs).
     InvDepth,
-    /// ρ-first: a genuinely *additive* inverse-depth EKF. State is
+    /// Rho-first: a genuinely *additive* inverse-depth EKF. State is
     /// `(alpha, beta, rho)` in the anchor camera frame (no group, no log-depth),
     /// which removes the sequential-linearisation overconfidence of `Polar`.
+    /// This is the only chart that currently applies external camera pose
+    /// covariance as measurement-side uncertainty.
     InvDepthAdditive,
 }
 
@@ -26,7 +28,6 @@ pub enum Sparse3DChart {
 struct PendingFeature {
     ref_t_wc: Matrix4<f64>,
     ref_uv: Vector2<f64>,
-    ref_stamp: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -42,7 +43,7 @@ pub struct FeatureState3D {
     pub q0: Vector3<f64>, // anchor-frame landmark (fixed origin)  [Polar/InvDepth]
     pub x: SOT3,          // group refinement; q_hat_anchor = x^{-1} . q0  [Polar/InvDepth]
     pub sigma: Matrix3<f64>, // covariance in Euclidean error coords about q0  [Polar/InvDepth]
-    // ρ-first additive inverse-depth state [InvDepthAdditive only]: s = (alpha,
+    // Rho-first additive inverse-depth state [InvDepthAdditive only]: s = (alpha,
     // beta, rho) = (X/Z, Y/Z, 1/Z) of the landmark in the ANCHOR camera frame,
     // with covariance inv_p in those coords. Plain additive EKF, no group / no
     // re-charting. The SOT(3) fields above are unused in this chart (and vice
@@ -57,9 +58,9 @@ pub struct FeatureState3D {
     pub track_length: usize,
     pub ref_uv: Vector2<f64>,
     pub ref_stamp: f64,
-    /// Last update's normalized innovation squared (NIS = the gating
-    /// Mahalanobis²). Should be ~χ²(2) when the filter is consistent — the
-    /// GT-free online consistency check. NaN before the first update.
+    /// Last update normalized innovation squared (NIS = gating Mahalanobis
+    /// squared). Should be close to chi2(2) when the filter is consistent.
+    /// NaN before the first update.
     pub last_nis: f64,
 }
 
@@ -165,11 +166,16 @@ impl Sparse3DFilter {
         Self::new(k, Sparse3DChart::InvDepth, settings)
     }
 
-    /// ρ-first: additive inverse-depth EKF (see `Sparse3DChart::InvDepthAdditive`).
+    /// Rho-first: additive inverse-depth EKF (see `Sparse3DChart::InvDepthAdditive`).
     pub fn invdepth_additive3d(k: Matrix3<f64>, settings: SparseVogSettings) -> Self {
         Self::new(k, Sparse3DChart::InvDepthAdditive, settings)
     }
 
+    /// Update from one camera measurement set.
+    ///
+    /// `p_vv` and `p_ww` are per-frame camera translation and rotation
+    /// covariances. They are consumed by `InvDepthAdditive`; the legacy IEKF
+    /// charts currently ignore them except for shared birth-time terms.
     pub fn update(
         &mut self,
         measurement: &VisionMeasurement,
@@ -273,7 +279,6 @@ impl Sparse3DFilter {
                 .or_insert_with(|| PendingFeature {
                     ref_t_wc: prev_t_wc,
                     ref_uv: uv_prev,
-                    ref_stamp: self.prev_stamp,
                 })
                 .clone();
 
@@ -292,12 +297,20 @@ impl Sparse3DFilter {
                 continue;
             }
 
-            let baseline_tau_sq =
-                baseline_tau(p_vv, &t_ref, (stamp - pending.ref_stamp).max(dt), dt);
+            let baseline_tau_sq = baseline_tau(p_vv, &t_ref);
             // Anchor the landmark in the CURRENT camera frame (= anchor frame);
             // the IEKF group element x (init identity) carries all later
             // refinement, so we never re-anchor. q0 is the fixed origin.
             let position = position_from_depth(&self.k, &uv_curr, z_obs);
+            let pose_birth_cov = current_anchor_rotation_init_cov(
+                &self.k,
+                &pending.ref_uv,
+                &uv_curr,
+                &r_ref,
+                &t_ref,
+                &position,
+                p_ww,
+            );
             let covariance = init_cov_3d(
                 self.chart,
                 &self.settings,
@@ -306,6 +319,7 @@ impl Sparse3DFilter {
                 z_obs,
                 drive,
                 baseline_tau_sq,
+                &pose_birth_cov,
             );
             // IEKF covariance lives in Euclidean error coords about q0. At
             // creation x = id and the anchor frame is the current frame, so the
@@ -313,7 +327,7 @@ impl Sparse3DFilter {
             // Jacobian (chart_to_euc . cov . chart_to_euc^T).
             let j_c2e = chart_to_euc_jac(self.chart, &position);
             let sigma = j_c2e * covariance * j_c2e.transpose();
-            // ρ-first additive state: anchor-frame (alpha,beta,rho) and its cov.
+            // Rho-first additive state: anchor-frame (alpha,beta,rho) and its cov.
             // For InvDepthAdditive, `covariance` (from init_cov_3d) is already the
             // Euclidean init cov (euc_to_chart_jac == I), which is what we cache;
             // map it to (alpha,beta,rho) coords for inv_p via the euclid->invdepth
@@ -499,65 +513,15 @@ fn update_feature_3d(
     }
 }
 
-/// ρ-first additive inverse-depth EKF update for one landmark.
+/// Rho-first additive inverse-depth EKF update for one landmark.
 ///
 /// State `s = (alpha, beta, rho) = (X/Z, Y/Z, 1/Z)` of the landmark in the anchor
 /// camera frame, covariance `feat.inv_p` in those coords. The known relative pose
 /// anchor->current is folded into the pinhole measurement; the update is a plain
-/// EKF (the inverse-depth refinement group is abelian / flat — `s <- s + gamma`),
+/// EKF (the inverse-depth refinement group is abelian / flat: `s <- s + gamma`),
 /// with the same Gaussian-Beta inlier weighting and optional process-noise floor
 /// as the SOT(3) path. No log-depth, no re-charting -> no sequential-linearisation
 /// overconfidence (see docs/sparse3d_invdepth_rewrite.md).
-/// Anchor-frame inverse-depth chart of a 3-point: (X/Z, Y/Z, 1/Z). Involution
-/// (its own inverse), so it maps both P_anchor -> s and back.
-fn pa_chart(p: &Vector3<f64>) -> Vector3<f64> {
-    Vector3::new(p[0] / p[2], p[1] / p[2], 1.0 / p[2])
-}
-
-/// Sigma-point (unscented) propagation of the rotation process noise `p_ww`
-/// through the full `exp(-[δφ]×)·q_c -> inverse-depth-chart` map, with
-/// `δφ ~ N(0, P_ww·dt²)`. Returns the added chart-space covariance and the
-/// 2nd-order mean (bias) shift the first-order `[q_c]× P_ww [q_c]×ᵀ` term drops.
-/// 6 symmetric points, κ=0 (n+λ=n ⇒ scale √3, weight 1/6).
-fn unscented_rotation_chart(
-    p_ww: &Matrix3<f64>,
-    dt2: f64,
-    q_c: &Vector3<f64>,
-    r_ca: &Matrix3<f64>,
-    t_ca_t: &Vector3<f64>,
-) -> Option<(Matrix3<f64>, Vector3<f64>)> {
-    let chol = (p_ww * dt2).cholesky()?;
-    let l = chol.l();
-    let scale = 3.0_f64.sqrt();
-    let r_inv = r_ca.transpose();
-    let s0 = pa_chart(&(r_inv * (q_c - t_ca_t))); // == nominal inv_s
-    let map = |dphi: Vector3<f64>| {
-        let rot = nalgebra::Rotation3::from_scaled_axis(-dphi).into_inner();
-        pa_chart(&(r_inv * (rot * q_c - t_ca_t)))
-    };
-    let mut sp = [Vector3::<f64>::zeros(); 6];
-    for i in 0..3 {
-        let col: Vector3<f64> = l.column(i).into_owned() * scale;
-        sp[2 * i] = map(col);
-        sp[2 * i + 1] = map(-col);
-    }
-    let mut mean = Vector3::zeros();
-    for s in &sp {
-        mean += s;
-    }
-    mean /= 6.0;
-    let mut q_chart = Matrix3::zeros();
-    for s in &sp {
-        let d = s - mean;
-        q_chart += d * d.transpose();
-    }
-    q_chart /= 6.0;
-    if !q_chart.iter().all(|x| x.is_finite()) || !mean.iter().all(|x| x.is_finite()) {
-        return None;
-    }
-    Some((q_chart, mean - s0))
-}
-
 fn invdepth_additive_update_3d(
     k: &Matrix3<f64>,
     settings: &SparseVogSettings,
@@ -595,45 +559,21 @@ fn invdepth_additive_update_3d(
         )
     };
 
-    if dt > 0.0 && (p_vv.is_some() || p_ww.is_some() || settings.range_walk_var > 0.0) {
+    if dt > 0.0 && settings.range_walk_var > 0.0 {
         let q_c = r_ca * pa_of(&feat.inv_s) + t_ca_t;
         if q_c[2] > settings.min_depth {
             let j_g = r_ca * jpa_of(&feat.inv_s);
             if let Some(j_inv) = j_g.try_inverse() {
-                let dt2 = dt * dt;
-                // Linear (translation + radial floor) terms, pulled back into the
-                // chart by J_inv. Both are exact (translation is additive in q_c;
-                // the floor is a heuristic).
-                // When pose_measurement is set, the fed-pose terms (p_vv, p_ww) are
-                // folded into R below instead — only the radial floor stays here.
+                // Radial floor, pulled back into the chart by J_inv. Fed-pose
+                // covariance belongs in measurement R below.
                 let mut q_cur = Matrix3::zeros();
-                if let Some(pvv) = p_vv.filter(|_| !settings.pose_measurement) {
-                    q_cur += pvv * dt2;
-                }
                 if settings.range_walk_var > 0.0 {
                     let r_hat = q_c / q_c.norm();
                     q_cur +=
                         settings.range_walk_var * q_c.norm_squared() * (r_hat * r_hat.transpose());
                 }
-                let mut sigma = feat.inv_p + j_inv * q_cur * j_inv.transpose();
-                // Rotation term: unscented (2nd-order: variance + mean bias) or
-                // the first-order [q_c]× P_ww [q_c]×ᵀ linearisation.
-                let mut inv_s_shift = Vector3::zeros();
-                if let Some(pww) = p_ww.filter(|_| !settings.pose_measurement) {
-                    if settings.rotation_unscented {
-                        if let Some((q_chart, bias)) =
-                            unscented_rotation_chart(pww, dt2, &q_c, &r_ca, &t_ca_t)
-                        {
-                            sigma += q_chart;
-                            inv_s_shift = bias;
-                        }
-                    } else {
-                        let qx = base_skew(&q_c);
-                        sigma += j_inv * (qx * pww * qx.transpose() * dt2) * j_inv.transpose();
-                    }
-                }
+                let sigma = feat.inv_p + j_inv * q_cur * j_inv.transpose();
                 feat.inv_p = 0.5 * (sigma + sigma.transpose());
-                feat.inv_s += inv_s_shift;
             }
         }
     }
@@ -647,34 +587,22 @@ fn invdepth_additive_update_3d(
     let (xc, yc, zc) = (q_c[0], q_c[1], q_c[2]);
     let z2 = zc * zc;
     let proj = Matrix2x3::new(fx / zc, 0.0, -fx * xc / z2, 0.0, fy / zc, -fy * yc / z2);
-    // Measurement-side pose uncertainty (the "consider"/Schmidt treatment of the
-    // fed pose): the pixel comes from the true pose but the filter is fed a noisy
-    // pose, so pose error is a *measurement* discrepancy, folded into R so it
-    // enters both S and the Joseph posterior K·R·Kᵀ. Geometrically self-scaling:
-    //   translation  J_t = ∂pixel/∂ρ = -proj        -> proj·P_vv·dt²·projᵀ  (∝1/Z²)
-    //   rotation     J_φ = ∂pixel/∂φ = proj·[q_c]×   -> J_φ·P_ww·dt²·J_φᵀ    (depth-indep)
-    if settings.pose_measurement && dt > 0.0 {
-        let dt2 = dt * dt;
+    // Measurement-side pose uncertainty: the pixel comes from the true pose but
+    // the filter is fed a noisy pose. Pose error is therefore a measurement
+    // discrepancy, folded into R so it enters both S and the Joseph posterior.
+    // Translation scales through proj * P_vv * proj^T; rotation scales through
+    // (proj * skew(q_c)) * P_ww * (proj * skew(q_c))^T.
+    if dt > 0.0 {
         if let Some(pvv) = p_vv {
-            r_meas += proj * (pvv * dt2) * proj.transpose();
+            r_meas += proj * pvv * proj.transpose();
         }
         if let Some(pww) = p_ww {
             let jphi = proj * base_skew(&q_c);
-            r_meas += jphi * (pww * dt2) * jphi.transpose();
+            r_meas += jphi * pww * jphi.transpose();
         }
-        // Anchor-pose uncertainty: the anchor frame (T_wc_anchor) was itself set
-        // from a noisy pose at init; that error is fixed for the landmark's life.
-        // J_a = proj·R_ca·[-[P_anchor]× | I]  (P_anchor = anchor-frame point).
-        if settings.anchor_measurement {
-            let rca_proj = proj * r_ca; // = J_a translation block (2x3)
-            if let Some(pvv) = p_vv {
-                r_meas += rca_proj * (pvv * dt2) * rca_proj.transpose();
-            }
-            if let Some(pww) = p_ww {
-                let j_a = rca_proj * (-base_skew(&pa_of(&feat.inv_s)));
-                r_meas += j_a * (pww * dt2) * j_a.transpose();
-            }
-        }
+        // Fixed anchor-pose uncertainty is folded into the landmark covariance
+        // at feature birth. Re-adding it here as per-frame measurement noise
+        // double counts the same anchor error.
     }
     let c = proj * r_ca * jpa_of(&feat.inv_s); // dh/ds (2x3)
     let s_mat = c * feat.inv_p * c.transpose() + r_meas;
@@ -752,8 +680,8 @@ fn iekf_update_3d(
     feat: &mut FeatureState3D,
     uv_obs: &Vector2<f64>,
     t_cw_curr: &Matrix4<f64>,
-    p_vv: Option<&Matrix3<f64>>,
-    p_ww: Option<&Matrix3<f64>>,
+    _p_vv: Option<&Matrix3<f64>>,
+    _p_ww: Option<&Matrix3<f64>>,
     dt: f64,
 ) -> bool {
     let fx = k[(0, 0)];
@@ -793,29 +721,15 @@ fn iekf_update_3d(
         m
     };
 
-    // Per-step process noise: the IEKF has no propagation, so without this the
-    // static-landmark Σ shrinks monotonically and collapses below the
-    // accumulated relative-pose / triangulation uncertainty (the source of the
-    // depth-growing NEES). Two contributions, both formed in the CURRENT camera
-    // frame and pulled back into the fixed-q0 error coords by J_c = R_ca·G:
-    //   * p_vv·dt²            -- translation-rate (velocity) covariance,
-    //   * range_walk_var·‖q_c‖²·r̂r̂ᵀ -- a depth-scaled radial (range) random-walk
-    //     floor that stops Σ from going below the un-modelled range bias.
-    if dt > 0.0 && (p_vv.is_some() || p_ww.is_some() || settings.range_walk_var > 0.0) {
+    // Per-step radial floor. The IEKF has no propagation, so without a floor the
+    // static-landmark covariance can shrink below unmodelled range bias.
+    if dt > 0.0 && settings.range_walk_var > 0.0 {
         let p = q_hat_a_of(&feat.x);
         let q_c = r_ca * p + t_ca_t;
         if q_c[2] > settings.min_depth {
             let j_c = r_ca * dq_hat_a(&feat.x);
             if let Some(j_inv) = j_c.try_inverse() {
-                let dt2 = dt * dt;
                 let mut q_cur = Matrix3::zeros();
-                if let Some(pvv) = p_vv {
-                    q_cur += pvv * dt2;
-                }
-                if let Some(pww) = p_ww {
-                    let qx = base_skew(&q_c);
-                    q_cur += qx * pww * qx.transpose() * dt2;
-                }
                 if settings.range_walk_var > 0.0 {
                     let r_hat = q_c / q_c.norm();
                     q_cur +=
@@ -835,19 +749,16 @@ fn iekf_update_3d(
     // P assuming the measurement is an inlier.
     let (maha_sq, det_s, full_delta, p_post) = match settings.second_order_mode {
         SecondOrderMode::Analytic => {
-            // Option A -- analytic second-order EqF. Restores the dropped
-            // projective curvature: bias-corrects the prediction by ½tr(H_mΣ)
-            // and inflates S by Λ_kl = ½tr(H_kΣH_lΣ), driving NEES -> dim at
-            // weak parallax. Symbols and derivation:
-            // ECHO-LI-notes/docs/sparse3d_secondorder_eqf_derivation.md (§§3-5).
-            let p = q_hat_a_of(&feat.x); // q̂_a
+            // Analytic second-order EqF: bias-correct the prediction and add
+            // closed-form second-order innovation inflation.
+            let p = q_hat_a_of(&feat.x);
             let q_c = r_ca * p + t_ca_t;
             if q_c[2] < settings.min_depth {
                 return false;
             }
             let (xc, yc, zc) = (q_c[0], q_c[1], q_c[2]);
             let z2 = zc * zc;
-            // Projection Jacobian P (2x3) and per-channel Hessians Π_u, Π_v (eqs 10-11).
+            // Projection Jacobian P (2x3) and per-channel Hessians.
             let proj = Matrix2x3::new(fx / zc, 0.0, -fx * xc / z2, 0.0, fy / zc, -fy * yc / z2);
             let pi_u = Matrix3::new(
                 0.0,
@@ -879,15 +790,15 @@ fn iekf_update_3d(
             let pr = proj * r_ca; // (PR)_m weights the action-curvature term
             let pr_u = pr.row(0).transpose();
             let pr_v = pr.row(1).transpose();
-            // Cholesky Σ = L Lᵀ; the columns ℓ_j whiten the directional Hessian.
+            // Cholesky factor: the columns of L whiten the directional Hessian.
             let Some(chol) = feat.sigma.cholesky() else {
                 return true;
             };
             let l = chol.l();
             let mut omega = [Vector3::zeros(); 3];
             let mut alpha = [0.0f64; 3];
-            let mut wxp = [Vector3::zeros(); 3]; // ω_j × p
-            let mut b = [Vector3::zeros(); 3]; // R G ℓ_j
+            let mut wxp = [Vector3::zeros(); 3];
+            let mut b = [Vector3::zeros(); 3];
             for j in 0..3 {
                 let lj = l.column(j).into_owned();
                 let oj = m2g_top * lj;
@@ -896,9 +807,8 @@ fn iekf_update_3d(
                 wxp[j] = oj.cross(&p);
                 b[j] = rg * lj;
             }
-            // Whitened output Hessians H̃_u, H̃_v (symmetric 3x3, eq 9 + eq 13):
-            //   (H̃_m)_{ij} = b_iᵀ Π_m b_j + (PR)_m · B(ℓ_i, ℓ_j),
-            // B the polarization of the SOT(3) action's quadratic term q_a^{(2)}.
+            // Whitened output Hessians. B is the polarization of the SOT(3)
+            // action quadratic term.
             let mut ht_u = Matrix3::zeros();
             let mut ht_v = Matrix3::zeros();
             for i in 0..3 {
@@ -916,10 +826,10 @@ fn iekf_update_3d(
                     ht_v[(j, i)] = hv;
                 }
             }
-            // Bias-corrected prediction ŷ_m = h_m(0) + ½ tr(H̃_m) (eq 5).
+            // Bias-corrected prediction.
             let y_pred = Vector2::new(fx * xc / zc + cx, fy * yc / zc + cy);
             let y_hat = y_pred + 0.5 * Vector2::new(ht_u.trace(), ht_v.trace());
-            // Inflation Λ_kl = ½ tr(H̃_k H̃_l) = ½ <H̃_k, H̃_l>_F  (Gram, PSD) (eq 6).
+            // Second-order innovation inflation (Gram, PSD).
             let lam_uv = 0.5 * ht_u.dot(&ht_v);
             let lambda = Matrix2::new(0.5 * ht_u.dot(&ht_u), lam_uv, lam_uv, 0.5 * ht_v.dot(&ht_v));
             let s = c * feat.sigma * c.transpose() + r_meas + lambda;
@@ -935,7 +845,7 @@ fn iekf_update_3d(
             if settings.mahalanobis_reset_chi2 > 0.0 && maha_sq > settings.mahalanobis_reset_chi2 {
                 return false;
             }
-            // Cross-cov is Σ Cᵀ to this order, so the gain keeps the EKF shape (eq 7-8).
+            // Cross-covariance keeps the EKF gain shape to this order.
             let gain = feat.sigma * c.transpose() * s_inv;
             let full_delta = gain * residual;
             let p_post = feat.sigma - gain * s * gain.transpose();
@@ -1057,6 +967,7 @@ fn init_cov_3d(
     z_obs: f64,
     drive: f64,
     baseline_tau_sq: f64,
+    anchor_pose_cov: &Matrix3<f64>,
 ) -> Matrix3<f64> {
     let z = z_obs.max(settings.min_depth);
     let x_over_z = position[0] / z;
@@ -1070,6 +981,7 @@ fn init_cov_3d(
     };
     let j_depth = Vector3::new(x_over_z, y_over_z, 1.0);
     p_euc += var_z * (j_depth * j_depth.transpose());
+    p_euc += anchor_pose_cov;
 
     let m = euc_to_chart_jac(chart, position);
     let mut cov = m * p_euc * m.transpose();
@@ -1207,16 +1119,74 @@ fn update_beta(settings: &SparseVogSettings, feat: &mut FeatureState3D, w1: f64,
     feat.b = new_b.clamp(settings.ab_min, settings.ab_max);
 }
 
-fn baseline_tau(p_vv: Option<&Matrix3<f64>>, t: &Vector3<f64>, dt_total: f64, dt: f64) -> f64 {
+fn baseline_tau(p_vv: Option<&Matrix3<f64>>, t: &Vector3<f64>) -> f64 {
     let Some(p_vv) = p_vv else {
         return 0.0;
     };
     let norm_sq = t.norm_squared();
-    if norm_sq <= 1e-16 || dt <= 0.0 {
+    if norm_sq <= 1e-16 {
         return 0.0;
     }
     let t_hat = t / norm_sq.sqrt();
-    dt_total * dt * (t_hat.transpose() * p_vv * t_hat)[(0, 0)] / norm_sq
+    (t_hat.transpose() * p_vv * t_hat)[(0, 0)] / norm_sq
+}
+
+fn current_anchor_rotation_init_cov(
+    k: &Matrix3<f64>,
+    uv_ref: &Vector2<f64>,
+    uv_curr: &Vector2<f64>,
+    r_ref: &Matrix3<f64>,
+    t_ref: &Vector3<f64>,
+    position: &Vector3<f64>,
+    p_ww: Option<&Matrix3<f64>>,
+) -> Matrix3<f64> {
+    let Some(p_ww) = p_ww else {
+        return Matrix3::zeros();
+    };
+    let x_curr = (uv_curr[0] - k[(0, 2)]) / k[(0, 0)];
+    let y_curr = (uv_curr[1] - k[(1, 2)]) / k[(1, 1)];
+    let x_prev = (uv_ref[0] - k[(0, 2)]) / k[(0, 0)];
+    let y_prev = (uv_ref[1] - k[(1, 2)]) / k[(1, 1)];
+    let b_curr = Vector3::new(x_curr, y_curr, 1.0);
+    let b_prev = Vector3::new(x_prev, y_prev, 1.0);
+    let aligned = r_ref * b_prev;
+    if aligned[2].abs() <= 1e-12 {
+        return Matrix3::zeros();
+    }
+    let x_prev_rect = aligned[0] / aligned[2];
+    let y_prev_rect = aligned[1] / aligned[2];
+    let n = Vector2::new(
+        x_prev_rect * t_ref[2] - t_ref[0],
+        y_prev_rect * t_ref[2] - t_ref[1],
+    );
+    let d = Vector2::new(x_prev_rect - x_curr, y_prev_rect - y_curr);
+    let g = n.dot(&n);
+    let h = n.dot(&d);
+    if h.abs() <= 1e-12 || g <= 1e-24 {
+        return Matrix3::zeros();
+    }
+
+    let mut j = Matrix3::zeros();
+    for axis in 0..3 {
+        let da = base_skew(&aligned).column(axis).into_owned();
+        let dt = base_skew(t_ref).column(axis).into_owned();
+        let dx = (da[0] * aligned[2] - aligned[0] * da[2]) / (aligned[2] * aligned[2]);
+        let dy = (da[1] * aligned[2] - aligned[1] * da[2]) / (aligned[2] * aligned[2]);
+        let dn = Vector2::new(
+            dx * t_ref[2] + x_prev_rect * dt[2] - dt[0],
+            dy * t_ref[2] + y_prev_rect * dt[2] - dt[1],
+        );
+        let dd = Vector2::new(dx, dy);
+        let dg = 2.0 * n.dot(&dn);
+        let dh = dn.dot(&d) + n.dot(&dd);
+        let dz = (dg * h - g * dh) / (h * h);
+        let dq_est = b_curr * dz;
+        let dq_true = base_skew(position).column(axis).into_owned();
+        j.set_column(axis, &(dq_est - dq_true));
+    }
+
+    let cov = j * p_ww * j.transpose();
+    0.5 * (cov + cov.transpose())
 }
 
 fn triangulate_pixel(

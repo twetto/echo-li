@@ -541,6 +541,56 @@ impl VIOFilter {
     pub fn state_estimate(&self) -> VIOState {
         self.eqf.state_estimate()
     }
+
+    pub fn sparse_camera_pose_covariances(&self) -> Option<(Matrix3<f64>, Matrix3<f64>)> {
+        let state = self.eqf.state_estimate();
+        let cov = sparse_camera_pose_covariance(&state, &self.eqf.sigma)?;
+        if cov.iter().any(|v| !v.is_finite()) {
+            return None;
+        }
+        let p_ww = cov.fixed_view::<3, 3>(0, 0).into_owned();
+        let p_vv = cov.fixed_view::<3, 3>(3, 3).into_owned();
+        Some((p_vv, p_ww))
+    }
+}
+
+fn sparse_camera_pose_jacobian(state: &VIOState) -> SMatrix<f64, 6, 21> {
+    let adj = state.sensor.camera_offset.inverse().adjoint();
+    let mut j = SMatrix::<f64, 6, 21>::zeros();
+    j.fixed_view_mut::<6, 6>(0, 6).copy_from(&adj);
+    j.fixed_view_mut::<6, 6>(0, 15)
+        .copy_from(&SMatrix::<f64, 6, 6>::identity());
+    j
+}
+
+fn sparse_camera_pose_covariance(
+    state: &VIOState,
+    sigma: &DMatrix<f64>,
+) -> Option<SMatrix<f64, 6, 6>> {
+    if sigma.nrows() < 21 || sigma.ncols() < 21 {
+        return None;
+    }
+
+    let j = sparse_camera_pose_jacobian(state);
+    let mut cov = SMatrix::<f64, 6, 6>::zeros();
+    for r in 0..6 {
+        for c in 0..6 {
+            let mut v = 0.0;
+            for a in 0..21 {
+                for b in 0..21 {
+                    v += j[(r, a)] * sigma[(a, b)] * j[(c, b)];
+                }
+            }
+            cov[(r, c)] = v;
+        }
+    }
+
+    cov = 0.5 * (cov + cov.transpose());
+    if cov.iter().all(|v| v.is_finite()) {
+        Some(cov)
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -851,5 +901,98 @@ mod landmark_init_selection_tests {
             select_new_landmark_ids(&coords, &HashSet::new(), &priors, &HashSet::new(), false, 1);
 
         assert_eq!(selected, vec![1]);
+    }
+}
+
+#[cfg(test)]
+mod sparse_camera_pose_covariance_tests {
+    use super::*;
+    use echo_lie::{SE3, SO3};
+    use nalgebra::{DMatrix, SVector, Vector6};
+
+    fn make_state() -> VIOState {
+        VIOState::new(
+            VIOSensorState {
+                input_bias: Vector6::zeros(),
+                pose: SE3::new(
+                    SO3::exp(&Vector3::new(0.13, -0.07, 0.19)),
+                    Vector3::new(1.2, -0.4, 0.8),
+                ),
+                velocity: Vector3::new(0.3, -0.2, 0.1),
+                camera_offset: SE3::new(
+                    SO3::exp(&Vector3::new(-0.04, 0.08, 0.03)),
+                    Vector3::new(0.12, -0.03, 0.04),
+                ),
+            },
+            Vec::new(),
+        )
+    }
+
+    fn camera_pose(state: &VIOState) -> SE3 {
+        state.sensor.pose.compose(&state.sensor.camera_offset)
+    }
+
+    #[test]
+    fn sparse_camera_pose_jacobian_matches_finite_difference() {
+        let state = make_state();
+        let base = camera_pose(&state);
+        let analytic = sparse_camera_pose_jacobian(&state);
+        let h = 1e-7;
+        let mut numeric = SMatrix::<f64, 6, 21>::zeros();
+
+        for col in 0..21 {
+            let mut perturbed = state.clone();
+            let mut dx = SVector::<f64, 6>::zeros();
+            if (6..12).contains(&col) {
+                dx[col - 6] = h;
+                perturbed.sensor.pose = perturbed.sensor.pose.compose(&SE3::exp(&dx));
+            } else if (15..21).contains(&col) {
+                dx[col - 15] = h;
+                perturbed.sensor.camera_offset =
+                    perturbed.sensor.camera_offset.compose(&SE3::exp(&dx));
+            } else {
+                continue;
+            }
+
+            let right_delta = base.inverse().compose(&camera_pose(&perturbed)).log() / h;
+            numeric.set_column(col, &right_delta);
+        }
+
+        let diff = analytic - numeric;
+        assert!(
+            diff.norm() < 1e-7,
+            "camera pose covariance Jacobian mismatch: norm={:.3e}\nanalytic={:?}\nnumeric={:?}",
+            diff.norm(),
+            analytic,
+            numeric
+        );
+    }
+
+    #[test]
+    fn sparse_camera_pose_covariance_is_j_sigma_jt() {
+        let state = make_state();
+        let mut sigma = DMatrix::<f64>::zeros(21, 21);
+        for r in 0..21 {
+            for c in 0..21 {
+                sigma[(r, c)] = ((r + 1) as f64 * 0.07).sin() * ((c + 2) as f64 * 0.11).cos();
+            }
+        }
+        sigma = &sigma * sigma.transpose() + DMatrix::<f64>::identity(21, 21) * 1e-6;
+
+        let got = sparse_camera_pose_covariance(&state, &sigma).unwrap();
+        let j = sparse_camera_pose_jacobian(&state);
+        let mut expected = SMatrix::<f64, 6, 6>::zeros();
+        for r in 0..6 {
+            for c in 0..6 {
+                for a in 0..21 {
+                    for b in 0..21 {
+                        expected[(r, c)] += j[(r, a)] * sigma[(a, b)] * j[(c, b)];
+                    }
+                }
+            }
+        }
+        expected = 0.5 * (expected + expected.transpose());
+
+        assert!((got - expected).norm() < 1e-10);
     }
 }
