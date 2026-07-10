@@ -1,3 +1,5 @@
+pub mod bearing_chart;
+
 use std::collections::{HashMap, HashSet};
 
 use echo_lie::SOT3;
