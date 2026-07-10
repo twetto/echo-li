@@ -950,23 +950,16 @@ fn build_sparse_filter(
     args: &Args,
     vio_config: Option<&VIOConfig>,
     k_matrix: Matrix3<f64>,
+    cam_model: &Arc<dyn CameraModel>,
     tracker_max_features: usize,
 ) -> Option<Sparse3DFilter> {
-    // The sparse filter is fed pixels ALREADY undistorted into the pinhole-K
-    // domain (see `undistorted_pinhole_measurement`), so the bearing chart's
-    // camera must be a plain pinhole with the same K — undistorting again with
-    // the real (rad-tan / fisheye) model would double-undistort. Wide-FoV support
-    // requires feeding raw pixels + the real camera instead; that is separate.
-    let fx = k_matrix[(0, 0)];
-    let fy = k_matrix[(1, 1)];
-    let cx = k_matrix[(0, 2)];
-    let cy = k_matrix[(1, 2)];
+    // The bearing chart consumes RAW pixels and undistorts once through the real
+    // camera (see the sparse-update call site) — no legacy pinhole projection.
+    // The old pinhole/K charts still take `undistorted_pinhole_measurement`.
     let build = |chart, settings: SparseVogSettings| {
         let filter = Sparse3DFilter::new(k_matrix, chart, settings);
         if chart == Sparse3DChart::BearingInvDepthAdditive {
-            let pinhole: Arc<dyn CameraModel> =
-                Arc::new(CameraProjection::pinhole([fx, fy, cx, cy], [0, 0]));
-            filter.with_camera(pinhole)
+            filter.with_camera(cam_model.clone())
         } else {
             filter
         }
@@ -1324,8 +1317,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             patch_depth_cov_vis_max
         );
     }
-    let mut sparse_filter =
-        build_sparse_filter(&args, vio_config.as_ref(), k_matrix, tracker_max_features);
+    let mut sparse_filter = build_sparse_filter(
+        &args,
+        vio_config.as_ref(),
+        k_matrix,
+        &cam_model,
+        tracker_max_features,
+    );
     let mut states_out: Vec<(f64, VIOState)> = Vec::new();
     let mut imu_count: usize = 0;
     let mut vision_count: usize = 0;
@@ -1594,7 +1592,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .as_ref()
                             .map(|(p_vv, p_ww)| (Some(p_vv), Some(p_ww)))
                             .unwrap_or((None, None));
-                        sparse.update(&sparse_measurement, &t_wc, p_vv, p_ww);
+                        // The bearing chart takes RAW pixels and undistorts once
+                        // through its real camera; the legacy pinhole/K charts take
+                        // the pre-undistorted pinhole-K measurement.
+                        let sparse_meas =
+                            if sparse.chart() == Sparse3DChart::BearingInvDepthAdditive {
+                                &measurement
+                            } else {
+                                &sparse_measurement
+                            };
+                        sparse.update(sparse_meas, &t_wc, p_vv, p_ww);
                         if let Some(mapper) = &mut patch_depth_mapper {
                             if !patch_gray_data.is_empty() {
                                 let frame = FrameProducts {
