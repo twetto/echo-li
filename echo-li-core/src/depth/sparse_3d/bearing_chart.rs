@@ -13,11 +13,6 @@
 //! central bearing `b0 = normalize(alpha, beta, 1)` the two represent the same
 //! anchor point, but the tangent chart stays well-conditioned for any camera
 //! model (fisheye, wide FoV). See `sparse3d_bearing_camera_plan.md`.
-//!
-//! These primitives are wired into `Sparse3DChart::BearingInvDepthAdditive` in a
-//! follow-up commit; kept standalone here so the chart math is tested in
-//! isolation first.
-#![allow(dead_code)]
 
 use nalgebra::{Matrix3, Matrix3x2, Vector2, Vector3};
 

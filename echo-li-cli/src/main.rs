@@ -160,6 +160,9 @@ fn parse_sparse_chart(name: &str) -> Sparse3DChart {
         "invdepth_additive3d" | "invdepth-additive" | "rho3d" | "rho" | "additive" => {
             Sparse3DChart::InvDepthAdditive
         }
+        "bearing_invdepth_additive3d" | "bearing-additive" | "bearing" => {
+            Sparse3DChart::BearingInvDepthAdditive
+        }
         "invdepth" | "invdepth3d" | "inverse-depth" => Sparse3DChart::InvDepth,
         _ => Sparse3DChart::Polar,
     }
@@ -949,6 +952,25 @@ fn build_sparse_filter(
     k_matrix: Matrix3<f64>,
     tracker_max_features: usize,
 ) -> Option<Sparse3DFilter> {
+    // The sparse filter is fed pixels ALREADY undistorted into the pinhole-K
+    // domain (see `undistorted_pinhole_measurement`), so the bearing chart's
+    // camera must be a plain pinhole with the same K — undistorting again with
+    // the real (rad-tan / fisheye) model would double-undistort. Wide-FoV support
+    // requires feeding raw pixels + the real camera instead; that is separate.
+    let fx = k_matrix[(0, 0)];
+    let fy = k_matrix[(1, 1)];
+    let cx = k_matrix[(0, 2)];
+    let cy = k_matrix[(1, 2)];
+    let build = |chart, settings: SparseVogSettings| {
+        let filter = Sparse3DFilter::new(k_matrix, chart, settings);
+        if chart == Sparse3DChart::BearingInvDepthAdditive {
+            let pinhole: Arc<dyn CameraModel> =
+                Arc::new(CameraProjection::pinhole([fx, fy, cx, cy], [0, 0]));
+            filter.with_camera(pinhole)
+        } else {
+            filter
+        }
+    };
     if let Some(sparse_conf) = vio_config.and_then(|c| c.sparse_vog.as_ref()) {
         if !sparse_conf.enabled {
             println!("Sparse filter: disabled by config");
@@ -960,7 +982,7 @@ fn build_sparse_filter(
             "Sparse filter: {:?}, max_pool_size={}",
             chart, settings.max_pool_size
         );
-        return Some(Sparse3DFilter::new(k_matrix, chart, settings));
+        return Some(build(chart, settings));
     }
     if args.sparse {
         let chart = parse_sparse_chart(&args.sparse_chart);
@@ -970,7 +992,7 @@ fn build_sparse_filter(
             "Sparse filter: {:?}, max_pool_size={}",
             chart, settings.max_pool_size
         );
-        return Some(Sparse3DFilter::new(k_matrix, chart, settings));
+        return Some(build(chart, settings));
     }
     None
 }

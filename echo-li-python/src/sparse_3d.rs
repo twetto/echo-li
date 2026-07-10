@@ -63,6 +63,29 @@ impl PySparse3DFilter {
         })
     }
 
+    #[staticmethod]
+    #[pyo3(signature = (fx, fy, cx, cy, **kwargs))]
+    fn bearing_invdepth_additive3d(
+        fx: f64,
+        fy: f64,
+        cx: f64,
+        cy: f64,
+        kwargs: Option<&Bound<'_, pyo3::types::PyDict>>,
+    ) -> PyResult<Self> {
+        let k = intrinsics_matrix(fx, fy, cx, cy);
+        let settings = parse_settings(kwargs)?;
+        // Pixels reach the filter already undistorted into the pinhole-K domain,
+        // so a pinhole camera is the matching projection here.
+        let cam: std::sync::Arc<dyn echo_li_core::mathematical::camera::CameraModel> =
+            std::sync::Arc::new(camera_geometry::CameraProjection::pinhole(
+                [fx, fy, cx, cy],
+                [0, 0],
+            ));
+        Ok(Self {
+            inner: Sparse3DFilter::bearing_invdepth3d(k, cam, settings),
+        })
+    }
+
     #[pyo3(signature = (stamp, feature_uvs, t_wc, p_vv=None, p_ww=None))]
     fn update(
         &mut self,

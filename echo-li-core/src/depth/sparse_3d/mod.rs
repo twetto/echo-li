@@ -1,6 +1,7 @@
 pub mod bearing_chart;
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use echo_lie::SOT3;
 use nalgebra::{Matrix2, Matrix2x3, Matrix3, Matrix3x2, Matrix4, Vector2, Vector3, Vector4};
@@ -9,7 +10,14 @@ use crate::coordinate_suite::base_skew;
 use crate::coordinate_suite::invdepth::{conv_euc2ind, conv_ind2euc, point_chart_invdepth_inv};
 use crate::coordinate_suite::normal::{conv_euc2normal, conv_normal2euc, point_chart_normal_inv};
 use crate::depth::sparse_gb::{SecondOrderMode, SparseVogSettings};
+use crate::mathematical::camera::CameraModel;
 use crate::mathematical::vision_measurement::VisionMeasurement;
+
+/// Minimum sine of the ray-angle between the two views before a
+/// `BearingInvDepthAdditive` landmark may be triangulated at birth. This is only
+/// a numerical-degeneracy floor; birth-covariance inflation (~1/parallax^2) plus
+/// `conv_variance_threshold` do the quality gating.
+const BEARING_MIN_PARALLAX_SIN: f64 = 0.02;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sparse3DChart {
@@ -24,6 +32,13 @@ pub enum Sparse3DChart {
     /// This is the only chart that currently applies external camera pose
     /// covariance as measurement-side uncertainty.
     InvDepthAdditive,
+    /// Camera-model-agnostic sibling of `InvDepthAdditive`: the same additive
+    /// inverse-range EKF, but the anchor point is parameterized on a local
+    /// tangent-bearing chart `P = b(eta)/rho` (see `bearing_chart`) instead of
+    /// the pinhole plane, and projection goes through the shared `CameraModel`
+    /// (`project`/`projection_jacobian`). Handles fisheye / wide FoV; requires a
+    /// camera to be attached to the filter.
+    BearingInvDepthAdditive,
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +68,12 @@ pub struct FeatureState3D {
     // covariance directly (chart_to_euc_jac == I for InvDepthAdditive).
     pub inv_s: Vector3<f64>,
     pub inv_p: Matrix3<f64>,
+    // BearingInvDepthAdditive only: fixed anchor unit bearing `b0` and its
+    // orthonormal tangent basis `U`. Here `inv_s = (eta1, eta2, rho)` and the
+    // anchor point is `P = b(eta)/rho`, `b(eta) = normalize(b0 + U eta)`.
+    // Zero/unused for the other charts.
+    pub anchor_ray: Vector3<f64>,
+    pub tangent_basis: Matrix3x2<f64>,
     pub anchor_t_wc: Matrix4<f64>, // camera->world pose at the anchor (creation) frame
     // --- Gaussian-Beta inlier model + bookkeeping ---
     pub a: f64,
@@ -70,7 +91,9 @@ impl FeatureState3D {
     pub fn depth_for_chart(&self, chart: Sparse3DChart) -> f64 {
         match chart {
             Sparse3DChart::Polar => self.position.norm(),
-            Sparse3DChart::InvDepth | Sparse3DChart::InvDepthAdditive => self.position[2],
+            Sparse3DChart::InvDepth
+            | Sparse3DChart::InvDepthAdditive
+            | Sparse3DChart::BearingInvDepthAdditive => self.position[2],
         }
     }
 
@@ -94,7 +117,7 @@ impl FeatureState3D {
                 }
             }
             // Cached covariance is already Euclidean (current frame) here.
-            Sparse3DChart::InvDepthAdditive => {
+            Sparse3DChart::InvDepthAdditive | Sparse3DChart::BearingInvDepthAdditive => {
                 if self.position[2] < 1e-6 {
                     f64::INFINITY
                 } else {
@@ -132,6 +155,9 @@ impl FeatureState3D {
 
 pub struct Sparse3DFilter {
     k: Matrix3<f64>,
+    /// Shared calibrated camera, required by `BearingInvDepthAdditive` for
+    /// generic projection; unused by the pinhole/K charts.
+    camera: Option<Arc<dyn CameraModel>>,
     chart: Sparse3DChart,
     settings: SparseVogSettings,
     sigma_norm_sq: f64,
@@ -148,6 +174,7 @@ impl Sparse3DFilter {
         let sigma_norm_sq = (settings.sigma_pixel / k[(0, 0)]).powi(2);
         Self {
             k,
+            camera: None,
             chart,
             settings,
             sigma_norm_sq,
@@ -158,6 +185,23 @@ impl Sparse3DFilter {
             prev_t_wc: None,
             prev_stamp: -1.0,
         }
+    }
+
+    /// Attach the shared calibrated camera (required for
+    /// `BearingInvDepthAdditive`).
+    pub fn with_camera(mut self, camera: Arc<dyn CameraModel>) -> Self {
+        self.camera = Some(camera);
+        self
+    }
+
+    /// Camera-agnostic tangent-bearing inverse-range EKF
+    /// (`BearingInvDepthAdditive`); needs a camera via [`Self::with_camera`].
+    pub fn bearing_invdepth3d(
+        k: Matrix3<f64>,
+        camera: Arc<dyn CameraModel>,
+        settings: SparseVogSettings,
+    ) -> Self {
+        Self::new(k, Sparse3DChart::BearingInvDepthAdditive, settings).with_camera(camera)
     }
 
     pub fn polar3d(k: Matrix3<f64>, settings: SparseVogSettings) -> Self {
@@ -209,6 +253,7 @@ impl Sparse3DFilter {
             let chart = self.chart;
             let settings = self.settings.clone();
             let k = self.k;
+            let cam = self.camera.as_deref();
             self.features
                 .par_iter_mut()
                 .filter_map(|feat| {
@@ -218,7 +263,7 @@ impl Sparse3DFilter {
                     }
                     let uv_curr = curr_uvs.get(&fid)?;
                     (!update_feature_3d(
-                        chart, &k, &settings, feat, uv_curr, &t_cw_curr, p_vv, p_ww, dt,
+                        chart, &k, cam, &settings, feat, uv_curr, &t_cw_curr, p_vv, p_ww, dt,
                     ))
                     .then_some(fid)
                 })
@@ -228,6 +273,7 @@ impl Sparse3DFilter {
         #[cfg(not(feature = "parallel"))]
         let reset_features = {
             let mut reset_features = Vec::new();
+            let cam = self.camera.as_deref();
             for feat in &mut self.features {
                 let fid = feat.feat_id;
                 if !self.prev_uvs.contains_key(&fid) {
@@ -241,6 +287,7 @@ impl Sparse3DFilter {
                 if !update_feature_3d(
                     self.chart,
                     &self.k,
+                    cam,
                     &self.settings,
                     feat,
                     uv_curr,
@@ -287,6 +334,77 @@ impl Sparse3DFilter {
             let t_curr_ref = t_cw_curr * pending.ref_t_wc;
             let r_ref = t_curr_ref.fixed_view::<3, 3>(0, 0).into_owned();
             let t_ref = t_curr_ref.fixed_view::<3, 1>(0, 3).into_owned();
+
+            // Camera-agnostic bearing-chart birth: two-view ray triangulation on
+            // unit bearings, anchored in the current frame at eta = 0. (The
+            // rigorous birth covariance is refined in a follow-up; here it is a
+            // pragmatic angular/range diagonal.)
+            if self.chart == Sparse3DChart::BearingInvDepthAdditive {
+                let Some(cam) = self.camera.clone() else {
+                    continue;
+                };
+                if (uv_curr - pending.ref_uv).norm() < self.settings.reanchor_flow_px {
+                    continue;
+                }
+                let b0 = cam.undistort(&uv_curr);
+                let b_prev = cam.undistort(&pending.ref_uv);
+                // Parallax gate: two-view triangulation is severely biased toward
+                // the camera at low parallax. Require enough ray-angle between the
+                // two bearings (in the current frame) before birthing.
+                let b_prev_c = (r_ref * b_prev).normalize();
+                if b0.cross(&b_prev_c).norm() < BEARING_MIN_PARALLAX_SIN {
+                    continue;
+                }
+                let Some((range_anchor, _)) =
+                    bearing_chart::two_ray_ranges(&b0, &b_prev, &r_ref, &t_ref)
+                else {
+                    continue;
+                };
+                if !range_anchor.is_finite()
+                    || range_anchor < self.settings.min_depth
+                    || range_anchor > self.settings.max_depth
+                {
+                    continue;
+                }
+                let u = bearing_chart::tangent_basis(&b0);
+                let rho = 1.0 / range_anchor;
+                let inv_s = Vector3::new(0.0, 0.0, rho);
+                let focal = 0.5 * (self.k[(0, 0)] + self.k[(1, 1)]);
+                let sigma_eta = self.settings.sigma_pixel / focal;
+                let rho_var = (self.settings.init_depth_var / range_anchor.powi(4)).max(1e-12);
+                let inv_p = Matrix3::from_diagonal(&Vector3::new(
+                    sigma_eta * sigma_eta,
+                    sigma_eta * sigma_eta,
+                    rho_var,
+                ));
+                let (position, j0) =
+                    bearing_chart::point_and_jacobian(&b0, &u, &Vector2::zeros(), rho);
+                let cov_euc = j0 * inv_p * j0.transpose();
+                let cov_euc = 0.5 * (cov_euc + cov_euc.transpose());
+                let feat = FeatureState3D {
+                    feat_id: fid,
+                    position,
+                    covariance: cov_euc,
+                    q0: position,
+                    x: SOT3::identity(),
+                    sigma: cov_euc,
+                    inv_s,
+                    inv_p,
+                    anchor_ray: b0,
+                    tangent_basis: u,
+                    anchor_t_wc: *t_wc,
+                    a: self.settings.a_init,
+                    b: self.settings.b_init,
+                    track_length: 1,
+                    ref_uv: uv_curr,
+                    ref_stamp: stamp,
+                    last_nis: f64::NAN,
+                };
+                self.insert_feature(feat);
+                self.pending.remove(&fid);
+                continue;
+            }
+
             let (z_obs, drive) = triangulate_pixel(
                 &self.k,
                 &self.settings,
@@ -354,6 +472,8 @@ impl Sparse3DFilter {
                 sigma,
                 inv_s,
                 inv_p,
+                anchor_ray: Vector3::zeros(),
+                tangent_basis: Matrix3x2::zeros(),
                 anchor_t_wc: *t_wc,
                 a: self.settings.a_init,
                 b: self.settings.b_init,
@@ -471,8 +591,10 @@ fn chart_to_euc_jac(chart: Sparse3DChart, q: &Vector3<f64>) -> Matrix3<f64> {
     match chart {
         Sparse3DChart::Polar => conv_normal2euc(q),
         Sparse3DChart::InvDepth => conv_ind2euc(q),
-        // The additive chart caches `covariance` already in Euclidean coords.
-        Sparse3DChart::InvDepthAdditive => Matrix3::identity(),
+        // The additive charts cache `covariance` already in Euclidean coords.
+        Sparse3DChart::InvDepthAdditive | Sparse3DChart::BearingInvDepthAdditive => {
+            Matrix3::identity()
+        }
     }
 }
 
@@ -480,7 +602,9 @@ fn euc_to_chart_jac(chart: Sparse3DChart, q: &Vector3<f64>) -> Matrix3<f64> {
     match chart {
         Sparse3DChart::Polar => conv_euc2normal(q),
         Sparse3DChart::InvDepth => conv_euc2ind(q),
-        Sparse3DChart::InvDepthAdditive => Matrix3::identity(),
+        Sparse3DChart::InvDepthAdditive | Sparse3DChart::BearingInvDepthAdditive => {
+            Matrix3::identity()
+        }
     }
 }
 
@@ -488,17 +612,19 @@ fn apply_chart_delta(chart: Sparse3DChart, q: &Vector3<f64>, delta: &Vector3<f64
     match chart {
         Sparse3DChart::Polar => point_chart_normal_inv(delta, q),
         Sparse3DChart::InvDepth => point_chart_invdepth_inv(delta, q),
-        // additive chart applies the delta in (alpha,beta,rho); not used via this
+        // additive charts apply the delta in chart coords; not used via this
         // helper (the additive update is self-contained), but keep the match total.
-        Sparse3DChart::InvDepthAdditive => q + delta,
+        Sparse3DChart::InvDepthAdditive | Sparse3DChart::BearingInvDepthAdditive => q + delta,
     }
 }
 
 /// Per-landmark measurement update, dispatched by chart: the SOT(3) IEKF for
 /// `Polar`/`InvDepth`, the additive inverse-depth EKF for `InvDepthAdditive`.
+#[allow(clippy::too_many_arguments)]
 fn update_feature_3d(
     chart: Sparse3DChart,
     k: &Matrix3<f64>,
+    cam: Option<&dyn CameraModel>,
     settings: &SparseVogSettings,
     feat: &mut FeatureState3D,
     uv_obs: &Vector2<f64>,
@@ -511,6 +637,13 @@ fn update_feature_3d(
         Sparse3DChart::InvDepthAdditive => {
             invdepth_additive_update_3d(k, settings, feat, uv_obs, t_cw_curr, p_vv, p_ww, dt)
         }
+        Sparse3DChart::BearingInvDepthAdditive => match cam {
+            Some(cam) => bearing_invdepth_additive_update_3d(
+                cam, k, settings, feat, uv_obs, t_cw_curr, p_vv, p_ww, dt,
+            ),
+            // No camera attached: cannot project. Drop the track.
+            None => false,
+        },
         _ => iekf_update_3d(chart, k, settings, feat, uv_obs, t_cw_curr, p_vv, p_ww, dt),
     }
 }
@@ -664,6 +797,132 @@ fn invdepth_additive_update_3d(
     // Refresh cached current-frame estimate + Euclidean covariance for the API.
     let j_g = r_ca * jpa_of(&feat.inv_s); // dP_cur/ds
     feat.position = r_ca * pa_of(&feat.inv_s) + t_ca_t;
+    let cov_euc = j_g * feat.inv_p * j_g.transpose();
+    feat.covariance = 0.5 * (cov_euc + cov_euc.transpose());
+    true
+}
+
+/// Camera-agnostic additive inverse-range EKF update on the tangent-bearing
+/// chart. Structurally identical to [`invdepth_additive_update_3d`]; only the
+/// anchor parameterization (`P = b(eta)/rho` via [`bearing_chart`]) and the
+/// projection (`cam.project` / `cam.projection_jacobian`) differ. `k` is used
+/// only for the Gaussian-Beta outlier density scale.
+#[allow(clippy::too_many_arguments)]
+fn bearing_invdepth_additive_update_3d(
+    cam: &dyn CameraModel,
+    k: &Matrix3<f64>,
+    settings: &SparseVogSettings,
+    feat: &mut FeatureState3D,
+    uv_obs: &Vector2<f64>,
+    t_cw_curr: &Matrix4<f64>,
+    p_vv: Option<&Matrix3<f64>>,
+    p_ww: Option<&Matrix3<f64>>,
+    dt: f64,
+) -> bool {
+    let fx = k[(0, 0)];
+    let fy = k[(1, 1)];
+
+    let t_ca = t_cw_curr * feat.anchor_t_wc;
+    let r_ca = t_ca.fixed_view::<3, 3>(0, 0).into_owned();
+    let t_ca_t = t_ca.fixed_view::<3, 1>(0, 3).into_owned();
+
+    // anchor-frame point P(s) and its Jacobian dP/ds on the bearing chart.
+    let b0 = feat.anchor_ray;
+    let u = feat.tangent_basis;
+    let pj_of = |s: &Vector3<f64>| {
+        let eta = Vector2::new(s[0], s[1]);
+        bearing_chart::point_and_jacobian(&b0, &u, &eta, s[2])
+    };
+
+    if dt > 0.0 && settings.range_walk_var > 0.0 {
+        let (pa, jpa) = pj_of(&feat.inv_s);
+        let q_c = r_ca * pa + t_ca_t;
+        if q_c[2] > settings.min_depth {
+            let j_g = r_ca * jpa;
+            if let Some(j_inv) = j_g.try_inverse() {
+                let r_hat = q_c / q_c.norm();
+                let q_cur =
+                    settings.range_walk_var * q_c.norm_squared() * (r_hat * r_hat.transpose());
+                let sigma = feat.inv_p + j_inv * q_cur * j_inv.transpose();
+                feat.inv_p = 0.5 * (sigma + sigma.transpose());
+            }
+        }
+    }
+
+    let mut r_meas = Matrix2::identity() * settings.sigma_pixel.powi(2);
+
+    let (pa, jpa) = pj_of(&feat.inv_s);
+    let q_c = r_ca * pa + t_ca_t;
+    if q_c[2] < settings.min_depth {
+        return false;
+    }
+    let proj = cam.projection_jacobian(&q_c); // dpixel/dP_cam (2x3)
+    // Measurement-side pose uncertainty (see invdepth_additive_update_3d).
+    if dt > 0.0 {
+        if let Some(pvv) = p_vv {
+            r_meas += proj * pvv * proj.transpose();
+        }
+        if let Some(pww) = p_ww {
+            let jphi = proj * base_skew(&q_c);
+            r_meas += jphi * pww * jphi.transpose();
+        }
+    }
+    let c = proj * r_ca * jpa; // dh/ds (2x3)
+    let s_mat = c * feat.inv_p * c.transpose() + r_meas;
+    let Some(s_inv) = (s_mat + Matrix2::identity() * 1e-8).try_inverse() else {
+        return true;
+    };
+    let det_s = s_mat.determinant();
+    if det_s < 1e-30 {
+        return true;
+    }
+    let y_pred = cam.project(&q_c);
+    let residual = uv_obs - y_pred;
+    let maha_sq = (residual.transpose() * s_inv * residual)[(0, 0)];
+    feat.last_nis = maha_sq;
+    if settings.mahalanobis_reset_chi2 > 0.0 && maha_sq > settings.mahalanobis_reset_chi2 {
+        return false;
+    }
+    let gain = feat.inv_p * c.transpose() * s_inv; // 3x2
+    let full_delta = gain * residual;
+    let i_kc = Matrix3::identity() - gain * c;
+    let p_post = i_kc * feat.inv_p * i_kc.transpose() + gain * r_meas * gain.transpose();
+
+    let gauss_pdf = (-0.5 * maha_sq).exp() / ((2.0 * std::f64::consts::PI).powi(2) * det_s).sqrt();
+    let uniform_prior = 1.0 / (fx * fy * 4.0);
+    let ab = feat.a + feat.b;
+    if ab <= 0.0 {
+        return true;
+    }
+    let c1 = (feat.a / ab) * gauss_pdf;
+    let c2 = (feat.b / ab) * uniform_prior;
+    let z_norm = c1 + c2;
+    if z_norm < 1e-30 {
+        feat.b = (feat.b + 1.0).min(settings.ab_max);
+        return true;
+    }
+    let w1 = c1 / z_norm;
+    let w2 = c2 / z_norm;
+
+    let gamma = w1 * full_delta;
+    let p_new = w1 * p_post + w2 * feat.inv_p + w1 * w2 * (full_delta * full_delta.transpose());
+    if p_new
+        .symmetric_eigen()
+        .eigenvalues
+        .iter()
+        .any(|v| *v <= 0.0 || !v.is_finite())
+    {
+        return true;
+    }
+
+    feat.inv_s += gamma;
+    feat.inv_p = 0.5 * (p_new + p_new.transpose());
+    feat.track_length += 1;
+    update_beta(settings, feat, w1, w2);
+
+    let (pa_new, jpa_new) = pj_of(&feat.inv_s);
+    let j_g = r_ca * jpa_new; // dP_cur/ds
+    feat.position = r_ca * pa_new + t_ca_t;
     let cov_euc = j_g * feat.inv_p * j_g.transpose();
     feat.covariance = 0.5 * (cov_euc + cov_euc.transpose());
     true
@@ -1293,6 +1552,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn bearing_chart_matches_invdepth_for_pinhole_camera() {
+        use crate::mathematical::camera::{CameraModel, PinholeModel};
+        use approx::assert_relative_eq;
+        use std::sync::Arc;
+
+        let cam: Arc<dyn CameraModel> = Arc::new(PinholeModel {
+            fx: 458.0,
+            fy: 458.0,
+            cx: 376.0,
+            cy: 240.0,
+        });
+        let mut f_inv = Sparse3DFilter::invdepth_additive3d(k(), settings());
+        let mut f_bear = Sparse3DFilter::bearing_invdepth3d(k(), cam, settings());
+
+        // Camera translates along x; a fixed world point in front of it.
+        let point_w = Vector3::new(0.5, 0.1, 4.0);
+        let n = 40;
+        for i in 0..n {
+            update_with_point(&mut f_inv, i, point_w);
+            update_with_point(&mut f_bear, i, point_w);
+        }
+
+        let p_inv = f_inv.feature(42).expect("invdepth track").position;
+        let p_bear = f_bear.feature(42).expect("bearing track").position;
+
+        // True current-frame point at the last processed pose. With adequate
+        // parallax the bearing chart converges to the same geometry as the
+        // pinhole chart and to ground truth.
+        let p_true = point_w - Vector3::new((n as f64 - 1.0) * 0.05, 0.0, 0.0);
+        assert_relative_eq!(p_bear, p_inv, epsilon = 0.01);
+        assert_relative_eq!(p_bear, p_true, epsilon = 0.01);
+    }
+
     fn feature(fid: u64) -> FeatureState3D {
         FeatureState3D {
             feat_id: fid,
@@ -1303,6 +1596,8 @@ mod tests {
             sigma: Matrix3::identity(),
             inv_s: Vector3::zeros(),
             inv_p: Matrix3::zeros(),
+            anchor_ray: Vector3::zeros(),
+            tangent_basis: Matrix3x2::zeros(),
             anchor_t_wc: Matrix4::identity(),
             a: 1.0,
             b: 1.0,

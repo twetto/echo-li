@@ -126,6 +126,8 @@ def main():
                     help="score only features with track_length >= this")
     ap.add_argument("--sigma-t", type=float, default=0.0, help="constant p_vv = s^2 I")
     ap.add_argument("--sigma-phi", type=float, default=0.0, help="constant p_ww = s^2 I")
+    ap.add_argument("--chart", default="invdepth", choices=["invdepth", "bearing"],
+                    help="sparse chart to score")
     args = ap.parse_args()
     root = Path(args.dataset)
     if (root/"mav0").exists():
@@ -148,7 +150,11 @@ def main():
     tracker = echo_li.Frontend(fcfg, w, h)
 
     sf_kwargs = dict(sigma_pixel=0.5, min_track_length=1)
-    filt = echo_li.Sparse3DFilter.invdepth_additive3d(fx, fy, cx, cy, **sf_kwargs)
+    if args.chart == "bearing":
+        filt = echo_li.Sparse3DFilter.bearing_invdepth_additive3d(fx, fy, cx, cy, **sf_kwargs)
+    else:
+        filt = echo_li.Sparse3DFilter.invdepth_additive3d(fx, fy, cx, cy, **sf_kwargs)
+    print(f"chart: {args.chart}")
     p_vv = ((args.sigma_t) ** 2 * np.eye(3)).tolist() if args.sigma_t > 0 else None
     p_ww = ((args.sigma_phi) ** 2 * np.eye(3)).tolist() if args.sigma_phi > 0 else None
 
@@ -224,6 +230,8 @@ def main():
         print(f"bias (mean z):            {np.mean(z):7.2f}")
         print(f"rel depth err:            median {np.median(np.abs(rel))*100:5.1f}%  "
               f"p90 {np.percentile(np.abs(rel), 90)*100:5.1f}%")
+        print(f"SIGNED rel depth err:     median {np.median(rel)*100:+5.1f}%  "
+              f"mean {np.mean(rel)*100:+5.1f}%  (neg = estimate too close)")
         print(f"GT depth range:           {np.min(gtds):.1f}..{np.max(gtds):.1f} m "
               f"(median {np.median(gtds):.1f})")
     if len(nis):
