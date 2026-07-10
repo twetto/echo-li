@@ -11,6 +11,7 @@ parallel = ["echo-li-core/parallel", "rudolf-v/parallel"]
 echo-li-core = { path = "../echo-li-core" }
 echo-lie = { path = "../echo-lie" }
 rudolf-v.workspace = true
+camera-geometry.workspace = true
 nalgebra.workspace = true
 clap.workspace = true
 serde.workspace = true

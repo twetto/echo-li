@@ -1303,6 +1303,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "camera-geometry"
+version = "0.1.0"
+source = "git+https://github.com/twetto/Rudolf-V#2df2ad24f1dc65d38baf02171c3184621d1e4c32"
+dependencies = [
+ "nalgebra",
+]
+
+[[package]]
 name = "camino"
 version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2697,6 +2705,7 @@ checksum = "4c3cf4824e2d5f025c7b531afcb2325364084a16806f6d47fbc1f5fbd9960590"
 name = "echo-li-cli"
 version = "0.1.0"
 dependencies = [
+ "camera-geometry",
  "clap",
  "echo-li-core",
  "echo-lie",
@@ -2716,6 +2725,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "approx",
+ "camera-geometry",
  "csv",
  "echo-lie",
  "image",
@@ -2734,6 +2744,7 @@ dependencies = [
 name = "echo-li-python"
 version = "0.1.0"
 dependencies = [
+ "camera-geometry",
  "echo-li-core",
  "echo-lie",
  "nalgebra",
@@ -3195,7 +3206,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4548,7 +4559,7 @@ dependencies = [
  "portable-atomic-util",
  "serde_core",
  "wasm-bindgen",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -9448,9 +9459,10 @@ checksum = "6c20b6793b5c2fa6553b250154b78d6d0db37e72700ae35fad9387a46f487c97"
 [[package]]
 name = "rudolf-v"
 version = "0.1.0"
-source = "git+https://github.com/twetto/Rudolf-V#39d12ea10e1481b80708463c9ec401b615ab5c31"
+source = "git+https://github.com/twetto/Rudolf-V#2df2ad24f1dc65d38baf02171c3184621d1e4c32"
 dependencies = [
  "bytemuck",
+ "camera-geometry",
  "image",
  "minifb",
  "nalgebra",
@@ -9509,7 +9521,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -10340,7 +10352,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -11915,7 +11927,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

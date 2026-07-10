@@ -3,29 +3,23 @@ use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 use std::sync::Arc;
 
-use echo_li_core::mathematical::camera::{CameraModel, PinholeModel, RadTanModel};
+use camera_geometry::CameraProjection;
+use echo_li_core::mathematical::camera::CameraModel;
 
 pub(crate) fn to_camera_arc(cam: &Bound<'_, PyAny>) -> PyResult<Arc<dyn CameraModel>> {
     if let Ok(p) = cam.downcast::<PinholeCamera>() {
         let inner = p.borrow();
-        Ok(Arc::new(PinholeModel {
-            fx: inner.fx,
-            fy: inner.fy,
-            cx: inner.cx,
-            cy: inner.cy,
-        }))
+        Ok(Arc::new(CameraProjection::pinhole(
+            [inner.fx, inner.fy, inner.cx, inner.cy],
+            [0, 0],
+        )))
     } else if let Ok(r) = cam.downcast::<RadTanCamera>() {
         let inner = r.borrow();
-        Ok(Arc::new(RadTanModel {
-            fx: inner.fx,
-            fy: inner.fy,
-            cx: inner.cx,
-            cy: inner.cy,
-            k1: inner.k1,
-            k2: inner.k2,
-            p1: inner.p1,
-            p2: inner.p2,
-        }))
+        Ok(Arc::new(CameraProjection::pinhole_radtan(
+            [inner.fx, inner.fy, inner.cx, inner.cy],
+            [inner.k1, inner.k2, inner.p1, inner.p2],
+            [0, 0],
+        )))
     } else {
         Err(pyo3::exceptions::PyTypeError::new_err(
             "Expected PinholeCamera or RadTanCamera",
@@ -56,17 +50,17 @@ impl PinholeCamera {
     ) -> PyResult<Bound<'py, PyArray1<f64>>> {
         let p = point.as_slice()?;
         if p.len() != 3 {
-            return Err(pyo3::exceptions::PyValueError::new_err("point must have 3 elements"));
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "point must have 3 elements",
+            ));
         }
-        let model = PinholeModel {
-            fx: self.fx,
-            fy: self.fy,
-            cx: self.cx,
-            cy: self.cy,
-        };
+        let model = CameraProjection::pinhole([self.fx, self.fy, self.cx, self.cy], [0, 0]);
         let v = nalgebra::Vector3::new(p[0], p[1], p[2]);
         let uv = model.project(&v);
-        Ok(PyArray1::from_owned_array(py, Array1::from_vec(vec![uv[0], uv[1]])))
+        Ok(PyArray1::from_owned_array(
+            py,
+            Array1::from_vec(vec![uv[0], uv[1]]),
+        ))
     }
 
     fn undistort<'py>(
@@ -76,14 +70,11 @@ impl PinholeCamera {
     ) -> PyResult<Bound<'py, PyArray1<f64>>> {
         let s = uv.as_slice()?;
         if s.len() != 2 {
-            return Err(pyo3::exceptions::PyValueError::new_err("uv must have 2 elements"));
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "uv must have 2 elements",
+            ));
         }
-        let model = PinholeModel {
-            fx: self.fx,
-            fy: self.fy,
-            cx: self.cx,
-            cy: self.cy,
-        };
+        let model = CameraProjection::pinhole([self.fx, self.fy, self.cx, self.cy], [0, 0]);
         let bearing = model.undistort(&nalgebra::Vector2::new(s[0], s[1]));
         Ok(PyArray1::from_owned_array(
             py,
@@ -135,21 +126,21 @@ impl RadTanCamera {
     ) -> PyResult<Bound<'py, PyArray1<f64>>> {
         let p = point.as_slice()?;
         if p.len() != 3 {
-            return Err(pyo3::exceptions::PyValueError::new_err("point must have 3 elements"));
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "point must have 3 elements",
+            ));
         }
-        let model = RadTanModel {
-            fx: self.fx,
-            fy: self.fy,
-            cx: self.cx,
-            cy: self.cy,
-            k1: self.k1,
-            k2: self.k2,
-            p1: self.p1,
-            p2: self.p2,
-        };
+        let model = CameraProjection::pinhole_radtan(
+            [self.fx, self.fy, self.cx, self.cy],
+            [self.k1, self.k2, self.p1, self.p2],
+            [0, 0],
+        );
         let v = nalgebra::Vector3::new(p[0], p[1], p[2]);
         let uv = model.project(&v);
-        Ok(PyArray1::from_owned_array(py, Array1::from_vec(vec![uv[0], uv[1]])))
+        Ok(PyArray1::from_owned_array(
+            py,
+            Array1::from_vec(vec![uv[0], uv[1]]),
+        ))
     }
 
     fn undistort<'py>(
@@ -159,18 +150,15 @@ impl RadTanCamera {
     ) -> PyResult<Bound<'py, PyArray1<f64>>> {
         let s = uv.as_slice()?;
         if s.len() != 2 {
-            return Err(pyo3::exceptions::PyValueError::new_err("uv must have 2 elements"));
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "uv must have 2 elements",
+            ));
         }
-        let model = RadTanModel {
-            fx: self.fx,
-            fy: self.fy,
-            cx: self.cx,
-            cy: self.cy,
-            k1: self.k1,
-            k2: self.k2,
-            p1: self.p1,
-            p2: self.p2,
-        };
+        let model = CameraProjection::pinhole_radtan(
+            [self.fx, self.fy, self.cx, self.cy],
+            [self.k1, self.k2, self.p1, self.p2],
+            [0, 0],
+        );
         let bearing = model.undistort(&nalgebra::Vector2::new(s[0], s[1]));
         Ok(PyArray1::from_owned_array(
             py,

@@ -9,6 +9,7 @@ parallel = ["dep:rayon"]
 [dependencies]
 echo-lie.workspace = true
 rudolf-v.workspace = true
+camera-geometry.workspace = true
 nalgebra.workspace = true
 anyhow.workspace = true
 log.workspace = true

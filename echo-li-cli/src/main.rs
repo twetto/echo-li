@@ -1,3 +1,4 @@
+use camera_geometry::CameraProjection;
 use clap::Parser;
 use echo_li_core::config::VIOConfig;
 use echo_li_core::core_types::CameraIntrinsics;
@@ -16,6 +17,7 @@ use echo_li_core::trajectory_metrics::TrajectoryMetrics;
 use echo_li_core::{LandmarkDepthPrior, VIOFilter, VIOFilterSettings};
 use nalgebra::{Matrix3, Matrix4, Vector2};
 use rudolf_v::camera::CameraIntrinsics as RudolfCameraIntrinsics;
+use rudolf_v::camera::DistortionModel as RudolfDistortionModel;
 use rudolf_v::camera::StereoRig;
 use rudolf_v::frontend::{DetectorType, Frontend, FrontendConfig, LbpPolicy};
 use rudolf_v::image::Image as RudolfImage;
@@ -705,25 +707,29 @@ fn build_camera_model(
         } else {
             println!("Distortion: none (pinhole)");
         }
-        let rudolf_cam = RudolfCameraIntrinsics {
-            fx: intr.fx,
-            fy: intr.fy,
-            cx: intr.cx,
-            cy: intr.cy,
-            resolution: [intr.width, intr.height],
-            distortion,
+        let projection = if distortion.len() >= 4 {
+            CameraProjection::pinhole_radtan(
+                [intr.fx, intr.fy, intr.cx, intr.cy],
+                [distortion[0], distortion[1], distortion[2], distortion[3]],
+                [intr.width, intr.height],
+            )
+        } else {
+            CameraProjection::pinhole(
+                [intr.fx, intr.fy, intr.cx, intr.cy],
+                [intr.width, intr.height],
+            )
         };
         (
-            Arc::new(rudolf_cam) as Arc<dyn CameraModel>,
+            Arc::new(projection) as Arc<dyn CameraModel>,
             Matrix3::new(intr.fx, 0.0, intr.cx, 0.0, intr.fy, intr.cy, 0.0, 0.0, 1.0),
             intr.width,
             intr.height,
         )
     } else {
         println!("No intrinsics found, using EuRoC defaults");
-        let rudolf_cam = RudolfCameraIntrinsics::new(458.65, 457.3, 367.2, 248.3, 752, 480);
+        let projection = CameraProjection::pinhole([458.65, 457.3, 367.2, 248.3], [752, 480]);
         (
-            Arc::new(rudolf_cam) as Arc<dyn CameraModel>,
+            Arc::new(projection) as Arc<dyn CameraModel>,
             Matrix3::new(458.65, 0.0, 367.2, 0.0, 457.3, 248.3, 0.0, 0.0, 1.0),
             752,
             480,
@@ -928,7 +934,7 @@ fn build_patch_depth_mapper(
             }
             t_c1_c0[(r, 3)] = rig.t_10[r];
         }
-        mapper.init_stereo_ref(&rig.cam1, t_c1_c0);
+        mapper.init_stereo_ref(&rig.cam1.projection(), t_c1_c0);
         println!(
             "Patch depth: stereo ref from cam1 (baseline={:.4}m)",
             rig.baseline_meters()
@@ -1161,21 +1167,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .unwrap_or((0.1, 5.0));
 
-    let frontend_cam = reader
-        .intrinsics
-        .as_ref()
-        .map(|intr| RudolfCameraIntrinsics {
+    let frontend_cam = reader.intrinsics.as_ref().map(|intr| {
+        let distortion = intr
+            .distortion_coefficients
+            .as_deref()
+            .unwrap_or_default()
+            .to_vec();
+        let model = if distortion.is_empty() {
+            RudolfDistortionModel::None
+        } else {
+            RudolfDistortionModel::RadTan
+        };
+        RudolfCameraIntrinsics {
             fx: intr.fx,
             fy: intr.fy,
             cx: intr.cx,
             cy: intr.cy,
             resolution: [intr.width, intr.height],
-            distortion: intr
-                .distortion_coefficients
-                .as_deref()
-                .unwrap_or_default()
-                .to_vec(),
-        });
+            distortion,
+            model,
+        }
+    });
     let (mut frontend, tracker_max_features) =
         build_frontend(vio_config.as_ref(), img_w, img_h, frontend_cam)?;
 
