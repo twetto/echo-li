@@ -686,54 +686,54 @@ fn send_rerun_blueprint(
     Ok(())
 }
 
+/// Build the single shared camera from dataset calibration. The projection model
+/// is dispatched from the calibration's `camera_model` / `distortion_model`
+/// strings (pinhole / radial-tangential / equidistant fisheye); unsupported
+/// models are a hard error rather than being silently treated as rad-tan.
 fn build_camera_model(
     reader: &ASLDatasetReader,
-) -> (Arc<dyn CameraModel>, Matrix3<f64>, usize, usize) {
+) -> Result<(Arc<dyn CameraModel>, Matrix3<f64>, usize, usize), Box<dyn std::error::Error>> {
     if let Some(intr) = &reader.intrinsics {
-        println!(
-            "Camera intrinsics: {}x{} fx={:.1} fy={:.1} cx={:.1} cy={:.1}",
-            intr.width, intr.height, intr.fx, intr.fy, intr.cx, intr.cy
-        );
         let distortion = intr
             .distortion_coefficients
             .as_deref()
             .unwrap_or_default()
             .to_vec();
-        if distortion.len() >= 4 {
-            println!(
-                "Distortion: radial-tangential k1={:.4} k2={:.4} p1={:.6} p2={:.6}",
-                distortion[0], distortion[1], distortion[2], distortion[3]
-            );
-        } else {
-            println!("Distortion: none (pinhole)");
-        }
-        let projection = if distortion.len() >= 4 {
-            CameraProjection::pinhole_radtan(
-                [intr.fx, intr.fy, intr.cx, intr.cy],
-                [distortion[0], distortion[1], distortion[2], distortion[3]],
-                [intr.width, intr.height],
-            )
-        } else {
-            CameraProjection::pinhole(
-                [intr.fx, intr.fy, intr.cx, intr.cy],
-                [intr.width, intr.height],
-            )
-        };
-        (
+        let camera_model = intr.camera_model.as_deref().unwrap_or("pinhole");
+        let distortion_model = intr.distortion_model.as_deref();
+        println!(
+            "Camera intrinsics: {}x{} fx={:.1} fy={:.1} cx={:.1} cy={:.1} model={} distortion={}",
+            intr.width,
+            intr.height,
+            intr.fx,
+            intr.fy,
+            intr.cx,
+            intr.cy,
+            camera_model,
+            distortion_model.unwrap_or("none"),
+        );
+        let projection = CameraProjection::from_kalibr_parts(
+            camera_model,
+            distortion_model,
+            [intr.fx, intr.fy, intr.cx, intr.cy],
+            &distortion,
+            [intr.width, intr.height],
+        )?;
+        Ok((
             Arc::new(projection) as Arc<dyn CameraModel>,
             Matrix3::new(intr.fx, 0.0, intr.cx, 0.0, intr.fy, intr.cy, 0.0, 0.0, 1.0),
             intr.width,
             intr.height,
-        )
+        ))
     } else {
         println!("No intrinsics found, using EuRoC defaults");
         let projection = CameraProjection::pinhole([458.65, 457.3, 367.2, 248.3], [752, 480]);
-        (
+        Ok((
             Arc::new(projection) as Arc<dyn CameraModel>,
             Matrix3::new(458.65, 0.0, 367.2, 0.0, 457.3, 248.3, 0.0, 0.0, 1.0),
             752,
             480,
-        )
+        ))
     }
 }
 
@@ -1113,7 +1113,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         settings.max_landmarks
     );
 
-    let (cam_model, k_matrix, img_w, img_h) = build_camera_model(&reader);
+    let (cam_model, k_matrix, img_w, img_h) = build_camera_model(&reader)?;
 
     let occupancy_requested = args.occupancy_map
         || vio_config
@@ -1173,10 +1173,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .as_deref()
             .unwrap_or_default()
             .to_vec();
-        let model = if distortion.is_empty() {
-            RudolfDistortionModel::None
-        } else {
-            RudolfDistortionModel::RadTan
+        // build_camera_model already validated the model, so map the known
+        // distortion families for the frontend gate; anything else falls back to
+        // None (only reachable for pure pinhole).
+        let model = match intr.distortion_model.as_deref() {
+            Some("equidistant") => RudolfDistortionModel::Equidistant,
+            Some("radtan" | "radial-tangential") => RudolfDistortionModel::RadTan,
+            _ => RudolfDistortionModel::None,
         };
         RudolfCameraIntrinsics {
             fx: intr.fx,
