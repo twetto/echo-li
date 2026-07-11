@@ -80,38 +80,3 @@ impl CameraModel for PinholeModel {
         projection_jacobian_via(&self.projection(), p)
     }
 }
-
-/// Convenience radial-tangential camera for tests and simple call sites; backed
-/// by the same `camera_geometry` authority.
-pub struct RadTanModel {
-    pub fx: f64,
-    pub fy: f64,
-    pub cx: f64,
-    pub cy: f64,
-    pub k1: f64,
-    pub k2: f64,
-    pub p1: f64,
-    pub p2: f64,
-}
-
-impl RadTanModel {
-    pub fn projection(&self) -> CameraProjection {
-        CameraProjection::pinhole_radtan(
-            [self.fx, self.fy, self.cx, self.cy],
-            [self.k1, self.k2, self.p1, self.p2],
-            [0, 0],
-        )
-    }
-}
-
-impl CameraModel for RadTanModel {
-    fn project(&self, p: &Vector3<f64>) -> Vector2<f64> {
-        project_via(&self.projection(), p)
-    }
-    fn undistort(&self, uv: &Vector2<f64>) -> Vector3<f64> {
-        undistort_via(&self.projection(), uv)
-    }
-    fn projection_jacobian(&self, p: &Vector3<f64>) -> Matrix2x3<f64> {
-        projection_jacobian_via(&self.projection(), p)
-    }
-}

@@ -234,7 +234,7 @@ fn default_true() -> bool {
 }
 
 fn default_sparse_parametrization() -> String {
-    "invdepth3d".to_string()
+    "invdepth_additive3d".to_string()
 }
 
 impl SparseVogConfig {

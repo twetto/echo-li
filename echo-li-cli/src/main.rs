@@ -57,8 +57,9 @@ struct Args {
     #[arg(long, default_value_t = true)]
     sparse: bool,
 
-    /// Sparse filter chart: polar3d, invdepth3d, or invdepth_additive3d (ρ-first).
-    #[arg(long, default_value = "polar3d")]
+    /// Sparse filter chart: invdepth_additive3d (ρ-first) or
+    /// bearing_invdepth_additive3d (camera-agnostic).
+    #[arg(long, default_value = "invdepth_additive3d")]
     sparse_chart: String,
 
     /// Run patch-grid direct depth mapper. Enabled automatically by PatchDepth config.

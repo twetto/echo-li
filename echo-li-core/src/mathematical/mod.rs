@@ -8,7 +8,7 @@ pub mod vio_state;
 pub mod vision_measurement;
 
 pub use bias_group_ops::BiasGroupOps;
-pub use camera::{CameraModel, PinholeModel, RadTanModel};
+pub use camera::{CameraModel, PinholeModel};
 pub use eqf_matrices::EqFCoordinateSuite;
 pub use imu_velocity::IMUVelocity;
 pub use vio_eqf::VIOEqF;
