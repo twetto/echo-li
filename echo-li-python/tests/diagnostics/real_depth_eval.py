@@ -170,6 +170,7 @@ def main():
     frames = [(t, p) for t, p in frames if gt_t[0] <= t <= gt_t[-1]]
 
     zscores, relerrs, nises, gtds = [], [], [], []
+    zmeta = []  # (z, track_length, gt_depth, radius_px) per scored obs
     n_eval = 0
     tstart = time.time()
     for i, (t, p) in enumerate(frames):
@@ -215,9 +216,12 @@ def main():
                 var_z = np.asarray(fd["covariance_euclidean"])[2, 2]
                 if var_z <= 0:
                     continue
-                zscores.append((est_z - d) / np.sqrt(var_z))
+                zval = (est_z - d) / np.sqrt(var_z)
+                zscores.append(zval)
                 relerrs.append((est_z - d) / d)
                 gtds.append(d)
+                uu, vv = uvs[fid]
+                zmeta.append((zval, fd["track_length"], d, float(np.hypot(uu - cx, vv - cy))))
             n_eval += 1
         if i % 400 == 0:
             print(f"  [{i}/{len(frames)}] t={t-gt_t[0]:5.1f}s live={len(live)} "
@@ -239,6 +243,26 @@ def main():
               f"mean {np.mean(rel)*100:+5.1f}%  (neg = estimate too close)")
         print(f"GT depth range:           {np.min(gtds):.1f}..{np.max(gtds):.1f} m "
               f"(median {np.median(gtds):.1f})")
+
+        # --- NEES decomposition (mechanism: Sigma-collapse vs tracker persistent bias) ---
+        zm = np.array(zmeta)  # cols: z, track_len, gt_depth, radius
+        zz = zm[:, 0] ** 2
+        tl = zm[:, 1]
+        print("--- NEES-1D decomposition ---")
+        print(f"median z^2 {np.median(zz):8.2f}  mean z^2 {np.mean(zz):9.2f}  "
+              f"(tail ratio mean/median {np.mean(zz)/max(np.median(zz),1e-9):6.0f}x)")
+        print("  by track length (update count):")
+        for lo, hi in [(10, 20), (20, 40), (40, 80), (80, 160), (160, 1e9)]:
+            m = (tl >= lo) & (tl < hi)
+            if m.any():
+                hs = "inf" if hi > 1e8 else f"{int(hi)}"
+                print(f"    len {lo:>4}-{hs:>4}: n={int(m.sum()):6d}  "
+                      f"NEES median {np.median(zz[m]):8.2f}  mean {np.mean(zz[m]):10.2f}")
+        order = np.argsort(zz)[::-1]
+        for frac in (0.01, 0.05, 0.10):
+            k = max(1, int(frac * len(zz)))
+            print(f"  top {frac*100:2.0f}% obs ({k:5d}) carry {zz[order[:k]].sum()/zz.sum()*100:5.1f}% "
+                  f"of NEES mass  (their median track len {np.median(tl[order[:k]]):.0f})")
     if len(nis):
         print(f"NIS (chi2(2), GT-free):   mean {np.mean(nis):5.2f}  median "
               f"{np.median(nis):5.2f}  p95 {np.percentile(nis, 95):5.2f}   "
