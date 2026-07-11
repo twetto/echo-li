@@ -11,6 +11,7 @@ mod vio_filter;
 fn _echo_li(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<camera::PinholeCamera>()?;
     m.add_class::<camera::RadTanCamera>()?;
+    m.add_class::<camera::EquidistantCamera>()?;
     m.add_class::<frontend::FrontendConfig>()?;
     m.add_class::<frontend::PyFrontend>()?;
     m.add_class::<vio_filter::PyVIOFilter>()?;

@@ -151,7 +151,12 @@ def main():
 
     sf_kwargs = dict(sigma_pixel=0.5, min_track_length=1)
     if args.chart == "bearing":
-        filt = echo_li.Sparse3DFilter.bearing_invdepth_additive3d(fx, fy, cx, cy, **sf_kwargs)
+        # This instrument pre-undistorts pixels into the pinhole-K domain (and does
+        # its GT-depth lookup with a pinhole projection), so the bearing chart's
+        # camera is a PinholeCamera here — the *domain* camera, not the dataset
+        # model. Passing the real radtan/fisheye camera would double-undistort.
+        filt = echo_li.Sparse3DFilter.bearing_invdepth_additive3d(
+            echo_li.PinholeCamera(fx, fy, cx, cy), **sf_kwargs)
     else:
         filt = echo_li.Sparse3DFilter.invdepth_additive3d(fx, fy, cx, cy, **sf_kwargs)
     print(f"chart: {args.chart}")

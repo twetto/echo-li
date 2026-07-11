@@ -63,24 +63,22 @@ impl PySparse3DFilter {
         })
     }
 
+    /// Camera-agnostic bearing inverse-depth chart. Takes a camera model
+    /// (pinhole / radtan / equidistant fisheye) and consumes RAW pixels,
+    /// undistorting once through that camera; K is derived from the camera
+    /// intrinsics. Pass a `PinholeCamera` for the pre-undistorted pinhole-K
+    /// domain (e.g. the EuRoC parity harness), or an `EquidistantCamera` for
+    /// true wide-FoV fisheye.
     #[staticmethod]
-    #[pyo3(signature = (fx, fy, cx, cy, **kwargs))]
+    #[pyo3(signature = (camera, **kwargs))]
     fn bearing_invdepth_additive3d(
-        fx: f64,
-        fy: f64,
-        cx: f64,
-        cy: f64,
+        camera: &Bound<'_, pyo3::types::PyAny>,
         kwargs: Option<&Bound<'_, pyo3::types::PyDict>>,
     ) -> PyResult<Self> {
+        let (fx, fy, cx, cy) = crate::camera::intrinsics_of(camera)?;
         let k = intrinsics_matrix(fx, fy, cx, cy);
         let settings = parse_settings(kwargs)?;
-        // Pixels reach the filter already undistorted into the pinhole-K domain,
-        // so a pinhole camera is the matching projection here.
-        let cam: std::sync::Arc<dyn echo_li_core::mathematical::camera::CameraModel> =
-            std::sync::Arc::new(camera_geometry::CameraProjection::pinhole(
-                [fx, fy, cx, cy],
-                [0, 0],
-            ));
+        let cam = crate::camera::to_camera_arc(camera)?;
         Ok(Self {
             inner: Sparse3DFilter::bearing_invdepth3d(k, cam, settings),
         })
