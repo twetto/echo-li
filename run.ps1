@@ -1,0 +1,11 @@
+cargo run -p echo-li-cli --release --features rerun --  -d ..\python-vio\V1_01_easy -c configs\eqvio_euroc_rho.yaml --vis
+cargo run -p echo-li-cli --release --features rerun --  -d ..\..\..\Downloads\vicon_room1\vicon_room1\V1_02_medium -c configs\eqvio_euroc_rho.yaml --vis
+cargo run -p echo-li-cli --release --features rerun --  -d ..\..\..\Downloads\vicon_room1\vicon_room1\V1_03_difficult -c configs\eqvio_euroc_rho.yaml --vis
+cargo run -p echo-li-cli --release --features rerun --  -d ..\..\..\Downloads\vicon_room2\vicon_room2\V2_01_easy\V2_01_easy -c configs\eqvio_euroc_rho.yaml --vis
+cargo run -p echo-li-cli --release --features rerun --  -d ..\..\..\Downloads\vicon_room2\vicon_room2\V2_02_medium\V2_02_medium -c configs\eqvio_euroc_rho.yaml --vis
+cargo run -p echo-li-cli --release --features rerun --  -d ..\..\..\Downloads\vicon_room2\vicon_room2\V2_03_difficult\V2_03_difficult -c configs\eqvio_euroc_rho.yaml --vis
+cargo run -p echo-li-cli --release --features rerun --  -d ..\..\..\Downloads\machine_hall\machine_hall\MH_01_easy\MH_01_easy -c configs\eqvio_euroc_rho.yaml --vis
+cargo run -p echo-li-cli --release --features rerun --  -d ..\..\..\Downloads\machine_hall\machine_hall\MH_02_easy\MH_02_easy -c configs\eqvio_euroc_rho.yaml --vis
+cargo run -p echo-li-cli --release --features rerun --  -d ..\..\..\Downloads\machine_hall\machine_hall\MH_03_medium\MH_03_medium -c configs\eqvio_euroc_rho.yaml --vis
+cargo run -p echo-li-cli --release --features rerun --  -d ..\..\..\Downloads\machine_hall\machine_hall\MH_04_difficult\MH_04_difficult -c configs\eqvio_euroc_rho.yaml --vis
+cargo run -p echo-li-cli --release --features rerun --  -d ..\..\..\Downloads\machine_hall\machine_hall\MH_05_difficult\MH_05_difficult -c configs\eqvio_euroc_rho.yaml --vis

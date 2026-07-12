@@ -11,8 +11,8 @@ computable cues, and rank them by how well they discriminate outliers (>3 px):
              Sampson epipolar distance under the GT essential matrix
              (the idealized 'RANSAC residual'), flow magnitude
 
-Outputs per-signal AUC (rank-based, sign-adjusted) + outlier-rate by decile for
-the top signals.
+Outputs per-signal AUC (rank-based, sign-adjusted), an ROC-curves figure, and
+outlier-rate by decile for the top signals.
 
   .venv/Scripts/python.exe echo-li-python/tests/diagnostics/tail_cue_analysis.py \
       ~/Downloads/vicon_room1/vicon_room1/V1_03_difficult
@@ -23,6 +23,9 @@ import numpy as np
 import cv2, yaml
 from scipy.spatial.transform import Rotation as Rot, Slerp
 from scipy.stats import rankdata
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from real_depth_eval import load_csv, zbuf_cache, zbuf_lookup  # noqa: E402
@@ -56,12 +59,29 @@ def auc(signal, is_out):
     return (a, 1) if a >= 0.5 else (1-a, -1)
 
 
+def roc_curve(signal, is_out, direction):
+    """ROC points after orienting the signal so higher predicts an outlier."""
+    g = np.isfinite(signal)
+    score, y = direction * signal[g], is_out[g]
+    n1, n0 = y.sum(), (~y).sum()
+    if n1 == 0 or n0 == 0:
+        return np.array([]), np.array([])
+    order = np.argsort(-score, kind="stable")
+    score, y = score[order], y[order]
+    distinct = np.r_[score[1:] != score[:-1], True]
+    tp = np.cumsum(y)[distinct]
+    fp = np.cumsum(~y)[distinct]
+    return np.r_[0.0, fp/n0], np.r_[0.0, tp/n1]
+
+
 def main():
     ap = argparse.ArgumentParser()
     repo = Path(__file__).resolve().parents[3]
     ap.add_argument("dataset")
     ap.add_argument("--config", default=str(repo/"configs"/"eqvio_euroc_rho.yaml"))
     ap.add_argument("--dump", default=None, help="save the cue matrix (npz) for pooling")
+    ap.add_argument("--roc-out", default="tail_cue_roc.png",
+                    help="ROC-curves figure path")
     args = ap.parse_args()
     root = Path(args.dataset)
     if (root/"mav0").exists():
@@ -228,6 +248,45 @@ def main():
             m_ = g & (s >= q[b]) & (s <= q[b+1])
             rates.append(100*out[m_].mean() if m_.sum() else np.nan)
         print(f"  {name:>18}: " + " ".join(f"{r:5.1f}" for r in rates))
+
+    # Paper-sized typography without adding seaborn as a runtime dependency.
+    paper_rc = {
+        "font.size": 16,
+        "axes.titlesize": 18,
+        "axes.labelsize": 18,
+        "axes.linewidth": 1.0,
+        "xtick.labelsize": 16,
+        "ytick.labelsize": 16,
+        "legend.fontsize": 13,
+        "legend.title_fontsize": 14,
+        "lines.linewidth": 2.0,
+        "savefig.dpi": 300,
+    }
+    with plt.style.context("seaborn-v0_8-whitegrid"), plt.rc_context(paper_rc):
+        fig, ax = plt.subplots(figsize=(11, 7))
+        colors = plt.get_cmap("tab20").colors
+        linestyles = ("-", "--", "-.", ":")
+        for rank, (a, name, j, sgn) in enumerate(results):
+            fpr, tpr = roc_curve(d[:, j], out, sgn)
+            if len(fpr):
+                ax.plot(fpr, tpr, color=colors[rank % len(colors)],
+                        linestyle=linestyles[(rank // len(colors)) % len(linestyles)],
+                        lw=2.5 if rank < 4 else 1.8,
+                        label=f"{name} ({a:.3f})")
+        ax.plot([0, 1], [0, 1], color="0.25", linestyle="--", lw=1.5,
+                label="chance (0.500)")
+        ax.set(xlabel="False-positive rate", ylabel="True-positive rate",
+               title=f"Track-outlier ROC curves (error > {OUTLIER_PX:g} px)",
+               xlim=(0, 1), ylim=(0, 1))
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xticks(np.linspace(0, 1, 6))
+        ax.set_yticks(np.linspace(0, 1, 6))
+        ax.grid(True, color="0.85", linewidth=0.8)
+        ax.legend(title="Signal (AUC)", loc="center left",
+                  bbox_to_anchor=(1.02, 0.5), frameon=True)
+        fig.savefig(args.roc_out, bbox_inches="tight")
+        plt.close(fig)
+    print(f"\nsaved ROC curves to {args.roc_out}")
 
 
 if __name__ == "__main__":
