@@ -133,6 +133,76 @@ def nees_decomposition(err, cov, est, pc, f):
     return xy_marg, xy_cond, pix_nees, full_from_parts
 
 
+def project_current_to_obs(x_cur, T_wc_cur, T_cw_obs, f, cx, cy):
+    xh = np.array([x_cur[0], x_cur[1], x_cur[2], 1.0], float)
+    pc = (T_cw_obs @ (T_wc_cur @ xh))[:3]
+    if pc[2] <= 1e-9:
+        return None
+    return np.array([f * pc[0] / pc[2] + cx, f * pc[1] / pc[2] + cy], float)
+
+
+def pixel_jac_current(x_cur, T_wc_cur, T_cw_obs, f, cx, cy):
+    base = project_current_to_obs(x_cur, T_wc_cur, T_cw_obs, f, cx, cy)
+    if base is None:
+        return None
+    J = np.zeros((2, 3), float)
+    step = 1e-5 * max(1.0, float(np.linalg.norm(x_cur)))
+    for k in range(3):
+        dx = np.zeros(3, float)
+        dx[k] = step
+        up = project_current_to_obs(x_cur + dx, T_wc_cur, T_cw_obs, f, cx, cy)
+        um = project_current_to_obs(x_cur - dx, T_wc_cur, T_cw_obs, f, cx, cy)
+        if up is None or um is None:
+            return None
+        J[:, k] = (up - um) / (2.0 * step)
+    return J
+
+
+def fisher_cov_from_track(obs, x_cur, T_wc_cur, f, cx, cy, sigma_px, bias_sigma_px):
+    """Fisher covariance in current camera coordinates for one track.
+
+    Measurement model:
+
+        u_i = pi_i(x_cur) + b_track + eps_i
+
+    with eps_i ~ N(0, sigma_px^2 I) and b_track ~ N(0, bias_sigma_px^2 I).
+    Marginalizing b_track gives a block-correlated pixel covariance within the
+    track. `bias_sigma_px=0` reduces to iid pixel Fisher covariance.
+    """
+    if len(obs) < 2 or sigma_px <= 0:
+        return None
+    jx = []
+    jy = []
+    for T_wc_obs, _uv in obs:
+        J = pixel_jac_current(x_cur, T_wc_cur, np.linalg.inv(T_wc_obs), f, cx, cy)
+        if J is None or not np.isfinite(J).all():
+            continue
+        jx.append(J[0])
+        jy.append(J[1])
+    if len(jx) < 2:
+        return None
+
+    def add_component(Js):
+        J = np.asarray(Js, float)
+        n = len(J)
+        s2 = sigma_px * sigma_px
+        if bias_sigma_px <= 0:
+            return (J.T @ J) / s2
+        b2 = bias_sigma_px * bias_sigma_px
+        sum_j = np.sum(J, axis=0)
+        return (J.T @ J) / s2 - (b2 / (s2 * (s2 + n * b2))) * np.outer(sum_j, sum_j)
+
+    H = add_component(jx) + add_component(jy)
+    H = 0.5 * (H + H.T)
+    try:
+        cov = np.linalg.inv(H + 1e-12 * np.eye(3))
+    except np.linalg.LinAlgError:
+        return None
+    if not np.isfinite(cov).all():
+        return None
+    return 0.5 * (cov + cov.T)
+
+
 def print_bin_stats(name, values, mask, label):
     m = mask & np.isfinite(values)
     if m.sum() < 20:
@@ -178,6 +248,10 @@ def main():
                     help="override SparseVog Gaussian-Beta concentration cap")
     ap.add_argument("--mahalanobis-reset-chi2", type=float, default=None,
                     help="override hard reset gate; <=0 disables in Sparse3D")
+    ap.add_argument("--bias-sigma-px", type=float, default=0.0,
+                    help="diagnostic only: marginalized persistent per-track pixel bias sigma")
+    ap.add_argument("--fisher-sigma-px", type=float, default=None,
+                    help="diagnostic only: white pixel sigma for iid/bias Fisher covariance")
     ap.add_argument("--measurements", default="rudolf", choices=["rudolf", "klt", "exact"],
                     help="feed Rudolf-V, diagnostic Python KLT, or exact reprojections")
     repo = Path(__file__).resolve().parents[3]
@@ -247,6 +321,7 @@ def main():
     Xw = {}
     born = {}
     pos_prev = {}
+    obs_hist = {}
     seen_ids = set()
     nid = 0
     prev = None
@@ -291,6 +366,7 @@ def main():
                 Xw[j] = md.backproject_world((float(p[0]), float(p[1])), d_rng, T_wb, f, cx, cy)
                 born[j] = i
                 pos_prev[j] = p
+                obs_hist[j] = []
                 seen_ids.add(j)
             # In Rudolf mode, pos_prev must be the current frontend output only.
             # Keeping old IDs after Rudolf-V has dropped them draws frozen points
@@ -350,6 +426,7 @@ def main():
                     Xw[nid] = md.backproject_world((x, y), d_rng, T_wb, f, cx, cy)
                     born[nid] = i
                     pos_prev[nid] = np.array([x, y])
+                    obs_hist[nid] = []
                     seen_ids.add(nid)
                     nid += 1
 
@@ -362,6 +439,8 @@ def main():
                         uvs[int(j)] = (float(gp[0]), float(gp[1]))
             else:
                 uvs = {int(j): (float(p[0]), float(p[1])) for j, p in pos_prev.items()}
+            for j, uv in uvs.items():
+                obs_hist.setdefault(j, []).append((T_wc.copy(), np.array(uv, float)))
             filt.update(float(i) / 25.0, uvs, T_wc.tolist(), None, None)
             n_live_updates += len(uvs)
 
@@ -425,6 +504,21 @@ def main():
             z_score = err[2] / np.sqrt(var_z)
             nees3 = finite_mahalanobis(err, cov)
             xy_marg, xy_cond, pix_nees, nees3_parts = nees_decomposition(err, cov, est, pc, f)
+            fisher_sigma = args.fisher_sigma_px
+            if fisher_sigma is None:
+                fisher_sigma = float(settings.get("sigma_pixel", SIGMA_PX))
+            cov_iid = fisher_cov_from_track(
+                obs_hist.get(j, []), est, T_wc, f, cx, cy, fisher_sigma, 0.0)
+            cov_bias = fisher_cov_from_track(
+                obs_hist.get(j, []), est, T_wc, f, cx, cy, fisher_sigma, args.bias_sigma_px)
+            nees3_iid = finite_mahalanobis(err, cov_iid) if cov_iid is not None else np.nan
+            nees3_bias = finite_mahalanobis(err, cov_bias) if cov_bias is not None else np.nan
+            _xm_iid, xy_iid, pix_iid, _parts_iid = (
+                nees_decomposition(err, cov_iid, est, pc, f)
+                if cov_iid is not None else (np.nan, np.nan, np.nan, np.nan))
+            _xm_bias, xy_bias, pix_bias, _parts_bias = (
+                nees_decomposition(err, cov_bias, est, pc, f)
+                if cov_bias is not None else (np.nan, np.nan, np.nan, np.nan))
 
             gp, rng, _, _pc = project_world_fast(Xw[j], T_bw, f, cx, cy)
             if depth is None:
@@ -445,6 +539,7 @@ def main():
             rows.append((
                 i - born[j], track_len, z_score, z_score * z_score, nees3,
                 xy_marg, xy_cond, pix_nees, nees3_parts,
+                nees3_iid, xy_iid, pix_iid, nees3_bias, xy_bias, pix_bias,
                 err[2] / pc[2], np.linalg.norm(err) / np.linalg.norm(pc),
                 drift_px[j], dstd, occluded, border, pc[2], float(inlier_ratio), nis))
 
@@ -474,6 +569,7 @@ def main():
         return
 
     (age, tl, z, z2, nees3, xy_marg, xy_cond, pix_nees, nees3_parts,
+     nees3_iid, xy_iid, pix_iid, nees3_bias, xy_bias, pix_bias,
      relz, rel3, drift, dstd, occ, border, depth_z, inlier, nis) = A.T
     print(f"depth NEES-1D mean/median: {np.mean(z2):8.2f} / {np.median(z2):8.2f}  (ideal 1)")
     print(f"3D NEES mean/median:       {np.nanmean(nees3):8.2f} / {np.nanmedian(nees3):8.2f}  (ideal 3)")
@@ -491,6 +587,16 @@ def main():
     if len(decomp_f):
         print(f"3D split check |full-(z+xy|z)|: "
               f"median {np.median(np.abs(decomp_f)):.2e}  p99 {np.percentile(np.abs(decomp_f), 99):.2e}")
+    print(f"diagnostic Fisher sigma:   {float(args.fisher_sigma_px if args.fisher_sigma_px is not None else settings.get('sigma_pixel', SIGMA_PX)):.3f}px")
+    iid_f = nees3_iid[np.isfinite(nees3_iid)]
+    if len(iid_f):
+        print(f"iid Fisher 3D mean/med:    {np.mean(iid_f):8.2f} / {np.median(iid_f):8.2f}  "
+              f"xy|z med {np.nanmedian(xy_iid):8.2f}  pix med {np.nanmedian(pix_iid):8.2f}")
+    bias_f = nees3_bias[np.isfinite(nees3_bias)]
+    if len(bias_f):
+        print(f"bias Fisher 3D mean/med:   {np.mean(bias_f):8.2f} / {np.median(bias_f):8.2f}  "
+              f"xy|z med {np.nanmedian(xy_bias):8.2f}  pix med {np.nanmedian(pix_bias):8.2f}  "
+              f"(bias sigma {args.bias_sigma_px:.3f}px)")
     print(f"|z|<1/<2/<3:               {np.mean(np.abs(z) < 1)*100:5.1f}% / "
           f"{np.mean(np.abs(z) < 2)*100:5.1f}% / {np.mean(np.abs(z) < 3)*100:5.1f}%")
     print(f"signed rel depth err:      median {np.median(relz)*100:+6.2f}%  "
@@ -541,10 +647,14 @@ def main():
         print_bin_stats("valid", z2, clean, "vis/int/lowmid")
         print_bin_stats("valid xy|z", xy_cond, clean, "vis/int/lowmid")
         print_bin_stats("valid full3", nees3, clean, "vis/int/lowmid")
+        print_bin_stats("valid iid3", nees3_iid, clean, "vis/int/lowmid")
+        print_bin_stats("valid bias3", nees3_bias, clean, "vis/int/lowmid")
         clean_core = clean & (drift <= 3.0)
         print_bin_stats("valid", z2, clean_core, "drift<=3px")
         print_bin_stats("valid xy|z", xy_cond, clean_core, "drift<=3px")
         print_bin_stats("valid full3", nees3, clean_core, "drift<=3px")
+        print_bin_stats("valid iid3", nees3_iid, clean_core, "drift<=3px")
+        print_bin_stats("valid bias3", nees3_bias, clean_core, "drift<=3px")
 
     print("\n--- NEES mass concentration ---")
     order = np.argsort(z2)[::-1]
