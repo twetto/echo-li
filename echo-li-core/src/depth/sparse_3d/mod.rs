@@ -648,6 +648,11 @@ fn update_feature_3d(
     }
 }
 
+fn measurement_variance_px2(settings: &SparseVogSettings, feat: &FeatureState3D) -> f64 {
+    let age = feat.track_length.saturating_sub(1) as f64;
+    settings.sigma_pixel.powi(2) + (settings.flow_age_rate_px_per_frame * age).powi(2)
+}
+
 /// Rho-first additive inverse-depth EKF update for one landmark.
 ///
 /// State `s = (alpha, beta, rho) = (X/Z, Y/Z, 1/Z)` of the landmark in the anchor
@@ -713,7 +718,7 @@ fn invdepth_additive_update_3d(
         }
     }
 
-    let mut r_meas = Matrix2::identity() * settings.sigma_pixel.powi(2);
+    let mut r_meas = Matrix2::identity() * measurement_variance_px2(settings, feat);
 
     let q_c = r_ca * pa_of(&feat.inv_s) + t_ca_t;
     if q_c[2] < settings.min_depth {
@@ -849,7 +854,7 @@ fn bearing_invdepth_additive_update_3d(
         }
     }
 
-    let mut r_meas = Matrix2::identity() * settings.sigma_pixel.powi(2);
+    let mut r_meas = Matrix2::identity() * measurement_variance_px2(settings, feat);
 
     let (pa, jpa) = pj_of(&feat.inv_s);
     let q_c = r_ca * pa + t_ca_t;
@@ -1002,7 +1007,7 @@ fn iekf_update_3d(
         }
     }
 
-    let r_meas = Matrix2::identity() * settings.sigma_pixel.powi(2);
+    let r_meas = Matrix2::identity() * measurement_variance_px2(settings, feat);
 
     // Each branch produces the inlier-conditioned update terms shared by the
     // Gaussian-Beta tail below: the gating Mahalanobis^2 and det(S), the full
@@ -1311,7 +1316,7 @@ fn bearing_update_3d(
         h_euc * chart_to_euc_jac(chart, &q)
     };
     let y_pred = Vector2::new(fx * q[0] / q[2] + cx, fy * q[1] / q[2] + cy);
-    let r = Matrix2::identity() * settings.sigma_pixel.powi(2);
+    let r = Matrix2::identity() * measurement_variance_px2(settings, feat);
     let s = h * feat.covariance * h.transpose() + r;
     let Some(s_inv) = (s + Matrix2::identity() * 1e-8).try_inverse() else {
         return true;

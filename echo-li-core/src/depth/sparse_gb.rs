@@ -37,6 +37,12 @@ pub struct SparseVogSettings {
     pub init_depth_var: f64,
     pub init_invdepth_var: f64,
     pub sigma_pixel: f64,
+    /// Optional per-feature-age pixel-noise inflation used by Sparse3D's 2D
+    /// image-residual updates:
+    /// `sigma_eff^2 = sigma_pixel^2 + (flow_age_rate_px_per_frame * age)^2`.
+    /// The scalar 1D `SparseGBFilter` keeps its historical triangulated-depth
+    /// noise model and does not consume this setting.
+    pub flow_age_rate_px_per_frame: f64,
     pub uniform_z_max: f64,
     pub uniform_rho_max: f64,
     pub uniform_d_min: f64,
@@ -97,6 +103,7 @@ impl Default for SparseVogSettings {
             init_depth_var: 1.0,
             init_invdepth_var: 1.0,
             sigma_pixel: 0.5,
+            flow_age_rate_px_per_frame: 0.0,
             uniform_z_max: 20.0,
             uniform_rho_max: 10.0,
             uniform_d_min: -5.0,
