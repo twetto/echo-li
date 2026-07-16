@@ -75,6 +75,64 @@ def finite_mahalanobis(err, cov):
         return np.nan
 
 
+def finite_quadratic(err, cov):
+    err = np.asarray(err, float)
+    cov = np.asarray(cov, float)
+    if not np.isfinite(err).all() or not np.isfinite(cov).all():
+        return np.nan
+    try:
+        return float(err @ np.linalg.solve(cov + 1e-12 * np.eye(len(err)), err))
+    except np.linalg.LinAlgError:
+        return np.nan
+
+
+def nees_decomposition(err, cov, est, pc, f):
+    """Return tangent/radial 3D consistency diagnostics.
+
+    `z2` is the marginal camera-z NEES already printed by the script.
+    `xy_marg` is the marginal NEES of the camera x/y Cartesian error.
+    `xy_cond` is the conditional NEES of x/y after accounting for z error:
+
+        full 3D NEES = z2 + xy_cond
+
+    up to numerical jitter. This makes the radial/tangent split exact for the
+    reported Euclidean covariance instead of comparing unrelated projections.
+    `pix_nees` projects the same 3D covariance into the image plane for a
+    measurement-space tangent check.
+    """
+    cov = 0.5 * (np.asarray(cov, float) + np.asarray(cov, float).T)
+    err = np.asarray(err, float)
+    est = np.asarray(est, float)
+    pc = np.asarray(pc, float)
+
+    pzz = float(cov[2, 2])
+    if pzz <= 0 or not np.isfinite(pzz):
+        return np.nan, np.nan, np.nan, np.nan
+
+    xy_marg = finite_quadratic(err[:2], cov[:2, :2])
+
+    pxz = cov[:2, 2]
+    pxy_cond = cov[:2, :2] - np.outer(pxz, pxz) / pzz
+    exy_cond = err[:2] - pxz * (err[2] / pzz)
+    xy_cond = finite_quadratic(exy_cond, pxy_cond)
+
+    pix_nees = np.nan
+    if est[2] > 1e-6 and pc[2] > 1e-6:
+        uv_est = f * est[:2] / est[2]
+        uv_gt = f * pc[:2] / pc[2]
+        pix_err = uv_est - uv_gt
+        z = est[2]
+        j_proj = np.array([
+            [f / z, 0.0, -f * est[0] / (z * z)],
+            [0.0, f / z, -f * est[1] / (z * z)],
+        ])
+        pix_cov = j_proj @ cov @ j_proj.T
+        pix_nees = finite_quadratic(pix_err, pix_cov)
+
+    full_from_parts = err[2] * err[2] / pzz + xy_cond
+    return xy_marg, xy_cond, pix_nees, full_from_parts
+
+
 def print_bin_stats(name, values, mask, label):
     m = mask & np.isfinite(values)
     if m.sum() < 20:
@@ -366,6 +424,7 @@ def main():
             err = est - pc
             z_score = err[2] / np.sqrt(var_z)
             nees3 = finite_mahalanobis(err, cov)
+            xy_marg, xy_cond, pix_nees, nees3_parts = nees_decomposition(err, cov, est, pc, f)
 
             gp, rng, _, _pc = project_world_fast(Xw[j], T_bw, f, cx, cy)
             if depth is None:
@@ -385,6 +444,7 @@ def main():
             nis = float(nis_value) if np.isfinite(nis_value) else np.nan
             rows.append((
                 i - born[j], track_len, z_score, z_score * z_score, nees3,
+                xy_marg, xy_cond, pix_nees, nees3_parts,
                 err[2] / pc[2], np.linalg.norm(err) / np.linalg.norm(pc),
                 drift_px[j], dstd, occluded, border, pc[2], float(inlier_ratio), nis))
 
@@ -413,9 +473,24 @@ def main():
         print("No scored observations. Lower --min-track, increase --frames, or check dataset path.")
         return
 
-    age, tl, z, z2, nees3, relz, rel3, drift, dstd, occ, border, depth_z, inlier, nis = A.T
+    (age, tl, z, z2, nees3, xy_marg, xy_cond, pix_nees, nees3_parts,
+     relz, rel3, drift, dstd, occ, border, depth_z, inlier, nis) = A.T
     print(f"depth NEES-1D mean/median: {np.mean(z2):8.2f} / {np.median(z2):8.2f}  (ideal 1)")
     print(f"3D NEES mean/median:       {np.nanmean(nees3):8.2f} / {np.nanmedian(nees3):8.2f}  (ideal 3)")
+    print(f"3D split mean/median:      z {np.nanmean(z2):8.2f} / {np.nanmedian(z2):8.2f}  "
+          f"xy|z {np.nanmean(xy_cond):8.2f} / {np.nanmedian(xy_cond):8.2f}  "
+          f"(ideal 1 + 2)")
+    print(f"XY marginal mean/median:   {np.nanmean(xy_marg):8.2f} / {np.nanmedian(xy_marg):8.2f}  "
+          f"(diagnostic only)")
+    pix_f = pix_nees[np.isfinite(pix_nees)]
+    if len(pix_f):
+        print(f"pixel-plane NEES mean/med: {np.mean(pix_f):8.2f} / {np.median(pix_f):8.2f}  "
+              f"(ideal 2 if linearized projection matches)")
+    decomp_resid = nees3 - nees3_parts
+    decomp_f = decomp_resid[np.isfinite(decomp_resid)]
+    if len(decomp_f):
+        print(f"3D split check |full-(z+xy|z)|: "
+              f"median {np.median(np.abs(decomp_f)):.2e}  p99 {np.percentile(np.abs(decomp_f), 99):.2e}")
     print(f"|z|<1/<2/<3:               {np.mean(np.abs(z) < 1)*100:5.1f}% / "
           f"{np.mean(np.abs(z) < 2)*100:5.1f}% / {np.mean(np.abs(z) < 3)*100:5.1f}%")
     print(f"signed rel depth err:      median {np.median(relz)*100:+6.2f}%  "
@@ -438,6 +513,15 @@ def main():
             label = f"{lo}-{int(hi) if hi < 1e8 else 'inf'}"
             print_bin_stats("track_len", z2, m, label)
 
+    print("\n--- full 3D NEES split by track length ---")
+    for lo, hi in [(10, 20), (20, 40), (40, 80), (80, 160), (160, 1e9)]:
+        m = (tl >= lo) & (tl < hi)
+        if m.any():
+            label = f"{lo}-{int(hi) if hi < 1e8 else 'inf'}"
+            print_bin_stats("z", z2, m, label)
+            print_bin_stats("xy|z", xy_cond, m, label)
+            print_bin_stats("full3", nees3, m, label)
+
     print("\n--- depth NEES-1D by measurement drift and scene covariates ---")
     for lo, hi in [(0, 0.25), (0.25, 0.5), (0.5, 1.0), (1.0, 2.0), (2.0, 1e9)]:
         m = (drift >= lo) & (drift < hi)
@@ -455,8 +539,12 @@ def main():
         clean = (occ == 0) & (border == 0) & finite_dstd & (dstd < q75)
         print("\n--- gated valid-domain NEES ---")
         print_bin_stats("valid", z2, clean, "vis/int/lowmid")
+        print_bin_stats("valid xy|z", xy_cond, clean, "vis/int/lowmid")
+        print_bin_stats("valid full3", nees3, clean, "vis/int/lowmid")
         clean_core = clean & (drift <= 3.0)
         print_bin_stats("valid", z2, clean_core, "drift<=3px")
+        print_bin_stats("valid xy|z", xy_cond, clean_core, "drift<=3px")
+        print_bin_stats("valid full3", nees3, clean_core, "drift<=3px")
 
     print("\n--- NEES mass concentration ---")
     order = np.argsort(z2)[::-1]
@@ -466,6 +554,15 @@ def main():
         print(f"top {frac*100:4.0f}% obs carry {np.sum(z2[order[:k]]) / total * 100:5.1f}% "
               f"of depth NEES mass; median age {np.median(age[order[:k]]):.0f}, "
               f"median drift {np.median(drift[order[:k]]):.2f}px")
+    order3 = np.argsort(nees3)[::-1]
+    total3 = np.nansum(nees3)
+    for frac in (0.01, 0.05, 0.10):
+        k = max(1, int(frac * len(nees3)))
+        top = order3[:k]
+        print(f"top {frac*100:4.0f}% obs carry {np.nansum(nees3[top]) / total3 * 100:5.1f}% "
+              f"of 3D NEES mass; median z {np.nanmedian(z2[top]):.2f}, "
+              f"median xy|z {np.nanmedian(xy_cond[top]):.2f}, "
+              f"median drift {np.median(drift[top]):.2f}px")
 
 
 if __name__ == "__main__":

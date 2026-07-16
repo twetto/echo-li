@@ -73,4 +73,4 @@ echo
 echo "Logs written to $OUTDIR"
 echo
 echo "Quick summary:"
-rg -n "=====|depth NEES-1D|3D NEES|measurement drift|occluded obs|border-risk|NIS chi2|valid vis/int/lowmid|valid   drift<=3px|top    1%" "$COMBINED" || true
+rg -n "=====|depth NEES-1D|3D NEES|3D split|XY marginal|pixel-plane|measurement drift|occluded obs|border-risk|NIS chi2|valid vis/int/lowmid|valid   drift<=3px|valid xy\\|z|valid full3|top    1%" "$COMBINED" || true
