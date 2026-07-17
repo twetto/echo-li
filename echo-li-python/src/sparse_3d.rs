@@ -212,6 +212,7 @@ fn parse_settings(kwargs: Option<&Bound<'_, pyo3::types::PyDict>>) -> PyResult<S
     set!("init_invdepth_var", init_invdepth_var);
     set!("sigma_pixel", sigma_pixel);
     set!("flow_age_rate_px_per_frame", flow_age_rate_px_per_frame);
+    set!("bias_walk_var", bias_walk_var);
     set!("uniform_z_max", uniform_z_max);
     set!("uniform_rho_max", uniform_rho_max);
     set!("uniform_d_min", uniform_d_min);

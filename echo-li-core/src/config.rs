@@ -194,6 +194,8 @@ pub struct SparseVogConfig {
     #[serde(default)]
     pub flow_age_rate_px_per_frame: Option<f64>,
     #[serde(default)]
+    pub bias_walk_var: Option<f64>,
+    #[serde(default)]
     pub uniform_z_max: Option<f64>,
     #[serde(default)]
     pub uniform_rho_max: Option<f64>,
@@ -270,6 +272,9 @@ impl SparseVogConfig {
         }
         if let Some(v) = self.flow_age_rate_px_per_frame {
             settings.flow_age_rate_px_per_frame = v;
+        }
+        if let Some(v) = self.bias_walk_var {
+            settings.bias_walk_var = v;
         }
         if let Some(v) = self.uniform_z_max {
             settings.uniform_z_max = v;

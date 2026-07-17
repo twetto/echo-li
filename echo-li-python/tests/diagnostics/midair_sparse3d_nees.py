@@ -38,6 +38,7 @@ SIGMA_PX = 0.5
 SPARSE_VOG_KEYS = [
     "max_pool_size", "min_track_length", "conv_inlier_ratio", "conv_variance_threshold",
     "init_depth_var", "init_invdepth_var", "sigma_pixel", "flow_age_rate_px_per_frame",
+    "bias_walk_var",
     "uniform_z_max", "uniform_rho_max", "uniform_d_min", "uniform_d_max",
     "a_init", "b_init", "ab_min", "ab_max",
     "min_inlier_ratio", "mahalanobis_reset_chi2", "process_depth_var", "min_parallax",
@@ -158,39 +159,54 @@ def pixel_jac_current(x_cur, T_wc_cur, T_cw_obs, f, cx, cy):
     return J
 
 
-def fisher_cov_from_track(obs, x_cur, T_wc_cur, f, cx, cy, sigma_px, bias_sigma_px):
+def fisher_cov_from_track(obs, x_cur, T_wc_cur, f, cx, cy, sigma_px, bias_sigma_px,
+                          bias_mode="const"):
     """Fisher covariance in current camera coordinates for one track.
 
-    Measurement model:
+    Measurement model  u_i = pi_i(x_cur) + b_i + eps_i,  eps_i ~ N(0, sigma_px^2 I).
+    The per-track correspondence bias b_i has a mode-dependent covariance (per pixel
+    component, scale = `bias_sigma_px`); marginalizing it gives a block-correlated
+    stacked pixel covariance C = sigma_px^2 I + U, and this returns inv(J^T C^-1 J).
 
-        u_i = pi_i(x_cur) + b_track + eps_i
+      const     : b_i = b (constant offset).      U = s^2_b * 1 1^T        (rank-1)
+      driftrate : b_i = age_i * v (coherent drift). U = s^2_v * a a^T       (rank-1)
+      rw        : b_i random walk.                 U = q^2 * min(age_i,age_j) (dense)
 
-    with eps_i ~ N(0, sigma_px^2 I) and b_track ~ N(0, bias_sigma_px^2 I).
-    Marginalizing b_track gives a block-correlated pixel covariance within the
-    track. `bias_sigma_px=0` reduces to iid pixel Fisher covariance.
+    `age_i` = within-track observation index from birth (0 at birth). `bias_sigma_px=0`
+    or bias_mode="none" reduces to the iid pixel Fisher covariance.
     """
     if len(obs) < 2 or sigma_px <= 0:
         return None
     jx = []
     jy = []
-    for T_wc_obs, _uv in obs:
+    ages = []
+    for age, (T_wc_obs, _uv) in enumerate(obs):
         J = pixel_jac_current(x_cur, T_wc_cur, np.linalg.inv(T_wc_obs), f, cx, cy)
         if J is None or not np.isfinite(J).all():
             continue
         jx.append(J[0])
         jy.append(J[1])
+        ages.append(age)          # frames-since-birth, aligned to kept obs
     if len(jx) < 2:
         return None
+    a = np.asarray(ages, float)
+    s2 = sigma_px * sigma_px
+    sc2 = bias_sigma_px * bias_sigma_px
 
     def add_component(Js):
         J = np.asarray(Js, float)
         n = len(J)
-        s2 = sigma_px * sigma_px
-        if bias_sigma_px <= 0:
+        if sc2 <= 0 or bias_mode == "none":
             return (J.T @ J) / s2
-        b2 = bias_sigma_px * bias_sigma_px
-        sum_j = np.sum(J, axis=0)
-        return (J.T @ J) / s2 - (b2 / (s2 * (s2 + n * b2))) * np.outer(sum_j, sum_j)
+        if bias_mode in ("const", "driftrate"):
+            w = np.ones(n) if bias_mode == "const" else a        # rank-1 loading
+            Jw = J.T @ w
+            coef = sc2 / (s2 * (s2 + sc2 * float(w @ w)))
+            return (J.T @ J) / s2 - coef * np.outer(Jw, Jw)
+        if bias_mode == "rw":
+            C = s2 * np.eye(n) + sc2 * np.minimum.outer(a, a)
+            return J.T @ np.linalg.solve(C, J)
+        raise ValueError(f"unknown bias_mode {bias_mode}")
 
     H = add_component(jx) + add_component(jy)
     H = 0.5 * (H + H.T)
@@ -248,6 +264,11 @@ def main():
                     help="override SparseVog Gaussian-Beta concentration cap")
     ap.add_argument("--mahalanobis-reset-chi2", type=float, default=None,
                     help="override hard reset gate; <=0 disables in Sparse3D")
+    ap.add_argument("--bias-mode", default="const",
+                    choices=["none", "const", "driftrate", "rw"],
+                    help="per-track bias covariance structure for the diagnostic Fisher "
+                         "cov: const=offset (s_b*11^T), driftrate=coherent (s_v*aa^T), "
+                         "rw=random walk (q*min(i,j)); scale set by --bias-sigma-px")
     ap.add_argument("--bias-sigma-px", type=float, default=0.0,
                     help="diagnostic only: marginalized persistent per-track pixel bias sigma")
     ap.add_argument("--fisher-sigma-px", type=float, default=None,
@@ -268,6 +289,12 @@ def main():
                     help="pixels from image edge considered border-risk for score splits")
     ap.add_argument("--chart", default="config",
                     choices=["config", "invdepth_additive", "bearing_invdepth_additive"])
+    ap.add_argument("--save-npz", default="",
+                    help="dump per-observation scored rows (+ column names) for offline "
+                         "stratification, e.g. NEES-vs-age at bias saturation")
+    ap.add_argument("--filter-bias-walk-var", type=float, default=None,
+                    help="enable the IN-FILTER 5-DOF random-walk correspondence-bias state "
+                         "(px^2/frame); changes the point estimate, unlike --bias-sigma-px")
     args = ap.parse_args()
 
     ds = md.MidAir(args.root, args.subset, args.cond, args.traj, args.scale)
@@ -289,6 +316,7 @@ def main():
     for key, value in [
         ("init_depth_var", args.init_depth_var),
         ("flow_age_rate_px_per_frame", args.flow_age_rate_px_per_frame),
+        ("bias_walk_var", args.filter_bias_walk_var),
         ("process_depth_var", args.process_depth_var),
         ("range_walk_var", args.range_walk_var),
         ("min_parallax", args.min_parallax),
@@ -326,6 +354,7 @@ def main():
     nid = 0
     prev = None
     rows = []
+    filt_front = []   # (age, |pi(est) - u_rudolf|) : filter-vs-frontend raw reprojection px
     n_live_updates = 0
     t0 = time.time()
     last = min(args.start + args.frames, ds.n)
@@ -501,6 +530,9 @@ def main():
             if var_z <= 0:
                 continue
             err = est - pc
+            if est[2] > 1e-6:
+                pe = np.array([f * est[0] / est[2] + cx, f * est[1] / est[2] + cy])
+                filt_front.append((i - born[j], float(np.linalg.norm(pe - pos_prev[j]))))
             z_score = err[2] / np.sqrt(var_z)
             nees3 = finite_mahalanobis(err, cov)
             xy_marg, xy_cond, pix_nees, nees3_parts = nees_decomposition(err, cov, est, pc, f)
@@ -510,7 +542,8 @@ def main():
             cov_iid = fisher_cov_from_track(
                 obs_hist.get(j, []), est, T_wc, f, cx, cy, fisher_sigma, 0.0)
             cov_bias = fisher_cov_from_track(
-                obs_hist.get(j, []), est, T_wc, f, cx, cy, fisher_sigma, args.bias_sigma_px)
+                obs_hist.get(j, []), est, T_wc, f, cx, cy, fisher_sigma,
+                args.bias_sigma_px, args.bias_mode)
             nees3_iid = finite_mahalanobis(err, cov_iid) if cov_iid is not None else np.nan
             nees3_bias = finite_mahalanobis(err, cov_bias) if cov_bias is not None else np.nan
             _xm_iid, xy_iid, pix_iid, _parts_iid = (
@@ -571,6 +604,14 @@ def main():
     (age, tl, z, z2, nees3, xy_marg, xy_cond, pix_nees, nees3_parts,
      nees3_iid, xy_iid, pix_iid, nees3_bias, xy_bias, pix_bias,
      relz, rel3, drift, dstd, occ, border, depth_z, inlier, nis) = A.T
+    if args.save_npz:
+        cols = ["age", "tl", "z", "z2", "nees3", "xy_marg", "xy_cond", "pix_nees",
+                "nees3_parts", "nees3_iid", "xy_iid", "pix_iid", "nees3_bias",
+                "xy_bias", "pix_bias", "relz", "rel3", "drift", "dstd", "occ",
+                "border", "depth_z", "inlier", "nis"]
+        np.savez(args.save_npz, rows=A, cols=np.array(cols),
+                 bias_sigma_px=float(args.bias_sigma_px), bias_mode=args.bias_mode)
+        print(f"saved per-obs rows -> {args.save_npz}")
     print(f"depth NEES-1D mean/median: {np.mean(z2):8.2f} / {np.median(z2):8.2f}  (ideal 1)")
     print(f"3D NEES mean/median:       {np.nanmean(nees3):8.2f} / {np.nanmedian(nees3):8.2f}  (ideal 3)")
     print(f"3D split mean/median:      z {np.nanmean(z2):8.2f} / {np.nanmedian(z2):8.2f}  "
@@ -604,7 +645,15 @@ def main():
     print(f"abs 3D rel err:            median {np.median(np.abs(rel3))*100:6.2f}%  "
           f"p90 {np.percentile(np.abs(rel3), 90)*100:6.2f}%")
     print(f"measurement drift vs GT:   median {np.median(drift):6.3f}px  "
-          f"p90 {np.percentile(drift, 90):6.3f}px")
+          f"p90 {np.percentile(drift, 90):6.3f}px  (frontend vs truth)")
+    if filt_front:
+        ff = np.array(filt_front, float)
+        print(f"filter vs frontend px:     median {np.median(ff[:, 1]):6.3f}px  "
+              f"p90 {np.percentile(ff[:, 1], 90):6.3f}px  (|pi(est) - u_rudolf|, raw)")
+        segs = [f"{lo}-{hi}:{np.median(ff[(ff[:,0]>=lo)&(ff[:,0]<hi),1]):.2f}"
+                for lo, hi in [(10, 20), (20, 40), (40, 80)]
+                if ((ff[:, 0] >= lo) & (ff[:, 0] < hi)).sum() >= 15]
+        print(f"  filter-vs-frontend median by age: {'  '.join(segs)}")
     print(f"occluded obs:              {np.mean(occ == 1)*100:5.1f}%")
     print(f"border-risk obs:           {np.mean(border == 1)*100:5.1f}%")
     nis_f = nis[np.isfinite(nis)]

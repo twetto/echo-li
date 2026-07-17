@@ -4,7 +4,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use echo_lie::SOT3;
-use nalgebra::{Matrix2, Matrix2x3, Matrix3, Matrix3x2, Matrix4, Vector2, Vector3, Vector4};
+use nalgebra::{
+    Matrix2, Matrix2x3, Matrix2x5, Matrix3, Matrix3x2, Matrix4, Matrix5, Vector2, Vector3, Vector4,
+};
 
 use crate::coordinate_suite::base_skew;
 use crate::coordinate_suite::invdepth::{conv_euc2ind, conv_ind2euc, point_chart_invdepth_inv};
@@ -85,6 +87,12 @@ pub struct FeatureState3D {
     /// squared). Should be close to chi2(2) when the filter is consistent.
     /// NaN before the first update.
     pub last_nis: f64,
+    // --- Per-track correspondence-bias state (BearingInvDepthAdditive only,
+    // enabled by settings.bias_walk_var > 0). Augments the 3-DOF landmark to a
+    // 5-DOF state s5 = (inv_s, bias). All zero / unused when disabled. ---
+    pub bias: Vector2<f64>,   // estimated 2D pixel bias b
+    pub p_sb: Matrix3x2<f64>, // cross-covariance cov(inv_s, bias)
+    pub p_bb: Matrix2<f64>,   // bias covariance cov(bias, bias)
 }
 
 impl FeatureState3D {
@@ -399,6 +407,9 @@ impl Sparse3DFilter {
                     ref_uv: uv_curr,
                     ref_stamp: stamp,
                     last_nis: f64::NAN,
+                    bias: Vector2::zeros(),
+                    p_sb: Matrix3x2::zeros(),
+                    p_bb: Matrix2::zeros(),
                 };
                 self.insert_feature(feat);
                 self.pending.remove(&fid);
@@ -481,6 +492,9 @@ impl Sparse3DFilter {
                 ref_uv: uv_curr,
                 ref_stamp: stamp,
                 last_nis: f64::NAN,
+                bias: Vector2::zeros(),
+                p_sb: Matrix3x2::zeros(),
+                p_bb: Matrix2::zeros(),
             };
             self.insert_feature(feat);
             self.pending.remove(&fid);
@@ -824,6 +838,9 @@ fn bearing_invdepth_additive_update_3d(
     p_ww: Option<&Matrix3<f64>>,
     dt: f64,
 ) -> bool {
+    if settings.bias_walk_var > 0.0 {
+        return bearing_bias_update_3d(cam, k, settings, feat, uv_obs, t_cw_curr, p_vv, p_ww, dt);
+    }
     let fx = k[(0, 0)];
     let fy = k[(1, 1)];
 
@@ -928,6 +945,159 @@ fn bearing_invdepth_additive_update_3d(
     let (pa_new, jpa_new) = pj_of(&feat.inv_s);
     let j_g = r_ca * jpa_new; // dP_cur/ds
     feat.position = r_ca * pa_new + t_ca_t;
+    let cov_euc = j_g * feat.inv_p * j_g.transpose();
+    feat.covariance = 0.5 * (cov_euc + cov_euc.transpose());
+    true
+}
+
+/// Bias-augmented bearing-invdepth update: joint 5-DOF EKF on the landmark chart
+/// state `s = (eta1, eta2, rho)` plus a per-track 2D correspondence-bias `b` with a
+/// random-walk process model. Measurement `u = pi(P(s)) + b + eps`, so H = [C | I2].
+///
+/// The bias absorbs the temporally-correlated Rudolf/KLT correspondence drift (exact-
+/// GT MidAir shows it is a random walk, not a constant offset), so repeated same-track
+/// observations no longer over-count and the reported landmark covariance stops
+/// collapsing. Because the bias explains the drift, the landmark estimate should also
+/// stay nearer truth. The reported `covariance` is the landmark MARGINAL (the 3x3
+/// block of the joint posterior projected to Euclidean). Enabled by
+/// `settings.bias_walk_var > 0`; see the parent function.
+fn bearing_bias_update_3d(
+    cam: &dyn CameraModel,
+    k: &Matrix3<f64>,
+    settings: &SparseVogSettings,
+    feat: &mut FeatureState3D,
+    uv_obs: &Vector2<f64>,
+    t_cw_curr: &Matrix4<f64>,
+    p_vv: Option<&Matrix3<f64>>,
+    p_ww: Option<&Matrix3<f64>>,
+    dt: f64,
+) -> bool {
+    let fx = k[(0, 0)];
+    let fy = k[(1, 1)];
+
+    let t_ca = t_cw_curr * feat.anchor_t_wc;
+    let r_ca = t_ca.fixed_view::<3, 3>(0, 0).into_owned();
+    let t_ca_t = t_ca.fixed_view::<3, 1>(0, 3).into_owned();
+    let b0 = feat.anchor_ray;
+    let u = feat.tangent_basis;
+    let pj_of = |s: &Vector3<f64>| {
+        let eta = Vector2::new(s[0], s[1]);
+        bearing_chart::point_and_jacobian(&b0, &u, &eta, s[2])
+    };
+
+    // --- process: landmark range walk (unchanged) + bias random walk ---
+    if dt > 0.0 && settings.range_walk_var > 0.0 {
+        let (pa, jpa) = pj_of(&feat.inv_s);
+        let q_c = r_ca * pa + t_ca_t;
+        if q_c[2] > settings.min_depth {
+            let j_g = r_ca * jpa;
+            if let Some(j_inv) = j_g.try_inverse() {
+                let r_hat = q_c / q_c.norm();
+                let q_cur =
+                    settings.range_walk_var * q_c.norm_squared() * (r_hat * r_hat.transpose());
+                let sigma = feat.inv_p + j_inv * q_cur * j_inv.transpose();
+                feat.inv_p = 0.5 * (sigma + sigma.transpose());
+            }
+        }
+    }
+    // Random walk on the bias: b_k = b_{k-1} + w_k, w_k ~ N(0, bias_walk_var I).
+    feat.p_bb += Matrix2::identity() * settings.bias_walk_var;
+
+    let mut r_meas = Matrix2::identity() * measurement_variance_px2(settings, feat);
+
+    let (pa, jpa) = pj_of(&feat.inv_s);
+    let q_c = r_ca * pa + t_ca_t;
+    if q_c[2] < settings.min_depth {
+        return false;
+    }
+    let proj = cam.projection_jacobian(&q_c);
+    if dt > 0.0 {
+        if let Some(pvv) = p_vv {
+            r_meas += proj * pvv * proj.transpose();
+        }
+        if let Some(pww) = p_ww {
+            let jphi = proj * base_skew(&q_c);
+            r_meas += jphi * pww * jphi.transpose();
+        }
+    }
+    let c = proj * r_ca * jpa; // dh/ds (2x3)
+
+    // Assemble the joint 5x5 covariance P5 and H = [C | I2].
+    let mut p5 = Matrix5::<f64>::zeros();
+    p5.fixed_view_mut::<3, 3>(0, 0).copy_from(&feat.inv_p);
+    p5.fixed_view_mut::<3, 2>(0, 3).copy_from(&feat.p_sb);
+    p5.fixed_view_mut::<2, 3>(3, 0)
+        .copy_from(&feat.p_sb.transpose());
+    p5.fixed_view_mut::<2, 2>(3, 3).copy_from(&feat.p_bb);
+    let mut h = Matrix2x5::<f64>::zeros();
+    h.fixed_view_mut::<2, 3>(0, 0).copy_from(&c);
+    h.fixed_view_mut::<2, 2>(0, 3)
+        .copy_from(&Matrix2::identity());
+
+    let s_mat = h * p5 * h.transpose() + r_meas;
+    let Some(s_inv) = (s_mat + Matrix2::identity() * 1e-8).try_inverse() else {
+        return true;
+    };
+    let det_s = s_mat.determinant();
+    if det_s < 1e-30 {
+        return true;
+    }
+    let y_pred = cam.project(&q_c);
+    let residual = uv_obs - y_pred - feat.bias; // measurement now includes the bias
+    let maha_sq = (residual.transpose() * s_inv * residual)[(0, 0)];
+    feat.last_nis = maha_sq;
+    if settings.mahalanobis_reset_chi2 > 0.0 && maha_sq > settings.mahalanobis_reset_chi2 {
+        return false;
+    }
+    let gain = p5 * h.transpose() * s_inv; // 5x2
+    let full_delta = gain * residual; // 5x1
+    let i_kh = Matrix5::identity() - gain * h;
+    let p_post = i_kh * p5 * i_kh.transpose() + gain * r_meas * gain.transpose();
+
+    let gauss_pdf = (-0.5 * maha_sq).exp() / ((2.0 * std::f64::consts::PI).powi(2) * det_s).sqrt();
+    let uniform_prior = 1.0 / (fx * fy * 4.0);
+    let ab = feat.a + feat.b;
+    if ab <= 0.0 {
+        return true;
+    }
+    let c1 = (feat.a / ab) * gauss_pdf;
+    let c2 = (feat.b / ab) * uniform_prior;
+    let z_norm = c1 + c2;
+    if z_norm < 1e-30 {
+        feat.b = (feat.b + 1.0).min(settings.ab_max);
+        return true;
+    }
+    let w1 = c1 / z_norm;
+    let w2 = c2 / z_norm;
+
+    let gamma = w1 * full_delta;
+    let p_new = w1 * p_post + w2 * p5 + w1 * w2 * (full_delta * full_delta.transpose());
+    if p_new
+        .symmetric_eigen()
+        .eigenvalues
+        .iter()
+        .any(|v| *v <= 0.0 || !v.is_finite())
+    {
+        return true;
+    }
+
+    feat.inv_s[0] += gamma[0];
+    feat.inv_s[1] += gamma[1];
+    feat.inv_s[2] += gamma[2];
+    feat.bias[0] += gamma[3];
+    feat.bias[1] += gamma[4];
+    let inv_p = p_new.fixed_view::<3, 3>(0, 0).into_owned();
+    feat.inv_p = 0.5 * (inv_p + inv_p.transpose());
+    feat.p_sb = p_new.fixed_view::<3, 2>(0, 3).into_owned();
+    let p_bb = p_new.fixed_view::<2, 2>(3, 3).into_owned();
+    feat.p_bb = 0.5 * (p_bb + p_bb.transpose());
+    feat.track_length += 1;
+    update_beta(settings, feat, w1, w2);
+
+    let (pa_new, jpa_new) = pj_of(&feat.inv_s);
+    let j_g = r_ca * jpa_new;
+    feat.position = r_ca * pa_new + t_ca_t;
+    // Reported covariance = landmark marginal (bias-explained, non-collapsed).
     let cov_euc = j_g * feat.inv_p * j_g.transpose();
     feat.covariance = 0.5 * (cov_euc + cov_euc.transpose());
     true
@@ -1610,6 +1780,9 @@ mod tests {
             ref_uv: Vector2::new(0.0, 0.0),
             ref_stamp: 0.0,
             last_nis: f64::NAN,
+            bias: Vector2::zeros(),
+            p_sb: Matrix3x2::zeros(),
+            p_bb: Matrix2::zeros(),
         }
     }
 

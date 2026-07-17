@@ -88,6 +88,16 @@ pub struct SparseVogSettings {
     /// filter's un-scaled per-step term). Only consumed by `Sparse3DFilter`.
     /// Findings: `ECHO-LI-notes/docs/sparse3d_secondorder_eqf_derivation.md`.
     pub range_walk_var: f64,
+    /// Per-frame random-walk variance (px^2) of a per-track 2D correspondence-bias
+    /// state augmented onto the landmark in the `BearingInvDepthAdditive` update.
+    /// Measurement model becomes `u = pi(P(s)) + b + eps`, `b_k = b_{k-1} + w_k`,
+    /// `w_k ~ N(0, bias_walk_var I)`. The bias absorbs the temporally-correlated
+    /// KLT/Rudolf correspondence drift so repeated same-track observations are not
+    /// over-counted (exact-GT MidAir shows this drift is a random walk, not a
+    /// constant offset). Default 0 (off) -> plain 3-DOF landmark EKF, exact prior
+    /// behavior. Only consumed by `Sparse3DFilter`'s bearing-invdepth chart.
+    /// Findings: `ECHO-LI-notes/docs/frontend/flow-bias/comprehensive_motion_ceiling.md`.
+    pub bias_walk_var: f64,
     /// Experimental sigma-point rotation propagation for the additive chart.
     pub rotation_unscented: bool,
 }
@@ -124,6 +134,7 @@ impl Default for SparseVogSettings {
             iekf_iterations: 1,
             second_order_mode: SecondOrderMode::Off,
             range_walk_var: 0.0,
+            bias_walk_var: 0.0,
             rotation_unscented: false,
         }
     }
