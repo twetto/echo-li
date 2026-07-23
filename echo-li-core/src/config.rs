@@ -196,6 +196,8 @@ pub struct SparseVogConfig {
     #[serde(default)]
     pub bias_walk_var: Option<f64>,
     #[serde(default)]
+    pub pose_range_scale: Option<f64>,
+    #[serde(default)]
     pub uniform_z_max: Option<f64>,
     #[serde(default)]
     pub uniform_rho_max: Option<f64>,
@@ -275,6 +277,9 @@ impl SparseVogConfig {
         }
         if let Some(v) = self.bias_walk_var {
             settings.bias_walk_var = v;
+        }
+        if let Some(v) = self.pose_range_scale {
+            settings.pose_range_scale = v;
         }
         if let Some(v) = self.uniform_z_max {
             settings.uniform_z_max = v;

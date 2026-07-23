@@ -88,6 +88,16 @@ pub struct SparseVogSettings {
     /// filter's un-scaled per-step term). Only consumed by `Sparse3DFilter`.
     /// Findings: `ECHO-LI-notes/docs/sparse3d_secondorder_eqf_derivation.md`.
     pub range_walk_var: f64,
+    /// Scale on the *pose-driven* range process noise (eq. 10-11 of the Sparse3D
+    /// formulation). When > 0 and per-frame incremental pose covariances (p_vv, p_ww)
+    /// are supplied to `update`, each frame injects a range (radial) process noise
+    /// q = scale * (r^2/b^2)(r^2 * sig_phi^2 + sig_t^2) along the line of sight, where
+    /// r is the current range, b the anchor->current baseline, and sig_.^2 the
+    /// incremental relative-pose variances. This is the channel that CAN inflate the
+    /// depth covariance (the measurement-noise term proj*P*proj^T is radial-blind:
+    /// d(pi)/dq * r_hat = 0). Per-landmark via the inverse-parallax r/b factor.
+    /// Default 0 (off). Only consumed by the `BearingInvDepthAdditive` update.
+    pub pose_range_scale: f64,
     /// Per-frame random-walk variance (px^2) of a per-track 2D correspondence-bias
     /// state augmented onto the landmark in the `BearingInvDepthAdditive` update.
     /// Measurement model becomes `u = pi(P(s)) + b + eps`, `b_k = b_{k-1} + w_k`,
@@ -134,6 +144,7 @@ impl Default for SparseVogSettings {
             iekf_iterations: 1,
             second_order_mode: SecondOrderMode::Off,
             range_walk_var: 0.0,
+            pose_range_scale: 0.0,
             bias_walk_var: 0.0,
             rotation_unscented: false,
         }

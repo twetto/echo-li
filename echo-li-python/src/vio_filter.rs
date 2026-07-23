@@ -1,5 +1,5 @@
-use numpy::ndarray::Array1;
-use numpy::PyArray1;
+use numpy::ndarray::{Array1, Array2};
+use numpy::{PyArray1, PyArray2};
 use pyo3::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -10,9 +10,9 @@ use echo_li_core::mathematical::camera::CameraModel;
 use echo_li_core::mathematical::imu_velocity::IMUVelocity;
 use echo_li_core::mathematical::vio_state::{VIOSensorState, VIOState};
 use echo_li_core::mathematical::vision_measurement::VisionMeasurement;
-use echo_li_core::{landmarks_to_global, LandmarkDepthPrior, VIOFilter};
-use echo_lie::SE3;
-use nalgebra::{Matrix4, Vector2, Vector3};
+use echo_li_core::{LandmarkDepthPrior, VIOFilter, landmarks_to_global};
+use echo_lie::{SE3, SO3};
+use nalgebra::{Matrix3, Matrix4, Vector2, Vector3, Vector6};
 use numpy::{PyReadonlyArray2, PyUntypedArrayMethods};
 
 use crate::camera::to_camera_arc;
@@ -77,6 +77,38 @@ impl PyVIOFilter {
         let data = t_bs.as_slice()?;
         let m = Matrix4::from_row_slice(data);
         self.camera_extrinsics = Some(SE3::from_matrix(&m));
+        Ok(())
+    }
+
+    /// Seed the filter from a known initial state (e.g. ground truth at a mid-flight start),
+    /// bypassing the stationary-start auto-initialiser. `rotation` is 3x3 body->world;
+    /// `velocity` is body-frame linear velocity. Call after `set_camera_extrinsics`.
+    #[pyo3(signature = (position, rotation, velocity))]
+    fn set_initial_state(
+        &mut self,
+        position: [f64; 3],
+        rotation: PyReadonlyArray2<'_, f64>,
+        velocity: [f64; 3],
+    ) -> PyResult<()> {
+        let shape = rotation.shape();
+        if shape[0] != 3 || shape[1] != 3 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "rotation must be 3x3",
+            ));
+        }
+        let r = SO3::from_matrix(&Matrix3::from_row_slice(rotation.as_slice()?));
+        let pose = SE3::new(r, Vector3::new(position[0], position[1], position[2]));
+        let cam_offset = self.camera_extrinsics.clone().unwrap_or_else(SE3::identity);
+        let sensor = VIOSensorState {
+            input_bias: Vector6::zeros(),
+            pose,
+            velocity: Vector3::new(velocity[0], velocity[1], velocity[2]),
+            camera_offset: cam_offset,
+        };
+        let xi0 = VIOState::new(sensor, vec![]);
+        self.filter = VIOFilter::new(self.filter.settings.clone(), xi0);
+        self.imu_buffer.clear();
+        self.initialized = true;
         Ok(())
     }
 
@@ -206,6 +238,25 @@ impl PyVIOFilter {
             dict.set_item(id, arr)?;
         }
         Ok(dict)
+    }
+
+    /// Current camera pose covariance from the EqF (J * Sigma * J^T through the camera-offset
+    /// adjoint): returns (P_vv, P_ww) as two 3x3 arrays -- world-frame position covariance and
+    /// attitude covariance of the camera pose. Feed these straight into Sparse3DFilter.update
+    /// so the landmark depth covariance accounts for pose uncertainty. None if unavailable.
+    fn get_camera_pose_covariance<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> Option<(Bound<'py, PyArray2<f64>>, Bound<'py, PyArray2<f64>>)> {
+        let mat3 = |m: &Matrix3<f64>| {
+            let data: Vec<f64> = (0..3)
+                .flat_map(|r| (0..3).map(move |c| m[(r, c)]))
+                .collect();
+            PyArray2::from_owned_array(py, Array2::from_shape_vec((3, 3), data).unwrap())
+        };
+        self.filter
+            .sparse_camera_pose_covariances()
+            .map(|(p_vv, p_ww)| (mat3(&p_vv), mat3(&p_ww)))
     }
 
     fn get_covariance_diagonal<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {

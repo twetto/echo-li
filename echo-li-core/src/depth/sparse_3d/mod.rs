@@ -856,17 +856,33 @@ fn bearing_invdepth_additive_update_3d(
         bearing_chart::point_and_jacobian(&b0, &u, &eta, s[2])
     };
 
-    if dt > 0.0 && settings.range_walk_var > 0.0 {
+    // Range (radial) process noise: the only channel that inflates the depth covariance
+    // (the measurement term proj*P*proj^T below is radial-blind, d(pi)/dq * r_hat = 0).
+    // Combines the fixed range-walk floor with the pose-driven, parallax-scaled term
+    // (eq. 10-11 of the formulation) when per-frame incremental pose covariances are supplied.
+    let pose_range_on = settings.pose_range_scale > 0.0 && p_vv.is_some() && p_ww.is_some();
+    if dt > 0.0 && (settings.range_walk_var > 0.0 || pose_range_on) {
         let (pa, jpa) = pj_of(&feat.inv_s);
         let q_c = r_ca * pa + t_ca_t;
         if q_c[2] > settings.min_depth {
-            let j_g = r_ca * jpa;
-            if let Some(j_inv) = j_g.try_inverse() {
-                let r_hat = q_c / q_c.norm();
-                let q_cur =
-                    settings.range_walk_var * q_c.norm_squared() * (r_hat * r_hat.transpose());
-                let sigma = feat.inv_p + j_inv * q_cur * j_inv.transpose();
-                feat.inv_p = 0.5 * (sigma + sigma.transpose());
+            let r2 = q_c.norm_squared();
+            let mut q_range = settings.range_walk_var * r2;
+            if pose_range_on {
+                // baseline (anchor->current) with a 1%-parallax floor bounding 1/b^2.
+                let b2 = t_ca_t.norm_squared().max(1e-4 * r2);
+                let sig_t2 = p_vv.unwrap().trace() / 3.0; // incremental translation var (m^2)
+                let sig_phi2 = p_ww.unwrap().trace() / 3.0; // incremental rotation var (rad^2)
+                let pose_q = settings.pose_range_scale * (r2 / b2) * (r2 * sig_phi2 + sig_t2);
+                q_range += pose_q.min(4.0 * r2); // cap fractional range var at (2r)^2
+            }
+            if q_range > 0.0 {
+                let j_g = r_ca * jpa;
+                if let Some(j_inv) = j_g.try_inverse() {
+                    let r_hat = q_c / q_c.norm();
+                    let q_cur = q_range * (r_hat * r_hat.transpose());
+                    let sigma = feat.inv_p + j_inv * q_cur * j_inv.transpose();
+                    feat.inv_p = 0.5 * (sigma + sigma.transpose());
+                }
             }
         }
     }
@@ -986,17 +1002,33 @@ fn bearing_bias_update_3d(
     };
 
     // --- process: landmark range walk (unchanged) + bias random walk ---
-    if dt > 0.0 && settings.range_walk_var > 0.0 {
+    // Range (radial) process noise: the only channel that inflates the depth covariance
+    // (the measurement term proj*P*proj^T below is radial-blind, d(pi)/dq * r_hat = 0).
+    // Combines the fixed range-walk floor with the pose-driven, parallax-scaled term
+    // (eq. 10-11 of the formulation) when per-frame incremental pose covariances are supplied.
+    let pose_range_on = settings.pose_range_scale > 0.0 && p_vv.is_some() && p_ww.is_some();
+    if dt > 0.0 && (settings.range_walk_var > 0.0 || pose_range_on) {
         let (pa, jpa) = pj_of(&feat.inv_s);
         let q_c = r_ca * pa + t_ca_t;
         if q_c[2] > settings.min_depth {
-            let j_g = r_ca * jpa;
-            if let Some(j_inv) = j_g.try_inverse() {
-                let r_hat = q_c / q_c.norm();
-                let q_cur =
-                    settings.range_walk_var * q_c.norm_squared() * (r_hat * r_hat.transpose());
-                let sigma = feat.inv_p + j_inv * q_cur * j_inv.transpose();
-                feat.inv_p = 0.5 * (sigma + sigma.transpose());
+            let r2 = q_c.norm_squared();
+            let mut q_range = settings.range_walk_var * r2;
+            if pose_range_on {
+                // baseline (anchor->current) with a 1%-parallax floor bounding 1/b^2.
+                let b2 = t_ca_t.norm_squared().max(1e-4 * r2);
+                let sig_t2 = p_vv.unwrap().trace() / 3.0; // incremental translation var (m^2)
+                let sig_phi2 = p_ww.unwrap().trace() / 3.0; // incremental rotation var (rad^2)
+                let pose_q = settings.pose_range_scale * (r2 / b2) * (r2 * sig_phi2 + sig_t2);
+                q_range += pose_q.min(4.0 * r2); // cap fractional range var at (2r)^2
+            }
+            if q_range > 0.0 {
+                let j_g = r_ca * jpa;
+                if let Some(j_inv) = j_g.try_inverse() {
+                    let r_hat = q_c / q_c.norm();
+                    let q_cur = q_range * (r_hat * r_hat.transpose());
+                    let sigma = feat.inv_p + j_inv * q_cur * j_inv.transpose();
+                    feat.inv_p = 0.5 * (sigma + sigma.transpose());
+                }
             }
         }
     }
