@@ -37,6 +37,12 @@ pub struct SparseVogSettings {
     pub init_depth_var: f64,
     pub init_invdepth_var: f64,
     pub sigma_pixel: f64,
+    /// Optional per-feature-age pixel-noise inflation used by Sparse3D's 2D
+    /// image-residual updates:
+    /// `sigma_eff^2 = sigma_pixel^2 + (flow_age_rate_px_per_frame * age)^2`.
+    /// The scalar 1D `SparseGBFilter` keeps its historical triangulated-depth
+    /// noise model and does not consume this setting.
+    pub flow_age_rate_px_per_frame: f64,
     pub uniform_z_max: f64,
     pub uniform_rho_max: f64,
     pub uniform_d_min: f64,
@@ -82,6 +88,26 @@ pub struct SparseVogSettings {
     /// filter's un-scaled per-step term). Only consumed by `Sparse3DFilter`.
     /// Findings: `ECHO-LI-notes/docs/sparse3d_secondorder_eqf_derivation.md`.
     pub range_walk_var: f64,
+    /// Scale on the *pose-driven* range process noise (eq. 10-11 of the Sparse3D
+    /// formulation). When > 0 and per-frame incremental pose covariances (p_vv, p_ww)
+    /// are supplied to `update`, each frame injects a range (radial) process noise
+    /// q = scale * (r^2/b^2)(r^2 * sig_phi^2 + sig_t^2) along the line of sight, where
+    /// r is the current range, b the anchor->current baseline, and sig_.^2 the
+    /// incremental relative-pose variances. This is the channel that CAN inflate the
+    /// depth covariance (the measurement-noise term proj*P*proj^T is radial-blind:
+    /// d(pi)/dq * r_hat = 0). Per-landmark via the inverse-parallax r/b factor.
+    /// Default 0 (off). Only consumed by the `BearingInvDepthAdditive` update.
+    pub pose_range_scale: f64,
+    /// Per-frame random-walk variance (px^2) of a per-track 2D correspondence-bias
+    /// state augmented onto the landmark in the `BearingInvDepthAdditive` update.
+    /// Measurement model becomes `u = pi(P(s)) + b + eps`, `b_k = b_{k-1} + w_k`,
+    /// `w_k ~ N(0, bias_walk_var I)`. The bias absorbs the temporally-correlated
+    /// KLT/Rudolf correspondence drift so repeated same-track observations are not
+    /// over-counted (exact-GT MidAir shows this drift is a random walk, not a
+    /// constant offset). Default 0 (off) -> plain 3-DOF landmark EKF, exact prior
+    /// behavior. Only consumed by `Sparse3DFilter`'s bearing-invdepth chart.
+    /// Findings: `ECHO-LI-notes/docs/frontend/flow-bias/comprehensive_motion_ceiling.md`.
+    pub bias_walk_var: f64,
     /// Experimental sigma-point rotation propagation for the additive chart.
     pub rotation_unscented: bool,
 }
@@ -97,6 +123,7 @@ impl Default for SparseVogSettings {
             init_depth_var: 1.0,
             init_invdepth_var: 1.0,
             sigma_pixel: 0.5,
+            flow_age_rate_px_per_frame: 0.0,
             uniform_z_max: 20.0,
             uniform_rho_max: 10.0,
             uniform_d_min: -5.0,
@@ -117,6 +144,8 @@ impl Default for SparseVogSettings {
             iekf_iterations: 1,
             second_order_mode: SecondOrderMode::Off,
             range_walk_var: 0.0,
+            pose_range_scale: 0.0,
+            bias_walk_var: 0.0,
             rotation_unscented: false,
         }
     }

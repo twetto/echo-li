@@ -1,0 +1,178 @@
+# MidAir Sparse3D diagnostic config.
+#
+# Purpose: exact-GT MidAir Sparse3D consistency with the real Rudolf-V frontend.
+# Do not treat this as an EuRoC/VIO operating config. The SparseVog measurement
+# noise below is derived from Rudolf-V pixels vs exact MidAir reprojection
+# (`midair_rudolf_flow_error.py`), not from EuRoC ATE tuning.
+
+RudolfV:
+  equaliseImageHistogram: true
+  featureDist: 16.0
+  featureSearchThreshold: 0.8
+  fastThreshold: 20
+  detector: shi_tomasi
+  maxFeatures: 300
+  maxLevel: 3
+  lbpPolicy: HardReject
+  kltResidual: false
+  enableRansac: true
+  epipolarGateThreshold: 1.0e-5
+  epipolarRefine: false
+  ransacParams:
+    inlierThreshold: 0.00001
+    maxIterations: 200
+    minDataPoints: 5
+    minInliers: 15
+  trackedFeatureDist: 16.0
+
+eqf:
+  maxFeatures: 40
+  initialValue:
+    sceneDepth: 3.0
+  initialVariance:
+    attitude: 0.13565029126052572
+    biasAcc: 1.5813333765300104
+    biasGyr: 97162.79515771076
+    cameraAttitude: 0.0010228558965517584
+    cameraPosition: 0.023501400846134893
+    point: 129.90415638150924
+    position: 0.1
+    velocity: 1.0
+  measurementNoise:
+    feature: 2.0
+    featureOutlierAbs: 5.0
+    featureOutlierProb: 0.03229809583062128
+    featureRetention: 0.18594708334486176
+  processVariance:
+    attitude: 6.025875320811407e-05
+    biasAcc: 0.0
+    biasGyr: 0.0
+    cameraAttitude: 5.075382174045239e-06
+    cameraPosition: 1.2188313140115635e-05
+    point: 0.00029845436136043135
+    position: 9.981466095928483e-06
+    velocity: 0.025317333863551263
+  settings:
+    coordinateChoice: Normal
+    fastRiccati: false
+    useDiscreteInnovationLift: false
+    useDiscreteVelocityLift: false
+    useEquivariantOutput: true
+    useFeaturePredictions: true
+    useMedianDepth: true
+    riccatiVariant: faster
+    imuBiasGroup: additive
+  velocityNoise:
+    acc: 0.012438843268295521
+    accBias: 0.004462289865453429
+    gyr: 0.000243153572917808
+    gyrBias: 0.00013372703521098622
+
+main:
+  writeState: true
+  cameraLag: 0.00
+
+Rerun:
+  histeqImage: true
+  freeCells: false
+
+SparseVog:
+  # Target chart for current Sparse3D work.
+  parametrization: bearing_invdepth_additive3d
+  max_pool_size: 300
+  min_track_length: 5
+  conv_variance_threshold: 2.0
+
+  # Birth prior is not the primary calibration lever for normal tracked
+  # features; keep the broad production value while evaluating birth covariance
+  # structurally.
+  init_depth_var: 10.0
+
+  # Derived from:
+  #   midair_rudolf_flow_error.py --set VO_test --cond sunny --traj 0
+  #   --frames 300 --scale 0.5 --config configs/diagnostics_midair_sparse3d.yaml
+  # Clean visible/interior inlier core: sigma_pixel_clean_core ~= 0.421 px.
+  # This replaces the EuRoC production value 5.0, which is intentionally
+  # conservative and hides exact-GT MidAir consistency.
+  sigma_pixel: 0.42
+
+  # Robust gated age scale from the same run: ~0.0058 px/frame. Sparse3D consumes
+  # this as age-dependent pixel noise:
+  # R_age_px2 ~= 0.42^2 + (0.0058 * age)^2, plus explicit occlusion/border/depth-edge gating.
+  flow_age_rate_px_per_frame: 0.0058
+
+  uniform_z_max: 20.0
+  a_init: 100000000.0
+  b_init: 0.00000001
+  ab_min: 1.0
+  ab_max: 200.0
+  min_inlier_ratio: 0.5
+  mahalanobis_reset_chi2: 0.2
+  # bias_walk_var: 0.04
+
+  # MidAir exact-GT diagnostic starts with no artificial static-depth floor.
+  # Re-enable only if NEES remains overconfident after the measured Rudolf-V
+  # error/gating model is applied.
+  process_depth_var: 0.0
+  # pose_range_scale: 0.0
+  min_parallax: 1.0e-4
+  min_cos_sim: 0.95
+  min_depth: 0.1
+  max_depth: 1000.0
+
+  pd_max_tri_side_px: 200
+  pd_max_dist_between_z: 0.1
+  pd_max_norm_deg: 10
+  pd_min_plane_features: 15
+  vis_min_depth: 0.5
+  vis_max_depth: 150.0
+
+Stereo:
+  enabled: false
+  pyramid_levels: 3
+  patch_half_size: 4
+  max_iterations: 30
+  n_search_candidates: 0
+  knn_propagation: 5
+  max_residual: 20.0
+  histeq: global
+
+PatchDepth:
+  camera_mode: per_patch_bearing
+  warp_mode: fast_translation
+  scale: 0.25
+  patch_size: 8
+  patch_stride: 4
+  gn_eta_convergence_tol: 0.001
+  pose_angular_velocity_var: 0.0
+  tiled_tile_size: 64
+  tiled_tile_overlap: 4
+  cell_size: 8
+  seed_radius_px: 64
+  min_baseline_ratio: 0.005
+  max_baseline_ratio: 0.3
+  n_pyramid_levels: 1
+  max_depth: 1000.0
+  min_structure_eigen: 1.0
+  max_structure_condition: 0.0
+  vis_min_depth: 0.5
+  vis_max_depth: 150.0
+  n_search_candidates: 1
+  cov_vis_min: 0.0
+  cov_vis_max: 0.5
+
+LocalOccupancy:
+  enabled: true
+  resolution: 0.10
+  width_cells: 160
+  height_cells: 160
+  sample_stride: 4
+  min_range: 0.25
+  max_range: 12.0
+  max_eta_std: 0.5
+  update_mode: uncertainty_aware
+  band_k: 2.0
+  sigma_floor_factor: 0.5
+  min_confidence_weight: 0.1
+  min_obstacle_height: -1.0
+  max_obstacle_height: 1.0

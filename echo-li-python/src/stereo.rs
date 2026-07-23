@@ -3,7 +3,7 @@ use pyo3::prelude::*;
 use std::path::PathBuf;
 
 use echo_li_core::config::VIOConfig;
-use rudolf_v::camera::StereoRig;
+use rudolf_v::camera::{CameraIntrinsics, StereoRig};
 use rudolf_v::histeq::HistEqMethod;
 use rudolf_v::image::Image as RudolfImage;
 use rudolf_v::stereo::{StereoConfig as RudolfStereoConfig, StereoMatcher};
@@ -89,6 +89,41 @@ impl PyStereo {
                 }
             }
         }
+        Ok(Self {
+            inner: StereoMatcher::new(rig, cfg, img_w, img_h),
+            img_w,
+            img_h,
+        })
+    }
+
+    /// Build a rectified pinhole stereo matcher from explicit calibration.
+    ///
+    /// `t_10` is the cam0->cam1 translation in cam1 coordinates under
+    /// Rudolf-V's convention `p_cam1 = R_10 p_cam0 + t_10`. For a standard
+    /// rectified left/right pair where cam1 is to the right of cam0, use
+    /// `t_10 = (-baseline, 0, 0)`.
+    #[staticmethod]
+    #[pyo3(signature = (fx, fy, cx, cy, img_w, img_h, t_10, r_10=None, vio_config=None))]
+    fn from_pinhole(
+        fx: f64,
+        fy: f64,
+        cx: f64,
+        cy: f64,
+        img_w: usize,
+        img_h: usize,
+        t_10: [f64; 3],
+        r_10: Option<[[f64; 3]; 3]>,
+        vio_config: Option<&str>,
+    ) -> PyResult<Self> {
+        let cam0 = CameraIntrinsics::new(fx, fy, cx, cy, img_w, img_h);
+        let cam1 = CameraIntrinsics::new(fx, fy, cx, cy, img_w, img_h);
+        let rig = StereoRig::new(
+            cam0,
+            cam1,
+            r_10.unwrap_or([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]),
+            t_10,
+        );
+        let cfg = stereo_config_from_vio(vio_config)?;
         Ok(Self {
             inner: StereoMatcher::new(rig, cfg, img_w, img_h),
             img_w,
@@ -200,4 +235,52 @@ impl PyStereo {
             .inner
             .match_features(&img, fe.features(), fe.current_pyramid()))
     }
+}
+
+fn stereo_config_from_vio(vio_config: Option<&str>) -> PyResult<RudolfStereoConfig> {
+    let mut cfg = RudolfStereoConfig::default();
+    if let Some(path) = vio_config {
+        let vio = VIOConfig::from_yaml(path).map_err(|e| {
+            pyo3::exceptions::PyIOError::new_err(format!("Failed to load config: {e}"))
+        })?;
+        if let Some(s) = vio.stereo.as_ref() {
+            if let Some(v) = s.pyramid_levels {
+                cfg.pyramid_levels = v;
+            }
+            if let Some(v) = s.patch_half_size {
+                cfg.patch_half_size = v;
+            }
+            if let Some(v) = s.max_iterations {
+                cfg.max_iterations = v;
+            }
+            if let Some(v) = s.convergence_eps {
+                cfg.convergence_eps = v;
+            }
+            if let Some(v) = s.min_inv_depth {
+                cfg.min_inv_depth = v;
+            }
+            if let Some(v) = s.max_inv_depth {
+                cfg.max_inv_depth = v;
+            }
+            if let Some(v) = s.init_inv_depth {
+                cfg.init_inv_depth = v;
+            }
+            if let Some(v) = s.max_residual {
+                cfg.max_residual = v;
+            }
+            if let Some(v) = s.n_search_candidates {
+                cfg.n_search_candidates = v;
+            }
+            if let Some(v) = s.knn_propagation {
+                cfg.knn_propagation = v;
+            }
+            if let Some(h) = &s.histeq {
+                cfg.histeq = match h.to_ascii_lowercase().as_str() {
+                    "global" => HistEqMethod::Global,
+                    _ => HistEqMethod::None,
+                };
+            }
+        }
+    }
+    Ok(cfg)
 }

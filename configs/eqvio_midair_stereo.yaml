@@ -52,20 +52,33 @@ RudolfV:
 eqf:
   maxFeatures: 40           # core EqF landmark cap
   initialValue:
-    sceneDepth: 3.0
+    # Stereo mode uses measured metric range for landmark births. sceneDepth is
+    # only the fallback for features without an accepted stereo prior.
+    sceneDepth: 24.0
   initialVariance:
     attitude: 0.13565029126052572
-    biasAcc: 1.5813333765300104
-    biasGyr: 97162.79515771076
+    # MidAir's repaired IMU stream has no evidence for large constant sensor
+    # biases. The broad monocular prior lets the filter absorb metric stereo
+    # constraints into accel/gyro bias, especially on sunny trajectory_0001.
+    biasAcc: 1.0e-8
+    biasGyr: 1.0e-10
     cameraAttitude: 0.0010228558965517584
     cameraPosition: 0.023501400846134893
-    point: 129.90415638150924
+    # Selected Rudolf-V stereo priors on MidAir have a clean center
+    # (median range error ~0.5%, p90 ~2-2.5%) but a heavy tail. A 1 m isotropic
+    # landmark birth std reflects the robust center better than the monocular
+    # 11.4 m std, while still leaving room for residual stereo/association error.
+    point: 1.0
     position: 0.1
     # velocity: 8.974852995731e-08  # asserts v=0 (std 0.3 mm/s); only valid
     # with a certified-stationary start. Loose value tolerates moving starts.
     velocity: 1.0
   measurementNoise:
-    feature: 2.0
+    # Effective Gaussian for the EqF image update, not the clean KLT center.
+    # MidAir stereo selected depths are accurate, but the feature stream remains
+    # heavy-tailed at occlusions/depth edges; traj1/traj2 A/B favored 4 px over
+    # 0.5/1/2 px for this stereo-birth configuration.
+    feature: 4.0
     featureOutlierAbs: 5.0
     featureOutlierProb: 0.03229809583062128
     featureRetention: 0.18594708334486176
@@ -149,7 +162,9 @@ SparseVog:
   ab_max: 200.0
   min_inlier_ratio: 0.5         # gate for Mahalanobis stuck-outlier reset
   mahalanobis_reset_chi2: 0.2
+  # bias_walk_var: 0.04         # px^2/frame correspondence-bias random walk
   process_depth_var: 0.01       # fallback when P_vv unavailable
+  # pose_range_scale: 0.0       # pose-cov-driven radial range process noise
   min_parallax: 1.0e-4
   min_cos_sim: 0.95
   min_depth: 0.1

@@ -10,8 +10,8 @@ members = [
 
 [workspace.dependencies]
 echo-lie = { path = "echo-lie" }
-rudolf-v = { git = "https://github.com/twetto/Rudolf-V" }
-camera-geometry = { git = "https://github.com/twetto/Rudolf-V" }
+rudolf-v = { path = "../Rudolf-V" }
+camera-geometry = { path = "../Rudolf-V/crates/camera-geometry" }
 nalgebra = "0.33"
 approx = "0.5"
 rand = "0.9"
