@@ -7,7 +7,6 @@ use rudolf_v::frontend::{self, Frontend, LbpPolicy};
 use rudolf_v::histeq::HistEqMethod;
 use rudolf_v::image::Image as RudolfImage;
 use rudolf_v::klt::LkMethod;
-use rudolf_v::klt_reference::{KltTemplatePolicy, ReferenceKltWarp};
 
 #[pyclass]
 #[derive(Clone)]
@@ -26,10 +25,6 @@ pub struct FrontendConfig {
     pub klt_max_iter: usize,
     #[pyo3(get, set)]
     pub klt_warp: String,
-    #[pyo3(get, set)]
-    pub klt_template_policy: String,
-    #[pyo3(get, set)]
-    pub klt_reference_warp: String,
     #[pyo3(get, set)]
     pub klt_residual: bool,
     #[pyo3(get, set)]
@@ -66,8 +61,6 @@ impl FrontendConfig {
         klt_window = 21,
         klt_max_iter = 30,
         klt_warp = "translation".to_string(),
-        klt_template_policy = "previous".to_string(),
-        klt_reference_warp = "translation".to_string(),
         klt_residual = false,
         enable_ransac = true,
         epipolar_gate_threshold = 0.0,
@@ -88,8 +81,6 @@ impl FrontendConfig {
         klt_window: usize,
         klt_max_iter: usize,
         klt_warp: String,
-        klt_template_policy: String,
-        klt_reference_warp: String,
         klt_residual: bool,
         enable_ransac: bool,
         epipolar_gate_threshold: f64,
@@ -110,8 +101,6 @@ impl FrontendConfig {
             klt_window,
             klt_max_iter,
             klt_warp,
-            klt_template_policy,
-            klt_reference_warp,
             klt_residual,
             enable_ransac,
             epipolar_gate_threshold,
@@ -150,8 +139,6 @@ impl FrontendConfig {
             klt_window: defaults.klt_window,
             klt_max_iter: defaults.klt_max_iter,
             klt_warp: "translation".to_string(),
-            klt_template_policy: "previous".to_string(),
-            klt_reference_warp: "translation".to_string(),
             klt_residual: rv.klt_residual,
             enable_ransac: rv.enable_ransac,
             epipolar_gate_threshold: rv.epipolar_gate_threshold,
@@ -208,20 +195,7 @@ impl FrontendConfig {
         cfg.cell_size = self.cell_size;
         cfg.klt_window = self.klt_window;
         cfg.klt_max_iter = self.klt_max_iter;
-        cfg.klt_method = match self.klt_warp.to_ascii_lowercase().as_str() {
-            "affine" => LkMethod::InverseCompositionalAffine,
-            _ => LkMethod::InverseCompositional,
-        };
-        cfg.klt_template_policy = match self.klt_template_policy.to_ascii_lowercase().as_str() {
-            "first" | "first_observation" | "first-observation" | "reference" | "anchor" => {
-                KltTemplatePolicy::FirstObservation
-            }
-            _ => KltTemplatePolicy::PreviousFrame,
-        };
-        cfg.klt_reference_warp = match self.klt_reference_warp.to_ascii_lowercase().as_str() {
-            "affine" => ReferenceKltWarp::Affine,
-            _ => ReferenceKltWarp::Translation,
-        };
+        cfg.klt_method = LkMethod::InverseCompositional;
         cfg.klt_residual_enabled = self.klt_residual;
         cfg.enable_internal_ransac = self.enable_ransac;
         cfg.epipolar_gate_threshold = self.epipolar_gate_threshold;

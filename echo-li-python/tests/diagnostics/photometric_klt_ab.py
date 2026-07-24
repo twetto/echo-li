@@ -225,7 +225,6 @@ def main():
     zbufs = zbuf_cache(root, frames, cam_pose, fx, fy, cx, cy, w, h)
 
     fcfg = echo_li.FrontendConfig.from_yaml(args.config)
-    fcfg.klt_template_policy = "previous"
     fcfg.klt_warp = "translation"
     fcfg.set_camera(fx, fy, cx, cy, w, h, dcoef.tolist())
     tracker = echo_li.Frontend(fcfg, w, h)

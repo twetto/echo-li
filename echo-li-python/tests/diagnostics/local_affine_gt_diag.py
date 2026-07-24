@@ -37,9 +37,7 @@ def load_frames(root):
 
 def make_tracker(config, w, h, fx, fy, cx, cy, dcoef):
     fcfg = echo_li.FrontendConfig.from_yaml(config)
-    fcfg.klt_template_policy = "previous"
     fcfg.klt_warp = "translation"
-    fcfg.klt_reference_warp = "translation"
     fcfg.set_camera(fx, fy, cx, cy, w, h, dcoef.tolist())
     return echo_li.Frontend(fcfg, w, h)
 
