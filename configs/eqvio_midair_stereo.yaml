@@ -110,6 +110,13 @@ eqf:
     # Riccati variant: fast = per-sample; faster = batched per image sub-frame.
     riccatiVariant: faster
     imuBiasGroup: additive
+    # Stereo log-inverse-range measurement channel (ell = -ln(range)): adds a 3rd
+    # measurement row per landmark that has a per-frame stereo range prior. Needs
+    # Stereo.enabled below (the matcher) to supply the priors.
+    stereoMeasurement: true
+    # Chi²(1) gate on the range innovation (0 disables). MidAir stereo has a clean
+    # center but a heavy occlusion/depth-edge tail; 6.63 ≈ 99th pct. Tuning knob.
+    rangeGateChi2: 6.63
   velocityNoise:
     acc: 0.012438843268295521
     accBias: 0.004462289865453429
@@ -177,8 +184,8 @@ SparseVog:
   vis_min_depth: 0.5
   vis_max_depth: 5.0
 Stereo:
-  # enabled: true
-  enabled: false
+  enabled: true
+  # enabled: false
   pyramid_levels: 3
   patch_half_size: 4
   max_iterations: 30

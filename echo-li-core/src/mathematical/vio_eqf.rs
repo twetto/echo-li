@@ -2,15 +2,15 @@ use echo_lie::SOT3;
 use nalgebra::{DMatrix, DVector, SMatrix, Vector2};
 use std::collections::HashMap;
 
+use crate::ImuBiasGroup;
 use crate::mathematical::bias_group_ops::BiasGroupOps;
 use crate::mathematical::camera::CameraModel;
 use crate::mathematical::eqf_matrices::EqFCoordinateSuite;
 use crate::mathematical::imu_velocity::IMUVelocity;
 use crate::mathematical::vio_group::{
-    lift_velocity, lift_velocity_discrete, state_group_action, vio_exp_with_bias_group, VIOGroup,
+    VIOGroup, lift_velocity, lift_velocity_discrete, state_group_action, vio_exp_with_bias_group,
 };
 use crate::mathematical::vio_state::{Landmark, VIOSensorState, VIOState};
-use crate::ImuBiasGroup;
 
 pub struct VIOEqF {
     pub xi0: VIOState,
@@ -422,6 +422,118 @@ impl VIOEqF {
         }
 
         self.perform_stacked_update(suite, &y_tilde, &ct, output_gain, use_discrete_correction);
+    }
+
+    /// Bearing + optional stereo log-inverse-range measurement update.
+    ///
+    /// `stereo_meas` maps landmark id -> `(ell_obs, r_ell)`, where
+    /// `ell_obs = -ln(range_s)` (log-inverse-range; the single sign negation from
+    /// Rudolf-V's `+log range` lives at the binding, see
+    /// stereo_output_matrix_derivation.md §9) and `r_ell = Var(range_s)/range_s^2`.
+    /// Observed ids absent from the map get the usual 2-row bearing update; ids
+    /// present get an extra log-inverse-range row (Normal chart: `[0,0,+1]`).
+    /// An empty map — or no observed stereo id — is byte-identical to
+    /// `perform_vision_update`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn perform_vision_update_with_stereo<S: EqFCoordinateSuite + ?Sized>(
+        &mut self,
+        suite: &S,
+        y_ids: &[u64],
+        y_coords: &HashMap<u64, Vector2<f64>>,
+        cam: &dyn CameraModel,
+        output_gain: &DMatrix<f64>,
+        use_equivariance: bool,
+        use_discrete_correction: bool,
+        stereo_meas: &HashMap<u64, (f64, f64)>,
+        range_gate_chi2: f64,
+    ) {
+        if y_ids.is_empty() {
+            return;
+        }
+        // No observed stereo landmark -> exact bearing-only path.
+        if !y_ids.iter().any(|id| stereo_meas.contains_key(id)) {
+            self.perform_vision_update(
+                suite,
+                y_ids,
+                y_coords,
+                cam,
+                output_gain,
+                use_equivariance,
+                use_discrete_correction,
+            );
+            return;
+        }
+
+        let n = self.xi0.dim();
+        let xi_hat = self.state_estimate();
+        let sigma_bearing_sq = output_gain[(0, 0)];
+
+        // Row layout: 2 bearing rows per obs, +1 log-inv-range row for stereo obs.
+        let total_rows: usize = y_ids
+            .iter()
+            .map(|id| if stereo_meas.contains_key(id) { 3 } else { 2 })
+            .sum();
+
+        let mut y_tilde = DVector::<f64>::zeros(total_rows);
+        let mut ct = DMatrix::<f64>::zeros(total_rows, n);
+        let mut r_diag = DVector::<f64>::zeros(total_rows);
+
+        let mut row = 0usize;
+        for &id in y_ids {
+            let pos = self
+                .xi0
+                .camera_landmarks
+                .iter()
+                .position(|l| l.id == id)
+                .expect("Landmark ID must exist in state");
+            let q0 = self.xi0.camera_landmarks[pos].p;
+            let q_hat = &self.x.q[pos];
+            let q = &xi_hat.camera_landmarks[pos].p;
+            let uv = *y_coords.get(&id).expect("Observed ID must exist");
+            let col = VIOSensorState::CDIM + 3 * pos;
+
+            // Bearing block (2x3) — same selection as output_matrix_C.
+            let ci_star = if use_equivariance {
+                suite.output_matrix_ci_star(&q0, q_hat, cam, &uv)
+            } else {
+                let p_c = q_hat.inverse().act(&q0);
+                let y_hat = cam.project(&p_c);
+                suite.output_matrix_ci_star(&q0, q_hat, cam, &y_hat)
+            };
+            ct.fixed_view_mut::<2, 3>(row, col).copy_from(&ci_star);
+            y_tilde
+                .fixed_rows_mut::<2>(row)
+                .copy_from(&(uv - cam.project(q)));
+            r_diag[row] = sigma_bearing_sq;
+            r_diag[row + 1] = sigma_bearing_sq;
+            row += 2;
+
+            // Stereo log-inverse-range row (1x3): ell = -ln‖q‖. Gate on the 1-D
+            // innovation (chi²(1)): S = c_ell·Σ_ll·c_ellᵀ + r_ell; drop the row
+            // when (ell_obs - ell_pred)² > gate·S (heavy occlusion/depth-edge
+            // tail). Bearing rows for this landmark are kept regardless.
+            if let Some(&(ell_obs, r_ell)) = stereo_meas.get(&id) {
+                let range_row = suite.output_range_row(&q0);
+                let ell_pred = -q.norm().ln();
+                let d_ell = ell_obs - ell_pred;
+                let sigma_ll = self.sigma.fixed_view::<3, 3>(col, col).into_owned();
+                let s = (range_row * sigma_ll).dot(&range_row) + r_ell;
+                let gated = range_gate_chi2 > 0.0 && s > 0.0 && d_ell * d_ell > range_gate_chi2 * s;
+                if !gated {
+                    ct.fixed_view_mut::<1, 3>(row, col).copy_from(&range_row);
+                    y_tilde[row] = d_ell;
+                    r_diag[row] = r_ell;
+                }
+                // gated => leave the pre-zeroed row (skipped by perform_stacked_update).
+                row += 1;
+            }
+        }
+
+        if !ct.iter().all(|v| v.is_finite()) {
+            return;
+        }
+        let r_noise = DMatrix::from_diagonal(&r_diag);
+        self.perform_stacked_update(suite, &y_tilde, &ct, &r_noise, use_discrete_correction);
     }
 
     // ------------------------------------------------------------------

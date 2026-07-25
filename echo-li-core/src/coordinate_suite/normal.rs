@@ -1,5 +1,5 @@
 use echo_lie::{SE3, SE23, SO3, SOT3, base::LieGroup};
-use nalgebra::{DMatrix, DVector, Matrix2x3, Matrix3, Matrix3x2, Vector2, Vector3};
+use nalgebra::{DMatrix, DVector, Matrix2x3, Matrix3, Matrix3x2, RowVector3, Vector2, Vector3};
 
 use crate::coordinate_suite::base_skew;
 use crate::coordinate_suite::euclid::EuclideanSuite;
@@ -394,6 +394,11 @@ impl EqFCoordinateSuite for NormalSuite {
         let mut c0i = Matrix2x3::zeros();
         c0i.fixed_view_mut::<2, 2>(0, 0).copy_from(&block_2x2);
         c0i
+    }
+
+    fn output_range_row(&self, q0: &Vector3<f64>) -> RowVector3<f64> {
+        // C_ℓ_normal = C_ℓ_euclid @ normal2euc  (= [0, 0, +1]: ε₂ = log(1/‖q‖) = ℓ + const)
+        (-q0.transpose() / q0.norm_squared()) * conv_normal2euc(q0)
     }
 
     fn lift_innovation(&self, total_innovation: &DVector<f64>, xi0: &VIOState) -> VIOAlgebra {

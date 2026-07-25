@@ -141,6 +141,12 @@ pub struct EqfSettings {
     /// (flushed when the next image frame arrives).
     #[serde(default)]
     pub riccati_variant: Option<String>,
+    /// Enable the stereo log-inverse-range measurement channel.
+    #[serde(default)]
+    pub stereo_measurement: bool,
+    /// Chi²(1) gate on the stereo range innovation; 0 disables.
+    #[serde(default)]
+    pub range_gate_chi2: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -736,6 +742,8 @@ impl VIOConfig {
     pub fn to_filter_settings(&self) -> crate::VIOFilterSettings {
         let mut settings = crate::VIOFilterSettings::default();
         settings.coordinate_choice = self.eqf.settings.coordinate_choice.clone();
+        settings.use_stereo_measurement = self.eqf.settings.stereo_measurement;
+        settings.range_gate_chi2 = self.eqf.settings.range_gate_chi2;
         settings.max_landmarks = self.eqf.max_features;
         settings.sigma_bearing = self.eqf.measurement_noise.feature;
         settings.initial_point_variance = self.eqf.initial_variance.point;
@@ -786,5 +794,24 @@ impl VIOConfig {
         settings.initial_scene_depth = self.eqf.initial_value.scene_depth;
 
         settings
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn midair_stereo_config_parses_and_enables_measurement() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../configs/eqvio_midair_stereo.yaml"
+        );
+        let cfg = VIOConfig::from_yaml(path).expect("parse eqvio_midair_stereo.yaml");
+        assert!(cfg.eqf.settings.stereo_measurement);
+        assert!((cfg.eqf.settings.range_gate_chi2 - 6.63).abs() < 1e-9);
+        let settings = cfg.to_filter_settings();
+        assert!(settings.use_stereo_measurement);
+        assert!((settings.range_gate_chi2 - 6.63).abs() < 1e-9);
     }
 }

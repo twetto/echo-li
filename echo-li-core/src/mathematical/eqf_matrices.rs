@@ -1,4 +1,4 @@
-use nalgebra::{DMatrix, DVector, Matrix2x3, SMatrix, Vector2, Vector3};
+use nalgebra::{DMatrix, DVector, Matrix2x3, RowVector3, SMatrix, Vector2, Vector3};
 
 use crate::mathematical::camera::CameraModel;
 use crate::mathematical::imu_velocity::IMUVelocity;
@@ -100,7 +100,16 @@ pub trait EqFCoordinateSuite: Send + Sync {
         c
     }
 
+    /// Log-inverse-range output row for the stereo measurement channel:
+    /// `ℓ(q) = -log‖q‖`, `∂ℓ/∂(chart)` as a 1×3 row in this suite's landmark
+    /// chart. Default is the Euclidean form `-q0ᵀ/‖q0‖²`; charts override by
+    /// mapping through their `conv_*2euc`. See
+    /// ECHO-LI-notes/docs/eqvio/stereo_output_matrix_derivation.md.
+    fn output_range_row(&self, q0: &Vector3<f64>) -> RowVector3<f64> {
+        -q0.transpose() / q0.norm_squared()
+    }
+
     fn lift_innovation(&self, total_innovation: &DVector<f64>, xi0: &VIOState) -> VIOAlgebra;
     fn lift_innovation_discrete(&self, total_innovation: &DVector<f64>, xi0: &VIOState)
-        -> VIOGroup;
+    -> VIOGroup;
 }

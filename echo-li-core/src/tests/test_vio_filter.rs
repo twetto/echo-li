@@ -2326,3 +2326,121 @@ fn format_seconds(seconds: f64) -> String {
     let seconds = seconds % 60;
     format!("{minutes}m{seconds:02}s")
 }
+
+/// The stereo log-inverse-range output row `∂ℓ/∂(chart)` must equal the
+/// finite-difference of `ℓ = -ln‖q‖` through each chart's inverse map, and hit
+/// the closed forms from stereo_output_matrix_derivation.md: Normal `[0,0,+1]`,
+/// InvDepth `[0,0,1/ρ0]`, Euclidean `-q0ᵀ/‖q0‖²`.
+#[test]
+fn stereo_range_row_matches_log_inverse_range_jacobian() {
+    use crate::coordinate_suite::invdepth::point_chart_invdepth_inv;
+    use crate::coordinate_suite::normal::point_chart_normal_inv;
+
+    let q0 = Vector3::new(0.7, -0.4, 3.2);
+    let h = 1e-6;
+    let ell = |p: &Vector3<f64>| -p.norm().ln();
+
+    let fd = |inv: &dyn Fn(&Vector3<f64>, &Vector3<f64>) -> Vector3<f64>, k: usize| {
+        let mut ep = Vector3::zeros();
+        let mut em = Vector3::zeros();
+        ep[k] = h;
+        em[k] = -h;
+        (ell(&inv(&ep, &q0)) - ell(&inv(&em, &q0))) / (2.0 * h)
+    };
+
+    // Normal chart: closed form [0,0,+1] and matches FD.
+    let row_n = NormalSuite::new().output_range_row(&q0);
+    for k in 0..3 {
+        assert_abs_diff_eq!(row_n[k], fd(&point_chart_normal_inv, k), epsilon = 1e-4);
+    }
+    assert_abs_diff_eq!(row_n[0], 0.0, epsilon = 1e-9);
+    assert_abs_diff_eq!(row_n[1], 0.0, epsilon = 1e-9);
+    assert_abs_diff_eq!(row_n[2], 1.0, epsilon = 1e-9);
+
+    // InvDepth chart: closed form [0,0,1/ρ0]=[0,0,‖q0‖] and matches FD.
+    let row_i = InvDepthSuite::new().output_range_row(&q0);
+    for k in 0..3 {
+        assert_abs_diff_eq!(row_i[k], fd(&point_chart_invdepth_inv, k), epsilon = 1e-4);
+    }
+    assert_abs_diff_eq!(row_i[2], q0.norm(), epsilon = 1e-6);
+
+    // Euclidean base: -q0ᵀ/‖q0‖².
+    let row_e = EuclideanSuite.output_range_row(&q0);
+    let expected = -q0.transpose() / q0.norm_squared();
+    assert_abs_diff_eq!((row_e - expected).norm(), 0.0, epsilon = 1e-12);
+}
+
+/// End-to-end stereo update on the Normal chart: the log-inverse-range channel
+/// must (a) reduce the depth chart-coordinate covariance below a bearing-only
+/// update, and (b) move the estimate in the correct direction — a range measured
+/// closer than the prediction pulls the landmark closer (the end-to-end sign
+/// check for ℓ = -ln(range)).
+#[test]
+fn stereo_range_channel_informs_depth_with_correct_sign() {
+    let xi0 = make_xi0_with_landmarks(1);
+    let settings = VIOFilterSettings::default();
+    let init_cov = settings.initial_covariance(xi0.camera_landmarks.len());
+    let suite = NormalSuite::new();
+    let cam = make_pinhole();
+
+    let id = xi0.camera_landmarks[0].id;
+    let true_range = xi0.camera_landmarks[0].p.norm();
+    let y_ids = vec![id];
+    let mut y_coords = HashMap::new();
+    // Observe at the predicted pixel => zero bearing innovation, so only the
+    // stereo range channel drives the update.
+    y_coords.insert(id, cam.project(&xi0.camera_landmarks[0].p));
+    let output_gain = settings.output_gain_matrix(y_ids.len());
+    let depth_idx = VIOSensorState::CDIM + 2; // Normal chart: coord 2 = log-inv-depth
+
+    // (a) covariance: bearing-only vs bearing + exact range.
+    let mut eqf_bearing = VIOEqF::new(xi0.clone(), &init_cov);
+    eqf_bearing.perform_vision_update(&suite, &y_ids, &y_coords, &cam, &output_gain, true, false);
+    let depth_cov_bearing = eqf_bearing.sigma[(depth_idx, depth_idx)];
+
+    let mut stereo = HashMap::new();
+    stereo.insert(id, (-true_range.ln(), 1e-4));
+    let mut eqf_stereo = VIOEqF::new(xi0.clone(), &init_cov);
+    eqf_stereo.perform_vision_update_with_stereo(
+        &suite,
+        &y_ids,
+        &y_coords,
+        &cam,
+        &output_gain,
+        true,
+        false,
+        &stereo,
+        0.0,
+    );
+    let depth_cov_stereo = eqf_stereo.sigma[(depth_idx, depth_idx)];
+    assert!(
+        depth_cov_stereo < depth_cov_bearing - 1e-9,
+        "stereo depth cov {depth_cov_stereo} not below bearing-only {depth_cov_bearing}"
+    );
+
+    // (b) sign: a range measured 20% closer than the estimate pulls range DOWN.
+    let closer = 0.8 * true_range;
+    let mut stereo_closer = HashMap::new();
+    stereo_closer.insert(id, (-closer.ln(), 1e-3));
+    let mut eqf_closer = VIOEqF::new(xi0.clone(), &init_cov);
+    eqf_closer.perform_vision_update_with_stereo(
+        &suite,
+        &y_ids,
+        &y_coords,
+        &cam,
+        &output_gain,
+        true,
+        false,
+        &stereo_closer,
+        0.0,
+    );
+    let range_after = eqf_closer.state_estimate().camera_landmarks[0].p.norm();
+    assert!(
+        range_after.is_finite() && range_after > 0.0,
+        "range estimate non-finite/non-positive: {range_after}"
+    );
+    assert!(
+        range_after < true_range,
+        "measured-closer range must reduce the estimate: {range_after} vs true {true_range}"
+    );
+}

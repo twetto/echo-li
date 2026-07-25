@@ -119,6 +119,13 @@ pub struct VIOFilterSettings {
     // Riccati propagation variant (Phase 6). false = `Fast` per-sample;
     // true = `Faster` (covariance transport batched per IMU sub-frame).
     pub use_faster_riccati: bool,
+
+    // Stereo log-inverse-range measurement channel. When true, observed
+    // landmarks that carry a valid per-frame stereo range prior get an extra
+    // ℓ = -ln(range) measurement row (see stereo_output_matrix_derivation.md).
+    pub use_stereo_measurement: bool,
+    // Chi²(1) gate on the stereo range innovation; 0 disables gating.
+    pub range_gate_chi2: f64,
 }
 
 impl Default for VIOFilterSettings {
@@ -154,6 +161,8 @@ impl Default for VIOFilterSettings {
             max_landmarks: 40,
             outlier_threshold: 5.0,
             use_faster_riccati: false,
+            use_stereo_measurement: false,
+            range_gate_chi2: 0.0,
         }
     }
 }
@@ -424,6 +433,7 @@ impl VIOFilter {
         );
 
         let mut new_landmarks = Vec::new();
+        let mut new_covs: Vec<Matrix3<f64>> = Vec::new();
         for &id in &new_ids {
             if self.eqf.x.id.len() + new_landmarks.len() >= self.settings.max_landmarks {
                 break;
@@ -462,7 +472,28 @@ impl VIOFilter {
                 p[2],
                 fallback_range,
             );
+            // Birth covariance (chart coords). Non-stereo births keep the
+            // isotropic default; a stereo-backed birth sets the depth chart
+            // coordinate from the stereo log-range variance
+            // Var(ell) = range_var / range^2, mapped through the chart's
+            // d(ell)/d(eps2) = output_range_row. Charts whose depth is a single
+            // coordinate (Normal, InvDepth) have the range row concentrated on
+            // coord 2; Euclidean spreads it and falls back to isotropic.
+            let mut cov_i = Matrix3::identity() * self.settings.initial_point_variance;
+            if let Some(prior) = prior {
+                let c = self.suite.output_range_row(&p);
+                let var_ell = prior.range_var / (range * range);
+                if c[0].abs() < 1e-9
+                    && c[1].abs() < 1e-9
+                    && c[2].abs() > 1e-9
+                    && var_ell.is_finite()
+                    && var_ell > 0.0
+                {
+                    cov_i[(2, 2)] = var_ell / (c[2] * c[2]);
+                }
+            }
             new_landmarks.push(Landmark { p, id });
+            new_covs.push(cov_i);
         }
 
         if !new_landmarks.is_empty() {
@@ -471,7 +502,7 @@ impl VIOFilter {
             for i in 0..n_new {
                 new_cov
                     .fixed_view_mut::<3, 3>(3 * i, 3 * i)
-                    .copy_from(&(Matrix3::identity() * self.settings.initial_point_variance));
+                    .copy_from(&new_covs[i]);
             }
             self.eqf.add_new_landmarks(new_landmarks, &new_cov);
             self.invalidate_gain_cache();
@@ -525,7 +556,30 @@ impl VIOFilter {
         }
 
         let output_gain = self.settings.output_gain_matrix(n_obs);
-        self.eqf.perform_vision_update(
+        // Stereo log-inverse-range measurements reuse the per-frame stereo range
+        // priors already supplied for landmark birth. THE single sign negation
+        // ell = -ln(range) lives here (Rudolf-V and the patch mapper use
+        // +log range; the EqF chart and this channel use log-inverse-range — see
+        // parametrization_map_and_consistency.md §4a). Built by iterating the
+        // sorted `y_ids` (never the prior map) to stay reproducible.
+        let stereo_meas: HashMap<u64, (f64, f64)> = if self.settings.use_stereo_measurement {
+            y_ids
+                .iter()
+                .filter_map(|&id| {
+                    let prior = depth_priors.get(&id).filter(|p| valid_depth_prior(p))?;
+                    if prior.range > 0.0 && prior.range_var.is_finite() && prior.range_var > 0.0 {
+                        let ell = -prior.range.ln();
+                        let r_ell = prior.range_var / (prior.range * prior.range);
+                        Some((id, (ell, r_ell)))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        };
+        self.eqf.perform_vision_update_with_stereo(
             self.suite.as_ref(),
             &y_ids,
             &y_coords,
@@ -533,6 +587,8 @@ impl VIOFilter {
             &output_gain,
             self.settings.use_equivariant_output,
             self.settings.use_discrete_correction,
+            &stereo_meas,
+            self.settings.range_gate_chi2,
         );
 
         self.vision_count += 1;
