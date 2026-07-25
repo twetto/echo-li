@@ -624,6 +624,16 @@ def run_once(mode, args, ds, f, cx, cy, W, H, ext, events, map_xy):
             vel_gt_body = gt_body_velocity(ds, k)
             vel_err = float(np.linalg.norm(vel_est - vel_gt_body))
             gt = nwu_body_pose(ds, k)
+            # Pose-covariance consistency capture: EqF camera-pose cov (P_vv=pos,
+            # P_ww=att) + GT attitude, for offline NEES scoring.
+            pcov = vio.get_camera_pose_covariance()
+            gt_quat = Rot.from_matrix(gt[:3, :3]).as_quat()
+            if pcov is None:
+                p_vv = np.full((3, 3), np.nan)
+                p_ww = np.full((3, 3), np.nan)
+            else:
+                p_vv = np.asarray(pcov[0], float)
+                p_ww = np.asarray(pcov[1], float)
             if traj_panel is not None:
                 traj_panel.update(gt[:3, 3], pos)
             if writer is not None and ((len(rec) + 1) % args.video_stride == 0):
@@ -634,7 +644,8 @@ def run_once(mode, args, ds, f, cx, cy, W, H, ext, events, map_xy):
             rec.append((k, np.asarray(pos), np.asarray(quat), gt[:3, 3].copy(),
                         stats["tracked"], len(all_uvs), len(vio_uvs), len(priors),
                         vel_est, vel_gt_body, vel_err, gyro_bias, accel_bias,
-                        float(np.linalg.norm(gyro_bias)), float(np.linalg.norm(accel_bias))))
+                        float(np.linalg.norm(gyro_bias)), float(np.linalg.norm(accel_bias)),
+                        gt_quat, p_vv, p_ww))
             progress.update(stats["tracked"], len(vio_uvs), len(priors))
     finally:
         reader.close()
@@ -810,6 +821,9 @@ def main():
             payload[r["mode"] + "_vel_err"] = np.array([x[10] for x in rec], float)
             payload[r["mode"] + "_gyro_bias"] = np.array([x[11] for x in rec], float)
             payload[r["mode"] + "_accel_bias"] = np.array([x[12] for x in rec], float)
+            payload[r["mode"] + "_gt_quat"] = np.array([x[15] for x in rec], float)
+            payload[r["mode"] + "_pcov_pos"] = np.array([x[16] for x in rec], float)
+            payload[r["mode"] + "_pcov_att"] = np.array([x[17] for x in rec], float)
         payload["summary_names"] = np.array(["n", "ate", "path", "final", "prior_births",
                                              "deferred_new", "admitted_new",
                                              "prior_candidates", "prior_rel_sigma_p50"])
