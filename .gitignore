@@ -4,6 +4,8 @@ release/
 *.rs.bk
 .venv/
 venv/
+venv
+echo-li-python/venv
 __pycache__/
 *.pyc
 *.so

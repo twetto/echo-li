@@ -54,6 +54,8 @@ fn scan_dir(path: &Path, failures: &mut Vec<String>) {
         if name == ".git"
             || name == "target"
             || name == ".venv"
+            || name == "venv"
+            || name == "site-packages"
             || name == "sweep_results"
             || name.starts_with("eqvio_output_")
         {
