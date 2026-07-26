@@ -43,6 +43,7 @@ except ImportError:
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import midair_drift as md  # noqa: E402
+import run_manifest  # noqa: E402
 from midair_vio_run import umeyama  # noqa: E402
 import echo_li  # noqa: E402
 
@@ -654,6 +655,12 @@ def run_once(mode, args, ds, f, cx, cy, W, H, ext, events, map_xy):
     if writer is not None:
         writer.release()
         print(f"  saved video -> {vpath}")
+        run_manifest.save_run_manifest(vpath, args.config, extra={
+            "mode": mode, "traj": args.traj, "frames": args.frames,
+            "scale": args.scale, "gyro_frame": args.gyro_frame,
+            "eqf_max_obs": args.eqf_max_obs, "eqf_selection": args.eqf_selection,
+            "sparse_max_features": args.sparse_max_features,
+            "stereo_baseline_m": args.stereo_baseline_m})
     summarize_state_monitor(mode, rec)
 
     if len(rec) < 20:
@@ -835,6 +842,11 @@ def main():
         payload["summary_modes"] = np.array([r["mode"] for r in results])
         np.savez(args.save_npz, **payload)
         print("saved ->", args.save_npz)
+        run_manifest.save_run_manifest(args.save_npz, args.config, extra={
+            "modes": args.modes, "traj": args.traj, "frames": args.frames,
+            "scale": args.scale, "gyro_frame": args.gyro_frame,
+            "eqf_max_obs": args.eqf_max_obs, "sparse_max_features": args.sparse_max_features,
+            "stereo_baseline_m": args.stereo_baseline_m})
 
 
 if __name__ == "__main__":

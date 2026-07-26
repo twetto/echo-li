@@ -19,6 +19,7 @@ from scipy.spatial.transform import Rotation as Rot
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import midair_drift as md  # noqa: E402
+import run_manifest  # noqa: E402
 import echo_li  # noqa: E402
 
 
@@ -45,6 +46,14 @@ def main():
     ap.add_argument("--scale", type=float, default=0.5)
     ap.add_argument("--config", default=str(repo / "configs" / "eqvio_euroc_rho.yaml"))
     ap.add_argument("--save-npz", default="")
+    ap.add_argument("--stereo", action="store_true",
+                    help="drive full stereo VIO: per-frame left-right range priors fed via "
+                    "process_vision_with_depth_priors (metric-scale observable).")
+    ap.add_argument("--stereo-baseline-m", type=float, default=1.0)
+    ap.add_argument("--stereo-sigma-pixel-scale", type=float, default=20.0)
+    ap.add_argument("--eqf-max-obs", type=int, default=0,
+                    help="cap features fed to the EqF, prioritizing existing landmarks "
+                    "(matches prior_ab when >0). <=0 feeds all (default; measured better here).")
     ap.add_argument("--extrinsic", default="rtbc", choices=["rtbc", "inv", "identity", "rtbc_T"])
     ap.add_argument("--ext-euler", default="", help="rx,ry,rz deg: camera-frame mounting "
                     "rotation post-multiplied onto the extrinsic (R_bc @ Rz@Ry@Rx)")
@@ -84,6 +93,19 @@ def main():
     tracker = echo_li.Frontend(fcfg, W, H)
     cam = echo_li.PinholeCamera(f, f, cx, cy)
     vio = echo_li.VIOFilter(args.config, cam)
+    stereo = None
+    if args.stereo:
+        stereo = echo_li.Stereo.from_pinhole(
+            f, f, cx, cy, W, H, [-args.stereo_baseline_m, 0.0, 0.0], None, args.config)
+        print(f"stereo: rectified pinhole baseline={args.stereo_baseline_m:.3f}m "
+              f"sigma_pixel_scale={args.stereo_sigma_pixel_scale:g}")
+
+    def right_gray(k):
+        p = ds.dir / "color_right" / ds.traj / f"{k:06d}.JPEG"
+        im = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
+        if args.scale != 1.0:
+            im = cv2.resize(im, None, fx=args.scale, fy=args.scale, interpolation=cv2.INTER_AREA)
+        return im
     ext = {"rtbc": md.RT_BC, "inv": np.linalg.inv(md.RT_BC),
            "rtbc_T": md.RT_BC.T, "identity": np.eye(4)}[args.extrinsic]
     vio.set_camera_extrinsics(np.ascontiguousarray(ext))
@@ -125,7 +147,21 @@ def main():
         n += 1
         if not vio.is_initialized:
             continue
-        vio.process_vision(stamp, {int(fd["id"]): (float(fd["x"]), float(fd["y"])) for fd in feats})
+        uvs = {int(fd["id"]): (float(fd["x"]), float(fd["y"])) for fd in feats}
+        # Match prior_ab: cap EqF observations to its landmark budget, keeping
+        # existing landmarks first (continuity). Feeding all ~300 frontend
+        # features into a 40-landmark EqF churns landmarks and degrades tracking.
+        if args.eqf_max_obs > 0 and len(uvs) > args.eqf_max_obs:
+            existing = {int(x) for x in vio.get_landmarks().keys()}
+            ordered = list(uvs)
+            keep = ([f for f in ordered if f in existing] +
+                    [f for f in ordered if f not in existing])[:args.eqf_max_obs]
+            uvs = {f: uvs[f] for f in keep}
+        if stereo is not None and uvs:
+            priors = dict(stereo.range_priors(right_gray(k), tracker, args.stereo_sigma_pixel_scale))
+            vio.process_vision_with_depth_priors(stamp, uvs, priors)
+        else:
+            vio.process_vision(stamp, uvs)
         pos, quat = vio.get_pose()
         pcov = vio.get_camera_pose_covariance()
         pvv, pww = (np.zeros((3, 3)), np.zeros((3, 3))) if pcov is None else \
@@ -152,6 +188,11 @@ def main():
                  gt=gtp, R=R, t=t, ate=ate, tracked=[r[4] for r in rec],
                  pvv=np.array([r[5] for r in rec]), pww=np.array([r[6] for r in rec]))
         print("saved ->", args.save_npz)
+        run_manifest.save_run_manifest(args.save_npz, args.config, extra={
+            "traj": args.traj, "frames": nimg, "scale": args.scale,
+            "stereo": args.stereo, "eqf_max_obs": args.eqf_max_obs,
+            "gyro_frame": args.gyro_frame, "extrinsic": args.extrinsic,
+            "ate_m": round(ate, 3), "ate_pct": round(100 * ate / max(traj_len, 1e-6), 3)})
 
 
 if __name__ == "__main__":
