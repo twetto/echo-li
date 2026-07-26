@@ -28,6 +28,8 @@ pub struct FrontendConfig {
     #[pyo3(get, set)]
     pub klt_residual: bool,
     #[pyo3(get, set)]
+    pub klt_fb_threshold_px: f32,
+    #[pyo3(get, set)]
     pub enable_ransac: bool,
     #[pyo3(get, set)]
     pub epipolar_gate_threshold: f64,
@@ -62,6 +64,7 @@ impl FrontendConfig {
         klt_max_iter = 30,
         klt_warp = "translation".to_string(),
         klt_residual = false,
+        klt_fb_threshold_px = 0.0,
         enable_ransac = true,
         epipolar_gate_threshold = 0.0,
         epipolar_refine = false,
@@ -82,6 +85,7 @@ impl FrontendConfig {
         klt_max_iter: usize,
         klt_warp: String,
         klt_residual: bool,
+        klt_fb_threshold_px: f32,
         enable_ransac: bool,
         epipolar_gate_threshold: f64,
         epipolar_refine: bool,
@@ -102,6 +106,7 @@ impl FrontendConfig {
             klt_max_iter,
             klt_warp,
             klt_residual,
+            klt_fb_threshold_px,
             enable_ransac,
             epipolar_gate_threshold,
             epipolar_refine,
@@ -140,6 +145,7 @@ impl FrontendConfig {
             klt_max_iter: defaults.klt_max_iter,
             klt_warp: "translation".to_string(),
             klt_residual: rv.klt_residual,
+            klt_fb_threshold_px: 0.0,
             enable_ransac: rv.enable_ransac,
             epipolar_gate_threshold: rv.epipolar_gate_threshold,
             epipolar_refine: rv.epipolar_refine,
@@ -197,6 +203,7 @@ impl FrontendConfig {
         cfg.klt_max_iter = self.klt_max_iter;
         cfg.klt_method = LkMethod::InverseCompositional;
         cfg.klt_residual_enabled = self.klt_residual;
+        cfg.klt_fb_threshold_px = self.klt_fb_threshold_px;
         cfg.enable_internal_ransac = self.enable_ransac;
         cfg.epipolar_gate_threshold = self.epipolar_gate_threshold;
         cfg.epipolar_refine = self.epipolar_refine;

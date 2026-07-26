@@ -275,6 +275,8 @@ def main():
                     help="diagnostic only: white pixel sigma for iid/bias Fisher covariance")
     ap.add_argument("--measurements", default="rudolf", choices=["rudolf", "klt", "exact"],
                     help="feed Rudolf-V, diagnostic Python KLT, or exact reprojections")
+    ap.add_argument("--fb-threshold", type=float, default=0.0,
+                    help="Rudolf-V forward-backward KLT gate threshold in px (0=off)")
     repo = Path(__file__).resolve().parents[3]
     ap.add_argument("--config", default=str(repo / "configs" / "eqvio_euroc_rho.yaml"))
     ap.add_argument("--video", action="store_true",
@@ -342,6 +344,7 @@ def main():
     tracker = None
     if args.measurements == "rudolf":
         fcfg = echo_li.FrontendConfig.from_yaml(args.config)
+        fcfg.klt_fb_threshold_px = args.fb_threshold
         fcfg.set_camera(f, f, cx, cy, W, H, [])
         tracker = echo_li.Frontend(fcfg, W, H)
         print(f"frontend: Rudolf-V  config={Path(args.config).name}  {fcfg}")

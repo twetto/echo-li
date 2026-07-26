@@ -1305,7 +1305,7 @@ dependencies = [
 [[package]]
 name = "camera-geometry"
 version = "0.1.0"
-source = "git+https://github.com/twetto/Rudolf-V.git?rev=bc262650974a9e2abcb74ef1ee77c9145a4234b5#bc262650974a9e2abcb74ef1ee77c9145a4234b5"
+source = "git+https://github.com/twetto/Rudolf-V.git?rev=8e0e1da08528ab69dd72b0b8ead3ca9155334821#8e0e1da08528ab69dd72b0b8ead3ca9155334821"
 dependencies = [
  "nalgebra",
 ]
@@ -9459,7 +9459,7 @@ checksum = "6c20b6793b5c2fa6553b250154b78d6d0db37e72700ae35fad9387a46f487c97"
 [[package]]
 name = "rudolf-v"
 version = "0.1.0"
-source = "git+https://github.com/twetto/Rudolf-V.git?rev=bc262650974a9e2abcb74ef1ee77c9145a4234b5#bc262650974a9e2abcb74ef1ee77c9145a4234b5"
+source = "git+https://github.com/twetto/Rudolf-V.git?rev=8e0e1da08528ab69dd72b0b8ead3ca9155334821#8e0e1da08528ab69dd72b0b8ead3ca9155334821"
 dependencies = [
  "bytemuck",
  "camera-geometry",
