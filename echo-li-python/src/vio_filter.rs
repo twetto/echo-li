@@ -241,8 +241,8 @@ impl PyVIOFilter {
     }
 
     /// Current camera pose covariance from the EqF (J * Sigma * J^T through the camera-offset
-    /// adjoint): returns (P_vv, P_ww) as two 3x3 arrays -- world-frame position covariance and
-    /// attitude covariance of the camera pose. Feed these straight into Sparse3DFilter.update
+    /// adjoint): returns (P_vv, P_ww) as two 3x3 arrays -- position and attitude covariance of
+    /// the camera pose in the camera-fixed (local) frame. Feed these straight into Sparse3DFilter.update
     /// so the landmark depth covariance accounts for pose uncertainty. None if unavailable.
     fn get_camera_pose_covariance<'py>(
         &self,
