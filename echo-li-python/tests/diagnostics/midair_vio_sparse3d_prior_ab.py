@@ -523,6 +523,7 @@ def run_once(mode, args, ds, f, cx, cy, W, H, ext, events, map_xy):
     admitted_new = 0
     prior_candidates_total = 0
     prior_rel_sigmas = []
+    seed_q = []  # (frame, prior_range, gt_range) for seeded births
     t_ned_to_nwu = np.diag([1.0, -1.0, -1.0])
     writer = None
     vpath = None
@@ -593,7 +594,28 @@ def run_once(mode, args, ds, f, cx, cy, W, H, ext, events, map_xy):
             if mode == "baseline":
                 vio_uvs = cap_eqf_observations(
                     all_uvs, existing, priors, args.eqf_max_obs, args.eqf_selection)
-                vio.process_vision(stamp, vio_uvs)
+                if args.true_depth_seed:
+                    # Diagnostic: seed births with GT range (occlusion/depth-edge filtered)
+                    # to separate "bad landmark init" from "bad covariance model".
+                    dmap = ds.depth(k); hh, ww = dmap.shape
+                    tds = {}
+                    for fid, (uu, vvv) in vio_uvs.items():
+                        if fid in existing:
+                            continue
+                        gx, gy = int(round(uu)), int(round(vvv))
+                        if not (2 <= gx < ww - 2 and 2 <= gy < hh - 2):
+                            continue
+                        rr = float(dmap[gy, gx])
+                        if not (1.0 < rr < md.SKY):
+                            continue
+                        pat = dmap[gy - 2:gy + 3, gx - 2:gx + 3]
+                        pv = pat[(pat > 1.0) & (pat < md.SKY)]
+                        if pv.size < 9 or (pv.max() - pv.min()) / max(rr, 1e-3) > 0.15:
+                            continue
+                        tds[fid] = (rr, (0.02 * rr) ** 2)
+                    vio.process_vision_with_depth_priors(stamp, vio_uvs, tds)
+                else:
+                    vio.process_vision(stamp, vio_uvs)
                 births = set()
             elif mode in ("sparse3d_seeded", "stereo_seeded"):
                 vio_uvs = cap_eqf_observations(
@@ -603,6 +625,27 @@ def run_once(mode, args, ds, f, cx, cy, W, H, ext, events, map_xy):
                 births = after - existing
                 prior_births += len(births & set(priors))
                 admitted_new += len(births)
+                # Seed-quality probe: for each birth actually seeded by a prior, record
+                # (frame, prior_range, gt_range). prior/gt ~= pose scale error => the seed
+                # is recycling the filter's own (wrong) scale; ~=1 => seeds are sound.
+                # Occlusion/depth-edge pixels are skipped so occluders don't fake a bad ratio.
+                if args.seed_quality:
+                    seeded_ids = births & set(priors)
+                    if seeded_ids:
+                        dmap = ds.depth(k); hh, ww = dmap.shape
+                        for fid in seeded_ids:
+                            uu, vvv = all_uvs[fid]
+                            gx, gy = int(round(uu)), int(round(vvv))
+                            if not (2 <= gx < ww - 2 and 2 <= gy < hh - 2):
+                                continue
+                            rr = float(dmap[gy, gx])
+                            if not (1.0 < rr < md.SKY):
+                                continue
+                            pat = dmap[gy - 2:gy + 3, gx - 2:gx + 3]
+                            pv = pat[(pat > 1.0) & (pat < md.SKY)]
+                            if pv.size < 9 or (pv.max() - pv.min()) / max(rr, 1e-3) > 0.15:
+                                continue
+                            seed_q.append((k, float(priors[fid][0]), rr))
             else:
                 new_ids = set(all_uvs) - existing
                 allowed_new = new_ids & set(priors)
@@ -619,6 +662,13 @@ def run_once(mode, args, ds, f, cx, cy, W, H, ext, events, map_xy):
 
             pos, quat = vio.get_pose()
             vel_est = np.asarray(vio.get_velocity(), float)
+            # Velocity marginal variance: Sigma diag [12:15]. Base state layout is
+            # input_bias(6) | pose(6) | velocity(3) | camera_offset(6) = 21, confirmed
+            # against sparse_camera_pose_jacobian (pose at col 6, cam offset at col 15).
+            # Body-frame velocity is the gauge-FREE observable (EqVIO Prop 4.1), so this
+            # is the honest consistency test; absolute position/yaw NEES is gauge-noise.
+            _vc = vio.get_velocity_covariance()
+            vel_var = np.full((3, 3), np.nan) if _vc is None else np.asarray(_vc, float)
             gyro_bias, accel_bias = vio.get_biases()
             gyro_bias = np.asarray(gyro_bias, float)
             accel_bias = np.asarray(accel_bias, float)
@@ -646,7 +696,7 @@ def run_once(mode, args, ds, f, cx, cy, W, H, ext, events, map_xy):
                         stats["tracked"], len(all_uvs), len(vio_uvs), len(priors),
                         vel_est, vel_gt_body, vel_err, gyro_bias, accel_bias,
                         float(np.linalg.norm(gyro_bias)), float(np.linalg.norm(accel_bias)),
-                        gt_quat, p_vv, p_ww))
+                        gt_quat, p_vv, p_ww, vel_var))
             progress.update(stats["tracked"], len(vio_uvs), len(priors))
     finally:
         reader.close()
@@ -669,6 +719,7 @@ def run_once(mode, args, ds, f, cx, cy, W, H, ext, events, map_xy):
                 "deferred_new": deferred_new, "admitted_new": admitted_new,
                 "prior_candidates": prior_candidates_total,
                 "prior_rel_sigma_p50": np.nan,
+                "seed_q": seed_q,
                 "rec": rec}
     prior_rel_sigma_p50 = float(np.median(prior_rel_sigmas)) if prior_rel_sigmas else np.nan
     est = np.array([r[1] for r in rec])
@@ -679,7 +730,7 @@ def run_once(mode, args, ds, f, cx, cy, W, H, ext, events, map_xy):
     return {"mode": mode, "n": len(rec), "ate": ate, "path": path, "final": final,
             "prior_births": prior_births, "deferred_new": deferred_new,
             "admitted_new": admitted_new, "prior_candidates": prior_candidates_total,
-            "prior_rel_sigma_p50": prior_rel_sigma_p50, "rec": rec}
+            "prior_rel_sigma_p50": prior_rel_sigma_p50, "seed_q": seed_q, "rec": rec}
 
 
 def main():
@@ -711,6 +762,12 @@ def main():
                     help="skip Sparse3D priors whose reported range sigma/range is larger")
     ap.add_argument("--prior-var-scale", type=float, default=1.0,
                     help="logged into the prior map; current EqF core does not consume it yet")
+    ap.add_argument("--seed-quality", action="store_true",
+                    help="record (frame, prior_range, gt_range) for each prior-seeded birth "
+                    "to measure seed quality directly against GT depth.")
+    ap.add_argument("--true-depth-seed", action="store_true",
+                    help="baseline mode: seed births with GT range (occlusion/depth-edge "
+                    "filtered) instead of the median-depth pin. Diagnostic only.")
     ap.add_argument("--stereo-baseline-m", type=float, default=1.0,
                     help="MidAir left-right stereo baseline in metres")
     ap.add_argument("--stereo-sigma-pixel-scale", type=float, default=20.0,
@@ -831,6 +888,10 @@ def main():
             payload[r["mode"] + "_gt_quat"] = np.array([x[15] for x in rec], float)
             payload[r["mode"] + "_pcov_pos"] = np.array([x[16] for x in rec], float)
             payload[r["mode"] + "_pcov_att"] = np.array([x[17] for x in rec], float)
+            payload[r["mode"] + "_vel_var"] = np.array([x[18] for x in rec], float)
+            sq = r.pop("seed_q", [])
+            payload[r["mode"] + "_seed_q"] = (np.array(sq, float) if sq
+                                              else np.zeros((0, 3), float))
         payload["summary_names"] = np.array(["n", "ate", "path", "final", "prior_births",
                                              "deferred_new", "admitted_new",
                                              "prior_candidates", "prior_rel_sigma_p50"])

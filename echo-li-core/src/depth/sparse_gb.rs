@@ -13,8 +13,9 @@ pub enum DepthParametrization {
 /// Second-order measurement-update mode for the 3D IEKF.
 ///
 /// Restores the dropped projective curvature so the reported covariance is
-/// honest at weak parallax. See
-/// `ECHO-LI-notes/docs/sparse3d_secondorder_eqf_derivation.md`.
+/// honest at weak parallax: the first-order projection Jacobian drops the
+/// curvature of the inverse-depth map, which under-reports variance exactly
+/// where the baseline is short and the depth is least determined.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SecondOrderMode {
     /// First-order (iterated) EKF; `iekf_iterations` applies. Default.
@@ -86,7 +87,8 @@ pub struct SparseVogSettings {
     /// collapses below the un-modelled triangulation/range bias and NEES grows
     /// with depth. Default 0 (off). Distinct from `process_depth_var` (the 1D
     /// filter's un-scaled per-step term). Only consumed by `Sparse3DFilter`.
-    /// Findings: `ECHO-LI-notes/docs/sparse3d_secondorder_eqf_derivation.md`.
+    /// Scales with range^2 so the injected uncertainty is a fixed *relative*
+    /// depth uncertainty rather than an absolute one.
     pub range_walk_var: f64,
     /// Scale on the *pose-driven* range process noise (eq. 10-11 of the Sparse3D
     /// formulation). When > 0 and per-frame incremental pose covariances (p_vv, p_ww)
@@ -106,7 +108,8 @@ pub struct SparseVogSettings {
     /// over-counted (exact-GT MidAir shows this drift is a random walk, not a
     /// constant offset). Default 0 (off) -> plain 3-DOF landmark EKF, exact prior
     /// behavior. Only consumed by `Sparse3DFilter`'s bearing-invdepth chart.
-    /// Findings: `ECHO-LI-notes/docs/frontend/flow-bias/comprehensive_motion_ceiling.md`.
+    /// Absorbs slow correspondence drift (the tracked pixel sliding off its
+    /// landmark) as a random-walk pixel bias, so it is not misread as parallax.
     pub bias_walk_var: f64,
     /// Experimental sigma-point rotation propagation for the additive chart.
     pub rotation_unscented: bool,

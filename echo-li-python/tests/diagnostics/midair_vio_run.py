@@ -54,6 +54,23 @@ def main():
     ap.add_argument("--eqf-max-obs", type=int, default=0,
                     help="cap features fed to the EqF, prioritizing existing landmarks "
                     "(matches prior_ab when >0). <=0 feeds all (default; measured better here).")
+    ap.add_argument("--true-depth-seed", action="store_true",
+                    help="seed new landmarks with GT range from the depth map instead of the "
+                    "median-depth pin (birth-only prior). Skips occluded/depth-edge pixels "
+                    "(5x5 range spread >15%% of range) so occluders don't inject wrong depth.")
+    ap.add_argument("--true-depth-edge-frac", type=float, default=0.15)
+    ap.add_argument("--seed-scale", type=float, default=1.0,
+                    help="multiply every true-depth seed by this constant: a CONSISTENT but "
+                    "wrong-scale seed set (error lies in the unobservable scale mode).")
+    ap.add_argument("--seed-lognormal", type=float, default=0.0,
+                    help="per-landmark lognormal(0,sigma) multiplier on the true-depth seed: "
+                    "median-preserving but MUTUALLY INCONSISTENT seeds (error has an "
+                    "observable-subspace component). Reported prior variance stays at 2%%, "
+                    "mirroring Sparse3D reporting ~5%% rel-sigma while being far off.")
+    ap.add_argument("--probe-scale", action="store_true",
+                    help="per-frame stage decomposition of the SCALE error: how much of\n                    log(|v_est|/|v_gt|) is moved by IMU propagation vs by the vision update.")
+    ap.add_argument("--track-lifetimes", action="store_true",
+                    help="histogram in-state landmark lifetimes and filter occupancy: does a\n                    landmark live long enough to accumulate parallax and converge in depth?")
     ap.add_argument("--extrinsic", default="rtbc", choices=["rtbc", "inv", "identity", "rtbc_T"])
     ap.add_argument("--ext-euler", default="", help="rx,ry,rz deg: camera-frame mounting "
                     "rotation post-multiplied onto the extrinsic (R_bc @ Rz@Ry@Rx)")
@@ -121,7 +138,10 @@ def main():
     vio.set_initial_state((T @ gt0[:3, 3]).tolist(), np.ascontiguousarray(R0),
                           v0_body.tolist())
 
+    seed_rng = np.random.default_rng(0)  # reproducible seed perturbation
+    lm_birth = {}; lm_life = []; lm_occ = []; conv = []; probe = []
     rec = []; n = 0; t0 = time.time()
+    td_seeded = 0; td_occ_skipped = 0  # true-depth-seed stats
     for stamp, et, data in events:
         if et == "imu":
             gyro_s = data[0]
@@ -148,6 +168,10 @@ def main():
         if not vio.is_initialized:
             continue
         uvs = {int(fd["id"]): (float(fd["x"]), float(fd["y"])) for fd in feats}
+        if args.probe_scale:
+            _gv = ds.db[ds.traj]["groundtruth"]["velocity"]
+            vg_n = float(np.linalg.norm(_gv[min(k * 4, len(_gv) - 1)]))
+            v_pre = float(np.linalg.norm(np.asarray(vio.get_velocity())))
         # Match prior_ab: cap EqF observations to its landmark budget, keeping
         # existing landmarks first (continuity). Feeding all ~300 frontend
         # features into a 40-landmark EqF churns landmarks and degrades tracking.
@@ -160,8 +184,75 @@ def main():
         if stereo is not None and uvs:
             priors = dict(stereo.range_priors(right_gray(k), tracker, args.stereo_sigma_pixel_scale))
             vio.process_vision_with_depth_priors(stamp, uvs, priors)
+        elif args.true_depth_seed and uvs:
+            existing = {int(x) for x in vio.get_landmarks().keys()}
+            dmap = ds.depth(k); hh, ww = dmap.shape
+            priors = {}
+            for fid, (u, v) in uvs.items():
+                if fid in existing:      # only seed births; tracked landmarks ignore priors
+                    continue
+                gx, gy = int(round(u)), int(round(v))
+                if not (2 <= gx < ww - 2 and 2 <= gy < hh - 2):
+                    continue
+                r = float(dmap[gy, gx])
+                if not (1.0 < r < md.SKY):
+                    continue
+                patch = dmap[gy - 2:gy + 3, gx - 2:gx + 3]
+                pv = patch[(patch > 1.0) & (patch < md.SKY)]
+                if pv.size < 9 or (pv.max() - pv.min()) / max(r, 1e-3) > args.true_depth_edge_frac:
+                    td_occ_skipped += 1  # depth-edge / occlusion boundary -> don't seed true depth
+                    continue
+                rp = r * args.seed_scale
+                if args.seed_lognormal > 0.0:
+                    rp *= float(np.exp(seed_rng.normal(0.0, args.seed_lognormal)))
+                priors[fid] = (rp, (0.02 * rp) ** 2)
+            td_seeded += len(priors)
+            vio.process_vision_with_depth_priors(stamp, uvs, priors)
         else:
             vio.process_vision(stamp, uvs)
+        if args.track_lifetimes:
+            cur = {int(x) for x in vio.get_landmarks().keys()}
+            lm_occ.append(len(cur))
+            for lid in cur - set(lm_birth):
+                lm_birth[lid] = n
+            for lid in set(lm_birth) - cur:
+                lm_life.append(n - lm_birth.pop(lid))
+            if n % 5 == 0:
+                lms = vio.get_landmarks()
+                pos_b, quat_b = vio.get_pose()
+                Rwb = Rot.from_quat(np.asarray(quat_b)).as_matrix()
+                cam_w = np.asarray(pos_b) + Rwb @ ext[:3, 3]
+                dmap_c = ds.depth(k); hh_c, ww_c = dmap_c.shape
+                for lid, pw in lms.items():
+                    lid = int(lid)
+                    if lid not in uvs:
+                        continue
+                    u_, v_ = uvs[lid]
+                    gx, gy = int(round(u_)), int(round(v_))
+                    if not (2 <= gx < ww_c - 2 and 2 <= gy < hh_c - 2):
+                        continue
+                    gr = float(dmap_c[gy, gx])
+                    if not (1.0 < gr < md.SKY):
+                        continue
+                    pat = dmap_c[gy - 2:gy + 3, gx - 2:gx + 3]
+                    pv = pat[(pat > 1.0) & (pat < md.SKY)]
+                    if pv.size < 9 or (pv.max() - pv.min()) / max(gr, 1e-3) > 0.15:
+                        continue
+                    er = float(np.linalg.norm(np.asarray(pw) - cam_w))
+                    conv.append((n - lm_birth.get(lid, n), er, gr, n))
+        if args.probe_scale:
+            v_post = float(np.linalg.norm(np.asarray(vio.get_velocity())))
+            gb, ab = vio.get_biases()
+            _p, _q = vio.get_pose()
+            R_est = Rot.from_quat(np.asarray(_q)).as_matrix()
+            qg = ds.att[min(k * 4, len(ds.att) - 1)]
+            R_gt = T @ Rot.from_quat([qg[1], qg[2], qg[3], qg[0]]).as_matrix()
+            g_est = R_est.T @ np.array([0.0, 0.0, 1.0])
+            g_gt = R_gt.T @ np.array([0.0, 0.0, 1.0])
+            tilt = float(np.degrees(np.arccos(np.clip(g_est @ g_gt, -1, 1))))
+            probe.append((k, vg_n, v_pre, v_post,
+                          float(np.linalg.norm(np.asarray(ab))),
+                          float(np.linalg.norm(np.asarray(gb))), tilt))
         pos, quat = vio.get_pose()
         pcov = vio.get_camera_pose_covariance()
         pvv, pww = (np.zeros((3, 3)), np.zeros((3, 3))) if pcov is None else \
@@ -183,6 +274,85 @@ def main():
     print(f"GT path length {traj_len:.1f} m over {len(rec)} frames")
     print(f"ATE (SE3-aligned RMSE): {ate:.3f} m   =  {100*ate/max(traj_len,1e-6):.1f}% of path")
     print(f"final drift: est vs gt (aligned) = {np.linalg.norm((R@est[-1]+t)-gtp[-1]):.3f} m")
+    if args.true_depth_seed:
+        tot = td_seeded + td_occ_skipped
+        print(f"true-depth-seed: {td_seeded} births seeded, {td_occ_skipped} skipped as "
+              f"occlusion/depth-edge ({100*td_occ_skipped/max(tot,1):.1f}% of birth candidates)")
+    if args.probe_scale and len(probe) > 5:
+        P = np.array(probe, float)
+        kk, vg, vpre, vpost, ab, gb, tilt = P.T
+        ok = vg > 2.0
+        r_pre, r_post = np.log(vpre[ok] / vg[ok]), np.log(vpost[ok] / vg[ok])
+        d_upd = r_post - r_pre                       # moved BY the vision update
+        d_prop = r_pre[1:] - r_post[:-1]             # moved BY IMU propagation between frames
+        print("\n=== SCALE DRIFT STAGE DECOMPOSITION  (log |v_est|/|v_gt|) ===")
+        print(f"  start log-scale {r_post[0]:+.3f}   end {r_post[-1]:+.3f}   NET drift {r_post[-1]-r_post[0]:+.3f}")
+        print(f"  sum d_update (vision) = {d_upd.sum():+8.2f}   mean/frame {d_upd.mean():+.5f}")
+        print(f"  sum d_propag (IMU)    = {d_prop.sum():+8.2f}   mean/frame {d_prop.mean():+.5f}")
+        tot = abs(d_upd.sum()) + abs(d_prop.sum())
+        print(f"  => vision accounts for {100*abs(d_upd.sum())/max(tot,1e-9):.1f}% of |motion|, "
+              f"IMU {100*abs(d_prop.sum())/max(tot,1e-9):.1f}%")
+        print(f"  accel-bias |b_a|: start {ab[0]:.4f} end {ab[-1]:.4f} max {ab.max():.4f} (MidAir true ~4e-4)")
+        print(f"  gyro-bias  |b_g|: start {gb[0]:.5f} end {gb[-1]:.5f} max {gb.max():.5f}")
+        print(f"  gravity-dir (tilt) err deg: median {np.median(tilt):.2f} p90 {np.percentile(tilt,90):.2f} max {tilt.max():.2f}")
+        print(f"  corr(|b_a|, log-scale) = {np.corrcoef(ab[ok], r_post)[0,1]:+.2f}   "
+              f"corr(tilt, log-scale) = {np.corrcoef(tilt[ok], r_post)[0,1]:+.2f}")
+        # --- is the propagation drag explained by gravity leakage from attitude tilt? ---
+        tl = tilt[ok]; vgo = vg[ok]
+        dprop = d_prop                      # per-frame propagation-induced log-scale change
+        tl_p = tl[1:]                       # align with dprop
+        vg_p = vgo[1:]
+        print("\n  --- gravity-leakage test (propagation stage only) ---")
+        print(f"  corr(tilt, d_prop)            = {np.corrcoef(tl_p, dprop)[0,1]:+.3f}"
+              f"   (negative => more tilt, more downward drag)")
+        # magnitude: leaked accel g*sin(tilt) over dt, relative to speed
+        dt_f = 1.0 / 25.0
+        pred = 9.81 * np.sin(np.radians(tl_p)) * dt_f / np.maximum(vg_p, 1e-6)
+        print(f"  |d_prop| observed median      = {np.median(np.abs(dprop)):.5f} /frame")
+        print(f"  g*sin(tilt)*dt/|v| predicted  = {np.median(pred):.5f} /frame"
+              f"   ratio obs/pred = {np.median(np.abs(dprop))/max(np.median(pred),1e-12):.2f}")
+        # --- causality: lagged cross-correlation of INCREMENTS (detrended) ---
+        dt_tilt = np.diff(tl); dsc = np.diff(r_post)
+        n = min(len(dt_tilt), len(dsc)); dt_tilt, dsc = dt_tilt[:n], dsc[:n]
+        best = []
+        for L in range(-30, 31, 5):
+            if L < 0:   c = np.corrcoef(dt_tilt[-L:], dsc[:L])[0, 1]
+            elif L > 0: c = np.corrcoef(dt_tilt[:-L], dsc[L:])[0, 1]
+            else:       c = np.corrcoef(dt_tilt, dsc)[0, 1]
+            best.append((L, c))
+        pk = max(best, key=lambda t: abs(t[1]))
+        print(f"  lagged xcorr(d_tilt -> d_logscale) peak at lag {pk[0]:+d} frames, r={pk[1]:+.3f}"
+              f"   (lag>0 => TILT LEADS scale)")
+        print("   " + "  ".join(f"{L:+d}:{c:+.2f}" for L, c in best))
+    if args.track_lifetimes and conv:
+        C = np.array(conv, float)
+        age, er, gr, fr = C[:,0], C[:,1], C[:,2], C[:,3]
+        lr = np.log(er / gr)
+        # remove per-frame global scale: subtract that frame's median log-ratio
+        norm = np.empty_like(lr)
+        for f in np.unique(fr):
+            m = fr == f
+            norm[m] = lr[m] - np.median(lr[m])
+        print("\n=== depth convergence vs landmark age (in-state landmarks vs GT depth) ===")
+        print(f"{'age bin':>10} {'n':>7} {'med|log ratio|':>15} {'med ratio':>10} {'scale-norm med|log|':>20}")
+        for lo, hi in [(0,2),(3,5),(6,10),(11,20),(21,50),(51,1000)]:
+            m = (age >= lo) & (age <= hi)
+            if m.sum() < 20: continue
+            print(f"{str(lo)+'-'+str(hi):>10} {m.sum():7d} {np.median(np.abs(lr[m])):15.3f} "
+                  f"{np.median(er[m]/gr[m]):10.3f} {np.median(np.abs(norm[m])):20.3f}")
+        print(f"  corr(log age, |log ratio|) = {np.corrcoef(np.log(age+1), np.abs(lr))[0,1]:+.3f}")
+        print(f"  corr(log age, scale-norm |log ratio|) = {np.corrcoef(np.log(age+1), np.abs(norm))[0,1]:+.3f}")
+    if args.track_lifetimes:
+        lifes = np.array(lm_life + [n - b for b in lm_birth.values()], float)
+        occ = np.array(lm_occ, float)
+        print(f"\n=== landmark lifetimes (frames in EqF state) ===")
+        print(f"  n_tracks={len(lifes)}  mean={lifes.mean():.2f}  median={np.median(lifes):.1f}  "
+              f"p90={np.percentile(lifes,90):.1f}  p99={np.percentile(lifes,99):.1f}  max={lifes.max():.0f}")
+        print(f"  frac lifetime<=2: {100*np.mean(lifes<=2):.1f}%   <=5: {100*np.mean(lifes<=5):.1f}%   "
+              f">=20: {100*np.mean(lifes>=20):.1f}%")
+        print(f"  occupancy: mean={occ.mean():.1f} median={np.median(occ):.0f} max={occ.max():.0f} "
+              f"(cap from config)")
+        print(f"  births/frame={len(lifes)/max(len(occ),1):.1f}")
     if args.save_npz:
         np.savez(args.save_npz, k=[r[0] for r in rec], est=est, quat=[r[2] for r in rec],
                  gt=gtp, R=R, t=t, ate=ate, tracked=[r[4] for r in rec],
@@ -191,6 +361,7 @@ def main():
         run_manifest.save_run_manifest(args.save_npz, args.config, extra={
             "traj": args.traj, "frames": nimg, "scale": args.scale,
             "stereo": args.stereo, "eqf_max_obs": args.eqf_max_obs,
+            "true_depth_seed": args.true_depth_seed,
             "gyro_frame": args.gyro_frame, "extrinsic": args.extrinsic,
             "ate_m": round(ate, 3), "ate_pct": round(100 * ate / max(traj_len, 1e-6), 3)})
 

@@ -7,7 +7,7 @@ against a single-pixel gradient -- it localizes against the WINDOWED structure
 tensor H = sum grad I grad I^T over the (2r+1)^2 patch, on the histeq'd image the
 tracker actually sees. The aperture problem lives in the weak eigenvector of THAT
 H, not in the raw gradient. This diagnostic redoes the direction test properly and
-adds the two leading causal hypotheses from flow_bias_template_drift.md:
+adds the two leading causal hypotheses for template drift:
 
   1. Edgeness / aperture: small lambda_min(H) or high condition lambda_max/lambda_min
      => weak localization along the weak eigenvector => beta should align with it.

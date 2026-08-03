@@ -259,6 +259,19 @@ impl PyVIOFilter {
             .map(|(p_vv, p_ww)| (mat3(&p_vv), mat3(&p_ww)))
     }
 
+    /// Full 3x3 body-velocity covariance block from the EqF Riccati matrix.
+    ///
+    /// Body-frame velocity is the gauge-free observable (unlike global position/yaw), so this
+    /// is the block to score covariance consistency (NEES) against. None if unavailable.
+    fn get_velocity_covariance<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray2<f64>>> {
+        self.filter.velocity_covariance().map(|m| {
+            let data: Vec<f64> = (0..3)
+                .flat_map(|r| (0..3).map(move |c| m[(r, c)]))
+                .collect();
+            PyArray2::from_owned_array(py, Array2::from_shape_vec((3, 3), data).unwrap())
+        })
+    }
+
     fn get_covariance_diagonal<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
         let sigma = &self.filter.eqf.sigma;
         let n = sigma.nrows();

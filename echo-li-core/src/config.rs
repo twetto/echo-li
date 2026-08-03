@@ -98,6 +98,8 @@ pub struct EqfInitialVariance {
     pub camera_attitude: f64,
     pub camera_position: f64,
     pub point: f64,
+    #[serde(default)]
+    pub point_depth: Option<f64>,
     pub position: f64,
     pub velocity: f64,
 }
@@ -747,6 +749,7 @@ impl VIOConfig {
         settings.max_landmarks = self.eqf.max_features;
         settings.sigma_bearing = self.eqf.measurement_noise.feature;
         settings.initial_point_variance = self.eqf.initial_variance.point;
+        settings.initial_point_depth_variance = self.eqf.initial_variance.point_depth;
 
         // velocityNoise
         settings.sigma_gyroscope = self.eqf.velocity_noise.gyr;

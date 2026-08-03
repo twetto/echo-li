@@ -1,6 +1,6 @@
 """Exact-GT KLT drift (beta) on Mid-Air -- realistic 3D scene, NO ground-truth error.
 
-Result 13 (flow_bias_template_drift.md) showed the single textured *plane* synthetic
+An earlier synthetic result showed the single textured *plane*
 drifts only ~0.005 px/frame, ~60x less than the 0.3 px/frame beta measured on EuRoC --
 so most of EuRoC's beta was Vicon/Leica/time-sync GROUND-TRUTH error, not tracker drift.
 But a plane has no depth discontinuity and no occlusion, so it cannot test the two

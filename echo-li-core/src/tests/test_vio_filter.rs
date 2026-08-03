@@ -2329,7 +2329,7 @@ fn format_seconds(seconds: f64) -> String {
 
 /// The stereo log-inverse-range output row `∂ℓ/∂(chart)` must equal the
 /// finite-difference of `ℓ = -ln‖q‖` through each chart's inverse map, and hit
-/// the closed forms from stereo_output_matrix_derivation.md: Normal `[0,0,+1]`,
+/// the closed forms for the log-inverse-range row: Normal `[0,0,+1]`,
 /// InvDepth `[0,0,1/ρ0]`, Euclidean `-q0ᵀ/‖q0‖²`.
 #[test]
 fn stereo_range_row_matches_log_inverse_range_jacobian() {

@@ -103,8 +103,9 @@ pub trait EqFCoordinateSuite: Send + Sync {
     /// Log-inverse-range output row for the stereo measurement channel:
     /// `ℓ(q) = -log‖q‖`, `∂ℓ/∂(chart)` as a 1×3 row in this suite's landmark
     /// chart. Default is the Euclidean form `-q0ᵀ/‖q0‖²`; charts override by
-    /// mapping through their `conv_*2euc`. See
-    /// ECHO-LI-notes/docs/eqvio/stereo_output_matrix_derivation.md.
+    /// mapping through their `conv_*2euc`. Derivation: with l = -ln(r) and
+    /// r = ||q||, dl/dq = -q^T/||q||^2; a chart's row is that Euclidean row
+    /// composed with the chart-to-Euclidean Jacobian.
     fn output_range_row(&self, q0: &Vector3<f64>) -> RowVector3<f64> {
         -q0.transpose() / q0.norm_squared()
     }

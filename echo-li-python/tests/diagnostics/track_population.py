@@ -1,7 +1,7 @@
 """Stage 0 — track population: do long, clean, high-parallax tracks exist?
 
 The MSCKF question reduces to: is the "long AND pure AND high-baseline" quadrant
-populated in ECHO-LI's front-end? (rotation_odometry_diagnostic.md showed naive
+populated in ECHO-LI's front-end? (an earlier sweep showed naive
 long tracks are contaminated; rudolf keeps them short by design.) This measures,
 per Rudolf-V track over its whole life:
 

@@ -21,7 +21,7 @@ pub struct VIOEqF {
     scratch_m: DMatrix<f64>,
     scratch_sigma: DMatrix<f64>,
     // `Faster` variant accumulator — the sub-frame transition Φ in block form
-    // (Phase 6, see docs/imu_optimization_plan.md). Identity when empty.
+    // (batched per IMU sub-frame instead of per sample). Identity when empty.
     phi_ss: SMatrix<f64, 21, 21>,
     phi_lm_s: DMatrix<f64>,
     phi_lm_s_scratch: DMatrix<f64>,
@@ -300,7 +300,7 @@ impl VIOEqF {
     /// `Faster` variant — apply the batched sub-frame transition:
     /// Σ ← Φ·Σ·Φ^T + (Σ dt)·(B_last·InputGain·B_last^T + StateGain), then reset
     /// the accumulator. `B` is held at the sub-frame's last sample (the Phase 6
-    /// process-noise approximation — see docs/imu_optimization_plan.md). No-op
+    /// process-noise approximation: Q is held constant across the sub-frame). No-op
     /// when nothing is accumulated, so it is safe to call unconditionally.
     pub fn flush_riccati(&mut self, input_gain: &SMatrix<f64, 12, 12>, state_gain: &DMatrix<f64>) {
         if self.accum_count == 0 {
@@ -428,8 +428,9 @@ impl VIOEqF {
     ///
     /// `stereo_meas` maps landmark id -> `(ell_obs, r_ell)`, where
     /// `ell_obs = -ln(range_s)` (log-inverse-range; the single sign negation from
-    /// Rudolf-V's `+log range` lives at the binding, see
-    /// stereo_output_matrix_derivation.md §9) and `r_ell = Var(range_s)/range_s^2`.
+    /// Rudolf-V's `+log range` lives at the binding, so this channel only ever
+    /// sees the canonical sign) and `r_ell = Var(range_s)/range_s^2`, the
+    /// first-order propagation of range variance through `ell = -ln(range)`.
     /// Observed ids absent from the map get the usual 2-row bearing update; ids
     /// present get an extra log-inverse-range row (Normal chart: `[0,0,+1]`).
     /// An empty map — or no observed stereo id — is byte-identical to

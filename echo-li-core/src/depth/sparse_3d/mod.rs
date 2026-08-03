@@ -675,7 +675,8 @@ fn measurement_variance_px2(settings: &SparseVogSettings, feat: &FeatureState3D)
 /// EKF (the inverse-depth refinement group is abelian / flat: `s <- s + gamma`),
 /// with the same Gaussian-Beta inlier weighting and optional process-noise floor
 /// as the SOT(3) path. No log-depth, no re-charting -> no sequential-linearisation
-/// overconfidence (see docs/sparse3d_invdepth_rewrite.md).
+/// overconfidence: a multiplicative (log-depth) chart re-introduces it and
+/// biases the converged range, so the additive inverse-depth chart is used.
 fn invdepth_additive_update_3d(
     k: &Matrix3<f64>,
     settings: &SparseVogSettings,

@@ -6,7 +6,7 @@ collapsed below a deterministic error), not a per-step covariance fault: a tiny
 per-step radial process-noise floor should stop Σ collapsing and flatten NEES
 across depth.
 
-Finding (see ECHO-LI-notes/docs/sparse3d_secondorder_eqf_derivation.md §8):
+Finding:
   range_walk_var = 0      -> tail NEES 4.4 / 3.9 / 5.4  (Z = 320/640/1280, grows)
   range_walk_var = 1e-9   -> tail NEES 1.9 / 1.7 / 2.0  (depth-FLAT, mild under-conf)
   range_walk_var >~ 1e-6  -> destabilises (the floor is ACCUMULATING; too large

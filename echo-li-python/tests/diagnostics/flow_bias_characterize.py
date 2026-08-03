@@ -1,7 +1,7 @@
 """Characterize the tracker flow bias beta: its SHAPE and its TRIGGERS.
 
 The depth-NEES inconsistency traced to a correlated flow bias beta (see
-sparse3d_inconsistency_decomposition.md). This measures beta directly instead of
+the inconsistency decomposition). This measures beta directly instead of
 inferring it. Ground truth: each track is anchored at its FIRST frame to the 3D
 scene point (GT Leica depth + Vicon pose); at every later frame the perfect-tracker
 pixel is that point reprojected with the GT pose. beta(age) = tracker_pixel -

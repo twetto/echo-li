@@ -16,7 +16,8 @@ pub enum OccupancyUpdateMode {
     /// centred at the measured range, with confidence-weighted carve/hit
     /// magnitudes, so uncertain rays smear weak evidence and confident rays
     /// write a sharp surface. Uses the *absolute* scale of `var(η)` as a metric
-    /// σ (see docs/3d_mapping_for_navigation.md §"Uncertainty-aware update").
+    /// σ: a measurement is spread over the cells its uncertainty actually covers,
+    /// so a far/noisy return updates many cells weakly instead of one strongly.
     UncertaintyAware,
 }
 

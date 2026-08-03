@@ -6,7 +6,7 @@ landmark error. We sweep the two Σ-floor sources -- the per-step velocity
 covariance `p_vv` and the radial `range_walk_var` -- and report the settled NEES,
 to see which (and at what magnitude) recalibrates the filter.
 
-Findings (ECHO-LI-notes/docs/sparse3d_secondorder_eqf_derivation.md §8), Z=320,
+Findings at Z=320,
 translation pose-noise σ_t = 0.01 m/frame, Analytic 2nd-order:
   * range_walk_var ~ 1e-8 ALONE recalibrates even with pose noise (NEES ~ 3.1):
     the radial floor absorbs both the triangulation bias and the pose-induced

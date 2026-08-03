@@ -84,6 +84,14 @@ pub struct VIOFilterSettings {
 
     // initialVariance
     pub initial_point_variance: f64,
+    /// Optional depth-coordinate birth variance, overriding `initial_point_variance` on the
+    /// third (range/inverse-range) chart coordinate only.
+    ///
+    /// Landmark birth uncertainty is intrinsically ANISOTROPIC: the bearing is measured
+    /// precisely by the pixel, the depth is essentially unknown. A single isotropic value
+    /// cannot express that. This is what a Civera-style "ρ₀ small, σ_ρ covering ρ=0" prior
+    /// needs — an uninformative depth with a tight bearing.
+    pub initial_point_depth_variance: Option<f64>,
     pub initial_attitude_variance: f64,
     pub initial_position_variance: f64,
     pub initial_velocity_variance: f64,
@@ -122,7 +130,7 @@ pub struct VIOFilterSettings {
 
     // Stereo log-inverse-range measurement channel. When true, observed
     // landmarks that carry a valid per-frame stereo range prior get an extra
-    // ℓ = -ln(range) measurement row (see stereo_output_matrix_derivation.md).
+    // l = -ln(range) measurement row.
     pub use_stereo_measurement: bool,
     // Chi²(1) gate on the stereo range innovation; 0 disables gating.
     pub range_gate_chi2: f64,
@@ -137,6 +145,7 @@ impl Default for VIOFilterSettings {
             sigma_accelerometer_bias: 0.004462289865453429,
             sigma_bearing: 1.9297839969591413,
             initial_point_variance: 129.90415638150924,
+            initial_point_depth_variance: None,
             initial_attitude_variance: 0.13565029126052572,
             initial_position_variance: 0.1,
             initial_velocity_variance: 8.974852995731e-08,
@@ -214,9 +223,11 @@ impl VIOFilterSettings {
 
         for i in 0..n_landmarks {
             let start = s + 3 * i;
-            sigma
-                .fixed_view_mut::<3, 3>(start, start)
-                .copy_from(&(Matrix3::identity() * self.initial_point_variance));
+            let mut blk = Matrix3::identity() * self.initial_point_variance;
+            if let Some(dv) = self.initial_point_depth_variance {
+                blk[(2, 2)] = dv;
+            }
+            sigma.fixed_view_mut::<3, 3>(start, start).copy_from(&blk);
         }
         sigma
     }
@@ -480,6 +491,9 @@ impl VIOFilter {
             // coordinate (Normal, InvDepth) have the range row concentrated on
             // coord 2; Euclidean spreads it and falls back to isotropic.
             let mut cov_i = Matrix3::identity() * self.settings.initial_point_variance;
+            if let Some(dv) = self.settings.initial_point_depth_variance {
+                cov_i[(2, 2)] = dv;
+            }
             if let Some(prior) = prior {
                 let c = self.suite.output_range_row(&p);
                 let var_ell = prior.range_var / (range * range);
@@ -560,7 +574,7 @@ impl VIOFilter {
         // priors already supplied for landmark birth. THE single sign negation
         // ell = -ln(range) lives here (Rudolf-V and the patch mapper use
         // +log range; the EqF chart and this channel use log-inverse-range — see
-        // parametrization_map_and_consistency.md §4a). Built by iterating the
+        // the canonical sign convention here). Built by iterating the
         // sorted `y_ids` (never the prior map) to stay reproducible.
         let stereo_meas: HashMap<u64, (f64, f64)> = if self.settings.use_stereo_measurement {
             y_ids
@@ -607,6 +621,24 @@ impl VIOFilter {
         let p_ww = cov.fixed_view::<3, 3>(0, 0).into_owned();
         let p_vv = cov.fixed_view::<3, 3>(3, 3).into_owned();
         Some((p_vv, p_ww))
+    }
+
+    /// Full 3x3 body-velocity covariance block of the EqF Riccati matrix.
+    ///
+    /// Body-frame velocity is the gauge-FREE observable (global position and yaw are
+    /// unobservable by construction), so this is the block to score covariance
+    /// consistency against. Base-state layout is
+    /// `input_bias(6) | pose(6) | velocity(3) | camera_offset(6)` = 21, hence rows 12..15.
+    pub fn velocity_covariance(&self) -> Option<Matrix3<f64>> {
+        let sigma = &self.eqf.sigma;
+        if sigma.nrows() < 15 || sigma.ncols() < 15 {
+            return None;
+        }
+        let cov = sigma.fixed_view::<3, 3>(12, 12).into_owned();
+        if cov.iter().any(|v| !v.is_finite()) {
+            return None;
+        }
+        Some(cov)
     }
 }
 

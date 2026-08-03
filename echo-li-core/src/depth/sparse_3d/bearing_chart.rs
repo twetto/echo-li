@@ -12,7 +12,8 @@
 //! `(alpha, beta, rho) = (X/Z, Y/Z, 1/Z)` chart: for a pinhole camera and a
 //! central bearing `b0 = normalize(alpha, beta, 1)` the two represent the same
 //! anchor point, but the tangent chart stays well-conditioned for any camera
-//! model (fisheye, wide FoV). See `sparse3d_bearing_camera_plan.md`.
+//! model (fisheye, wide FoV): the bearing is carried on S^2 rather than as a
+//! pinhole-normalised (x/z, y/z) pair, which degenerates near 90 deg FoV.
 
 use nalgebra::{Matrix3, Matrix3x2, Vector2, Vector3};
 
