@@ -235,8 +235,8 @@ pub struct SparseVogConfig {
     pub min_depth: Option<f64>,
     #[serde(default)]
     pub max_depth: Option<f64>,
-    #[serde(default)]
-    pub reanchor_flow_px: Option<f64>,
+    #[serde(default, alias = "reanchor_flow_px")]
+    pub birth_min_flow_px: Option<f64>,
     #[serde(default)]
     pub vis_min_depth: Option<f64>,
     #[serde(default)]
@@ -334,8 +334,8 @@ impl SparseVogConfig {
         if let Some(v) = self.max_depth {
             settings.max_depth = v;
         }
-        if let Some(v) = self.reanchor_flow_px {
-            settings.reanchor_flow_px = v;
+        if let Some(v) = self.birth_min_flow_px {
+            settings.birth_min_flow_px = v;
         }
         settings
     }

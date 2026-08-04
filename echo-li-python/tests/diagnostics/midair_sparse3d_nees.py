@@ -42,7 +42,7 @@ SPARSE_VOG_KEYS = [
     "uniform_z_max", "uniform_rho_max", "uniform_d_min", "uniform_d_max",
     "a_init", "b_init", "ab_min", "ab_max",
     "min_inlier_ratio", "mahalanobis_reset_chi2", "process_depth_var", "min_parallax",
-    "min_cos_sim", "min_depth", "max_depth", "reanchor_flow_px", "use_equivariant_output",
+    "min_cos_sim", "min_depth", "max_depth", "birth_min_flow_px", "use_equivariant_output",
     "iekf_iterations", "range_walk_var", "pose_range_scale", "rotation_unscented",
 ]
 

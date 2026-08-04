@@ -59,7 +59,12 @@ pub struct SparseVogSettings {
     pub min_cos_sim: f64,
     pub min_depth: f64,
     pub max_depth: f64,
-    pub reanchor_flow_px: f64,
+    /// Minimum pixel flow a feature must accumulate since first sight before it is
+    /// birthed. Two-view triangulation is severely biased toward the camera at low
+    /// parallax, so a feature is held pending until it has moved this far, then
+    /// triangulated and anchored in the frame where it is born. Despite the historical
+    /// name this never re-anchors an existing landmark: anchors are fixed at birth.
+    pub birth_min_flow_px: f64,
     /// Average the perspective output Jacobian between the predicted and the
     /// measured normalized image coords in the 3D bearing update, like the EqF
     /// coordinate suite's `output_matrix_ci_star`. NOTE: experiments show this
@@ -142,7 +147,7 @@ impl Default for SparseVogSettings {
             min_cos_sim: 0.95,
             min_depth: 0.1,
             max_depth: 100.0,
-            reanchor_flow_px: 3.0,
+            birth_min_flow_px: 3.0,
             use_equivariant_output: false,
             iekf_iterations: 1,
             second_order_mode: SecondOrderMode::Off,

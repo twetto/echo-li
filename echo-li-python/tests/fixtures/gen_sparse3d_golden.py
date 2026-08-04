@@ -60,7 +60,7 @@ SETTINGS = {
     "min_cos_sim": 0.95,
     "min_depth": 0.1,
     "max_depth": 150.0,
-    "reanchor_flow_px": 3.0,
+    "birth_min_flow_px": 3.0,
 }
 
 K = np.array([[FX, 0.0, CX], [0.0, FY, CY], [0.0, 0.0, 1.0]])

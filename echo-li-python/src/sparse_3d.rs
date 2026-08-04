@@ -242,7 +242,7 @@ fn parse_settings(kwargs: Option<&Bound<'_, pyo3::types::PyDict>>) -> PyResult<S
     set!("min_cos_sim", min_cos_sim);
     set!("min_depth", min_depth);
     set!("max_depth", max_depth);
-    set!("reanchor_flow_px", reanchor_flow_px);
+    set!("birth_min_flow_px", birth_min_flow_px);
     set!("use_equivariant_output", use_equivariant_output);
     set!("iekf_iterations", iekf_iterations);
     set!("range_walk_var", range_walk_var);

@@ -351,7 +351,7 @@ impl Sparse3DFilter {
                 let Some(cam) = self.camera.clone() else {
                     continue;
                 };
-                if (uv_curr - pending.ref_uv).norm() < self.settings.reanchor_flow_px {
+                if (uv_curr - pending.ref_uv).norm() < self.settings.birth_min_flow_px {
                     continue;
                 }
                 let b0 = cam.undistort(&uv_curr);
@@ -424,7 +424,7 @@ impl Sparse3DFilter {
                 &r_ref,
                 &t_ref,
             );
-            if z_obs <= 0.0 || drive * self.k[(0, 0)] < self.settings.reanchor_flow_px {
+            if z_obs <= 0.0 || drive * self.k[(0, 0)] < self.settings.birth_min_flow_px {
                 continue;
             }
 
@@ -1717,7 +1717,7 @@ mod tests {
             conv_variance_threshold: 10.0,
             init_depth_var: 1.0,
             sigma_pixel: 0.5,
-            reanchor_flow_px: 0.5,
+            birth_min_flow_px: 0.5,
             min_cos_sim: 0.90,
             max_depth: 100.0,
             ..Default::default()
