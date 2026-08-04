@@ -158,6 +158,20 @@ impl PySparse3DFilter {
                 "covariance_euclidean",
                 PyArray2::from_owned_array(py, cov_euc_arr),
             )?;
+            // Anchor camera position (translation of anchor_t_wc). Features sharing an
+            // anchor frame share this exactly, so it identifies distinct anchors -- which is
+            // what bounds the pose-window size if anchor poses are kept in the filter state.
+            feat_dict.set_item(
+                "anchor_t",
+                PyArray1::from_owned_array(
+                    py,
+                    Array1::from_vec(vec![
+                        feat.anchor_t_wc[(0, 3)],
+                        feat.anchor_t_wc[(1, 3)],
+                        feat.anchor_t_wc[(2, 3)],
+                    ]),
+                ),
+            )?;
             feat_dict.set_item("track_length", feat.track_length)?;
             feat_dict.set_item("inlier_ratio", feat.inlier_ratio())?;
             feat_dict.set_item("nis", feat.last_nis)?;

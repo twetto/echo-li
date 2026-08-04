@@ -211,7 +211,18 @@ class PrefetchFrameReader(FrameReader):
         return img
 
 
-def sparse_priors(filt, min_track, max_rel_sigma, var_scale):
+def sparse_priors(filt, min_track, max_rel_sigma, var_scale, far_gate=0.0):
+    """Sparse3D range priors for EqF landmark birth.
+
+    `far_gate` (k > 0) rejects any prior whose range exceeds k x the MEDIAN prior
+    range of this frame. Rationale: measured seed quality shows the damaging
+    population is the far tail (traj_2: 3.6% of seeds >3x true range, max 5.45x;
+    traj_1 has none, max 0.90x, and does not destabilise the filter), and the
+    perturbation sweep shows too-far seeds cost ~2.4x more ATE than too-near ones
+    at equal magnitude. The cap is taken relative to the frame's own median rather
+    than an absolute metre value, so it is scale-free: it inherits whatever scale
+    the filter currently believes and therefore cannot itself inject scale.
+    """
     priors = {}
     candidates = 0
     rel_sigmas = []
@@ -231,6 +242,11 @@ def sparse_priors(filt, min_track, max_rel_sigma, var_scale):
             rel_sigmas.append(rel_sigma)
         if var_r > 0.0 and np.isfinite(var_r) and rel_sigma <= max_rel_sigma:
             priors[int(fid)] = [rng, var_r]
+    if far_gate > 0.0 and len(priors) >= 3:
+        med = float(np.median([pr[0] for pr in priors.values()]))
+        if med > 0.0:
+            cap = far_gate * med
+            priors = {f: pr for f, pr in priors.items() if pr[0] <= cap}
     return priors, candidates, rel_sigmas
 
 
@@ -524,6 +540,7 @@ def run_once(mode, args, ds, f, cx, cy, W, H, ext, events, map_xy):
     prior_candidates_total = 0
     prior_rel_sigmas = []
     seed_q = []  # (frame, prior_range, gt_range) for seeded births
+    anchor_census = []  # (frame, n_live_features, n_distinct_anchors)
     t_ned_to_nwu = np.diag([1.0, -1.0, -1.0])
     writer = None
     vpath = None
@@ -573,8 +590,14 @@ def run_once(mode, args, ds, f, cx, cy, W, H, ext, events, map_xy):
                 else:
                     T_wc_sparse = vio_body_pose(vio) @ ext
                 sparse.update(float(stamp), all_uvs, T_wc_sparse.tolist(), None, None)
+                if args.anchor_census:
+                    _f = sparse.get_features()
+                    _keys = {tuple(np.round(np.asarray(_fd["anchor_t"], float), 4))
+                             for _fd in _f.values()}
+                    anchor_census.append((k, len(_f), len(_keys)))
                 priors, candidates, rel_sigmas = sparse_priors(
-                    sparse, args.sparse_min_track, args.max_rel_sigma, args.prior_var_scale)
+                    sparse, args.sparse_min_track, args.max_rel_sigma, args.prior_var_scale,
+                    args.far_gate)
                 prior_candidates_total += candidates
                 prior_rel_sigmas.extend(rel_sigmas)
             elif stereo is not None and right_gray is not None and all_uvs:
@@ -711,6 +734,15 @@ def run_once(mode, args, ds, f, cx, cy, W, H, ext, events, map_xy):
             "eqf_max_obs": args.eqf_max_obs, "eqf_selection": args.eqf_selection,
             "sparse_max_features": args.sparse_max_features,
             "stereo_baseline_m": args.stereo_baseline_m})
+    if args.anchor_census and anchor_census:
+        A = np.array(anchor_census, float)
+        nf, na = A[:, 1], A[:, 2]
+        print("\n=== ANCHOR CENSUS (Sparse3D) ===")
+        print(f"  live features    : mean {nf.mean():7.1f}  median {np.median(nf):7.0f}  max {nf.max():7.0f}")
+        print(f"  DISTINCT anchors : mean {na.mean():7.1f}  median {np.median(na):7.0f}  max {na.max():7.0f}")
+        print(f"  sharing factor (features per anchor): median {np.median(nf/np.maximum(na,1)):.2f}")
+        print(f"  clone cost if every anchor kept (6 dof): median {6*np.median(na):.0f} dims, "
+              f"max {6*na.max():.0f} dims   [base EqF state = 141]")
     summarize_state_monitor(mode, rec)
 
     if len(rec) < 20:
@@ -762,6 +794,12 @@ def main():
                     help="skip Sparse3D priors whose reported range sigma/range is larger")
     ap.add_argument("--prior-var-scale", type=float, default=1.0,
                     help="logged into the prior map; current EqF core does not consume it yet")
+    ap.add_argument("--anchor-census", action="store_true",
+                    help="per frame, count live Sparse3D features and how many DISTINCT anchor "
+                    "poses they use -- the state cost of keeping every anchor as a pose clone.")
+    ap.add_argument("--far-gate", type=float, default=0.0,
+                    help="reject Sparse3D priors farther than k x the frame median prior "
+                    "range (scale-free far-outlier gate). 0 disables.")
     ap.add_argument("--seed-quality", action="store_true",
                     help="record (frame, prior_range, gt_range) for each prior-seeded birth "
                     "to measure seed quality directly against GT depth.")
