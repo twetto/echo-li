@@ -114,7 +114,12 @@ SparseVog:
   # Re-enable only if NEES remains overconfident after the measured Rudolf-V
   # error/gating model is applied.
   process_depth_var: 0.0
-  # pose_range_scale: 0.0
+  pose_range_scale: 1.0       # pose-cov-driven radial range process noise (eq. 10-11).
+                              # Unit scale is the value validated in filter_formulation V-D:
+                              # estimated-pose range-NEES median 122->0.675 here (reference
+                              # 255->1.2), exact-pose baseline untouched at 0.108 because
+                              # exact poses carry ~0 incremental pose covariance.
+                              # Was commented out at 0.0, i.e. the validated fix did not ship.
   min_parallax: 1.0e-4
   min_cos_sim: 0.95
   min_depth: 0.1

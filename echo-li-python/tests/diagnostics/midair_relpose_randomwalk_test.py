@@ -115,15 +115,17 @@ def main():
             T = T_nwu @ ds.pose(int(k))
             gt_p[i], gt_q[i] = T[:3, 3], Rot.from_matrix(T[:3, :3]).as_quat()
     n = len(kidx)
-    R_bc = md.RT_BC[:3, :3]
+    # Body->camera extrinsic. EuRoC has a real lever arm, MidAir's RT_BC has none,
+    # so compose the FULL SE(3): T_wc = T_wb @ T_bc (reduces to the old rotation-only
+    # form exactly when the translation is zero).
+    T_bc = d["baseline_t_bc"] if "baseline_t_bc" in d.files else md.RT_BC
 
-    # Camera poses, estimated and GT, in a common world convention. Zero lever arm
-    # (RT_BC has no translation), so T_wc = T_wb @ R_bc.
+    # Camera poses, estimated and GT, in a common world convention.
     Twc_est, Twc_gt = np.zeros((n, 4, 4)), np.zeros((n, 4, 4))
     finite = np.zeros(n, bool)
     for i in range(n):
-        Twc_est[i] = se3(Rot.from_quat(np.asarray(est_q[i])).as_matrix() @ R_bc, est_p[i])
-        Twc_gt[i] = se3(Rot.from_quat(np.asarray(gt_q[i])).as_matrix() @ R_bc, gt_p[i])
+        Twc_est[i] = se3(Rot.from_quat(np.asarray(est_q[i])).as_matrix(), est_p[i]) @ T_bc
+        Twc_gt[i] = se3(Rot.from_quat(np.asarray(gt_q[i])).as_matrix(), gt_p[i]) @ T_bc
         finite[i] = np.isfinite(pvv[i]).all() and np.isfinite(pww[i]).all()
 
     # SANITY must be gauge-free: the VIO world frame differs from GT's by a constant

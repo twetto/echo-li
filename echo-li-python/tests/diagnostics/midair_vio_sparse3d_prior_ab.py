@@ -589,7 +589,14 @@ def run_once(mode, args, ds, f, cx, cy, W, H, ext, events, map_xy):
                     T_wc_sparse = nwu_body_pose(ds, k) @ md.RT_BC
                 else:
                     T_wc_sparse = vio_body_pose(vio) @ ext
-                sparse.update(float(stamp), all_uvs, T_wc_sparse.tolist(), None, None)
+                # Feed the EqF camera-pose covariance so Sparse3D's pose-driven range
+                # process noise (eq. 10-11, gated on p_vv.is_some()) is actually reachable.
+                # This harness passed None,None before 2026-08-05, so every seeding result
+                # recorded prior to that ran with the pose term OFF regardless of config.
+                _pc = vio.get_camera_pose_covariance() if args.sparse_pose != "gt" else None
+                _pvv = None if _pc is None else np.asarray(_pc[0], float).tolist()
+                _pww = None if _pc is None else np.asarray(_pc[1], float).tolist()
+                sparse.update(float(stamp), all_uvs, T_wc_sparse.tolist(), _pvv, _pww)
                 if args.anchor_census:
                     _f = sparse.get_features()
                     _keys = {tuple(np.round(np.asarray(_fd["anchor_t"], float), 4))
