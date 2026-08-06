@@ -108,7 +108,7 @@ SparseVog:
   ab_max: 200.0
   min_inlier_ratio: 0.5
   mahalanobis_reset_chi2: 0.2
-  # bias_walk_var: 0.04
+  bias_walk_var: 0.0
 
   # MidAir exact-GT diagnostic starts with no artificial static-depth floor.
   # Re-enable only if NEES remains overconfident after the measured Rudolf-V

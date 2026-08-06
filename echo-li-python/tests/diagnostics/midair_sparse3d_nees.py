@@ -273,6 +273,11 @@ def main():
                     help="diagnostic only: marginalized persistent per-track pixel bias sigma")
     ap.add_argument("--fisher-sigma-px", type=float, default=None,
                     help="diagnostic only: white pixel sigma for iid/bias Fisher covariance")
+    ap.add_argument("--pose-npz", default="",
+                    help="VIO run npz (k, est, quat) -> drive Sparse3D with ESTIMATED poses "
+                         "instead of GT. Combined with --measurements rudolf this is the only "
+                         "configuration where BOTH error sources are present at once: real "
+                         "correspondence drift AND real pose error, scored against GT depth.")
     ap.add_argument("--measurements", default="rudolf", choices=["rudolf", "klt", "exact"],
                     help="feed Rudolf-V, diagnostic Python KLT, or exact reprojections")
     ap.add_argument("--fb-threshold", type=float, default=0.0,
@@ -365,10 +370,37 @@ def main():
     if args.video:
         writer, vpath = md.open_writer(args.video_out, W, H, args.fps)
 
+    est_pose = {}
+    est_cov = {}
+    if args.pose_npz:
+        from scipy.spatial.transform import Rotation as _Rot
+        _d = np.load(args.pose_npz)
+        _T = np.eye(4); _T[:3, :3] = np.diag([1.0, -1.0, -1.0])
+        for _j, _k in enumerate(_d["k"].astype(int)):
+            _M = np.eye(4)
+            _M[:3, :3] = _Rot.from_quat(_d["quat"][_j]).as_matrix()
+            _M[:3, 3] = _d["est"][_j]
+            # ds.pose() is the RAW MidAir frame; the saved estimate is in the VIO/NWU
+            # frame (midair_vio_run applies T=diag(1,-1,-1)). T is an involution, so
+            # the same matrix maps back.
+            est_pose[int(_k)] = _T @ _M
+            if "pvv" in _d.files:
+                # Rotate the camera-frame pose covariance into the raw frame too, so
+                # the pose-driven range noise sees a covariance consistent with the
+                # poses it is paired with.
+                _R = _T[:3, :3]
+                est_cov[int(_k)] = (_R @ np.asarray(_d["pvv"][_j], float) @ _R.T,
+                                    _R @ np.asarray(_d["pww"][_j], float) @ _R.T)
+        _dif = [np.linalg.norm(est_pose[k][:3, 3] - ds.pose(k)[:3, 3])
+                for k in list(est_pose)[::37] if k < ds.n]
+        print(f"estimated poses: {len(est_pose)} frames from {args.pose_npz}")
+        print(f"  SANITY est-vs-GT position gap: median {np.median(_dif):.2f} m "
+              f"(drift-sized = frames agree; ~1e3 m = frame convention error)")
+
     for i in range(args.start, last):
         img = ds.image(i)
         depth = None
-        T_wb = ds.pose(i)
+        T_wb = est_pose.get(i, ds.pose(i)) if est_pose else ds.pose(i)
         T_bw = np.linalg.inv(T_wb)
         T_wc = T_wb @ md.RT_BC
         cur_pyr = cgx = cgy = None
@@ -473,7 +505,10 @@ def main():
                 uvs = {int(j): (float(p[0]), float(p[1])) for j, p in pos_prev.items()}
             for j, uv in uvs.items():
                 obs_hist.setdefault(j, []).append((T_wc.copy(), np.array(uv, float)))
-            filt.update(float(i) / 25.0, uvs, T_wc.tolist(), None, None)
+            _pc = est_cov.get(i)
+            filt.update(float(i) / 25.0, uvs, T_wc.tolist(),
+                        None if _pc is None else _pc[0].tolist(),
+                        None if _pc is None else _pc[1].tolist())
             n_live_updates += len(uvs)
 
         if writer is not None:

@@ -109,6 +109,22 @@ impl PySparse3DFilter {
         self.inner.query(feature_id)
     }
 
+    /// True if Sparse3D is tracking this id at all -- live OR pending. Pending is the
+    /// important half: those are newly-tracked features that have no usable prior yet,
+    /// and are exactly the ones that should be DEFERRED rather than born at the constant
+    /// sceneDepth. get_features() only reports live features and would miss them.
+    /// (range, range_var) with the same convergence gates the EqF seeding path uses
+    /// (min_track_length, conv_inlier_ratio, conv_variance_threshold). Returns
+    /// (-1, inf) when the landmark is not usable as a prior. `query` applies the same
+    /// gates but to DEPTH; seeding reads range, so expose both.
+    fn query_range(&self, fid: u64) -> (f64, f64) {
+        self.inner.query_range(fid)
+    }
+
+    fn has_track(&self, fid: u64) -> bool {
+        self.inner.has_track(fid)
+    }
+
     fn get_features<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
         let dict = pyo3::types::PyDict::new(py);
         let chart = self.inner.chart();

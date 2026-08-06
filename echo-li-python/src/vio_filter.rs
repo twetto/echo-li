@@ -205,6 +205,44 @@ impl PyVIOFilter {
             .process_vision_with_depth_priors(measurement, self.camera.as_ref(), &priors);
     }
 
+    /// Same as `process_vision_with_depth_priors`, but with the deferral set the CLI
+    /// already uses: ids in `defer_fallback_ids` that have NO usable prior are skipped
+    /// rather than born at the constant `sceneDepth`. Without this the Python path
+    /// always falls back, so the guard at lib.rs is unreachable from Python.
+    fn process_vision_with_depth_priors_and_deferred(
+        &mut self,
+        stamp: f64,
+        feature_uvs: HashMap<u64, [f32; 2]>,
+        depth_priors: HashMap<u64, [f64; 2]>,
+        defer_fallback_ids: Vec<u64>,
+    ) {
+        if !self.initialized {
+            return;
+        }
+        let cam_coords: HashMap<u64, Vector2<f32>> = feature_uvs
+            .into_iter()
+            .map(|(id, uv)| (id, Vector2::new(uv[0], uv[1])))
+            .collect();
+        let priors: HashMap<u64, LandmarkDepthPrior> = depth_priors
+            .into_iter()
+            .map(|(id, rv)| {
+                (
+                    id,
+                    LandmarkDepthPrior { range: rv[0], range_var: rv[1] },
+                )
+            })
+            .collect();
+        let deferred: std::collections::HashSet<u64> =
+            defer_fallback_ids.into_iter().collect();
+        let measurement = VisionMeasurement::new(stamp, cam_coords);
+        self.filter.process_vision_with_depth_priors_and_deferred_fallbacks(
+            measurement,
+            self.camera.as_ref(),
+            &priors,
+            &deferred,
+        );
+    }
+
     fn get_pose<'py>(
         &self,
         py: Python<'py>,

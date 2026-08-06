@@ -534,6 +534,9 @@ def run_once(mode, args, ds, f, cx, cy, W, H, ext, events, map_xy):
         )
 
     rec = []
+    n_deferred = 0
+    n_noprior = 0
+    n_tracked_noprior = 0
     prior_births = 0
     deferred_new = 0
     admitted_new = 0
@@ -650,7 +653,17 @@ def run_once(mode, args, ds, f, cx, cy, W, H, ext, events, map_xy):
             elif mode in ("sparse3d_seeded", "stereo_seeded"):
                 vio_uvs = cap_eqf_observations(
                     all_uvs, existing, priors, args.eqf_max_obs, args.eqf_selection)
-                vio.process_vision_with_depth_priors(stamp, vio_uvs, priors)
+                _noprior = [int(f) for f in vio_uvs if int(f) not in priors]
+                n_noprior += len(_noprior)
+                n_tracked_noprior += sum(1 for f in _noprior if sparse is not None
+                                         and sparse.has_track(f))
+                if args.defer_fallback and sparse is not None:
+                    _defer = [f for f in _noprior if sparse.has_track(f)]
+                    n_deferred += len(_defer)
+                    vio.process_vision_with_depth_priors_and_deferred(
+                        stamp, vio_uvs, priors, _defer)
+                else:
+                    vio.process_vision_with_depth_priors(stamp, vio_uvs, priors)
                 after = {int(x) for x in vio.get_landmarks().keys()}
                 births = after - existing
                 prior_births += len(births & set(priors))
@@ -684,7 +697,17 @@ def run_once(mode, args, ds, f, cx, cy, W, H, ext, events, map_xy):
                 vio_uvs = {fid: uv for fid, uv in all_uvs.items() if fid in keep}
                 vio_uvs = cap_eqf_observations(
                     vio_uvs, existing, priors, args.eqf_max_obs, args.eqf_selection)
-                vio.process_vision_with_depth_priors(stamp, vio_uvs, priors)
+                _noprior = [int(f) for f in vio_uvs if int(f) not in priors]
+                n_noprior += len(_noprior)
+                n_tracked_noprior += sum(1 for f in _noprior if sparse is not None
+                                         and sparse.has_track(f))
+                if args.defer_fallback and sparse is not None:
+                    _defer = [f for f in _noprior if sparse.has_track(f)]
+                    n_deferred += len(_defer)
+                    vio.process_vision_with_depth_priors_and_deferred(
+                        stamp, vio_uvs, priors, _defer)
+                else:
+                    vio.process_vision_with_depth_priors(stamp, vio_uvs, priors)
                 after = {int(x) for x in vio.get_landmarks().keys()}
                 births = after - existing
                 admitted_new += len(births)
@@ -766,6 +789,9 @@ def run_once(mode, args, ds, f, cx, cy, W, H, ext, events, map_xy):
     R, t, ate = umeyama(est, gtp)
     path = float(np.linalg.norm(np.diff(gtp, axis=0), axis=1).sum())
     final = float(np.linalg.norm((R @ est[-1] + t) - gtp[-1]))
+    print(f"[defer] {mode}: candidates lacking a prior = {n_noprior}; "
+          f"of those, Sparse3D IS tracking (defer-eligible) = {n_tracked_noprior} "
+          f"({100.0 * n_tracked_noprior / max(n_noprior, 1):.1f}%); actually deferred = {n_deferred}")
     return {"mode": mode, "n": len(rec), "ate": ate, "path": path, "final": final,
             "prior_births": prior_births, "deferred_new": deferred_new,
             "admitted_new": admitted_new, "prior_candidates": prior_candidates_total,
@@ -804,6 +830,11 @@ def main():
     ap.add_argument("--anchor-census", action="store_true",
                     help="per frame, count live Sparse3D features and how many DISTINCT anchor "
                     "poses they use -- the state cost of keeping every anchor as a pose clone.")
+    ap.add_argument("--defer-fallback", action="store_true",
+                    help="skip fallback birth for features Sparse3D is tracking but has not "
+                         "converged, instead of birthing them at the constant sceneDepth. "
+                         "The CLI already does this; the Python path could not until the "
+                         "deferred binding was exposed.")
     ap.add_argument("--far-gate", type=float, default=0.0,
                     help="reject Sparse3D priors farther than k x the frame median prior "
                     "range (scale-free far-outlier gate). 0 disables.")
