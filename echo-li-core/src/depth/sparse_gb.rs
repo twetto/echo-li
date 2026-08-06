@@ -105,6 +105,20 @@ pub struct SparseVogSettings {
     /// d(pi)/dq * r_hat = 0). Per-landmark via the inverse-parallax r/b factor.
     /// Default 0 (off). Only consumed by the `BearingInvDepthAdditive` update.
     pub pose_range_scale: f64,
+    /// Coherent (bias-driven) companion to `pose_range_scale`, fixing its GROWTH RATE.
+    ///
+    /// `pose_range_scale` injects a near-constant increment each frame, so the variance it
+    /// accumulates grows ~linearly in track age N (a random walk). A *persistent* pose bias
+    /// instead makes the range error grow ~N, hence its variance ~N^2 -- a different power,
+    /// which no scalar multiplier can produce. Adding `2*N*c*x` per frame telescopes to
+    /// `N^2*c*x` (sum of 2n over n=1..N), so the total is `scale*x*N + coherent*x*N^2` and
+    /// the effective exponent interpolates between 1 and 2 via the ratio. Here
+    /// `x = (r^2/b^2)(r^2 sig_phi^2 + sig_t^2)` as for `pose_range_scale`.
+    ///
+    /// Default 0 (off). No constant value has been found that works across pose runs of
+    /// differing quality: the reported covariance is wrong in both level and growth rate,
+    /// and one constant cannot correct both.
+    pub pose_range_coherent: f64,
     /// Per-frame random-walk variance (px^2) of a per-track 2D correspondence-bias
     /// state augmented onto the landmark in the `BearingInvDepthAdditive` update.
     /// Measurement model becomes `u = pi(P(s)) + b + eps`, `b_k = b_{k-1} + w_k`,
@@ -153,6 +167,7 @@ impl Default for SparseVogSettings {
             second_order_mode: SecondOrderMode::Off,
             range_walk_var: 0.0,
             pose_range_scale: 0.0,
+            pose_range_coherent: 0.0,
             bias_walk_var: 0.0,
             rotation_unscented: false,
         }

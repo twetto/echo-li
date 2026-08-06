@@ -177,8 +177,11 @@ def main():
             continue
         gp = np.array([np.interp(stamp, gt_t, gt_p[:, i]) for i in range(3)])
         gq = slerp(stamp).as_quat()
+        gb, ab = vio.get_biases()   # IMU bias estimates; their DRIFT RATE is the best
+                                    # online predictor of the per-track error twist
         rec.append((len(rec), np.asarray(pos), np.asarray(quat), gp, gq,
-                    np.asarray(pcov[0], float), np.asarray(pcov[1], float)))
+                    np.asarray(pcov[0], float), np.asarray(pcov[1], float),
+                    np.asarray(gb, float), np.asarray(ab, float)))
         if len(rec) % 200 == 0:
             print(f"  [{len(rec):5d}] t={stamp:.2f} tracked={stats['tracked']}")
         if args.max_frames and len(rec) >= args.max_frames:
@@ -205,6 +208,8 @@ def main():
                  baseline_gt_quat=np.array([r[4] for r in rec]),
                  baseline_pcov_pos=np.array([r[5] for r in rec]),
                  baseline_pcov_att=np.array([r[6] for r in rec]),
+                 baseline_gyro_bias=np.array([r[7] for r in rec]),
+                 baseline_accel_bias=np.array([r[8] for r in rec]),
                  baseline_t_bc=t_bs, ate=ate, path_len=path_len)
         print("saved ->", args.save_npz)
         run_manifest.save_run_manifest(args.save_npz, args.config,

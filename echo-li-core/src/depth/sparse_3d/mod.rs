@@ -873,7 +873,16 @@ fn bearing_invdepth_additive_update_3d(
                 let b2 = t_ca_t.norm_squared().max(1e-4 * r2);
                 let sig_t2 = p_vv.unwrap().trace() / 3.0; // incremental translation var (m^2)
                 let sig_phi2 = p_ww.unwrap().trace() / 3.0; // incremental rotation var (rad^2)
-                let pose_q = settings.pose_range_scale * (r2 / b2) * (r2 * sig_phi2 + sig_t2);
+                let x = (r2 / b2) * (r2 * sig_phi2 + sig_t2);
+                // Diffusive part: constant per frame -> accumulates ~N (random walk).
+                let mut pose_q = settings.pose_range_scale * x;
+                // Coherent part: a persistent pose bias gives range error ~N, variance ~N^2.
+                // 2*N*c*x per frame telescopes to N^2*c*x, so the total grows as
+                // scale*x*N + coherent*x*N^2 and the exponent interpolates 1..2.
+                if settings.pose_range_coherent > 0.0 {
+                    let age = feat.track_length as f64;
+                    pose_q += 2.0 * age * settings.pose_range_coherent * x;
+                }
                 q_range += pose_q.min(4.0 * r2); // cap fractional range var at (2r)^2
             }
             if q_range > 0.0 {
@@ -1019,7 +1028,16 @@ fn bearing_bias_update_3d(
                 let b2 = t_ca_t.norm_squared().max(1e-4 * r2);
                 let sig_t2 = p_vv.unwrap().trace() / 3.0; // incremental translation var (m^2)
                 let sig_phi2 = p_ww.unwrap().trace() / 3.0; // incremental rotation var (rad^2)
-                let pose_q = settings.pose_range_scale * (r2 / b2) * (r2 * sig_phi2 + sig_t2);
+                let x = (r2 / b2) * (r2 * sig_phi2 + sig_t2);
+                // Diffusive part: constant per frame -> accumulates ~N (random walk).
+                let mut pose_q = settings.pose_range_scale * x;
+                // Coherent part: a persistent pose bias gives range error ~N, variance ~N^2.
+                // 2*N*c*x per frame telescopes to N^2*c*x, so the total grows as
+                // scale*x*N + coherent*x*N^2 and the exponent interpolates 1..2.
+                if settings.pose_range_coherent > 0.0 {
+                    let age = feat.track_length as f64;
+                    pose_q += 2.0 * age * settings.pose_range_coherent * x;
+                }
                 q_range += pose_q.min(4.0 * r2); // cap fractional range var at (2r)^2
             }
             if q_range > 0.0 {

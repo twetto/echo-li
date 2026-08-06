@@ -32,7 +32,7 @@ SPARSE_KEYS = ["parametrization", "min_track_length", "conv_variance_threshold",
                "init_depth_var", "sigma_pixel", "uniform_z_max", "a_init", "b_init",
                "ab_min", "ab_max", "min_inlier_ratio", "mahalanobis_reset_chi2",
                "process_depth_var", "min_parallax", "min_cos_sim", "min_depth", "max_depth",
-               "bias_walk_var", "pose_range_scale"]
+               "bias_walk_var", "pose_range_scale", "pose_range_coherent"]
 R = 4  # border margin
 
 
@@ -208,6 +208,10 @@ def main():
     ap.add_argument("--range-walk-var", type=float, default=None,
                     help="override SparseVog range_walk_var: a RANGE process noise (radial) -- the "
                     "channel that CAN inflate depth cov, unlike the measurement-noise pose term")
+    ap.add_argument("--pose-range-coherent", type=float, default=None,
+                    help="coherent (bias-driven) companion to --pose-range-scale; adds a term "
+                         "growing as track_age^2 so the accumulated range variance is no longer "
+                         "purely diffusive (filter_formulation X.1)")
     ap.add_argument("--pose-range-scale", type=float, default=None,
                     help="enable the pose-driven, parallax-scaled range process noise (eq 10-11); "
                     "needs --pose-cov incremental so per-frame relative pose cov drives it")
@@ -225,6 +229,8 @@ def main():
         settings["range_walk_var"] = args.range_walk_var
     if args.pose_range_scale is not None:
         settings["pose_range_scale"] = args.pose_range_scale
+    if args.pose_range_coherent is not None:
+        settings["pose_range_coherent"] = args.pose_range_coherent
     # keep the config's sigma_pixel (its convergence gates are tuned to it); the GT-pose run is
     # the reference and the GT-vs-EST delta isolates pose error under identical filter settings.
     est_pose = load_est_poses(args.pose_npz)

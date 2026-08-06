@@ -25,6 +25,9 @@ pub struct PyVIOFilter {
     imu_buffer: Vec<IMUVelocity>,
     initialized: bool,
     n_init_samples: usize,
+    // Remembered so it survives set_initial_state, which REPLACES self.filter
+    // and would otherwise silently discard the setting.
+    gram_window: usize,
 }
 
 #[pymethods]
@@ -59,6 +62,7 @@ impl PyVIOFilter {
                 imu_buffer: Vec::new(),
                 initialized: false,
                 n_init_samples,
+                gram_window: 0,
             })
         } else {
             Err(pyo3::exceptions::PyTypeError::new_err(
@@ -107,6 +111,9 @@ impl PyVIOFilter {
         };
         let xi0 = VIOState::new(sensor, vec![]);
         self.filter = VIOFilter::new(self.filter.settings.clone(), xi0);
+        if self.gram_window > 0 {
+            self.filter.enable_gramian(self.gram_window);
+        }
         self.imu_buffer.clear();
         self.initialized = true;
         Ok(())
@@ -132,6 +139,9 @@ impl PyVIOFilter {
                 };
                 let xi0 = VIOState::new(sensor, vec![]);
                 self.filter = VIOFilter::new(self.filter.settings.clone(), xi0);
+        if self.gram_window > 0 {
+            self.filter.enable_gramian(self.gram_window);
+        }
                 for buffered_imu in self.imu_buffer.drain(..) {
                     self.filter.process_imu(buffered_imu);
                 }
@@ -257,6 +267,33 @@ impl PyVIOFilter {
         self.filter
             .sparse_camera_pose_covariances()
             .map(|(p_vv, p_ww)| (mat3(&p_vv), mat3(&p_ww)))
+    }
+
+    /// Enable observability-Gramian accumulation over `window` vision frames (0 = off).
+    fn enable_gramian(&mut self, window: usize) {
+        self.gram_window = window;
+        self.filter.enable_gramian(window);
+    }
+
+    /// (gramian 21x21, frames, resets) or None until a full window has accumulated.
+    /// Row/col 12..15 is body velocity, matching get_velocity_covariance.
+    fn get_observability_gramian<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> Option<(Bound<'py, PyArray2<f64>>, usize, usize)> {
+        self.filter.observability_gramian().map(|(g, f, r)| {
+            let mut data: Vec<f64> = Vec::with_capacity(21 * 21);
+            for i in 0..21 {
+                for j in 0..21 {
+                    data.push(g[(i, j)]);
+                }
+            }
+            (
+                PyArray2::from_owned_array(py, Array2::from_shape_vec((21, 21), data).unwrap()),
+                f,
+                r,
+            )
+        })
     }
 
     /// Full 3x3 body-velocity covariance block from the EqF Riccati matrix.

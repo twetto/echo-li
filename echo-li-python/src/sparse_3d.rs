@@ -247,6 +247,7 @@ fn parse_settings(kwargs: Option<&Bound<'_, pyo3::types::PyDict>>) -> PyResult<S
     set!("iekf_iterations", iekf_iterations);
     set!("range_walk_var", range_walk_var);
     set!("pose_range_scale", pose_range_scale);
+    set!("pose_range_coherent", pose_range_coherent);
     set!("rotation_unscented", rotation_unscented);
 
     if let Some(v) = kw.get_item("second_order_mode")? {

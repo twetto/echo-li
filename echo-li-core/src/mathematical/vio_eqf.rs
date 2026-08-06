@@ -28,6 +28,23 @@ pub struct VIOEqF {
     phi_li_li: Vec<SMatrix<f64, 3, 3>>,
     accum_dt: f64,
     accum_count: usize,
+    // --- Observability Gramian over a sliding window (0 = disabled) ---------
+    // O = sum_k (C_k Psi_k)^T R_k^-1 (C_k Psi_k), restricted to the 21 sensor
+    // columns, where Psi_k is the accumulated transition from the window start.
+    // This measures how much information the filter has actually EARNED about
+    // each sensor direction, which is computable from the Jacobians alone --
+    // unlike the error itself. A direction whose reported covariance is smaller
+    // than the inverse of its accumulated information is provably over-confident.
+    // C has zeros in all 21 sensor columns (vision informs bearings only), so the
+    // sensor information arrives entirely through Psi_lm_s, the landmark-sensor
+    // coupling built during propagation.
+    gram_window: usize,
+    gram: DMatrix<f64>,
+    gpsi_ss: SMatrix<f64, 21, 21>,
+    gpsi_lm_s: DMatrix<f64>,
+    gram_ids: Vec<u64>,
+    gram_frames: usize,
+    gram_resets: usize,
     last_b_s: SMatrix<f64, 21, 12>,
     last_b_lm: DMatrix<f64>,
 }
@@ -61,6 +78,13 @@ impl VIOEqF {
             phi_li_li: vec![SMatrix::<f64, 3, 3>::identity(); n_lm],
             accum_dt: 0.0,
             accum_count: 0,
+            gram_window: 0,
+            gram: DMatrix::<f64>::zeros(21, 21),
+            gpsi_ss: SMatrix::<f64, 21, 21>::identity(),
+            gpsi_lm_s: DMatrix::<f64>::zeros(0, 21),
+            gram_ids: Vec::new(),
+            gram_frames: 0,
+            gram_resets: 0,
             last_b_s: SMatrix::<f64, 21, 12>::zeros(),
             last_b_lm: DMatrix::<f64>::zeros(3 * n_lm, 12),
         }
@@ -173,6 +197,43 @@ impl VIOEqF {
         let n_lm = (n - s) / 3;
         let f_ss_t = f_ss.transpose();
         let f_lm_s_t = f_lm_s.transpose();
+
+        // Psi <- Phi Psi, with Phi = [[F_ss, 0], [F_lm_s, F_li_li]]:
+        //   Psi_lm_s' = F_lm_s Psi_ss + F_li_li Psi_lm_s   (before Psi_ss is overwritten)
+        //   Psi_ss'   = F_ss Psi_ss
+        if self.gram_window > 0 {
+            // Landmarks are born and die every vision frame, so a reset on any
+            // dimension change would end the window immediately. Instead remap:
+            // surviving landmarks keep their accumulated coupling, new ones start
+            // at zero (a fresh landmark carries no dependence on the sensor state
+            // at the window start), dead ones are dropped. The window survives.
+            if self.gram_ids != self.x.id {
+                let mut remap = DMatrix::<f64>::zeros(3 * n_lm, 21);
+                for (i, id) in self.x.id.iter().enumerate().take(n_lm) {
+                    if let Some(j) = self.gram_ids.iter().position(|o| o == id) {
+                        if 3 * j + 3 <= self.gpsi_lm_s.nrows() {
+                            let src = self.gpsi_lm_s.view((3 * j, 0), (3, 21)).into_owned();
+                            remap.view_mut((3 * i, 0), (3, 21)).copy_from(&src);
+                        }
+                    }
+                }
+                self.gpsi_lm_s = remap;
+                self.gram_ids = self.x.id.clone();
+            }
+            {
+                // f_lm_s * gpsi_ss is Dyn x Const<21>; gpsi_lm_s is fully dynamic.
+                let prod = f_lm_s * self.gpsi_ss;
+                let mut lm_new =
+                    DMatrix::<f64>::from_column_slice(prod.nrows(), 21, prod.as_slice());
+                for (i, f_i) in f_li_li.iter().enumerate().take(n_lm) {
+                    let cur = lm_new.view((3 * i, 0), (3, 21)).into_owned();
+                    let blk = f_i * self.gpsi_lm_s.view((3 * i, 0), (3, 21)) + cur;
+                    lm_new.view_mut((3 * i, 0), (3, 21)).copy_from(&blk);
+                }
+                self.gpsi_lm_s = lm_new;
+                self.gpsi_ss = f_ss * self.gpsi_ss;
+            }
+        }
 
         // ---- Step 1: M = F · Σ ----
         {
@@ -541,6 +602,36 @@ impl VIOEqF {
     // Sequential scalar update (sparse C, symmetric rank-1 downdate)
     // ------------------------------------------------------------------
 
+    /// Restart the Gramian window at the current state dimension.
+    fn reset_gramian(&mut self, n_lm: usize) {
+        self.gram = DMatrix::<f64>::zeros(21, 21);
+        self.gpsi_ss = SMatrix::<f64, 21, 21>::identity();
+        self.gpsi_lm_s = DMatrix::<f64>::zeros(3 * n_lm, 21);
+        self.gram_ids = self.x.id.clone();
+        self.gram_frames = 0;
+        self.gram_resets += 1;
+    }
+
+    /// Enable (window > 0) or disable (0) observability-Gramian accumulation.
+    pub fn enable_gramian(&mut self, window: usize) {
+        self.gram_window = window;
+        let n_lm = (self.xi0.dim() - VIOSensorState::CDIM) / 3;
+        self.reset_gramian(n_lm);
+        self.gram_resets = 0;
+    }
+
+    /// Accumulated information about the 21-dim sensor state over the current
+    /// window, with the number of vision frames it covers. `None` until a full
+    /// window has accumulated, so callers never see a partially-filled Gramian.
+    pub fn observability_gramian(&self) -> Option<(DMatrix<f64>, usize, usize)> {
+        if self.gram_window == 0 {
+            return None;
+        }
+        // Always report, so callers can see how often the window is being cut
+        // short by state-dimension changes rather than silently getting nothing.
+        Some((self.gram.clone(), self.gram_frames, self.gram_resets))
+    }
+
     pub fn perform_stacked_update<S: EqFCoordinateSuite + ?Sized>(
         &mut self,
         suite: &S,
@@ -555,6 +646,31 @@ impl VIOEqF {
         }
 
         let n = self.xi0.dim();
+
+        // --- Observability Gramian: O += (C Psi)^T R^-1 (C Psi) ---------------
+        // C's 21 sensor columns are identically zero, so C Psi = C_lm Psi_lm_s.
+        if self.gram_window > 0 && self.gpsi_lm_s.nrows() == n - VIOSensorState::CDIM {
+            // (Psi is kept in step with the live landmark set by the remap in
+            // apply_transport, so this guard holds except on the very first frame.)
+            let s0 = VIOSensorState::CDIM;
+            let c_lm = c_star.view((0, s0), (m, n - s0));
+            let cpsi = c_lm * &self.gpsi_lm_s; // m x 21
+            for j in 0..m {
+                let r_j = r_noise[(j, j)];
+                if !(r_j > 0.0) {
+                    continue;
+                }
+                let row = cpsi.row(j);
+                let outer = row.transpose() * row / r_j;
+                self.gram += outer;
+            }
+            self.gram_frames += 1;
+            if self.gram_frames >= 2 * self.gram_window {
+                let n_lm = (n - s0) / 3;
+                self.reset_gramian(n_lm);
+            }
+        }
+
         let mut gamma = DVector::<f64>::zeros(n);
 
         for j in 0..m {

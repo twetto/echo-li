@@ -69,6 +69,9 @@ def main():
                     "mirroring Sparse3D reporting ~5%% rel-sigma while being far off.")
     ap.add_argument("--probe-scale", action="store_true",
                     help="per-frame stage decomposition of the SCALE error: how much of\n                    log(|v_est|/|v_gt|) is moved by IMU propagation vs by the vision update.")
+    ap.add_argument("--gramian-window", type=int, default=0,
+                    help="accumulate the observability Gramian over this many vision frames "
+                         "(0 = off); enables the information-floor diagnostic")
     ap.add_argument("--track-lifetimes", action="store_true",
                     help="histogram in-state landmark lifetimes and filter occupancy: does a\n                    landmark live long enough to accumulate parallax and converge in depth?")
     ap.add_argument("--extrinsic", default="rtbc", choices=["rtbc", "inv", "identity", "rtbc_T"])
@@ -126,6 +129,8 @@ def main():
     ext = {"rtbc": md.RT_BC, "inv": np.linalg.inv(md.RT_BC),
            "rtbc_T": md.RT_BC.T, "identity": np.eye(4)}[args.extrinsic]
     vio.set_camera_extrinsics(np.ascontiguousarray(ext))
+    if args.gramian_window:
+        vio.enable_gramian(args.gramian_window)
     print(f"extrinsic={args.extrinsic}\n{ext[:3,:3]}")
     # Mid-Air VO_test starts mid-flight (~7 m/s); the stationary auto-init fails, so seed the
     # initial state from GT. Mid-Air is NED (Z down); the filter's world is Z-up (gravity along
@@ -259,7 +264,16 @@ def main():
             (np.asarray(pcov[0]), np.asarray(pcov[1]))
         gt = ds.pose(k)
         gt_pos_nwu = T @ gt[:3, 3]
-        rec.append((k, np.asarray(pos), np.asarray(quat), gt_pos_nwu.copy(), stats["tracked"], pvv, pww))
+        _gb, _ab = vio.get_biases()
+        _gr = vio.get_observability_gramian() if args.gramian_window else None
+        _vc = vio.get_velocity_covariance()
+        _ve = vio.get_velocity()
+        rec.append((k, np.asarray(pos), np.asarray(quat), gt_pos_nwu.copy(), stats["tracked"],
+                    pvv, pww, np.asarray(_gb, float), np.asarray(_ab, float),
+                    np.full((21, 21), np.nan) if _gr is None else np.asarray(_gr[0], float),
+                    -1 if _gr is None else int(_gr[1]), -1 if _gr is None else int(_gr[2]),
+                    np.full((3, 3), np.nan) if _vc is None else np.asarray(_vc, float),
+                    np.asarray(_ve, float)))
         if n % 100 == 0:
             print(f"  [{n}/{nimg}] t={stamp:5.1f}s tracked={stats['tracked']:3d} "
                   f"|est|={np.linalg.norm(pos):5.1f} |gt|={np.linalg.norm(gt_pos_nwu):5.1f} "
@@ -356,7 +370,14 @@ def main():
     if args.save_npz:
         np.savez(args.save_npz, k=[r[0] for r in rec], est=est, quat=[r[2] for r in rec],
                  gt=gtp, R=R, t=t, ate=ate, tracked=[r[4] for r in rec],
-                 pvv=np.array([r[5] for r in rec]), pww=np.array([r[6] for r in rec]))
+                 pvv=np.array([r[5] for r in rec]), pww=np.array([r[6] for r in rec]),
+                 gyro_bias=np.array([r[7] for r in rec]),
+                 accel_bias=np.array([r[8] for r in rec]),
+                 gramian=np.array([r[9] for r in rec]),
+                 gram_frames=np.array([r[10] for r in rec]),
+                 gram_resets=np.array([r[11] for r in rec]),
+                 vel_cov=np.array([r[12] for r in rec]),
+                 vel_est_body=np.array([r[13] for r in rec]))
         print("saved ->", args.save_npz)
         run_manifest.save_run_manifest(args.save_npz, args.config, extra={
             "traj": args.traj, "frames": nimg, "scale": args.scale,

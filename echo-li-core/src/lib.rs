@@ -629,6 +629,20 @@ impl VIOFilter {
     /// unobservable by construction), so this is the block to score covariance
     /// consistency against. Base-state layout is
     /// `input_bias(6) | pose(6) | velocity(3) | camera_offset(6)` = 21, hence rows 12..15.
+    /// Turn on observability-Gramian accumulation over a sliding window of
+    /// `window` vision frames (0 disables). The Gramian measures information the
+    /// filter has actually earned per direction, which -- unlike the error -- is
+    /// computable from the Jacobians alone.
+    pub fn enable_gramian(&mut self, window: usize) {
+        self.eqf.enable_gramian(window);
+    }
+
+    /// `(gramian_21x21, frames_covered, resets_so_far)`, or None until a full
+    /// window has accumulated.
+    pub fn observability_gramian(&self) -> Option<(DMatrix<f64>, usize, usize)> {
+        self.eqf.observability_gramian()
+    }
+
     pub fn velocity_covariance(&self) -> Option<Matrix3<f64>> {
         let sigma = &self.eqf.sigma;
         if sigma.nrows() < 15 || sigma.ncols() < 15 {
