@@ -1,0 +1,111 @@
+# TartanAir V2 config for EqF + Sparse3D depth NEES evidence.
+#
+# Adapted from diagnostics_midair_e2e_depth_nees.yaml for TartanAir V2
+# OldScandinavia/Data_easy.  Key differences from MidAir:
+#   - IMU noise: σ_a=0.047 m/s², σ_g=0.063 rad/s (measured from GT velocity
+#     residuals; uniform across P000–P006, no per-traj randomization).
+#   - Bias: negligible (|b_a|<0.01 m/s², |b_g|<3e-5 rad/s), priors set tight.
+#   - Scene depth: median 7–18 m across trajectories (default 10 m).
+#   - Camera: 640×640 pinhole, f=320, cx=cy=320 (at scale=0.5: 320×320, f=160).
+#   - Gyro: already body-frame (no spatial→body repair needed, unlike MidAir).
+#
+# Noise measurement:
+#   GT specific force = R_slerp^T @ (dv/dt_central - g_NED)
+#   residual = acc_measured - GT
+#   7 trajectories: σ_a ∈ [0.043, 0.049], σ_g ∈ [0.057, 0.067]
+#
+# Evidence script: echo-li-python/tests/diagnostics/tartanair_e2e_depth_nees.py
+RudolfV:
+  equaliseImageHistogram: true
+  featureDist: 16.0
+  featureSearchThreshold: 0.8
+  fastThreshold: 20
+  detector: shi_tomasi
+  maxFeatures: 300
+  maxLevel: 3
+  lbpPolicy: HardReject
+  kltResidual: false
+  enableRansac: true
+  epipolarGateThreshold: 1.0e-5
+  epipolarRefine: false
+  ransacParams:
+    inlierThreshold: 0.00001
+    maxIterations: 200
+    minDataPoints: 5
+    minInliers: 15
+  trackedFeatureDist: 16.0
+eqf:
+  maxFeatures: 40
+  initialValue:
+    sceneDepth: 10.0
+  initialVariance:
+    attitude: 0.13565029126052572
+    # TartanAir has negligible bias — tight priors to prevent unnecessary
+    # uncertainty injection on low-excitation trajectories.
+    biasAcc: 0.00001
+    biasGyr: 0.0000001
+    cameraAttitude: 0.0010228558965517584
+    cameraPosition: 0.023501400846134893
+    point: 129.90415638150924
+    position: 0.1
+    velocity: 1.0
+  measurementNoise:
+    feature: 2.0
+    featureOutlierAbs: 5.0
+    featureOutlierProb: 0.03229809583062128
+    featureRetention: 0.18594708334486176
+  processVariance:
+    attitude: 6.025875320811407e-05
+    biasAcc: 0.0
+    biasGyr: 0.0
+    cameraAttitude: 5.075382174045239e-06
+    cameraPosition: 1.2188313140115635e-05
+    point: 0.00029845436136043135
+    position: 9.981466095928483e-06
+    velocity: 0.025
+  settings:
+    coordinateChoice: Normal
+    fastRiccati: false
+    useDiscreteInnovationLift: false
+    useDiscreteVelocityLift: false
+    useEquivariantOutput: true
+    useFeaturePredictions: true
+    useMedianDepth: true
+    riccatiVariant: faster
+    imuBiasGroup: additive
+  velocityNoise:
+    # Measured from TartanAir V2 OldScandinavia GT velocity residuals.
+    # Per-sample σ at 100 Hz: σ_a ∈ [0.043, 0.049], σ_g ∈ [0.057, 0.067].
+    # EqF convention is continuous-time noise density (σ/√Hz):
+    #   σ_density = σ_sample · √dt = σ_sample · 0.1
+    acc: 0.0047
+    accBias: 0.004462289865453429
+    gyr: 0.0063
+    gyrBias: 0.00013372703521098622
+main:
+  writeState: true
+  cameraLag: 0.00
+SparseVog:
+  parametrization: bearing_invdepth_additive3d
+  max_pool_size: 300
+  min_track_length: 5
+  conv_variance_threshold: 2.0
+  init_depth_var: 10.0
+  sigma_pixel: 1.0
+  uniform_z_max: 20.0
+  a_init: 100000000.0
+  b_init: 0.00000001
+  ab_min: 1.0
+  ab_max: 200.0
+  min_inlier_ratio: 0.5
+  mahalanobis_reset_chi2: 0.2
+  bias_walk_var: 0.0
+  process_depth_var: 0.01
+  pose_range_scale: 1.0
+  pose_range_coherent: 0.0
+  min_parallax: 1.0e-4
+  min_cos_sim: 0.95
+  min_depth: 0.1
+  max_depth: 150.0
+Stereo:
+  enabled: false
