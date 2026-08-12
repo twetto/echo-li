@@ -58,23 +58,17 @@ fn keyframe_buffer_uses_baseline_gate() {
     }];
 
     let img = textured_image();
-    assert!(
-        mapper
-            .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
-            .is_none()
-    );
+    assert!(mapper
+        .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
+        .is_none());
     assert_eq!(mapper.keyframe_count(), 1);
-    assert!(
-        mapper
-            .update_with_priors(frame(1, 0.001, img.clone()), &seeds, None, 0.0)
-            .is_none()
-    );
+    assert!(mapper
+        .update_with_priors(frame(1, 0.001, img.clone()), &seeds, None, 0.0)
+        .is_none());
     assert_eq!(mapper.keyframe_count(), 2);
-    assert!(
-        mapper
-            .update_with_priors(frame(2, 0.02, img), &seeds, None, 0.0)
-            .is_some()
-    );
+    assert!(mapper
+        .update_with_priors(frame(2, 0.02, img), &seeds, None, 0.0)
+        .is_some());
     assert_eq!(mapper.keyframe_count(), 2);
 }
 
@@ -93,21 +87,18 @@ fn seed_priors_produce_cell_depths() {
     }];
     let img = vec![120u8; 32 * 32];
 
-    assert!(
-        mapper
-            .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
-            .is_none()
-    );
+    assert!(mapper
+        .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
+        .is_none());
     let out = mapper
         .update_with_priors(frame(1, 0.02, img), &seeds, None, 0.0)
         .unwrap();
     // Output is log-range η; seed η = ln(2) so range = exp(η) ≈ 2.0.
-    assert!(
-        out.eta
-            .data
-            .iter()
-            .any(|e| e.is_finite() && (e.exp() - 2.0).abs() < 0.1)
-    );
+    assert!(out
+        .eta
+        .data
+        .iter()
+        .any(|e| e.is_finite() && (e.exp() - 2.0).abs() < 0.1));
     assert!(out.status.data.contains(&PatchStatus::SeedOnly));
 }
 
@@ -127,11 +118,9 @@ fn bearing_lut_handles_distorted_path_for_photometric_solve() {
     }];
     let img = textured_image();
 
-    assert!(
-        mapper
-            .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
-            .is_none()
-    );
+    assert!(mapper
+        .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
+        .is_none());
     let out = mapper
         .update_with_priors(frame(1, 0.02, img), &seeds, None, 0.0)
         .unwrap();
@@ -156,11 +145,9 @@ fn fast_translation_refines_undistorted_pinhole_patches() {
     }];
     let img = textured_image();
 
-    assert!(
-        mapper
-            .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
-            .is_none()
-    );
+    assert!(mapper
+        .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
+        .is_none());
     let out = mapper
         .update_with_priors(frame(1, 0.02, img), &seeds, None, 0.0)
         .unwrap();
@@ -187,11 +174,9 @@ fn fast_translation_refines_undistorted_pinhole_4x4_patches() {
     }];
     let img = textured_image();
 
-    assert!(
-        mapper
-            .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
-            .is_none()
-    );
+    assert!(mapper
+        .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
+        .is_none());
     let out = mapper
         .update_with_priors(frame(1, 0.02, img), &seeds, None, 0.0)
         .unwrap();
@@ -232,11 +217,9 @@ fn tiled_bearing_mode_runs_tile_local_update() {
     }];
     let img = textured_image();
 
-    assert!(
-        mapper
-            .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
-            .is_none()
-    );
+    assert!(mapper
+        .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
+        .is_none());
     let out = mapper
         .update_with_priors(frame(1, 0.02, img), &seeds, None, 0.0)
         .unwrap();
@@ -333,10 +316,9 @@ fn tiled_bearing_requires_fast_translation_warp() {
         Ok(_) => panic!("tiled_bearing should reject exact warp mode"),
         Err(err) => err,
     };
-    assert!(
-        err.to_string()
-            .contains("requires warp_mode=fast_translation")
-    );
+    assert!(err
+        .to_string()
+        .contains("requires warp_mode=fast_translation"));
 }
 
 #[test]
@@ -362,11 +344,9 @@ fn tiled_bearing_mode_runs_with_two_pyramid_levels() {
     }];
     let img = textured_image();
 
-    assert!(
-        mapper
-            .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
-            .is_none()
-    );
+    assert!(mapper
+        .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
+        .is_none());
     let out = mapper
         .update_with_priors(frame(1, 0.02, img), &seeds, None, 0.0)
         .unwrap();
@@ -397,11 +377,9 @@ fn per_patch_bearing_mode_runs() {
     }];
     let img = textured_image();
 
-    assert!(
-        mapper
-            .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
-            .is_none()
-    );
+    assert!(mapper
+        .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
+        .is_none());
     let out = mapper
         .update_with_priors(frame(1, 0.02, img), &seeds, None, 0.0)
         .unwrap();
@@ -581,6 +559,48 @@ fn tiled_bearing_projection_jacobian_matches_finite_difference() {
         assert!((analytic[(0, axis)] - numeric[0]).abs() < 1e-6);
         assert!((analytic[(1, axis)] - numeric[1]).abs() < 1e-6);
     }
+}
+
+#[test]
+fn anisotropic_photo_weight_uses_packed_pixel_covariance() {
+    let sigma_photo_sq = 1.0;
+    let cov_u = Some([4.0, 0.0, 0.0]);
+    let cov_v = Some([0.0, 0.0, 4.0]);
+
+    let weight_u_grad =
+        photo_inv_sigma_eff_sq_anisotropic(2.0, 0.0, sigma_photo_sq, 0.0, cov_u, None);
+    let weight_v_grad =
+        photo_inv_sigma_eff_sq_anisotropic(2.0, 0.0, sigma_photo_sq, 0.0, cov_v, None);
+
+    assert!(weight_u_grad < weight_v_grad);
+    assert!((weight_v_grad - 1.0).abs() < 1e-12);
+}
+
+#[test]
+fn warp_uncertainty_projects_full_angular_covariance() {
+    let (camera, intr) = camera();
+    let levels = build_tiled_bearing_levels(camera.as_ref(), &intr, 32, 32, 1.0, 1, 16, 8);
+    let tile = &levels[0].tiles[0];
+    let rel_pose = RelativePose {
+        r: nalgebra::Matrix3::identity(),
+        t: nalgebra::Vector3::new(0.1, -0.2, 0.05),
+    };
+    let x_ref = tile.bearing_at_level_pixel(9.0, 10.0) * 2.0 + rel_pose.t;
+    let warp_uncertainty = WarpUncertainty {
+        scalar_sq: 0.0,
+        translation_dt2: None,
+        angular_dt2: Some(nalgebra::Matrix3::from_diagonal(&nalgebra::Vector3::new(
+            1e-4, 2e-4, 3e-4,
+        ))),
+    };
+
+    let pixel_cov = warp_uncertainty
+        .patch_pixel_cov(tile, &x_ref, &rel_pose)
+        .expect("angular covariance should project into pixel covariance");
+
+    assert!(pixel_cov[0] >= 0.0);
+    assert!(pixel_cov[2] >= 0.0);
+    assert!(pixel_cov[0] > 0.0 || pixel_cov[1] != 0.0 || pixel_cov[2] > 0.0);
 }
 
 #[test]
@@ -875,11 +895,9 @@ fn structure_tensor_min_eigen_active_suppresses_all_depth_output() {
         eta_var: 0.04,
     }];
     let img = textured_image();
-    assert!(
-        mapper
-            .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
-            .is_none()
-    );
+    assert!(mapper
+        .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
+        .is_none());
     let out = mapper
         .update_with_priors(frame(1, 0.02, img), &seeds, None, 0.0)
         .unwrap();
@@ -891,7 +909,7 @@ fn structure_tensor_min_eigen_active_suppresses_all_depth_output() {
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn per_patch_affine_simd_matches_scalar_leaf() {
-    use super::simd::{PerPatchAffineGeom, per_patch_affine_accum_avx2_if_available};
+    use super::simd::{per_patch_affine_accum_avx2_if_available, PerPatchAffineGeom};
     use rudolf_v::image::Image;
 
     let (w, h) = (40usize, 40usize);

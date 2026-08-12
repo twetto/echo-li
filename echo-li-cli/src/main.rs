@@ -1,8 +1,9 @@
-use clap::Parser;
 use camera_geometry::CameraProjection;
+use clap::Parser;
 use echo_li_core::config::VIOConfig;
 use echo_li_core::core_types::CameraIntrinsics;
 use echo_li_core::dataserver::ASLDatasetReader;
+use echo_li_core::depth::occupancy::{LocalOccupancyMap, LocalOccupancySettings};
 use echo_li_core::depth::patch_depth::{
     FrameProducts, PatchDepthCameraMode, PatchDepthMapper, PatchDepthOutput,
     PatchDepthSeedCoordinates, PatchDepthSettings, PatchStatus,
@@ -15,8 +16,10 @@ use echo_li_core::mathematical::*;
 use echo_li_core::trajectory_metrics::TrajectoryMetrics;
 use echo_li_core::{LandmarkDepthPrior, VIOFilter, VIOFilterSettings};
 use nalgebra::{Matrix3, Matrix4, Vector2};
+use rudolf_v::camera::CameraIntrinsics as RudolfCameraIntrinsics;
+use rudolf_v::camera::DistortionModel as RudolfDistortionModel;
 use rudolf_v::camera::StereoRig;
-use rudolf_v::frontend::{Frontend, FrontendConfig, LbpPolicy};
+use rudolf_v::frontend::{DetectorType, Frontend, FrontendConfig, LbpPolicy};
 use rudolf_v::image::Image as RudolfImage;
 use rudolf_v::klt::LkMethod;
 use rudolf_v::rigid_ransac::{Correspondence3d, Rigid3dRansacConfig};
@@ -54,8 +57,9 @@ struct Args {
     #[arg(long, default_value_t = true)]
     sparse: bool,
 
-    /// Sparse filter chart: polar3d or invdepth3d.
-    #[arg(long, default_value = "polar3d")]
+    /// Sparse filter chart: invdepth_additive3d (ρ-first) or
+    /// bearing_invdepth_additive3d (camera-agnostic).
+    #[arg(long, default_value = "invdepth_additive3d")]
     sparse_chart: String,
 
     /// Run patch-grid direct depth mapper. Enabled automatically by PatchDepth config.
@@ -69,6 +73,10 @@ struct Args {
     /// Enable stereo matching for EqF landmark depth initialization (requires cam1).
     #[arg(long, default_value_t = false)]
     stereo: bool,
+
+    /// Build a rolling local occupancy map from patch-depth rays.
+    #[arg(long, default_value_t = false)]
+    occupancy_map: bool,
 }
 
 fn write_trajectory(path: &std::path::Path, entries: &[(f64, VIOState)]) -> std::io::Result<()> {
@@ -150,6 +158,12 @@ fn write_trajectory_metrics(
 
 fn parse_sparse_chart(name: &str) -> Sparse3DChart {
     match name.to_ascii_lowercase().as_str() {
+        "invdepth_additive3d" | "invdepth-additive" | "rho3d" | "rho" | "additive" => {
+            Sparse3DChart::InvDepthAdditive
+        }
+        "bearing_invdepth_additive3d" | "bearing-additive" | "bearing" => {
+            Sparse3DChart::BearingInvDepthAdditive
+        }
         "invdepth" | "invdepth3d" | "inverse-depth" => Sparse3DChart::InvDepth,
         _ => Sparse3DChart::Polar,
     }
@@ -456,21 +470,84 @@ fn sparse_points_for_vis(
     (image_points, image_colors, world_points, world_colors)
 }
 
+/// Occupied / free voxel centres of the local 3D map as world points for Rerun.
+/// Occupied voxels are returned in full; free voxels are decimated by
+/// `FREE_VIS_STRIDE` per axis (the free volume is otherwise far too many cells to
+/// stream/draw). Unknown voxels are omitted.
+#[cfg(feature = "rerun")]
+fn occupancy_cells_for_vis(map: &LocalOccupancyMap) -> (Vec<[f32; 3]>, Vec<[f32; 3]>) {
+    // Free thinning: keep every Nth voxel per axis (2 -> 1/8 the count).
+    const FREE_VIS_STRIDE: usize = 2;
+    let snap = map.snapshot();
+    let occ_thr = map.settings().occupied_threshold;
+    let free_thr = map.settings().free_threshold;
+    let r = snap.resolution;
+    let (mut occupied, mut free) = (Vec::new(), Vec::new());
+    for cz in 0..snap.depth {
+        for cy in 0..snap.height {
+            for cx in 0..snap.width {
+                let l = snap.log_odds[(cz * snap.height + cy) * snap.width + cx];
+                let occupied_cell = l >= occ_thr;
+                if !occupied_cell && l > free_thr {
+                    continue; // unknown
+                }
+                if !occupied_cell
+                    && (cx % FREE_VIS_STRIDE != 0
+                        || cy % FREE_VIS_STRIDE != 0
+                        || cz % FREE_VIS_STRIDE != 0)
+                {
+                    continue; // thinned-out free voxel
+                }
+                let p = [
+                    (snap.origin_x + (cx as f64 + 0.5) * r) as f32,
+                    (snap.origin_y + (cy as f64 + 0.5) * r) as f32,
+                    (snap.origin_z + (cz as f64 + 0.5) * r) as f32,
+                ];
+                if occupied_cell {
+                    occupied.push(p);
+                } else {
+                    free.push(p);
+                }
+            }
+        }
+    }
+    (occupied, free)
+}
+
 #[cfg(feature = "rerun")]
 fn send_rerun_blueprint(
     rec: &rerun::RecordingStream,
+    k_matrix: &Matrix3<f64>,
     img_w: usize,
     img_h: usize,
 ) -> rerun::RecordingStreamResult<()> {
     use rerun::external::re_log_types::{BlueprintActivationCommand, LogMsg, RecordingId};
     use rerun::external::re_sdk_types::blueprint::archetypes::{
-        ContainerBlueprint, ViewBlueprint, ViewContents, ViewportBlueprint, VisualBounds2D,
+        ContainerBlueprint, EyeControls3D, ViewBlueprint, ViewContents, ViewportBlueprint,
+        VisualBounds2D,
     };
     use rerun::external::re_sdk_types::blueprint::components::{
         AutoLayout, AutoViews, ContainerKind, IncludedContent, RootContainer, ViewOrigin,
     };
     use rerun::external::re_sdk_types::components::{Name, Visible};
     use rerun::external::re_sdk_types::datatypes::{Bool, EntityPath, Range2D, Uuid};
+
+    let pinhole = || {
+        rerun::Pinhole::from_focal_length_and_resolution(
+            [k_matrix[(0, 0)] as f32, k_matrix[(1, 1)] as f32],
+            [img_w as f32, img_h as f32],
+        )
+        .with_principal_point([k_matrix[(0, 2)] as f32, k_matrix[(1, 2)] as f32])
+        // CamerasVisualizer registers the camera for tracking before drawing
+        // its frustum. Degenerate, transparent drawing properties therefore
+        // hide the helper without removing it from the tracking camera list.
+        .with_image_plane_distance(0.0)
+        .with_line_width(0.0)
+        .with_color(rerun::Color::TRANSPARENT)
+    };
+    // Only the virtual camera needs pinhole semantics: that makes Rerun adopt
+    // its full pose when tracking it. The physical pose remains a transform.
+    rec.log_static("world/view_camera", &pinhole())?;
 
     let app_id = rec
         .store_info()
@@ -564,6 +641,10 @@ fn send_rerun_blueprint(
         format!("{world_view_path}/ViewContents"),
         &ViewContents::new(["world/**"]),
     )?;
+    bp.log(
+        format!("{world_view_path}/EyeControls3D"),
+        &EyeControls3D::default().with_tracking_entity("world/view_camera"),
+    )?;
 
     bp.log(
         left_container_path.as_str(),
@@ -609,30 +690,35 @@ fn send_rerun_blueprint(
     Ok(())
 }
 
+/// Build the single shared camera from dataset calibration. The projection model
+/// is dispatched from the calibration's `camera_model` / `distortion_model`
+/// strings (pinhole / radial-tangential / equidistant fisheye); unsupported
+/// models are a hard error rather than being silently treated as rad-tan.
 fn build_camera_model(
     reader: &ASLDatasetReader,
 ) -> Result<(Arc<dyn CameraModel>, Matrix3<f64>, usize, usize), Box<dyn std::error::Error>> {
     if let Some(intr) = &reader.intrinsics {
-        println!(
-            "Camera intrinsics: {}x{} fx={:.1} fy={:.1} cx={:.1} cy={:.1}",
-            intr.width, intr.height, intr.fx, intr.fy, intr.cx, intr.cy
-        );
         let distortion = intr
             .distortion_coefficients
             .as_deref()
             .unwrap_or_default()
             .to_vec();
-        if distortion.len() >= 4 {
-            println!(
-                "Distortion: radial-tangential k1={:.4} k2={:.4} p1={:.6} p2={:.6}",
-                distortion[0], distortion[1], distortion[2], distortion[3]
-            );
-        } else {
-            println!("Distortion: none (pinhole)");
-        }
+        let camera_model = intr.camera_model.as_deref().unwrap_or("pinhole");
+        let distortion_model = intr.distortion_model.as_deref();
+        println!(
+            "Camera intrinsics: {}x{} fx={:.1} fy={:.1} cx={:.1} cy={:.1} model={} distortion={}",
+            intr.width,
+            intr.height,
+            intr.fx,
+            intr.fy,
+            intr.cx,
+            intr.cy,
+            camera_model,
+            distortion_model.unwrap_or("none"),
+        );
         let projection = CameraProjection::from_kalibr_parts(
-            intr.camera_model.as_deref().unwrap_or("pinhole"),
-            intr.distortion_model.as_deref(),
+            camera_model,
+            distortion_model,
             [intr.fx, intr.fy, intr.cx, intr.cy],
             &distortion,
             [intr.width, intr.height],
@@ -659,17 +745,63 @@ fn build_frontend(
     vio_config: Option<&VIOConfig>,
     img_w: usize,
     img_h: usize,
+    camera: Option<RudolfCameraIntrinsics>,
 ) -> Result<(Frontend, usize), Box<dyn std::error::Error>> {
     let mut config = FrontendConfig::default();
+    // Intrinsics enable the geometric-verification paths (pose-prior epipolar
+    // gate / internal RANSAC); without them both are inert.
+    config.camera = camera;
     if let Some(conf) = vio_config {
         config.max_features = conf.rudolf_v.max_features;
+        config.klt_residual_enabled = conf.rudolf_v.klt_residual;
+        config.enable_internal_ransac = conf.rudolf_v.enable_ransac;
+        config.epipolar_gate_threshold = conf.rudolf_v.epipolar_gate_threshold;
+        config.epipolar_refine = conf.rudolf_v.epipolar_refine;
+        config.epipolar_min_baseline = conf.rudolf_v.epipolar_min_baseline;
+        config.epipolar_max_reject_frac = conf.rudolf_v.epipolar_max_reject_frac;
         config.pyramid_levels = conf.rudolf_v.max_level;
         if let Some(fast_threshold) = conf.rudolf_v.fast_threshold {
             config.fast_threshold = fast_threshold;
         }
-        if conf.rudolf_v.equalise_image_histogram {
-            config.histeq = rudolf_v::histeq::HistEqMethod::Global;
+        if let Some(detector) = &conf.rudolf_v.detector {
+            config.detector = match detector.to_ascii_lowercase().as_str() {
+                "fast" => DetectorType::Fast,
+                "harris" => DetectorType::Harris,
+                "shi_tomasi" | "shitomasi" | "shi-tomasi" => DetectorType::ShiTomasi,
+                _ => {
+                    return Err(format!(
+                        "unsupported RudolfV.detector '{}'; expected fast, harris, or shi_tomasi",
+                        detector
+                    )
+                    .into());
+                }
+            };
         }
+        if let Some(v) = conf.rudolf_v.shi_tomasi_threshold {
+            config.shi_tomasi_threshold = v;
+        }
+        if let Some(v) = conf.rudolf_v.shi_tomasi_block_size {
+            config.shi_tomasi_block_size = v;
+        }
+        config.histeq = match conf.rudolf_v.histeq.as_deref() {
+            Some("none") => rudolf_v::histeq::HistEqMethod::None,
+            Some("global") => rudolf_v::histeq::HistEqMethod::Global,
+            Some("clahe") => rudolf_v::histeq::HistEqMethod::Clahe {
+                tile_size: conf.rudolf_v.clahe_tile_size,
+                clip_limit: conf.rudolf_v.clahe_clip_limit,
+            },
+            Some(other) => {
+                return Err(format!(
+                    "unsupported RudolfV.histeq '{other}'; expected none, global, or clahe"
+                )
+                .into());
+            }
+            // Legacy fallback: the equaliseImageHistogram bool.
+            None if conf.rudolf_v.equalise_image_histogram => {
+                rudolf_v::histeq::HistEqMethod::Global
+            }
+            None => rudolf_v::histeq::HistEqMethod::None,
+        };
         config.cell_size = conf.rudolf_v.feature_dist as usize;
         if let Some(policy) = &conf.rudolf_v.lbp_policy {
             config.lbp_policy = match policy.to_ascii_lowercase().as_str() {
@@ -691,7 +823,10 @@ fn build_frontend(
     }
     config.klt_method = LkMethod::InverseCompositional;
     let tracker_max_features = config.max_features;
-    println!("Tracker: Rudolf-V, max_features={}", tracker_max_features);
+    println!(
+        "Tracker: Rudolf-V, detector={:?}, max_features={}",
+        config.detector, tracker_max_features
+    );
     Ok((Frontend::new(config, img_w, img_h), tracker_max_features))
 }
 
@@ -816,8 +951,20 @@ fn build_sparse_filter(
     args: &Args,
     vio_config: Option<&VIOConfig>,
     k_matrix: Matrix3<f64>,
+    cam_model: &Arc<dyn CameraModel>,
     tracker_max_features: usize,
 ) -> Option<Sparse3DFilter> {
+    // The bearing chart consumes RAW pixels and undistorts once through the real
+    // camera (see the sparse-update call site) — no legacy pinhole projection.
+    // The old pinhole/K charts still take `undistorted_pinhole_measurement`.
+    let build = |chart, settings: SparseVogSettings| {
+        let filter = Sparse3DFilter::new(k_matrix, chart, settings);
+        if chart == Sparse3DChart::BearingInvDepthAdditive {
+            filter.with_camera(cam_model.clone())
+        } else {
+            filter
+        }
+    };
     if let Some(sparse_conf) = vio_config.and_then(|c| c.sparse_vog.as_ref()) {
         if !sparse_conf.enabled {
             println!("Sparse filter: disabled by config");
@@ -829,7 +976,7 @@ fn build_sparse_filter(
             "Sparse filter: {:?}, max_pool_size={}",
             chart, settings.max_pool_size
         );
-        return Some(Sparse3DFilter::new(k_matrix, chart, settings));
+        return Some(build(chart, settings));
     }
     if args.sparse {
         let chart = parse_sparse_chart(&args.sparse_chart);
@@ -839,9 +986,45 @@ fn build_sparse_filter(
             "Sparse filter: {:?}, max_pool_size={}",
             chart, settings.max_pool_size
         );
-        return Some(Sparse3DFilter::new(k_matrix, chart, settings));
+        return Some(build(chart, settings));
     }
     None
+}
+
+fn build_local_occupancy_map(
+    args: &Args,
+    vio_config: Option<&VIOConfig>,
+    patch_depth_enabled: bool,
+) -> Result<Option<LocalOccupancyMap>, Box<dyn std::error::Error>> {
+    let mut settings = vio_config
+        .and_then(|conf| conf.local_occupancy.as_ref())
+        .map(|conf| conf.to_local_occupancy_settings())
+        .unwrap_or_else(LocalOccupancySettings::default);
+    settings.enabled |= args.occupancy_map;
+
+    if !settings.enabled {
+        println!("Local occupancy: disabled");
+        return Ok(None);
+    }
+    if !patch_depth_enabled {
+        println!("Local occupancy: disabled (requires patch depth)");
+        return Ok(None);
+    }
+
+    let map = LocalOccupancyMap::new(settings.clone())?;
+    println!(
+        "Local occupancy: enabled {}x{}x{} voxels @ {:.3}m (z extent [{:.2}, {:.2}]m), range=[{:.2}, {:.2}]m, stride={}",
+        settings.width_cells,
+        settings.height_cells,
+        map.depth_cells(),
+        settings.resolution,
+        settings.min_obstacle_height,
+        settings.max_obstacle_height,
+        settings.min_range,
+        settings.max_range,
+        settings.sample_stride
+    );
+    Ok(Some(map))
 }
 
 fn write_outputs(
@@ -906,6 +1089,9 @@ fn write_outputs(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // RUST_LOG controls core telemetry (e.g. RUST_LOG=echo_li_core=debug for the
+    // landmark-init dump); default shows warnings and up.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     let args = Args::parse();
 
     println!("Loading dataset: {}", args.dataset);
@@ -945,8 +1131,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (cam_model, k_matrix, img_w, img_h) = build_camera_model(&reader)?;
 
+    let occupancy_requested = args.occupancy_map
+        || vio_config
+            .as_ref()
+            .and_then(|conf| conf.local_occupancy.as_ref())
+            .map(|conf| conf.enabled)
+            .unwrap_or(false);
     let patch_depth_enabled = !args.no_patch_depth
         && (args.patch_depth
+            || occupancy_requested
             || vio_config
                 .as_ref()
                 .and_then(|conf| conf.patch_depth.as_ref())
@@ -990,7 +1183,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .unwrap_or((0.1, 5.0));
 
-    let (mut frontend, tracker_max_features) = build_frontend(vio_config.as_ref(), img_w, img_h)?;
+    let frontend_cam = reader.intrinsics.as_ref().map(|intr| {
+        let distortion = intr
+            .distortion_coefficients
+            .as_deref()
+            .unwrap_or_default()
+            .to_vec();
+        // build_camera_model already validated the model, so map the known
+        // distortion families for the frontend gate; anything else falls back to
+        // None (only reachable for pure pinhole).
+        let model = match intr.distortion_model.as_deref() {
+            Some("equidistant") => RudolfDistortionModel::Equidistant,
+            Some("radtan" | "radial-tangential") => RudolfDistortionModel::RadTan,
+            _ => RudolfDistortionModel::None,
+        };
+        RudolfCameraIntrinsics {
+            fx: intr.fx,
+            fy: intr.fy,
+            cx: intr.cx,
+            cy: intr.cy,
+            resolution: [intr.width, intr.height],
+            distortion,
+            model,
+        }
+    });
+    let (mut frontend, tracker_max_features) =
+        build_frontend(vio_config.as_ref(), img_w, img_h, frontend_cam)?;
 
     let mut stereo_matcher =
         build_stereo_matcher(&args, vio_config.as_ref(), &reader, img_w, img_h);
@@ -1003,15 +1221,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize Rerun visualization
     #[cfg(feature = "rerun")]
     let rec: Option<rerun::RecordingStream> = if args.vis {
-        match rerun::RecordingStreamBuilder::new("echo-li").spawn() {
+        // Three sinks, by env:
+        //   ECHO_LI_RERUN_URL=rerun+http://<host>:9876/proxy  -> stream to an
+        //     already-running viewer (e.g. native Rerun on Windows = hardware GPU);
+        //   ECHO_LI_RRD=<path>  -> record to a file (headless);
+        //   otherwise spawn a local (WSL software) viewer.
+        let builder = rerun::RecordingStreamBuilder::new("echo-li");
+        let built = if let Ok(url) = std::env::var("ECHO_LI_RERUN_URL") {
+            println!("Rerun: connecting to viewer at {url}");
+            builder.connect_grpc_opts(url)
+        } else if let Ok(path) = std::env::var("ECHO_LI_RRD") {
+            builder.save(&path)
+        } else {
+            builder.spawn()
+        };
+        match built {
             Ok(r) => {
-                println!("Rerun viewer connected");
-                send_rerun_blueprint(&r, img_w, img_h).ok();
+                println!("Rerun stream ready");
+                send_rerun_blueprint(&r, &k_matrix, img_w, img_h).ok();
 
                 Some(r)
             }
             Err(e) => {
-                eprintln!("Warning: could not spawn Rerun viewer: {e}");
+                eprintln!("Warning: could not start Rerun stream: {e}");
                 None
             }
         }
@@ -1031,21 +1263,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // replay; no dropping of early images.
     // ------------------------------------------------------------------
     let initial_imu: Vec<IMUVelocity> = (&mut raw_imu_it).take(100).collect();
-    let init_pose = if check_stationary(&initial_imu, 100, 0.1, 0.5) {
-        let pose = estimate_initial_pose(&initial_imu, 100);
-        let r = pose.rotation.as_matrix();
+    // Gravity-align from the FIRST accel reading, unconditionally. The old
+    // stationarity gate fell back to identity attitude when the start was in
+    // motion, which diverges immediately (gravity integrates as phantom
+    // acceleration; EuRoC MH_01/V2_03). Even an in-flight accel sample is
+    // within ~10-15 deg of gravity — inside the filter's initial attitude
+    // sigma — whereas identity can be 180 deg off. Moving starts additionally
+    // need a loose eqf initialVariance.velocity (the old 9e-8 asserts v=0).
+    let stationary = check_stationary(&initial_imu, 100, 0.1, 0.5);
+    let init_pose = estimate_initial_pose(&initial_imu, 1);
+    {
+        let r = init_pose.rotation.as_matrix();
         let pitch_deg = (-r[(2, 0)]).clamp(-1.0, 1.0).asin().to_degrees();
         let roll_deg = r[(2, 1)].atan2(r[(2, 2)]).to_degrees();
         let t0 = initial_imu.first().map(|imu| imu.stamp).unwrap_or(0.0);
         println!(
-            "Static IMU initialization at t={:.3}: roll={:.1}° pitch={:.1}°",
-            t0, roll_deg, pitch_deg
+            "IMU gravity-align at t={:.3} (first sample, stationary={}): roll={:.1}° pitch={:.1}°",
+            t0, stationary, roll_deg, pitch_deg
         );
-        pose
-    } else {
-        println!("WARNING: Platform not stationary at start, using identity pose");
-        echo_lie::SE3::identity()
-    };
+    }
 
     let mut xi0 = VIOState::new(VIOSensorState::identity(), Vec::new());
     xi0.sensor.pose = init_pose;
@@ -1068,6 +1304,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         img_h,
         stereo_matcher.as_ref(),
     )?;
+    let mut local_occupancy =
+        build_local_occupancy_map(&args, vio_config.as_ref(), patch_depth_mapper.is_some())?;
+    let occupancy_intrinsics = CameraIntrinsics::from_matrix(&k_matrix);
     #[cfg(feature = "rerun")]
     if patch_depth_mapper.is_some() {
         println!(
@@ -1079,14 +1318,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             patch_depth_cov_vis_max
         );
     }
-    let mut sparse_filter =
-        build_sparse_filter(&args, vio_config.as_ref(), k_matrix, tracker_max_features);
+    let mut sparse_filter = build_sparse_filter(
+        &args,
+        vio_config.as_ref(),
+        k_matrix,
+        &cam_model,
+        tracker_max_features,
+    );
     let mut states_out: Vec<(f64, VIOState)> = Vec::new();
     let mut imu_count: usize = 0;
     let mut vision_count: usize = 0;
+    let mut sparse_pose_cov_count: usize = 0;
+    let mut sparse_pose_cov_missing_count: usize = 0;
     let mut prev_stereo_3d: HashMap<u64, [f64; 3]> = HashMap::new();
     let stereo_ransac_cfg = Rigid3dRansacConfig::default();
     let mut last_patch_depth_counts: Option<(usize, usize, usize, usize)> = None;
+    let mut last_occupancy_counts: Option<(usize, usize, usize)> = None;
     #[cfg(feature = "rerun")]
     let mut last_patch_depth_output: Option<PatchDepthOutput> = None;
     let trace_determinism = std::env::var_os("ECHO_LI_TRACE_DETERMINISM").is_some();
@@ -1101,8 +1348,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gt_poses_vis = reader.groundtruth();
     #[cfg(feature = "rerun")]
     let mut gt_align: Option<echo_lie::SE3> = None;
+    #[cfg(feature = "rerun")]
+    let vis_cfg = vio_config
+        .as_ref()
+        .map(|c| c.rerun.clone())
+        .unwrap_or_default();
 
     println!("\nRunning filter...");
+
+    // Previous frame's post-update camera pose, for the epipolar-gate prior.
+    let use_pose_prior = vio_config
+        .as_ref()
+        .is_some_and(|c| c.rudolf_v.epipolar_gate_threshold > 0.0);
+    let mut prev_cam_pose: Option<Matrix4<f64>> = None;
 
     loop {
         if let Some(next_img) = image_it.peek() {
@@ -1124,14 +1382,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let gray_data = gray_img.into_raw();
 
                 // Clone raw pixels for Rerun before consuming into Rudolf-V
+                // (fallback when the preprocessed/histeq image is unavailable).
                 #[cfg(feature = "rerun")]
-                let rerun_gray_data = if rec.is_some() {
+                let rerun_gray_data = if rec.is_some() && vis_cfg.image {
                     gray_data.clone()
                 } else {
                     vec![]
                 };
 
                 let rudolf_img = RudolfImage::from_vec(img_w, img_h, gray_data);
+
+                // Epipolar-gate prior: relative camera motion prev -> curr from
+                // the IMU-propagated (pre-vision) EqF prediction.
+                if use_pose_prior {
+                    if let (Some(f), Some(prev)) = (&filter, &prev_cam_pose) {
+                        let pred = camera_pose_matrix(&f.eqf.state_estimate());
+                        if let Some(pred_inv) = pred.try_inverse() {
+                            let t_rel = pred_inv * prev;
+                            let mut r = [[0.0f64; 3]; 3];
+                            for (i, row) in r.iter_mut().enumerate() {
+                                for (j, v) in row.iter_mut().enumerate() {
+                                    *v = t_rel[(i, j)];
+                                }
+                            }
+                            frontend
+                                .set_pose_prior(r, [t_rel[(0, 3)], t_rel[(1, 3)], t_rel[(2, 3)]]);
+                        }
+                    }
+                }
 
                 let (features_ref, stats) = frontend.process(&rudolf_img);
                 let features: Vec<rudolf_v::fast::Feature> = features_ref.to_vec();
@@ -1288,7 +1566,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         } else {
                             (HashMap::new(), HashSet::new())
                         };
-                    // Stereo priors override SparseVog (known baseline → tighter variance).
+                    // Stereo priors override SparseVog (known baseline, tighter variance).
                     depth_priors.extend(stereo_depth_priors.iter().map(|(&id, p)| (id, *p)));
                     let depth_prior_hash =
                         trace_determinism.then(|| hash_depth_priors(&depth_priors));
@@ -1303,12 +1581,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let state = f.eqf.state_estimate();
                     let state_hash = trace_determinism.then(|| hash_state(&state));
                     let t_wc = camera_pose_matrix(&state);
+                    let sparse_pose_cov = f.sparse_camera_pose_covariances();
+                    prev_cam_pose = Some(t_wc);
                     if let Some(sparse) = &mut sparse_filter {
-                        let sparse_pose_cov = f.sparse_camera_pose_covariances();
+                        if sparse_pose_cov.is_some() {
+                            sparse_pose_cov_count += 1;
+                        } else {
+                            sparse_pose_cov_missing_count += 1;
+                        }
                         let (p_vv, p_ww) = sparse_pose_cov
                             .as_ref()
                             .map(|(p_vv, p_ww)| (Some(p_vv), Some(p_ww)))
                             .unwrap_or((None, None));
+                        // The bearing chart takes RAW pixels and undistorts once
+                        // through its real camera; the legacy pinhole/K charts take
+                        // the pre-undistorted pinhole-K measurement.
                         let sparse_meas =
                             if sparse.chart() == Sparse3DChart::BearingInvDepthAdditive {
                                 &measurement
@@ -1362,6 +1649,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     };
                                 last_patch_depth_counts =
                                     patch_output.as_ref().map(patch_depth_status_counts);
+                                if let (Some(output), Some(occupancy)) =
+                                    (patch_output.as_ref(), local_occupancy.as_mut())
+                                {
+                                    occupancy.update_from_patch_depth(
+                                        output,
+                                        cam_model.as_ref(),
+                                        occupancy_intrinsics,
+                                        patch_seed_coordinates,
+                                        img_w,
+                                        img_h,
+                                        &t_wc,
+                                    );
+                                    last_occupancy_counts = Some(occupancy.counts());
+                                }
                                 #[cfg(feature = "rerun")]
                                 {
                                     last_patch_depth_output = patch_output;
@@ -1402,38 +1703,67 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         use std::time::Duration;
                         rec.set_time("log_time", Duration::from_secs_f64(img_data.stamp));
 
-                        // Camera image (grayscale)
-                        rec.log(
-                            "camera/image",
-                            &rerun::Image::from_l8(rerun_gray_data, [img_w as u32, img_h as u32]),
-                        )
-                        .ok();
+                        // Camera image (grayscale) — the tracker's preprocessed
+                        // (histeq'd) frame when enabled/available, else raw.
+                        if vis_cfg.image {
+                            let l8: Vec<u8> = match frontend
+                                .preprocessed_image()
+                                .filter(|_| vis_cfg.histeq_image)
+                            {
+                                Some(img) => {
+                                    let (w, h, stride) = (img.width(), img.height(), img.stride());
+                                    let src = img.as_slice();
+                                    if stride == w {
+                                        src[..w * h].to_vec()
+                                    } else {
+                                        let mut out = Vec::with_capacity(w * h);
+                                        for y in 0..h {
+                                            out.extend_from_slice(&src[y * stride..y * stride + w]);
+                                        }
+                                        out
+                                    }
+                                }
+                                None => rerun_gray_data,
+                            };
+                            rec.log(
+                                "camera/image",
+                                &rerun::Image::from_l8(l8, [img_w as u32, img_h as u32]),
+                            )
+                            .ok();
+                        }
 
                         if let Some(output) = &last_patch_depth_output {
-                            let rgb = patch_depth_rgb_for_vis(
-                                output,
-                                img_w,
-                                img_h,
-                                patch_depth_vis_min_depth,
-                                patch_depth_vis_max_depth,
-                            );
-                            rec.log(
-                                "patch_depth/image",
-                                &rerun::Image::from_rgb24(rgb, [img_w as u32, img_h as u32]),
-                            )
-                            .ok();
-                            let cov_rgb = patch_depth_cov_rgb_for_vis(
-                                output,
-                                img_w,
-                                img_h,
-                                patch_depth_cov_vis_min,
-                                patch_depth_cov_vis_max,
-                            );
-                            rec.log(
-                                "patch_depth_cov/image",
-                                &rerun::Image::from_rgb24(cov_rgb, [img_w as u32, img_h as u32]),
-                            )
-                            .ok();
+                            if vis_cfg.patch_depth {
+                                let rgb = patch_depth_rgb_for_vis(
+                                    output,
+                                    img_w,
+                                    img_h,
+                                    patch_depth_vis_min_depth,
+                                    patch_depth_vis_max_depth,
+                                );
+                                rec.log(
+                                    "patch_depth/image",
+                                    &rerun::Image::from_rgb24(rgb, [img_w as u32, img_h as u32]),
+                                )
+                                .ok();
+                            }
+                            if vis_cfg.patch_depth_cov {
+                                let cov_rgb = patch_depth_cov_rgb_for_vis(
+                                    output,
+                                    img_w,
+                                    img_h,
+                                    patch_depth_cov_vis_min,
+                                    patch_depth_cov_vis_max,
+                                );
+                                rec.log(
+                                    "patch_depth_cov/image",
+                                    &rerun::Image::from_rgb24(
+                                        cov_rgb,
+                                        [img_w as u32, img_h as u32],
+                                    ),
+                                )
+                                .ok();
+                            }
                             if !patch_depth_vis_announced {
                                 println!(
                                     "Patch depth Rerun entities: patch_depth/image, \
@@ -1444,7 +1774,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
 
                         // Tracked features on image
-                        if !tracker_points.is_empty() {
+                        if vis_cfg.features && !tracker_points.is_empty() {
                             rec.log(
                                 "camera/image/features",
                                 &rerun::Points2D::new(tracker_points)
@@ -1473,7 +1803,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         } else {
                             (Vec::new(), Vec::new(), Vec::new(), Vec::new())
                         };
-                        if !sparse_img_pts.is_empty() {
+                        if vis_cfg.sparse_image && !sparse_img_pts.is_empty() {
                             rec.log(
                                 "camera/image/sparse_out_of_state",
                                 &rerun::Points2D::new(sparse_img_pts)
@@ -1487,7 +1817,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         trajectory_vis.push(p_cam);
 
                         // 3D trajectory line
-                        if trajectory_vis.len() >= 2 {
+                        if vis_cfg.trajectory && trajectory_vis.len() >= 2 {
                             let strip: Vec<[f32; 3]> = trajectory_vis
                                 .iter()
                                 .map(|p| [p[0] as f32, p[1] as f32, p[2] as f32])
@@ -1519,7 +1849,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 &gt_poses_vis,
                             ));
                         }
-                        if let Some(align) = &gt_align {
+                        if vis_cfg.groundtruth
+                            && let Some(align) = &gt_align
+                        {
                             let inv = align.inverse();
                             let gt_strip: Vec<[f32; 3]> = gt_poses_vis
                                 .iter()
@@ -1546,7 +1878,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .values()
                             .map(|p| (p[0] as f32, p[1] as f32, p[2] as f32))
                             .collect();
-                        if !lm_pts.is_empty() {
+                        if vis_cfg.landmarks && !lm_pts.is_empty() {
                             rec.log(
                                 "world/landmarks",
                                 &rerun::Points3D::new(lm_pts)
@@ -1556,7 +1888,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .ok();
                         }
 
-                        if !sparse_world_pts.is_empty() {
+                        if vis_cfg.sparse_world && !sparse_world_pts.is_empty() {
                             rec.log(
                                 "world/sparse_out_of_state",
                                 &rerun::Points3D::new(sparse_world_pts)
@@ -1566,45 +1898,126 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .ok();
                         }
 
-                        // Camera pose as RGB arrows (X=red, Y=green, Z=blue)
-                        let origin = [p_cam[0] as f32, p_cam[1] as f32, p_cam[2] as f32];
-                        let r = r_cam.as_matrix();
-                        let scale = 0.1f32;
+                        // Local 3D occupancy map, both as solid voxel cubes:
+                        // occupied = opaque red, free = translucent green. NB: use
+                        // 2-level entity paths (siblings of world/landmarks) and
+                        // FillMode::Solid — 3-level paths don't render in the 3D
+                        // view, and the default Boxes3D fill is invisible wireframe.
+                        // Unlike Points3D (which ignore colour alpha), solid Boxes3D
+                        // DO blend: a colour with alpha < 0xFF becomes the mesh
+                        // additive_tint and is routed to rerun's premultiplied-alpha
+                        // transparent pass — so the free voxels are genuinely
+                        // see-through (lower the alpha byte for more transparency).
+                        if let Some(occ_map) = local_occupancy.as_ref() {
+                            let hx = (occ_map.settings().resolution * 0.5) as f32;
+                            let (occ_pts, free_pts) = occupancy_cells_for_vis(occ_map);
+                            if vis_cfg.occupied_cells && !occ_pts.is_empty() {
+                                let occ_half = vec![[hx, hx, hx]; occ_pts.len()];
+                                rec.log(
+                                    "world/occupied_cells",
+                                    &rerun::Boxes3D::from_centers_and_half_sizes(occ_pts, occ_half)
+                                        .with_fill_mode(rerun::FillMode::Solid)
+                                        .with_colors([0xFF0000FFu32]),
+                                )
+                                .ok();
+                            }
+                            if vis_cfg.free_cells && !free_pts.is_empty() {
+                                let free_half = vec![[hx, hx, hx]; free_pts.len()];
+                                rec.log(
+                                    "world/free_cells",
+                                    &rerun::Boxes3D::from_centers_and_half_sizes(
+                                        free_pts, free_half,
+                                    )
+                                    .with_fill_mode(rerun::FillMode::Solid)
+                                    .with_colors([0x33C03301u32]),
+                                )
+                                .ok();
+                            }
+                        }
+
+                        // Build the third-person pose from the estimated
+                        // world-from-camera pose. Mat3x3 values are columns.
+                        let camera_origin = [p_cam[0] as f32, p_cam[1] as f32, p_cam[2] as f32];
+                        let camera_rotation = r_cam.as_matrix();
+                        let camera_rotation_cols = [
+                            [
+                                camera_rotation[(0, 0)] as f32,
+                                camera_rotation[(1, 0)] as f32,
+                                camera_rotation[(2, 0)] as f32,
+                            ],
+                            [
+                                camera_rotation[(0, 1)] as f32,
+                                camera_rotation[(1, 1)] as f32,
+                                camera_rotation[(2, 1)] as f32,
+                            ],
+                            [
+                                camera_rotation[(0, 2)] as f32,
+                                camera_rotation[(1, 2)] as f32,
+                                camera_rotation[(2, 2)] as f32,
+                            ],
+                        ];
+                        // Camera coordinates are RDF, so -Y is above and -Z is
+                        // behind. Keep the chase eye above and behind the camera.
+                        const VIEW_ABOVE_M: f32 = 0.5;
+                        const VIEW_BEHIND_M: f32 = 2.0;
+                        let view_origin = std::array::from_fn(|i| {
+                            camera_origin[i]
+                                - VIEW_ABOVE_M * camera_rotation_cols[1][i]
+                                - VIEW_BEHIND_M * camera_rotation_cols[2][i]
+                        });
                         rec.log(
-                            "world/camera_axes",
-                            &rerun::Arrows3D::from_vectors([
-                                [
-                                    r[(0, 0)] as f32 * scale,
-                                    r[(1, 0)] as f32 * scale,
-                                    r[(2, 0)] as f32 * scale,
-                                ],
-                                [
-                                    r[(0, 1)] as f32 * scale,
-                                    r[(1, 1)] as f32 * scale,
-                                    r[(2, 1)] as f32 * scale,
-                                ],
-                                [
-                                    r[(0, 2)] as f32 * scale,
-                                    r[(1, 2)] as f32 * scale,
-                                    r[(2, 2)] as f32 * scale,
-                                ],
-                            ])
-                            .with_origins([origin, origin, origin])
-                            .with_colors([
-                                0xFF0000FFu32,
-                                0x00FF00FFu32,
-                                0x0000FFFFu32,
-                            ]),
+                            "world/view_camera",
+                            &rerun::Transform3D::from_translation_mat3x3(
+                                view_origin,
+                                camera_rotation_cols,
+                            ),
                         )
                         .ok();
+
+                        // Camera pose as RGB arrows (X=red, Y=green, Z=blue)
+                        if vis_cfg.camera_axes {
+                            let scale = 0.1f32;
+                            rec.log(
+                                "world/camera_axes",
+                                &rerun::Arrows3D::from_vectors([
+                                    [
+                                        camera_rotation[(0, 0)] as f32 * scale,
+                                        camera_rotation[(1, 0)] as f32 * scale,
+                                        camera_rotation[(2, 0)] as f32 * scale,
+                                    ],
+                                    [
+                                        camera_rotation[(0, 1)] as f32 * scale,
+                                        camera_rotation[(1, 1)] as f32 * scale,
+                                        camera_rotation[(2, 1)] as f32 * scale,
+                                    ],
+                                    [
+                                        camera_rotation[(0, 2)] as f32 * scale,
+                                        camera_rotation[(1, 2)] as f32 * scale,
+                                        camera_rotation[(2, 2)] as f32 * scale,
+                                    ],
+                                ])
+                                .with_origins([camera_origin, camera_origin, camera_origin])
+                                .with_colors([
+                                    0xFF0000FFu32,
+                                    0x00FF00FFu32,
+                                    0x0000FFFFu32,
+                                ]),
+                            )
+                            .ok();
+                        }
                     }
 
                     if vision_count % 100 == 0 || vision_count <= 5 {
                         let pos = states_out.last().unwrap().1.sensor.pose.translation;
                         let vel = states_out.last().unwrap().1.sensor.velocity;
+                        let occ_suffix = last_occupancy_counts
+                            .map(|(unk, free, occ)| {
+                                format!("  occ=(occ:{} free:{} unk:{})", occ, free, unk)
+                            })
+                            .unwrap_or_default();
                         if let Some((unk, seed, photo, rej)) = last_patch_depth_counts {
                             println!(
-                                "  [{:4}] t={:.3}  pos=({:+.2}, {:+.2}, {:+.2})  vel=({:+.3}, {:+.3}, {:+.3})  lm={}  patch=(photo:{} seed:{} unk:{} rej:{})",
+                                "  [{:4}] t={:.3}  pos=({:+.2}, {:+.2}, {:+.2})  vel=({:+.3}, {:+.3}, {:+.3})  lm={}  patch=(photo:{} seed:{} unk:{} rej:{}){}",
                                 vision_count,
                                 img_data.stamp,
                                 pos[0],
@@ -1617,11 +2030,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 photo,
                                 seed,
                                 unk,
-                                rej
+                                rej,
+                                occ_suffix
                             );
                         } else {
                             println!(
-                                "  [{:4}] t={:.3}  pos=({:+.2}, {:+.2}, {:+.2})  vel=({:+.3}, {:+.3}, {:+.3})  lm={}",
+                                "  [{:4}] t={:.3}  pos=({:+.2}, {:+.2}, {:+.2})  vel=({:+.3}, {:+.3}, {:+.3})  lm={}{}",
                                 vision_count,
                                 img_data.stamp,
                                 pos[0],
@@ -1630,7 +2044,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 vel[0],
                                 vel[1],
                                 vel[2],
-                                feat_global.len()
+                                feat_global.len(),
+                                occ_suffix
                             );
                         }
                     }
@@ -1646,6 +2061,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "\nProcessed {} IMU + {} vision in {:.2}s",
         imu_count, vision_count, elapsed
     );
+    if sparse_filter.is_some() {
+        println!(
+            "Sparse pose covariance supplied: {} frames, missing/non-finite: {} frames",
+            sparse_pose_cov_count, sparse_pose_cov_missing_count
+        );
+    }
+    if let Some(occupancy) = &local_occupancy {
+        let (unknown, free, occupied) = occupancy.counts();
+        println!(
+            "Local occupancy final: occupied={} free={} unknown={}",
+            occupied, free, unknown
+        );
+    }
 
     let dataset_name = PathBuf::from(&args.dataset)
         .file_name()

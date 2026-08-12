@@ -22,6 +22,17 @@ impl PatchDepthMapper {
         p_vv: Option<&Matrix3<f64>>,
         dt: f64,
     ) -> Option<PatchDepthOutput> {
+        self.update_with_priors_and_pose_covariances(frame, seeds, p_vv, None, dt)
+    }
+
+    pub fn update_with_priors_and_pose_covariances(
+        &mut self,
+        frame: FrameProducts,
+        seeds: &[SparseDepthPrior],
+        p_vv: Option<&Matrix3<f64>>,
+        p_ww: Option<&Matrix3<f64>>,
+        dt: f64,
+    ) -> Option<PatchDepthOutput> {
         if frame.width != self.width
             || frame.height != self.height
             || frame.gray.len() != self.width * self.height
@@ -29,7 +40,7 @@ impl PatchDepthMapper {
             return None;
         }
         if self.camera_mode == PatchDepthCameraMode::TiledBearing {
-            return self.update_with_priors_tiled_bearing(frame, seeds, p_vv, dt);
+            return self.update_with_priors_tiled_bearing(frame, seeds, p_vv, p_ww, dt);
         }
 
         let depth_frame = self.depth_frame_products(frame)?;
@@ -37,14 +48,21 @@ impl PatchDepthMapper {
         let selected = self.select_keyframe(&depth_frame.frame.pose_t_wc, median_depth);
         self.manage_keyframes(&depth_frame, median_depth);
         let (ref_keyframe, t_ref_curr) = selected?;
-        let sigma_warp_sq =
-            compute_sigma_warp_sq(&self.intrinsics, &t_ref_curr, p_vv, dt, median_depth);
+        let warp_uncertainty = compute_warp_uncertainty(
+            &self.intrinsics,
+            &t_ref_curr,
+            p_vv,
+            p_ww,
+            self.settings.pose_angular_velocity_var,
+            dt,
+            median_depth,
+        );
         Some(self.solve(
             &depth_frame,
             &ref_keyframe,
             &t_ref_curr,
             seeds,
-            sigma_warp_sq,
+            warp_uncertainty,
         ))
     }
 
@@ -53,6 +71,7 @@ impl PatchDepthMapper {
         frame: FrameProducts,
         seeds: &[SparseDepthPrior],
         p_vv: Option<&Matrix3<f64>>,
+        p_ww: Option<&Matrix3<f64>>,
         dt: f64,
     ) -> Option<PatchDepthOutput> {
         let depth_frame = self.tiled_bearing_frame_products(frame)?;
@@ -60,14 +79,21 @@ impl PatchDepthMapper {
         let selected = self.select_tiled_keyframe(&depth_frame.frame.pose_t_wc, median_depth);
         self.manage_tiled_keyframes(&depth_frame, median_depth);
         let (ref_keyframe, t_ref_curr) = selected?;
-        let sigma_warp_sq =
-            compute_sigma_warp_sq(&self.intrinsics, &t_ref_curr, p_vv, dt, median_depth);
+        let warp_uncertainty = compute_warp_uncertainty(
+            &self.intrinsics,
+            &t_ref_curr,
+            p_vv,
+            p_ww,
+            self.settings.pose_angular_velocity_var,
+            dt,
+            median_depth,
+        );
         Some(self.solve_tiled_bearing(
             &depth_frame,
             &ref_keyframe,
             &t_ref_curr,
             seeds,
-            sigma_warp_sq,
+            warp_uncertainty.scalar_sq,
         ))
     }
 
@@ -194,7 +220,13 @@ impl PatchDepthMapper {
         let median_depth = median_seed_depth(&seeds).unwrap_or(self.settings.max_depth);
         self.manage_keyframes(&depth_frame, median_depth);
 
-        Some(self.solve(&depth_frame, &ref_keyframe, &t_c1_c0, &seeds, 0.0))
+        Some(self.solve(
+            &depth_frame,
+            &ref_keyframe,
+            &t_c1_c0,
+            &seeds,
+            WarpUncertainty::scalar(0.0),
+        ))
     }
 
     pub(super) fn update_with_stereo_ref_tiled_bearing(

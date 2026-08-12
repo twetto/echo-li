@@ -2,9 +2,11 @@ use numpy::ndarray::Array2;
 use numpy::{PyArray2, PyReadonlyArray2, PyUntypedArrayMethods};
 use pyo3::prelude::*;
 
+use echo_li_core::config::VIOConfig;
 use echo_li_core::core_types::CameraIntrinsics;
 use echo_li_core::depth::patch_depth::{
-    FrameProducts, PatchDepthMapper, PatchDepthSettings, SparseDepthPrior,
+    FrameProducts, PatchDepthMapper, PatchDepthSeedCoordinates, PatchDepthSettings,
+    SparseDepthPrior,
 };
 use nalgebra::{Matrix4, Vector2};
 
@@ -17,7 +19,12 @@ pub struct PyPatchDepthMapper {
 
 #[pymethods]
 impl PyPatchDepthMapper {
+    /// Build a mapper. With `config` pointing at a VIO YAML, the `PatchDepth`
+    /// section is applied verbatim (same `to_patch_depth_settings` the CLI uses),
+    /// so `camera_mode`/`scale`/`max_depth`/etc. match the deployed pipeline.
+    /// Without a config the mapper falls back to `undistorted_pinhole` defaults.
     #[new]
+    #[pyo3(signature = (camera, fx, fy, cx, cy, width, height, config=None))]
     fn new(
         camera: &Bound<'_, PyAny>,
         fx: f64,
@@ -26,18 +33,49 @@ impl PyPatchDepthMapper {
         cy: f64,
         width: usize,
         height: usize,
+        config: Option<&str>,
     ) -> PyResult<Self> {
         let cam = to_camera_arc(camera)?;
         let intrinsics = CameraIntrinsics { fx, fy, cx, cy };
-        let settings = PatchDepthSettings::default();
-        let inner =
-            PatchDepthMapper::new_undistorted_pinhole(cam, intrinsics, width, height, settings)
-                .map_err(|e| {
+        let inner = match config {
+            Some(path) => {
+                let vio = VIOConfig::from_yaml(path).map_err(|e| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "Failed to create PatchDepthMapper: {e}"
+                        "Failed to load config {path}: {e}"
                     ))
                 })?;
+                let settings = vio
+                    .patch_depth
+                    .as_ref()
+                    .map(|c| c.to_patch_depth_settings())
+                    .unwrap_or_default();
+                // new() dispatches on settings.camera_mode (pinhole/tiled/per-patch/raw).
+                PatchDepthMapper::new(cam, intrinsics, width, height, settings)
+            }
+            None => PatchDepthMapper::new_undistorted_pinhole(
+                cam,
+                intrinsics,
+                width,
+                height,
+                PatchDepthSettings::default(),
+            ),
+        }
+        .map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "Failed to create PatchDepthMapper: {e}"
+            ))
+        })?;
         Ok(Self { inner })
+    }
+
+    /// "raw" if the mapper expects seed pixels in raw/distorted coordinates
+    /// (raw_distorted, per_patch_bearing), "pinhole" for the undistorted modes.
+    #[getter]
+    fn seed_coordinates(&self) -> &'static str {
+        match self.inner.expected_seed_coordinates() {
+            PatchDepthSeedCoordinates::RawDistorted => "raw",
+            PatchDepthSeedCoordinates::UndistortedPinhole => "pinhole",
+        }
     }
 
     fn update<'py>(
