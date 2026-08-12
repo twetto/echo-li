@@ -1,7 +1,11 @@
 use approx::assert_abs_diff_eq;
 use echo_lie::{SE3, SO3};
 use nalgebra::{DMatrix, DVector, SMatrix, Vector2, Vector3, Vector6};
+use rand::SeedableRng;
+use rand::rngs::StdRng;
+use rand_distr::{Distribution, Normal};
 use std::collections::HashMap;
+use std::time::Instant;
 
 use crate::coordinate_suite::euclid::EuclideanSuite;
 use crate::coordinate_suite::invdepth::InvDepthSuite;
@@ -12,9 +16,9 @@ use crate::mathematical::eqf_matrices::EqFCoordinateSuite;
 use crate::mathematical::imu_velocity::IMUVelocity;
 use crate::mathematical::vio_eqf::VIOEqF;
 use crate::mathematical::vio_group::{
-    lift_velocity, state_group_action, vio_exp_with_bias_group, VIOGroup,
+    VIOGroup, lift_velocity, state_group_action, vio_exp_with_bias_group,
 };
-use crate::mathematical::vio_state::{Landmark, VIOSensorState, VIOState, GRAVITY_CONSTANT};
+use crate::mathematical::vio_state::{GRAVITY_CONSTANT, Landmark, VIOSensorState, VIOState};
 use crate::mathematical::vision_measurement::VisionMeasurement;
 use crate::tests::testing_utilities::*;
 use crate::{ImuBiasGroup, LandmarkDepthPrior, VIOFilter, VIOFilterSettings};
@@ -283,10 +287,7 @@ fn nontrivial_semi_direct_group(ids: &[u64]) -> VIOGroup {
     x
 }
 
-fn assert_semi_direct_a0t_matches_finite_difference<S: EqFCoordinateSuite>(
-    suite: &S,
-    name: &str,
-) {
+fn assert_semi_direct_a0t_matches_finite_difference<S: EqFCoordinateSuite>(suite: &S, name: &str) {
     let xi0 = make_xi0_with_landmarks(2);
     let mut x_hat = VIOGroup::identity_with_bias_group(&xi0.get_ids(), ImuBiasGroup::SemiDirect);
     x_hat.beta = Vector6::new(0.1, -0.2, 0.05, 0.3, -0.1, 0.2);
@@ -437,8 +438,7 @@ fn assert_semi_direct_fast_and_faster_riccati_match_zero_noise<S: EqFCoordinateS
     let mut rng = rand::rng();
     let xi0 = reasonable_state_element(2, &mut rng);
     let init_cov = DMatrix::<f64>::identity(xi0.dim(), xi0.dim()) * 0.01;
-    let mut fast =
-        VIOEqF::new_with_bias_group(xi0.clone(), &init_cov, ImuBiasGroup::SemiDirect);
+    let mut fast = VIOEqF::new_with_bias_group(xi0.clone(), &init_cov, ImuBiasGroup::SemiDirect);
     let mut faster = VIOEqF::new_with_bias_group(xi0.clone(), &init_cov, ImuBiasGroup::SemiDirect);
     fast.x = nontrivial_semi_direct_group(&xi0.get_ids());
     faster.x = fast.x.clone();
@@ -1493,5 +1493,954 @@ fn test_faster_multi_sample_well_formed() {
     assert!(
         max_dev > 0.0,
         "Faster should not be identical to Fast over 10 samples"
+    );
+}
+
+#[test]
+#[ignore = "analytic-vs-numerical A under x.b (offset-gauge) drift; run with --ignored --nocapture"]
+fn diag_eqvio_state_matrix_a_gauge_drift() {
+    // The reference computes A by finite-differencing the true lifted map (whose
+    // core conjugation X·Λ·X^{-1} cancels the gauge), so A is gauge-invariant and
+    // bounded. Our analytic state_matrix_a uses a bare x.b.inverse().adjoint().
+    // If the analytic rewrite is faithful, both should stay equal and bounded as
+    // x.b (the camera-offset gauge) drifts; if the analytic broke the
+    // cancellation, analytic ∝ ‖x.b‖ while numerical stays flat.
+    let suite = EuclideanSuite;
+    let xi0 = make_xi0_with_landmarks(3);
+    let imu = IMUVelocity::new(
+        0.0,
+        Vector3::new(0.1, -0.2, 0.3),
+        Vector3::new(0.4, -0.1, 9.7),
+    );
+    // Which gauge directions make ||A|| grow? offset (x.b translation), global
+    // position (x.a translation), global yaw (x.a rotation about gravity/z).
+    let norm_a = |x: &VIOGroup| suite.state_matrix_a(x, &xi0, &imu).norm();
+    let base = || {
+        let mut x = VIOGroup::identity_with_bias_group(&xi0.get_ids(), ImuBiasGroup::SemiDirect);
+        x.a = SE3::new(
+            SO3::exp(&Vector3::new(0.12, -0.05, 0.03)),
+            Vector3::new(0.2, -0.1, 0.05),
+        );
+        x
+    };
+    println!("magnitude  offset(x.b t)  position(x.a t)  yaw(x.a Rz)  bias(x.beta)");
+    for m in [0.0_f64, 1.0, 1e2, 1e4, 1e6] {
+        let mut xb = base();
+        xb.b = SE3::new(SO3::identity(), Vector3::new(m, 0.0, 0.0));
+        let mut xp = base();
+        xp.a = SE3::new(xp.a.rotation.clone(), Vector3::new(m, 0.0, 0.0));
+        let mut xy = base();
+        let yaw = (m).min(3.0); // rad about gravity z, capped to stay a rotation
+        xy.a = SE3::new(
+            SO3::exp(&Vector3::new(0.0, 0.0, yaw)),
+            Vector3::new(0.2, -0.1, 0.05),
+        );
+        let mut xbias = base();
+        xbias.beta = Vector6::new(m, 0.0, 0.0, 0.0, 0.0, 0.0);
+        println!(
+            "{m:8.0e}    {:.3e}      {:.3e}        {:.3e}    {:.3e}",
+            norm_a(&xb),
+            norm_a(&xp),
+            norm_a(&xy),
+            norm_a(&xbias)
+        );
+    }
+}
+
+#[test]
+#[ignore = "single-trial covariance-growth trace; run with --ignored --nocapture"]
+fn diag_eqvio_far_landmark_cov_trace() {
+    // One trial, NormalSuite, depth 640. Print per-step covariance health to see
+    // whether the SPD failure is a gradual propagation blow-up or a sudden vision
+    // event, and whether it originates in the sensor block (shared, coordinate-
+    // independent) or the landmark block.
+    let depth = 640.0_f64;
+    let n_landmarks = 40;
+    let dt = 0.2_f64;
+    let sigma_px = 0.5_f64;
+    let n_steps = 45;
+    // sensor-block init covariance (diagonal), tunable to test whether the
+    // zero-init harness accelerates the offset-gauge drift; SENSOR_INIT_VAR=0
+    // reproduces the original harness.
+    let sensor_init_var: f64 = std::env::var("SENSOR_INIT_VAR")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.0);
+    eprintln!("SENSOR_INIT_VAR = {sensor_init_var:.1e}");
+    let suite = NormalSuite::new();
+    let cam = make_pinhole();
+    let s = VIOSensorState::CDIM;
+    let mut rng = StdRng::seed_from_u64(0xE0F0_0000_u64 ^ depth.to_bits());
+    let pixel_noise = Normal::new(0.0, sigma_px).unwrap();
+
+    let mut landmarks = Vec::with_capacity(n_landmarks);
+    for i in 0..n_landmarks {
+        let col = (i % 10) as f64;
+        let row = (i / 10) as f64;
+        let x_frac = 0.055 + 0.010 * col;
+        let y_frac = -0.045 + 0.030 * row;
+        landmarks.push(Landmark {
+            p: Vector3::new(x_frac * depth, y_frac * depth, depth),
+            id: i as u64,
+        });
+    }
+    let truth0 = VIOState::new(
+        VIOSensorState {
+            input_bias: Vector6::zeros(),
+            pose: SE3::identity(),
+            velocity: Vector3::new(1.0, 0.0, 0.0),
+            camera_offset: SE3::identity(),
+        },
+        landmarks,
+    );
+    let init_std = Vector3::<f64>::new(0.0005, 0.0005, 0.002);
+    let init_noise = [
+        Normal::new(0.0, init_std[0]).unwrap(),
+        Normal::new(0.0, init_std[1]).unwrap(),
+        Normal::new(0.0, init_std[2]).unwrap(),
+    ];
+    let mut init_eps = DVector::<f64>::zeros(truth0.dim());
+    for i in 0..n_landmarks {
+        init_eps[s + 3 * i] = init_noise[0].sample(&mut rng);
+        init_eps[s + 3 * i + 1] = init_noise[1].sample(&mut rng);
+        init_eps[s + 3 * i + 2] = init_noise[2].sample(&mut rng);
+    }
+    let xi0_est = suite.state_chart_inv(&init_eps, &truth0);
+    let mut init_cov = DMatrix::<f64>::zeros(truth0.dim(), truth0.dim());
+    for i in 0..s {
+        init_cov[(i, i)] = sensor_init_var;
+    }
+    for i in 0..n_landmarks {
+        for k in 0..3 {
+            init_cov[(s + 3 * i + k, s + 3 * i + k)] = init_std[k].powi(2);
+        }
+    }
+    let mut eqf = VIOEqF::new(xi0_est, &init_cov);
+    let settings = VIOFilterSettings::default();
+    let input_gain = SMatrix::<f64, 12, 12>::zeros();
+    let state_gain = settings.state_gain_matrix(truth0.camera_landmarks.len());
+    let output_gain = DMatrix::<f64>::identity(2 * n_landmarks, 2 * n_landmarks) * sigma_px.powi(2);
+    let imu = IMUVelocity::new(
+        0.0,
+        Vector3::zeros(),
+        Vector3::new(0.0, 0.0, GRAVITY_CONSTANT),
+    );
+    let mut truth = truth0;
+
+    let block_stats = |sigma: &DMatrix<f64>, lo: usize, hi: usize| -> (f64, f64, usize) {
+        let mut maxd = f64::MIN;
+        let mut argmax = lo;
+        for i in lo..hi {
+            if sigma[(i, i)] > maxd {
+                maxd = sigma[(i, i)];
+                argmax = i;
+            }
+        }
+        let mut mind = f64::MAX;
+        for i in lo..hi {
+            mind = mind.min(sigma[(i, i)]);
+        }
+        (maxd, mind, argmax)
+    };
+    let min_eig = |sigma: &DMatrix<f64>| -> f64 {
+        let sym = (sigma + sigma.transpose()) * 0.5;
+        sym.symmetric_eigenvalues()
+            .iter()
+            .cloned()
+            .fold(f64::MAX, f64::min)
+    };
+
+    println!("step phase | sensor[max_diag min_diag] lm[max_diag argmax] min_eig");
+    for step in 0..n_steps {
+        truth = crate::mathematical::vio_state::integrate_system_function(&truth, &imu, dt);
+        eqf.integrate_observer_state(&imu, dt, true);
+        // pre-propagation diagnostics: A-block magnitudes and Σ condition
+        let blocks = suite.propagation_blocks(&eqf.x, &eqf.xi0, &imu);
+        let max_a_ss = blocks.a_ss.iter().fold(0.0_f64, |a, &v| a.max(v.abs()));
+        let max_a_lmlm = blocks
+            .a_lm_lm
+            .iter()
+            .flat_map(|m| m.iter())
+            .fold(0.0_f64, |a, &v| a.max(v.abs()));
+        let max_a_lms = blocks.a_lm_s.iter().fold(0.0_f64, |a, &v| a.max(v.abs()));
+        let est = eqf.state_estimate();
+        let min_lm_z = est
+            .camera_landmarks
+            .iter()
+            .map(|l| l.p[2])
+            .fold(f64::MAX, f64::min);
+        let min_lm_norm = est
+            .camera_landmarks
+            .iter()
+            .map(|l| l.p.norm())
+            .fold(f64::MAX, f64::min);
+        let vel = est.sensor.velocity.norm();
+        let max_scale = eqf
+            .x
+            .q
+            .iter()
+            .map(|q| q.scale.abs())
+            .fold(0.0_f64, f64::max);
+        let min_scale = eqf
+            .x
+            .q
+            .iter()
+            .map(|q| q.scale.abs())
+            .fold(f64::MAX, f64::min);
+        // gauge coordinates: offset (x.b), bias (x.beta), position (x.a.t)
+        let xb_t = eqf.x.b.translation.norm();
+        let xb_r = eqf.x.b.rotation.as_matrix().norm(); // valid rotation => sqrt(3)=1.73
+        let xb_q = eqf.x.b.rotation.q.norm(); // unit quaternion => 1.0
+        let beta_n = eqf.x.beta.norm();
+        let xa_t = eqf.x.a.translation.norm();
+        let me_pre = min_eig(&eqf.sigma);
+        let cond = block_stats(&eqf.sigma, 0, eqf.sigma.nrows()).0 / me_pre.abs().max(1e-300);
+        eqf.integrate_riccati_fast(&suite, &imu, dt, &input_gain, &state_gain);
+        let me_prop = if eqf.sigma.iter().all(|v| v.is_finite()) {
+            min_eig(&eqf.sigma)
+        } else {
+            f64::NAN
+        };
+        println!(
+            "{step:3} | xb[t={xb_t:.2e} R={xb_r:.3e} q={xb_q:.4e}] bias={beta_n:.2e} pos_t={xa_t:.2e} maxA[lms={max_a_lms:.1e}] min_eig={me_prop:.3e}",
+        );
+        let _ = (
+            max_a_ss,
+            max_a_lmlm,
+            me_pre,
+            min_lm_norm,
+            min_scale,
+            max_scale,
+            cond,
+            min_lm_z,
+            vel,
+        );
+
+        let mut y_ids = Vec::with_capacity(n_landmarks);
+        let mut y_coords = HashMap::with_capacity(n_landmarks);
+        for lm in &truth.camera_landmarks {
+            if lm.p[2] <= 1e-6 {
+                continue;
+            }
+            let mut uv = cam.project(&lm.p);
+            uv[0] += pixel_noise.sample(&mut rng);
+            uv[1] += pixel_noise.sample(&mut rng);
+            y_ids.push(lm.id);
+            y_coords.insert(lm.id, uv);
+        }
+        eqf.perform_vision_update(&suite, &y_ids, &y_coords, &cam, &output_gain, true, false);
+        let (smax, smin, _) = block_stats(&eqf.sigma, 0, s);
+        let (lmax, _, larg) = block_stats(&eqf.sigma, s, eqf.sigma.nrows());
+        let me_vis = if eqf.sigma.iter().all(|v| v.is_finite()) {
+            min_eig(&eqf.sigma)
+        } else {
+            f64::NAN
+        };
+        println!(
+            "{step:3} vis   | sensor[{smax:.2e} {smin:.2e}] lm[{lmax:.2e} #{}] min_eig={me_vis:.3e}",
+            (larg - s) / 3
+        );
+        if !eqf.sigma.iter().all(|v| v.is_finite()) {
+            println!("  -> nonfinite covariance at step {step}, stopping");
+            break;
+        }
+    }
+}
+
+#[test]
+#[ignore = "diagnostic Monte Carlo; run with --ignored --nocapture"]
+fn diag_eqvio_far_landmark_nees_depth_sweep() {
+    let depths = [320.0, 640.0, 1280.0];
+    let n_mc = 8;
+    let n_steps = 120;
+    let n_landmarks = 40;
+    let dt = 0.2;
+    let sigma_px = 0.5;
+
+    // Coordinate-suite comparison. The init covariance is matched *physically*
+    // across suites (bearing ~0.5 mrad, range ~0.2 % of depth), because the same
+    // raw numbers mean wildly different things in each chart's third (depth)
+    // coordinate: log-range (Normal) is δr/r, inverse-depth (InvDepth) is
+    // δρ = ρ·δr/r = (δr/r)/depth, and Euclidean is δr (and bearing·depth in x,y).
+    // Without this matching the comparison would be confounded by the init alone.
+    let bear = 0.0005_f64; // physical bearing init std [rad]
+    let frange = 0.002_f64; // physical fractional-range init std
+    let suites: [&str; 3] = ["normal", "invdepth", "euclid"];
+
+    println!("EqVIO coordinate-suite far-landmark SPD/NEES diagnostic");
+    println!("known constant lateral motion, 40 in-state landmarks, noisy pixels");
+    println!(
+        "suite, variant, depth_m, valid_trials, finite_landmarks, mean_nees, median_nees, mean_range_rel_err, nonfinite_sigma, nan_sigma, inf_sigma, prop_fail, vision_fail, min_fail_step, median_fail_step, non_spd_sigma, spd_prop_fail, spd_vision_fail, min_spd_step, median_spd_step, min_diag_at_spd_fail, max_asym_at_spd_fail, nonpos_alpha, min_alpha, min_alpha_at_spd_fail, nonfinite_chart, singular_cov, no_finite_landmarks"
+    );
+
+    let total_rows = suites.len() * 2 * depths.len();
+    let sweep_start = Instant::now();
+    let mut row = 0usize;
+    for suite_name in suites {
+        for use_faster in [false, true] {
+            let variant = if use_faster { "faster" } else { "fast" };
+            for depth in depths {
+                row += 1;
+                // physically-matched per-suite init std in that chart's coords
+                let init_std = match suite_name {
+                    "normal" => Vector3::new(bear, bear, frange),
+                    "invdepth" => Vector3::new(bear, bear, frange / depth),
+                    "euclid" => Vector3::new(bear * depth, bear * depth, frange * depth),
+                    _ => unreachable!(),
+                };
+                let suite: Box<dyn EqFCoordinateSuite> = match suite_name {
+                    "normal" => Box::new(NormalSuite::new()),
+                    "invdepth" => Box::new(InvDepthSuite::new()),
+                    "euclid" => Box::new(EuclideanSuite),
+                    _ => unreachable!(),
+                };
+                let elapsed = sweep_start.elapsed().as_secs_f64();
+                let eta = elapsed / (row - 1).max(1) as f64 * (total_rows - row + 1) as f64;
+                eprintln!(
+                    "=== row {row}/{total_rows}: suite={suite_name} variant={variant} depth={depth:.0} | overall elapsed={} eta~{} ===",
+                    format_seconds(elapsed),
+                    format_seconds(if row == 1 { 0.0 } else { eta })
+                );
+                let progress_label = format!("{suite_name} {variant} depth={depth:.0}");
+                let stats = eqvio_far_landmark_nees_for_depth(
+                    suite.as_ref(),
+                    init_std,
+                    depth,
+                    n_mc,
+                    n_steps,
+                    n_landmarks,
+                    dt,
+                    sigma_px,
+                    use_faster,
+                    &progress_label,
+                );
+                println!(
+                    "{suite_name}, {variant}, {depth:.0}, {}/{}, {}, {:.3}, {:.3}, {:.4e}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {:.4e}, {:.4e}, {}, {:.4e}, {:.4e}, {}, {}, {}",
+                    stats.valid_trials,
+                    stats.total_trials,
+                    stats.finite_landmarks,
+                    stats.mean_nees,
+                    stats.median_nees,
+                    stats.mean_range_rel_err,
+                    stats.nonfinite_sigma_trials,
+                    stats.nan_sigma_trials,
+                    stats.inf_sigma_trials,
+                    stats.propagation_sigma_failures,
+                    stats.vision_sigma_failures,
+                    stats
+                        .min_sigma_failure_step
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "none".to_string()),
+                    stats
+                        .median_sigma_failure_step
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "none".to_string()),
+                    stats.non_spd_sigma_trials,
+                    stats.propagation_spd_failures,
+                    stats.vision_spd_failures,
+                    stats
+                        .min_spd_failure_step
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "none".to_string()),
+                    stats
+                        .median_spd_failure_step
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "none".to_string()),
+                    stats.min_diag_at_first_spd_failure,
+                    stats.max_asym_at_first_spd_failure,
+                    stats.nonpositive_alpha_trials,
+                    stats.min_alpha,
+                    stats.min_alpha_at_first_spd_failure,
+                    stats.nonfinite_chart_trials,
+                    stats.singular_cov_trials,
+                    stats.no_finite_landmark_trials
+                );
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EqvioFarLandmarkStats {
+    valid_trials: usize,
+    total_trials: usize,
+    finite_landmarks: usize,
+    mean_nees: f64,
+    median_nees: f64,
+    mean_range_rel_err: f64,
+    nonfinite_sigma_trials: usize,
+    nan_sigma_trials: usize,
+    inf_sigma_trials: usize,
+    propagation_sigma_failures: usize,
+    vision_sigma_failures: usize,
+    min_sigma_failure_step: Option<usize>,
+    median_sigma_failure_step: Option<usize>,
+    non_spd_sigma_trials: usize,
+    propagation_spd_failures: usize,
+    vision_spd_failures: usize,
+    min_spd_failure_step: Option<usize>,
+    median_spd_failure_step: Option<usize>,
+    min_diag_at_first_spd_failure: f64,
+    max_asym_at_first_spd_failure: f64,
+    nonpositive_alpha_trials: usize,
+    min_alpha: f64,
+    min_alpha_at_first_spd_failure: f64,
+    nonfinite_chart_trials: usize,
+    singular_cov_trials: usize,
+    no_finite_landmark_trials: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn eqvio_far_landmark_nees_for_depth(
+    suite: &dyn EqFCoordinateSuite,
+    init_std: Vector3<f64>,
+    depth: f64,
+    n_mc: usize,
+    n_steps: usize,
+    n_landmarks: usize,
+    dt: f64,
+    sigma_px: f64,
+    use_faster_riccati: bool,
+    progress_label: &str,
+) -> EqvioFarLandmarkStats {
+    let cam = make_pinhole();
+    let s = VIOSensorState::CDIM;
+    let mut rng = StdRng::seed_from_u64(0xE0F0_0000_u64 ^ depth.to_bits());
+    let pixel_noise = Normal::new(0.0, sigma_px).unwrap();
+    // physically-matched per-suite init (see caller); std per chart coordinate
+    let init_noise = [
+        Normal::new(0.0, init_std[0].max(1e-12)).unwrap(),
+        Normal::new(0.0, init_std[1].max(1e-12)).unwrap(),
+        Normal::new(0.0, init_std[2].max(1e-12)).unwrap(),
+    ];
+    let init_lm_cov = Vector3::new(
+        init_std[0].powi(2),
+        init_std[1].powi(2),
+        init_std[2].powi(2),
+    );
+    let imu = IMUVelocity::new(
+        0.0,
+        Vector3::zeros(),
+        Vector3::new(0.0, 0.0, GRAVITY_CONSTANT),
+    );
+    let settings = VIOFilterSettings::default();
+    let input_gain = SMatrix::<f64, 12, 12>::zeros();
+    let output_gain = DMatrix::<f64>::identity(2 * n_landmarks, 2 * n_landmarks) * sigma_px.powi(2);
+
+    let mut nees = Vec::with_capacity(n_mc);
+    let mut range_rel_err = Vec::with_capacity(n_mc);
+    let mut valid_trials = 0;
+    let mut nonfinite_sigma_trials = 0;
+    let mut nonfinite_chart_trials = 0;
+    let mut singular_cov_trials = 0;
+    let mut no_finite_landmark_trials = 0;
+    let mut propagation_sigma_failures = 0;
+    let mut vision_sigma_failures = 0;
+    let mut nan_sigma_trials = 0;
+    let mut inf_sigma_trials = 0;
+    let mut sigma_failure_steps = Vec::new();
+    let mut non_spd_sigma_trials = 0;
+    let mut propagation_spd_failures = 0;
+    let mut vision_spd_failures = 0;
+    let mut spd_failure_steps = Vec::new();
+    let mut min_diag_at_spd_failures = Vec::new();
+    let mut max_asym_at_spd_failures = Vec::new();
+    let mut nonpositive_alpha_trials = 0;
+    let mut min_alphas = Vec::new();
+    let mut min_alphas_at_spd_failures = Vec::new();
+    let row_start = Instant::now();
+    for trial_idx in 0..n_mc {
+        let mut landmarks = Vec::with_capacity(n_landmarks);
+        for i in 0..n_landmarks {
+            let col = (i % 10) as f64;
+            let row = (i / 10) as f64;
+            let x_frac = 0.055 + 0.010 * col;
+            let y_frac = -0.045 + 0.030 * row;
+            landmarks.push(Landmark {
+                p: Vector3::new(x_frac * depth, y_frac * depth, depth),
+                id: i as u64,
+            });
+        }
+        let truth0 = VIOState::new(
+            VIOSensorState {
+                input_bias: Vector6::zeros(),
+                pose: SE3::identity(),
+                velocity: Vector3::new(1.0, 0.0, 0.0),
+                camera_offset: SE3::identity(),
+            },
+            landmarks,
+        );
+
+        let mut init_eps = DVector::<f64>::zeros(truth0.dim());
+        for i in 0..n_landmarks {
+            init_eps[s + 3 * i] = init_noise[0].sample(&mut rng);
+            init_eps[s + 3 * i + 1] = init_noise[1].sample(&mut rng);
+            init_eps[s + 3 * i + 2] = init_noise[2].sample(&mut rng);
+        }
+        let xi0_est = suite.state_chart_inv(&init_eps, &truth0);
+
+        let mut init_cov = DMatrix::<f64>::zeros(truth0.dim(), truth0.dim());
+        for i in 0..n_landmarks {
+            for k in 0..3 {
+                init_cov[(s + 3 * i + k, s + 3 * i + k)] = init_lm_cov[k];
+            }
+        }
+        let mut eqf = VIOEqF::new(xi0_est, &init_cov);
+        let state_gain = settings.state_gain_matrix(truth0.camera_landmarks.len());
+        let mut truth = truth0;
+        let mut sigma_failure: Option<(usize, &'static str, &'static str)> = None;
+        let mut spd_failure: Option<(usize, &'static str, SigmaSpdFailure)> = None;
+        let mut alpha_failure = false;
+
+        for step in 0..n_steps {
+            truth = crate::mathematical::vio_state::integrate_system_function(&truth, &imu, dt);
+            eqf.integrate_observer_state(&imu, dt, true);
+            if use_faster_riccati {
+                eqf.accumulate_transition(suite, &imu, dt);
+                eqf.flush_riccati(&input_gain, &state_gain);
+            } else {
+                eqf.integrate_riccati_fast(suite, &imu, dt, &input_gain, &state_gain);
+            }
+            if let Some(kind) = sigma_nonfinite_kind(&eqf.sigma) {
+                sigma_failure = Some((step + 1, "propagation", kind));
+                break;
+            }
+            if spd_failure.is_none() {
+                if let Some(health) = sigma_spd_failure(&eqf.sigma) {
+                    spd_failure = Some((step + 1, "propagation", health));
+                }
+            }
+
+            let mut y_ids = Vec::with_capacity(n_landmarks);
+            let mut y_coords = HashMap::with_capacity(n_landmarks);
+            for lm in &truth.camera_landmarks {
+                if lm.p[2] <= 1e-6 {
+                    continue;
+                }
+                let mut uv = cam.project(&lm.p);
+                uv[0] += pixel_noise.sample(&mut rng);
+                uv[1] += pixel_noise.sample(&mut rng);
+                y_ids.push(lm.id);
+                y_coords.insert(lm.id, uv);
+            }
+            let ct = suite.output_matrix_C(&eqf.xi0, &eqf.x, &y_ids, &y_coords, &cam, true);
+            let alpha_health = scalar_update_alpha_health(&ct, &output_gain, &eqf.sigma);
+            if let Some(alpha) = alpha_health.min_alpha {
+                min_alphas.push(alpha);
+                if spd_failure.is_none() && alpha_health.first_nonpositive_row.is_some() {
+                    alpha_failure = true;
+                }
+            }
+            eqf.perform_vision_update(suite, &y_ids, &y_coords, &cam, &output_gain, true, false);
+            if let Some(kind) = sigma_nonfinite_kind(&eqf.sigma) {
+                sigma_failure = Some((step + 1, "vision", kind));
+                break;
+            }
+            if spd_failure.is_none() {
+                if let Some(health) = sigma_spd_failure(&eqf.sigma) {
+                    spd_failure = Some((step + 1, "vision", health));
+                    if let Some(alpha) = alpha_health.min_alpha {
+                        min_alphas_at_spd_failures.push(alpha);
+                    }
+                }
+            }
+        }
+
+        if alpha_failure {
+            nonpositive_alpha_trials += 1;
+        }
+        if let Some((step, phase, health)) = spd_failure {
+            non_spd_sigma_trials += 1;
+            spd_failure_steps.push(step);
+            min_diag_at_spd_failures.push(health.min_diag);
+            max_asym_at_spd_failures.push(health.max_asym);
+            match phase {
+                "propagation" => propagation_spd_failures += 1,
+                "vision" => vision_spd_failures += 1,
+                _ => {}
+            }
+        }
+        if let Some((step, phase, kind)) = sigma_failure {
+            nonfinite_sigma_trials += 1;
+            sigma_failure_steps.push(step);
+            match kind {
+                "nan" => nan_sigma_trials += 1,
+                "inf" => inf_sigma_trials += 1,
+                _ => {}
+            }
+            match phase {
+                "propagation" => propagation_sigma_failures += 1,
+                "vision" => vision_sigma_failures += 1,
+                _ => {}
+            }
+            print_diag_progress(progress_label, trial_idx + 1, n_mc, row_start);
+            continue;
+        }
+        let err_state = state_group_action(&eqf.x.inverse(), &truth);
+        let eps = suite.state_chart(&err_state, &eqf.xi0);
+        if !eps.iter().all(|v| v.is_finite()) {
+            nonfinite_chart_trials += 1;
+            print_diag_progress(progress_label, trial_idx + 1, n_mc, row_start);
+            continue;
+        }
+        let est = eqf.state_estimate();
+        let mut trial_finite_landmarks = 0;
+        let mut trial_singular_cov = false;
+        for (i, lm_true) in truth.camera_landmarks.iter().enumerate() {
+            let e_lm = eps.fixed_rows::<3>(s + 3 * i).into_owned();
+            let Some(p_lm) = eqf.get_landmark_cov_by_id(lm_true.id) else {
+                continue;
+            };
+            if !p_lm.iter().all(|v| v.is_finite()) || !e_lm.iter().all(|v| v.is_finite()) {
+                continue;
+            }
+            let Some(p_lm_inv) = (p_lm + SMatrix::<f64, 3, 3>::identity() * 1e-10).try_inverse()
+            else {
+                trial_singular_cov = true;
+                continue;
+            };
+            let trial_nees = (e_lm.transpose() * p_lm_inv * e_lm)[(0, 0)];
+            if trial_nees.is_finite() {
+                nees.push(trial_nees);
+                trial_finite_landmarks += 1;
+            }
+
+            let true_range = lm_true.p.norm();
+            let est_range = est.camera_landmarks[i].p.norm();
+            let rel_err = (est_range - true_range).abs() / true_range.max(1e-12);
+            if rel_err.is_finite() {
+                range_rel_err.push(rel_err);
+            }
+        }
+        if trial_finite_landmarks == 0 {
+            if trial_singular_cov {
+                singular_cov_trials += 1;
+            } else {
+                no_finite_landmark_trials += 1;
+            }
+        } else {
+            valid_trials += 1;
+        }
+        print_diag_progress(progress_label, trial_idx + 1, n_mc, row_start);
+    }
+
+    if nees.is_empty() || range_rel_err.is_empty() {
+        return EqvioFarLandmarkStats {
+            valid_trials,
+            total_trials: n_mc,
+            finite_landmarks: nees.len(),
+            mean_nees: f64::NAN,
+            median_nees: f64::NAN,
+            mean_range_rel_err: f64::NAN,
+            nonfinite_sigma_trials,
+            nan_sigma_trials,
+            inf_sigma_trials,
+            propagation_sigma_failures,
+            vision_sigma_failures,
+            min_sigma_failure_step: min_step(&sigma_failure_steps),
+            median_sigma_failure_step: median_step(&mut sigma_failure_steps),
+            non_spd_sigma_trials,
+            propagation_spd_failures,
+            vision_spd_failures,
+            min_spd_failure_step: min_step(&spd_failure_steps),
+            median_spd_failure_step: median_step(&mut spd_failure_steps),
+            min_diag_at_first_spd_failure: min_finite(&min_diag_at_spd_failures),
+            max_asym_at_first_spd_failure: max_finite(&max_asym_at_spd_failures),
+            nonpositive_alpha_trials,
+            min_alpha: min_finite(&min_alphas),
+            min_alpha_at_first_spd_failure: min_finite(&min_alphas_at_spd_failures),
+            nonfinite_chart_trials,
+            singular_cov_trials,
+            no_finite_landmark_trials,
+        };
+    }
+    nees.sort_by(|a, b| a.total_cmp(b));
+    let mean_nees = nees.iter().sum::<f64>() / nees.len() as f64;
+    let median_nees = nees[nees.len() / 2];
+    let mean_range_rel_err = range_rel_err.iter().sum::<f64>() / range_rel_err.len() as f64;
+    EqvioFarLandmarkStats {
+        valid_trials,
+        total_trials: n_mc,
+        finite_landmarks: nees.len(),
+        mean_nees,
+        median_nees,
+        mean_range_rel_err,
+        nonfinite_sigma_trials,
+        nan_sigma_trials,
+        inf_sigma_trials,
+        propagation_sigma_failures,
+        vision_sigma_failures,
+        min_sigma_failure_step: min_step(&sigma_failure_steps),
+        median_sigma_failure_step: median_step(&mut sigma_failure_steps),
+        non_spd_sigma_trials,
+        propagation_spd_failures,
+        vision_spd_failures,
+        min_spd_failure_step: min_step(&spd_failure_steps),
+        median_spd_failure_step: median_step(&mut spd_failure_steps),
+        min_diag_at_first_spd_failure: min_finite(&min_diag_at_spd_failures),
+        max_asym_at_first_spd_failure: max_finite(&max_asym_at_spd_failures),
+        nonpositive_alpha_trials,
+        min_alpha: min_finite(&min_alphas),
+        min_alpha_at_first_spd_failure: min_finite(&min_alphas_at_spd_failures),
+        nonfinite_chart_trials,
+        singular_cov_trials,
+        no_finite_landmark_trials,
+    }
+}
+
+fn sigma_nonfinite_kind(sigma: &DMatrix<f64>) -> Option<&'static str> {
+    if sigma.iter().any(|v| v.is_nan()) {
+        Some("nan")
+    } else if sigma.iter().any(|v| v.is_infinite()) {
+        Some("inf")
+    } else {
+        None
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SigmaSpdFailure {
+    min_diag: f64,
+    max_asym: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScalarUpdateAlphaHealth {
+    min_alpha: Option<f64>,
+    first_nonpositive_row: Option<usize>,
+}
+
+fn scalar_update_alpha_health(
+    c_star: &DMatrix<f64>,
+    r_noise: &DMatrix<f64>,
+    sigma: &DMatrix<f64>,
+) -> ScalarUpdateAlphaHealth {
+    let n = sigma.nrows();
+    let mut sigma_seq = sigma.clone();
+    let mut min_alpha = None;
+    let mut first_nonpositive_row = None;
+
+    for j in 0..c_star.nrows() {
+        let r_j = r_noise[(j, j)];
+        let mut v = DVector::<f64>::zeros(n);
+        for col in 0..n {
+            let c_jc = c_star[(j, col)];
+            if c_jc != 0.0 {
+                v.axpy(c_jc, &sigma_seq.column(col), 1.0);
+            }
+        }
+
+        let mut alpha = r_j;
+        for col in 0..n {
+            let c_jc = c_star[(j, col)];
+            if c_jc != 0.0 {
+                alpha += c_jc * v[col];
+            }
+        }
+
+        if alpha.is_finite() {
+            min_alpha = Some(min_alpha.map_or(alpha, |current: f64| current.min(alpha)));
+        }
+        if first_nonpositive_row.is_none() && (!alpha.is_finite() || alpha <= 0.0) {
+            first_nonpositive_row = Some(j);
+            break;
+        }
+        if alpha.abs() < 1e-30 {
+            continue;
+        }
+        sigma_seq.ger(-1.0 / alpha, &v, &v, 1.0);
+    }
+
+    ScalarUpdateAlphaHealth {
+        min_alpha,
+        first_nonpositive_row,
+    }
+}
+
+fn sigma_spd_failure(sigma: &DMatrix<f64>) -> Option<SigmaSpdFailure> {
+    if sigma_nonfinite_kind(sigma).is_some() {
+        return None;
+    }
+
+    let mut min_diag = f64::INFINITY;
+    let mut max_asym = 0.0_f64;
+    for i in 0..sigma.nrows() {
+        min_diag = min_diag.min(sigma[(i, i)]);
+        for j in (i + 1)..sigma.ncols() {
+            max_asym = max_asym.max((sigma[(i, j)] - sigma[(j, i)]).abs());
+        }
+    }
+
+    let sym_sigma = (sigma.clone() + sigma.transpose()) * 0.5;
+    if sym_sigma.cholesky().is_some() {
+        None
+    } else {
+        Some(SigmaSpdFailure { min_diag, max_asym })
+    }
+}
+
+fn min_step(steps: &[usize]) -> Option<usize> {
+    steps.iter().copied().min()
+}
+
+fn median_step(steps: &mut [usize]) -> Option<usize> {
+    if steps.is_empty() {
+        return None;
+    }
+    steps.sort_unstable();
+    Some(steps[steps.len() / 2])
+}
+
+fn min_finite(values: &[f64]) -> f64 {
+    values
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite())
+        .reduce(f64::min)
+        .unwrap_or(f64::NAN)
+}
+
+fn max_finite(values: &[f64]) -> f64 {
+    values
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite())
+        .reduce(f64::max)
+        .unwrap_or(f64::NAN)
+}
+
+fn print_diag_progress(label: &str, done: usize, total: usize, start: Instant) {
+    let elapsed = start.elapsed().as_secs_f64();
+    let per_trial = elapsed / done.max(1) as f64;
+    let eta = per_trial * total.saturating_sub(done) as f64;
+    eprintln!(
+        "progress: {label} trial {done}/{total} elapsed={} eta={}",
+        format_seconds(elapsed),
+        format_seconds(eta)
+    );
+}
+
+fn format_seconds(seconds: f64) -> String {
+    let seconds = seconds.max(0.0).round() as u64;
+    let minutes = seconds / 60;
+    let seconds = seconds % 60;
+    format!("{minutes}m{seconds:02}s")
+}
+
+/// The stereo log-inverse-range output row `∂ℓ/∂(chart)` must equal the
+/// finite-difference of `ℓ = -ln‖q‖` through each chart's inverse map, and hit
+/// the closed forms for the log-inverse-range row: Normal `[0,0,+1]`,
+/// InvDepth `[0,0,1/ρ0]`, Euclidean `-q0ᵀ/‖q0‖²`.
+#[test]
+fn stereo_range_row_matches_log_inverse_range_jacobian() {
+    use crate::coordinate_suite::invdepth::point_chart_invdepth_inv;
+    use crate::coordinate_suite::normal::point_chart_normal_inv;
+
+    let q0 = Vector3::new(0.7, -0.4, 3.2);
+    let h = 1e-6;
+    let ell = |p: &Vector3<f64>| -p.norm().ln();
+
+    let fd = |inv: &dyn Fn(&Vector3<f64>, &Vector3<f64>) -> Vector3<f64>, k: usize| {
+        let mut ep = Vector3::zeros();
+        let mut em = Vector3::zeros();
+        ep[k] = h;
+        em[k] = -h;
+        (ell(&inv(&ep, &q0)) - ell(&inv(&em, &q0))) / (2.0 * h)
+    };
+
+    // Normal chart: closed form [0,0,+1] and matches FD.
+    let row_n = NormalSuite::new().output_range_row(&q0);
+    for k in 0..3 {
+        assert_abs_diff_eq!(row_n[k], fd(&point_chart_normal_inv, k), epsilon = 1e-4);
+    }
+    assert_abs_diff_eq!(row_n[0], 0.0, epsilon = 1e-9);
+    assert_abs_diff_eq!(row_n[1], 0.0, epsilon = 1e-9);
+    assert_abs_diff_eq!(row_n[2], 1.0, epsilon = 1e-9);
+
+    // InvDepth chart: closed form [0,0,1/ρ0]=[0,0,‖q0‖] and matches FD.
+    let row_i = InvDepthSuite::new().output_range_row(&q0);
+    for k in 0..3 {
+        assert_abs_diff_eq!(row_i[k], fd(&point_chart_invdepth_inv, k), epsilon = 1e-4);
+    }
+    assert_abs_diff_eq!(row_i[2], q0.norm(), epsilon = 1e-6);
+
+    // Euclidean base: -q0ᵀ/‖q0‖².
+    let row_e = EuclideanSuite.output_range_row(&q0);
+    let expected = -q0.transpose() / q0.norm_squared();
+    assert_abs_diff_eq!((row_e - expected).norm(), 0.0, epsilon = 1e-12);
+}
+
+/// End-to-end stereo update on the Normal chart: the log-inverse-range channel
+/// must (a) reduce the depth chart-coordinate covariance below a bearing-only
+/// update, and (b) move the estimate in the correct direction — a range measured
+/// closer than the prediction pulls the landmark closer (the end-to-end sign
+/// check for ℓ = -ln(range)).
+#[test]
+fn stereo_range_channel_informs_depth_with_correct_sign() {
+    let xi0 = make_xi0_with_landmarks(1);
+    let settings = VIOFilterSettings::default();
+    let init_cov = settings.initial_covariance(xi0.camera_landmarks.len());
+    let suite = NormalSuite::new();
+    let cam = make_pinhole();
+
+    let id = xi0.camera_landmarks[0].id;
+    let true_range = xi0.camera_landmarks[0].p.norm();
+    let y_ids = vec![id];
+    let mut y_coords = HashMap::new();
+    // Observe at the predicted pixel => zero bearing innovation, so only the
+    // stereo range channel drives the update.
+    y_coords.insert(id, cam.project(&xi0.camera_landmarks[0].p));
+    let output_gain = settings.output_gain_matrix(y_ids.len());
+    let depth_idx = VIOSensorState::CDIM + 2; // Normal chart: coord 2 = log-inv-depth
+
+    // (a) covariance: bearing-only vs bearing + exact range.
+    let mut eqf_bearing = VIOEqF::new(xi0.clone(), &init_cov);
+    eqf_bearing.perform_vision_update(&suite, &y_ids, &y_coords, &cam, &output_gain, true, false);
+    let depth_cov_bearing = eqf_bearing.sigma[(depth_idx, depth_idx)];
+
+    let mut stereo = HashMap::new();
+    stereo.insert(id, (-true_range.ln(), 1e-4));
+    let mut eqf_stereo = VIOEqF::new(xi0.clone(), &init_cov);
+    eqf_stereo.perform_vision_update_with_stereo(
+        &suite,
+        &y_ids,
+        &y_coords,
+        &cam,
+        &output_gain,
+        true,
+        false,
+        &stereo,
+        0.0,
+    );
+    let depth_cov_stereo = eqf_stereo.sigma[(depth_idx, depth_idx)];
+    assert!(
+        depth_cov_stereo < depth_cov_bearing - 1e-9,
+        "stereo depth cov {depth_cov_stereo} not below bearing-only {depth_cov_bearing}"
+    );
+
+    // (b) sign: a range measured 20% closer than the estimate pulls range DOWN.
+    let closer = 0.8 * true_range;
+    let mut stereo_closer = HashMap::new();
+    stereo_closer.insert(id, (-closer.ln(), 1e-3));
+    let mut eqf_closer = VIOEqF::new(xi0.clone(), &init_cov);
+    eqf_closer.perform_vision_update_with_stereo(
+        &suite,
+        &y_ids,
+        &y_coords,
+        &cam,
+        &output_gain,
+        true,
+        false,
+        &stereo_closer,
+        0.0,
+    );
+    let range_after = eqf_closer.state_estimate().camera_landmarks[0].p.norm();
+    assert!(
+        range_after.is_finite() && range_after > 0.0,
+        "range estimate non-finite/non-positive: {range_after}"
+    );
+    assert!(
+        range_after < true_range,
+        "measured-closer range must reduce the estimate: {range_after} vs true {true_range}"
     );
 }

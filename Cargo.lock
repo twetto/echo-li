@@ -236,7 +236,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -247,7 +247,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1300,6 +1300,14 @@ dependencies = [
  "rustix 1.1.4",
  "wayland-backend",
  "wayland-client 0.31.14",
+]
+
+[[package]]
+name = "camera-geometry"
+version = "0.1.0"
+source = "git+https://github.com/twetto/Rudolf-V.git?rev=8e0e1da08528ab69dd72b0b8ead3ca9155334821#8e0e1da08528ab69dd72b0b8ead3ca9155334821"
+dependencies = [
+ "nalgebra",
 ]
 
 [[package]]
@@ -2625,7 +2633,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -2697,6 +2705,7 @@ checksum = "4c3cf4824e2d5f025c7b531afcb2325364084a16806f6d47fbc1f5fbd9960590"
 name = "echo-li-cli"
 version = "0.1.0"
 dependencies = [
+ "camera-geometry",
  "clap",
  "echo-li-core",
  "echo-lie",
@@ -2715,9 +2724,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "approx",
+ "camera-geometry",
  "csv",
  "echo-lie",
  "image",
+ "log",
  "nalgebra",
  "rand 0.9.4",
  "rand_distr",
@@ -2732,6 +2743,7 @@ dependencies = [
 name = "echo-li-python"
 version = "0.1.0"
 dependencies = [
+ "camera-geometry",
  "echo-li-core",
  "echo-lie",
  "nalgebra",
@@ -3192,7 +3204,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4545,7 +4557,7 @@ dependencies = [
  "portable-atomic-util",
  "serde_core",
  "wasm-bindgen",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5509,7 +5521,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -9445,9 +9457,10 @@ checksum = "6c20b6793b5c2fa6553b250154b78d6d0db37e72700ae35fad9387a46f487c97"
 [[package]]
 name = "rudolf-v"
 version = "0.1.0"
-source = "git+https://github.com/twetto/Rudolf-V#0549c757cbe39b0f4edca1a1bf8ee1d34f03274e"
+source = "git+https://github.com/twetto/Rudolf-V.git?rev=8e0e1da08528ab69dd72b0b8ead3ca9155334821#8e0e1da08528ab69dd72b0b8ead3ca9155334821"
 dependencies = [
  "bytemuck",
+ "camera-geometry",
  "image",
  "minifb",
  "nalgebra",
@@ -9493,7 +9506,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -9506,7 +9519,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -10107,7 +10120,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -10337,7 +10350,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -10918,7 +10931,7 @@ checksum = "f2f6fb2847f6742cd76af783a2a2c49e9375d0a111c7bef6f71cd9e738c72d6e"
 dependencies = [
  "memoffset 0.9.1",
  "tempfile",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -11912,7 +11925,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

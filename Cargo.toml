@@ -10,7 +10,8 @@ members = [
 
 [workspace.dependencies]
 echo-lie = { path = "echo-lie" }
-rudolf-v = { git = "https://github.com/twetto/Rudolf-V" }
+rudolf-v = { git = "https://github.com/twetto/Rudolf-V.git", rev = "8e0e1da08528ab69dd72b0b8ead3ca9155334821" }
+camera-geometry = { git = "https://github.com/twetto/Rudolf-V.git", rev = "8e0e1da08528ab69dd72b0b8ead3ca9155334821" }
 nalgebra = "0.33"
 approx = "0.5"
 rand = "0.9"
@@ -24,6 +25,8 @@ spade = "2.9"
 clap = { version = "4.5", features = ["derive"] }
 rerun = { version = "0.31", features = ["sdk"] }
 anyhow = "1.0"
+log = "0.4"
+env_logger = "0.11"
 
 [profile.release]
 debug = true

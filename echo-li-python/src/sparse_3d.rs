@@ -1,10 +1,10 @@
-use numpy::ndarray::Array1;
-use numpy::PyArray1;
+use numpy::ndarray::{Array1, Array2};
+use numpy::{PyArray1, PyArray2};
 use pyo3::prelude::*;
 use std::collections::HashMap;
 
 use echo_li_core::depth::sparse_3d::Sparse3DFilter;
-use echo_li_core::depth::sparse_gb::SparseVogSettings;
+use echo_li_core::depth::sparse_gb::{SecondOrderMode, SparseVogSettings};
 use echo_li_core::mathematical::vision_measurement::VisionMeasurement;
 use nalgebra::{Matrix3, Matrix4, Vector2};
 
@@ -47,22 +47,87 @@ impl PySparse3DFilter {
         })
     }
 
-    fn update(&mut self, stamp: f64, feature_uvs: HashMap<u64, [f32; 2]>, t_wc: [[f64; 4]; 4]) {
+    #[staticmethod]
+    #[pyo3(signature = (fx, fy, cx, cy, **kwargs))]
+    fn invdepth_additive3d(
+        fx: f64,
+        fy: f64,
+        cx: f64,
+        cy: f64,
+        kwargs: Option<&Bound<'_, pyo3::types::PyDict>>,
+    ) -> PyResult<Self> {
+        let k = intrinsics_matrix(fx, fy, cx, cy);
+        let settings = parse_settings(kwargs)?;
+        Ok(Self {
+            inner: Sparse3DFilter::invdepth_additive3d(k, settings),
+        })
+    }
+
+    /// Camera-agnostic bearing inverse-depth chart. Takes a camera model
+    /// (pinhole / radtan / equidistant fisheye) and consumes RAW pixels,
+    /// undistorting once through that camera; K is derived from the camera
+    /// intrinsics. Pass a `PinholeCamera` for the pre-undistorted pinhole-K
+    /// domain (e.g. the EuRoC parity harness), or an `EquidistantCamera` for
+    /// true wide-FoV fisheye.
+    #[staticmethod]
+    #[pyo3(signature = (camera, **kwargs))]
+    fn bearing_invdepth_additive3d(
+        camera: &Bound<'_, pyo3::types::PyAny>,
+        kwargs: Option<&Bound<'_, pyo3::types::PyDict>>,
+    ) -> PyResult<Self> {
+        let (fx, fy, cx, cy) = crate::camera::intrinsics_of(camera)?;
+        let k = intrinsics_matrix(fx, fy, cx, cy);
+        let settings = parse_settings(kwargs)?;
+        let cam = crate::camera::to_camera_arc(camera)?;
+        Ok(Self {
+            inner: Sparse3DFilter::bearing_invdepth3d(k, cam, settings),
+        })
+    }
+
+    #[pyo3(signature = (stamp, feature_uvs, t_wc, p_vv=None, p_ww=None))]
+    fn update(
+        &mut self,
+        stamp: f64,
+        feature_uvs: HashMap<u64, [f32; 2]>,
+        t_wc: [[f64; 4]; 4],
+        p_vv: Option<[[f64; 3]; 3]>,
+        p_ww: Option<[[f64; 3]; 3]>,
+    ) {
         let cam_coords: HashMap<u64, Vector2<f32>> = feature_uvs
             .into_iter()
             .map(|(id, uv)| (id, Vector2::new(uv[0], uv[1])))
             .collect();
         let measurement = VisionMeasurement::new(stamp, cam_coords);
         let t = array_to_matrix4(&t_wc);
-        self.inner.update(&measurement, &t, None);
+        let p_vv_mat = p_vv.map(|m| array_to_matrix3(&m));
+        let p_ww_mat = p_ww.map(|m| array_to_matrix3(&m));
+        self.inner
+            .update(&measurement, &t, p_vv_mat.as_ref(), p_ww_mat.as_ref());
     }
 
     fn query(&self, feature_id: u64) -> (f64, f64) {
         self.inner.query(feature_id)
     }
 
+    /// True if Sparse3D is tracking this id at all -- live OR pending. Pending is the
+    /// important half: those are newly-tracked features that have no usable prior yet,
+    /// and are exactly the ones that should be DEFERRED rather than born at the constant
+    /// sceneDepth. get_features() only reports live features and would miss them.
+    /// (range, range_var) with the same convergence gates the EqF seeding path uses
+    /// (min_track_length, conv_inlier_ratio, conv_variance_threshold). Returns
+    /// (-1, inf) when the landmark is not usable as a prior. `query` applies the same
+    /// gates but to DEPTH; seeding reads range, so expose both.
+    fn query_range(&self, fid: u64) -> (f64, f64) {
+        self.inner.query_range(fid)
+    }
+
+    fn has_track(&self, fid: u64) -> bool {
+        self.inner.has_track(fid)
+    }
+
     fn get_features<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
         let dict = pyo3::types::PyDict::new(py);
+        let chart = self.inner.chart();
         for feat in self.inner.features_iter() {
             let feat_dict = pyo3::types::PyDict::new(py);
             feat_dict.set_item(
@@ -72,8 +137,60 @@ impl PySparse3DFilter {
                     Array1::from_vec(vec![feat.position[0], feat.position[1], feat.position[2]]),
                 ),
             )?;
+            let cov = feat.covariance;
+            let cov_arr = Array2::from_shape_vec(
+                (3, 3),
+                vec![
+                    cov[(0, 0)],
+                    cov[(0, 1)],
+                    cov[(0, 2)],
+                    cov[(1, 0)],
+                    cov[(1, 1)],
+                    cov[(1, 2)],
+                    cov[(2, 0)],
+                    cov[(2, 1)],
+                    cov[(2, 2)],
+                ],
+            )
+            .expect("3x3 covariance shape is valid");
+            feat_dict.set_item("covariance", PyArray2::from_owned_array(py, cov_arr))?;
+            let cov_euc = feat.covariance_euclidean(chart);
+            let cov_euc_arr = Array2::from_shape_vec(
+                (3, 3),
+                vec![
+                    cov_euc[(0, 0)],
+                    cov_euc[(0, 1)],
+                    cov_euc[(0, 2)],
+                    cov_euc[(1, 0)],
+                    cov_euc[(1, 1)],
+                    cov_euc[(1, 2)],
+                    cov_euc[(2, 0)],
+                    cov_euc[(2, 1)],
+                    cov_euc[(2, 2)],
+                ],
+            )
+            .expect("3x3 euclidean covariance shape is valid");
+            feat_dict.set_item(
+                "covariance_euclidean",
+                PyArray2::from_owned_array(py, cov_euc_arr),
+            )?;
+            // Anchor camera position (translation of anchor_t_wc). Features sharing an
+            // anchor frame share this exactly, so it identifies distinct anchors -- which is
+            // what bounds the pose-window size if anchor poses are kept in the filter state.
+            feat_dict.set_item(
+                "anchor_t",
+                PyArray1::from_owned_array(
+                    py,
+                    Array1::from_vec(vec![
+                        feat.anchor_t_wc[(0, 3)],
+                        feat.anchor_t_wc[(1, 3)],
+                        feat.anchor_t_wc[(2, 3)],
+                    ]),
+                ),
+            )?;
             feat_dict.set_item("track_length", feat.track_length)?;
             feat_dict.set_item("inlier_ratio", feat.inlier_ratio())?;
+            feat_dict.set_item("nis", feat.last_nis)?;
             dict.set_item(feat.feat_id, feat_dict)?;
         }
         Ok(dict)
@@ -95,30 +212,71 @@ fn array_to_matrix4(a: &[[f64; 4]; 4]) -> Matrix4<f64> {
     )
 }
 
+fn array_to_matrix3(a: &[[f64; 3]; 3]) -> Matrix3<f64> {
+    Matrix3::new(
+        a[0][0], a[0][1], a[0][2], a[1][0], a[1][1], a[1][2], a[2][0], a[2][1], a[2][2],
+    )
+}
+
 fn parse_settings(kwargs: Option<&Bound<'_, pyo3::types::PyDict>>) -> PyResult<SparseVogSettings> {
     let mut s = SparseVogSettings::default();
     let Some(kw) = kwargs else { return Ok(s) };
 
-    if let Some(v) = kw.get_item("max_pool_size")? {
-        s.max_pool_size = v.extract()?;
+    // Expose every trajectory-affecting setting so callers (e.g. the golden
+    // parity fixture) can pin them identically to the pure-Python filter.
+    // Rust and Python defaults have diverged (init_depth_var, ab_max,
+    // min_inlier_ratio, max_depth), so relying on defaults is not safe.
+    macro_rules! set {
+        ($name:literal, $field:ident) => {
+            if let Some(v) = kw.get_item($name)? {
+                s.$field = v.extract()?;
+            }
+        };
     }
-    if let Some(v) = kw.get_item("min_track_length")? {
-        s.min_track_length = v.extract()?;
-    }
-    if let Some(v) = kw.get_item("sigma_pixel")? {
-        s.sigma_pixel = v.extract()?;
-    }
-    if let Some(v) = kw.get_item("conv_inlier_ratio")? {
-        s.conv_inlier_ratio = v.extract()?;
-    }
-    if let Some(v) = kw.get_item("conv_variance_threshold")? {
-        s.conv_variance_threshold = v.extract()?;
-    }
-    if let Some(v) = kw.get_item("min_depth")? {
-        s.min_depth = v.extract()?;
-    }
-    if let Some(v) = kw.get_item("max_depth")? {
-        s.max_depth = v.extract()?;
+
+    set!("max_pool_size", max_pool_size);
+    set!("min_track_length", min_track_length);
+    set!("conv_inlier_ratio", conv_inlier_ratio);
+    set!("conv_variance_threshold", conv_variance_threshold);
+    set!("init_depth_var", init_depth_var);
+    set!("init_invdepth_var", init_invdepth_var);
+    set!("sigma_pixel", sigma_pixel);
+    set!("flow_age_rate_px_per_frame", flow_age_rate_px_per_frame);
+    set!("bias_walk_var", bias_walk_var);
+    set!("uniform_z_max", uniform_z_max);
+    set!("uniform_rho_max", uniform_rho_max);
+    set!("uniform_d_min", uniform_d_min);
+    set!("uniform_d_max", uniform_d_max);
+    set!("a_init", a_init);
+    set!("b_init", b_init);
+    set!("ab_min", ab_min);
+    set!("ab_max", ab_max);
+    set!("min_inlier_ratio", min_inlier_ratio);
+    set!("mahalanobis_reset_chi2", mahalanobis_reset_chi2);
+    set!("process_depth_var", process_depth_var);
+    set!("min_parallax", min_parallax);
+    set!("min_cos_sim", min_cos_sim);
+    set!("min_depth", min_depth);
+    set!("max_depth", max_depth);
+    set!("birth_min_flow_px", birth_min_flow_px);
+    set!("use_equivariant_output", use_equivariant_output);
+    set!("iekf_iterations", iekf_iterations);
+    set!("range_walk_var", range_walk_var);
+    set!("pose_range_scale", pose_range_scale);
+    set!("pose_range_coherent", pose_range_coherent);
+    set!("rotation_unscented", rotation_unscented);
+
+    if let Some(v) = kw.get_item("second_order_mode")? {
+        let mode: String = v.extract()?;
+        s.second_order_mode = match mode.as_str() {
+            "off" => SecondOrderMode::Off,
+            "analytic" | "second_order" => SecondOrderMode::Analytic,
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "unknown second_order_mode {other:?} (expected \"off\" or \"analytic\")"
+                )));
+            }
+        };
     }
 
     Ok(s)

@@ -1,5 +1,5 @@
-use numpy::ndarray::Array1;
-use numpy::PyArray1;
+use numpy::ndarray::{Array1, Array2};
+use numpy::{PyArray1, PyArray2};
 use pyo3::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -10,9 +10,9 @@ use echo_li_core::mathematical::camera::CameraModel;
 use echo_li_core::mathematical::imu_velocity::IMUVelocity;
 use echo_li_core::mathematical::vio_state::{VIOSensorState, VIOState};
 use echo_li_core::mathematical::vision_measurement::VisionMeasurement;
-use echo_li_core::{landmarks_to_global, LandmarkDepthPrior, VIOFilter};
-use echo_lie::SE3;
-use nalgebra::{Matrix4, Vector2, Vector3};
+use echo_li_core::{LandmarkDepthPrior, VIOFilter, landmarks_to_global};
+use echo_lie::{SE3, SO3};
+use nalgebra::{Matrix3, Matrix4, Vector2, Vector3, Vector6};
 use numpy::{PyReadonlyArray2, PyUntypedArrayMethods};
 
 use crate::camera::to_camera_arc;
@@ -25,6 +25,9 @@ pub struct PyVIOFilter {
     imu_buffer: Vec<IMUVelocity>,
     initialized: bool,
     n_init_samples: usize,
+    // Remembered so it survives set_initial_state, which REPLACES self.filter
+    // and would otherwise silently discard the setting.
+    gram_window: usize,
 }
 
 #[pymethods]
@@ -59,6 +62,7 @@ impl PyVIOFilter {
                 imu_buffer: Vec::new(),
                 initialized: false,
                 n_init_samples,
+                gram_window: 0,
             })
         } else {
             Err(pyo3::exceptions::PyTypeError::new_err(
@@ -77,6 +81,41 @@ impl PyVIOFilter {
         let data = t_bs.as_slice()?;
         let m = Matrix4::from_row_slice(data);
         self.camera_extrinsics = Some(SE3::from_matrix(&m));
+        Ok(())
+    }
+
+    /// Seed the filter from a known initial state (e.g. ground truth at a mid-flight start),
+    /// bypassing the stationary-start auto-initialiser. `rotation` is 3x3 body->world;
+    /// `velocity` is body-frame linear velocity. Call after `set_camera_extrinsics`.
+    #[pyo3(signature = (position, rotation, velocity))]
+    fn set_initial_state(
+        &mut self,
+        position: [f64; 3],
+        rotation: PyReadonlyArray2<'_, f64>,
+        velocity: [f64; 3],
+    ) -> PyResult<()> {
+        let shape = rotation.shape();
+        if shape[0] != 3 || shape[1] != 3 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "rotation must be 3x3",
+            ));
+        }
+        let r = SO3::from_matrix(&Matrix3::from_row_slice(rotation.as_slice()?));
+        let pose = SE3::new(r, Vector3::new(position[0], position[1], position[2]));
+        let cam_offset = self.camera_extrinsics.clone().unwrap_or_else(SE3::identity);
+        let sensor = VIOSensorState {
+            input_bias: Vector6::zeros(),
+            pose,
+            velocity: Vector3::new(velocity[0], velocity[1], velocity[2]),
+            camera_offset: cam_offset,
+        };
+        let xi0 = VIOState::new(sensor, vec![]);
+        self.filter = VIOFilter::new(self.filter.settings.clone(), xi0);
+        if self.gram_window > 0 {
+            self.filter.enable_gramian(self.gram_window);
+        }
+        self.imu_buffer.clear();
+        self.initialized = true;
         Ok(())
     }
 
@@ -100,6 +139,9 @@ impl PyVIOFilter {
                 };
                 let xi0 = VIOState::new(sensor, vec![]);
                 self.filter = VIOFilter::new(self.filter.settings.clone(), xi0);
+        if self.gram_window > 0 {
+            self.filter.enable_gramian(self.gram_window);
+        }
                 for buffered_imu in self.imu_buffer.drain(..) {
                     self.filter.process_imu(buffered_imu);
                 }
@@ -163,6 +205,44 @@ impl PyVIOFilter {
             .process_vision_with_depth_priors(measurement, self.camera.as_ref(), &priors);
     }
 
+    /// Same as `process_vision_with_depth_priors`, but with the deferral set the CLI
+    /// already uses: ids in `defer_fallback_ids` that have NO usable prior are skipped
+    /// rather than born at the constant `sceneDepth`. Without this the Python path
+    /// always falls back, so the guard at lib.rs is unreachable from Python.
+    fn process_vision_with_depth_priors_and_deferred(
+        &mut self,
+        stamp: f64,
+        feature_uvs: HashMap<u64, [f32; 2]>,
+        depth_priors: HashMap<u64, [f64; 2]>,
+        defer_fallback_ids: Vec<u64>,
+    ) {
+        if !self.initialized {
+            return;
+        }
+        let cam_coords: HashMap<u64, Vector2<f32>> = feature_uvs
+            .into_iter()
+            .map(|(id, uv)| (id, Vector2::new(uv[0], uv[1])))
+            .collect();
+        let priors: HashMap<u64, LandmarkDepthPrior> = depth_priors
+            .into_iter()
+            .map(|(id, rv)| {
+                (
+                    id,
+                    LandmarkDepthPrior { range: rv[0], range_var: rv[1] },
+                )
+            })
+            .collect();
+        let deferred: std::collections::HashSet<u64> =
+            defer_fallback_ids.into_iter().collect();
+        let measurement = VisionMeasurement::new(stamp, cam_coords);
+        self.filter.process_vision_with_depth_priors_and_deferred_fallbacks(
+            measurement,
+            self.camera.as_ref(),
+            &priors,
+            &deferred,
+        );
+    }
+
     fn get_pose<'py>(
         &self,
         py: Python<'py>,
@@ -206,6 +286,65 @@ impl PyVIOFilter {
             dict.set_item(id, arr)?;
         }
         Ok(dict)
+    }
+
+    /// Current camera pose covariance from the EqF (J * Sigma * J^T through the camera-offset
+    /// adjoint): returns (P_vv, P_ww) as two 3x3 arrays -- position and attitude covariance of
+    /// the camera pose in the camera-fixed (local) frame. Feed these straight into Sparse3DFilter.update
+    /// so the landmark depth covariance accounts for pose uncertainty. None if unavailable.
+    fn get_camera_pose_covariance<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> Option<(Bound<'py, PyArray2<f64>>, Bound<'py, PyArray2<f64>>)> {
+        let mat3 = |m: &Matrix3<f64>| {
+            let data: Vec<f64> = (0..3)
+                .flat_map(|r| (0..3).map(move |c| m[(r, c)]))
+                .collect();
+            PyArray2::from_owned_array(py, Array2::from_shape_vec((3, 3), data).unwrap())
+        };
+        self.filter
+            .sparse_camera_pose_covariances()
+            .map(|(p_vv, p_ww)| (mat3(&p_vv), mat3(&p_ww)))
+    }
+
+    /// Enable observability-Gramian accumulation over `window` vision frames (0 = off).
+    fn enable_gramian(&mut self, window: usize) {
+        self.gram_window = window;
+        self.filter.enable_gramian(window);
+    }
+
+    /// (gramian 21x21, frames, resets) or None until a full window has accumulated.
+    /// Row/col 12..15 is body velocity, matching get_velocity_covariance.
+    fn get_observability_gramian<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> Option<(Bound<'py, PyArray2<f64>>, usize, usize)> {
+        self.filter.observability_gramian().map(|(g, f, r)| {
+            let mut data: Vec<f64> = Vec::with_capacity(21 * 21);
+            for i in 0..21 {
+                for j in 0..21 {
+                    data.push(g[(i, j)]);
+                }
+            }
+            (
+                PyArray2::from_owned_array(py, Array2::from_shape_vec((21, 21), data).unwrap()),
+                f,
+                r,
+            )
+        })
+    }
+
+    /// Full 3x3 body-velocity covariance block from the EqF Riccati matrix.
+    ///
+    /// Body-frame velocity is the gauge-free observable (unlike global position/yaw), so this
+    /// is the block to score covariance consistency (NEES) against. None if unavailable.
+    fn get_velocity_covariance<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray2<f64>>> {
+        self.filter.velocity_covariance().map(|m| {
+            let data: Vec<f64> = (0..3)
+                .flat_map(|r| (0..3).map(move |c| m[(r, c)]))
+                .collect();
+            PyArray2::from_owned_array(py, Array2::from_shape_vec((3, 3), data).unwrap())
+        })
     }
 
     fn get_covariance_diagonal<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {

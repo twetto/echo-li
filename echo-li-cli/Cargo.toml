@@ -9,6 +9,7 @@ parallel = ["echo-li-core/parallel", "rudolf-v/parallel"]
 
 [dependencies]
 echo-li-core = { path = "../echo-li-core" }
+camera-geometry.workspace = true
 echo-lie = { path = "../echo-lie" }
 rudolf-v.workspace = true
 nalgebra.workspace = true

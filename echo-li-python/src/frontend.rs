@@ -24,11 +24,31 @@ pub struct FrontendConfig {
     #[pyo3(get, set)]
     pub klt_max_iter: usize,
     #[pyo3(get, set)]
+    pub klt_warp: String,
+    #[pyo3(get, set)]
+    pub klt_residual: bool,
+    #[pyo3(get, set)]
+    pub klt_fb_threshold_px: f32,
+    #[pyo3(get, set)]
+    pub enable_ransac: bool,
+    #[pyo3(get, set)]
+    pub epipolar_gate_threshold: f64,
+    #[pyo3(get, set)]
+    pub epipolar_refine: bool,
+    #[pyo3(get, set)]
+    pub epipolar_min_baseline: f64,
+    #[pyo3(get, set)]
+    pub epipolar_max_reject_frac: f64,
+    #[pyo3(get, set)]
     pub lbp_verification: bool,
     #[pyo3(get, set)]
     pub lbp_policy: String,
     #[pyo3(get, set)]
     pub histeq: String,
+    #[pyo3(get, set)]
+    pub clahe_tile_size: usize,
+    #[pyo3(get, set)]
+    pub clahe_clip_limit: f32,
     intrinsics: Option<(f64, f64, f64, f64, usize, usize, Vec<f64>)>,
 }
 
@@ -42,9 +62,19 @@ impl FrontendConfig {
         cell_size = 64,
         klt_window = 21,
         klt_max_iter = 30,
+        klt_warp = "translation".to_string(),
+        klt_residual = false,
+        klt_fb_threshold_px = 0.0,
+        enable_ransac = true,
+        epipolar_gate_threshold = 0.0,
+        epipolar_refine = false,
+        epipolar_min_baseline = 1e-3,
+        epipolar_max_reject_frac = 0.5,
         lbp_verification = true,
         lbp_policy = "soft".to_string(),
         histeq = "global".to_string(),
+        clahe_tile_size = 256,
+        clahe_clip_limit = 4.0,
     ))]
     fn new(
         max_features: usize,
@@ -53,9 +83,19 @@ impl FrontendConfig {
         cell_size: usize,
         klt_window: usize,
         klt_max_iter: usize,
+        klt_warp: String,
+        klt_residual: bool,
+        klt_fb_threshold_px: f32,
+        enable_ransac: bool,
+        epipolar_gate_threshold: f64,
+        epipolar_refine: bool,
+        epipolar_min_baseline: f64,
+        epipolar_max_reject_frac: f64,
         lbp_verification: bool,
         lbp_policy: String,
         histeq: String,
+        clahe_tile_size: usize,
+        clahe_clip_limit: f32,
     ) -> Self {
         Self {
             max_features,
@@ -64,9 +104,19 @@ impl FrontendConfig {
             cell_size,
             klt_window,
             klt_max_iter,
+            klt_warp,
+            klt_residual,
+            klt_fb_threshold_px,
+            enable_ransac,
+            epipolar_gate_threshold,
+            epipolar_refine,
+            epipolar_min_baseline,
+            epipolar_max_reject_frac,
             lbp_verification,
             lbp_policy,
             histeq,
+            clahe_tile_size,
+            clahe_clip_limit,
             intrinsics: None,
         }
     }
@@ -77,11 +127,13 @@ impl FrontendConfig {
             pyo3::exceptions::PyIOError::new_err(format!("Failed to load config: {e}"))
         })?;
         let rv = &vio_config.rudolf_v;
-        let histeq = if rv.equalise_image_histogram {
-            "global".to_string()
-        } else {
-            "none".to_string()
-        };
+        let histeq = rv.histeq.clone().unwrap_or_else(|| {
+            if rv.equalise_image_histogram {
+                "global".to_string()
+            } else {
+                "none".to_string()
+            }
+        });
         let lbp_policy = rv.lbp_policy.as_deref().unwrap_or("soft").to_string();
         let defaults = frontend::FrontendConfig::default();
         Ok(Self {
@@ -91,9 +143,19 @@ impl FrontendConfig {
             cell_size: rv.feature_dist as usize,
             klt_window: defaults.klt_window,
             klt_max_iter: defaults.klt_max_iter,
+            klt_warp: "translation".to_string(),
+            klt_residual: rv.klt_residual,
+            klt_fb_threshold_px: 0.0,
+            enable_ransac: rv.enable_ransac,
+            epipolar_gate_threshold: rv.epipolar_gate_threshold,
+            epipolar_refine: rv.epipolar_refine,
+            epipolar_min_baseline: rv.epipolar_min_baseline,
+            epipolar_max_reject_frac: rv.epipolar_max_reject_frac,
             lbp_verification: defaults.lbp_verification_enabled,
             lbp_policy,
             histeq,
+            clahe_tile_size: rv.clahe_tile_size,
+            clahe_clip_limit: rv.clahe_clip_limit,
             intrinsics: None,
         })
     }
@@ -119,7 +181,13 @@ impl FrontendConfig {
         };
         format!(
             "FrontendConfig(max_features={}, fast_threshold={}, pyramid_levels={}, cell_size={}, lbp={}, histeq={}, {})",
-            self.max_features, self.fast_threshold, self.pyramid_levels, self.cell_size, self.lbp_policy, self.histeq, cam
+            self.max_features,
+            self.fast_threshold,
+            self.pyramid_levels,
+            self.cell_size,
+            self.lbp_policy,
+            self.histeq,
+            cam
         )
     }
 }
@@ -133,17 +201,24 @@ impl FrontendConfig {
         cfg.cell_size = self.cell_size;
         cfg.klt_window = self.klt_window;
         cfg.klt_max_iter = self.klt_max_iter;
+        cfg.klt_method = LkMethod::InverseCompositional;
+        cfg.klt_residual_enabled = self.klt_residual;
+        cfg.klt_fb_threshold_px = self.klt_fb_threshold_px;
+        cfg.enable_internal_ransac = self.enable_ransac;
+        cfg.epipolar_gate_threshold = self.epipolar_gate_threshold;
+        cfg.epipolar_refine = self.epipolar_refine;
+        cfg.epipolar_min_baseline = self.epipolar_min_baseline;
+        cfg.epipolar_max_reject_frac = self.epipolar_max_reject_frac;
         cfg.lbp_verification_enabled = self.lbp_verification;
         cfg.lbp_policy = match self.lbp_policy.to_ascii_lowercase().as_str() {
             "hardreject" | "hard_reject" | "hard-reject" | "hard" => LbpPolicy::HardReject,
             _ => LbpPolicy::SoftPenalty,
         };
-        cfg.klt_method = LkMethod::InverseCompositional;
         cfg.histeq = match self.histeq.to_ascii_lowercase().as_str() {
             "global" => HistEqMethod::Global,
             "clahe" => HistEqMethod::Clahe {
-                tile_size: 8,
-                clip_limit: 4.0,
+                tile_size: self.clahe_tile_size,
+                clip_limit: self.clahe_clip_limit,
             },
             _ => HistEqMethod::None,
         };
@@ -227,6 +302,26 @@ impl PyFrontend {
         self.inner.drop_tracks(&ids)
     }
 
+    /// Relative-pose prior for the NEXT process() call: 4x4 T (prev camera ->
+    /// current camera, i.e. x_curr ~ R x_prev + t). Enables the epipolar gate
+    /// when epipolar_gate_threshold > 0.
+    fn set_pose_prior(&mut self, t_rel: PyReadonlyArray2<'_, f64>) -> PyResult<()> {
+        let a = t_rel.as_array();
+        if a.shape() != [4, 4] {
+            return Err(pyo3::exceptions::PyValueError::new_err("t_rel must be 4x4"));
+        }
+        let mut r = [[0.0f64; 3]; 3];
+        let mut t = [0.0f64; 3];
+        for i in 0..3 {
+            for j in 0..3 {
+                r[i][j] = a[[i, j]];
+            }
+            t[i] = a[[i, 3]];
+        }
+        self.inner.set_pose_prior(r, t);
+        Ok(())
+    }
+
     fn reset(&mut self) {
         self.inner.reset();
     }
@@ -252,6 +347,7 @@ impl PyFrontend {
             dict.set_item("id", m.id)?;
             dict.set_item("age", m.age)?;
             dict.set_item("klt_quality", m.klt_quality)?;
+            dict.set_item("lbp_distance", m.lbp_distance)?;
             dict.set_item("reservoir_score", m.reservoir_score)?;
             dict.set_item("is_ekf_landmark", m.is_ekf_landmark)?;
             meta_list.append(dict)?;

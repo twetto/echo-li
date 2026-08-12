@@ -10,6 +10,24 @@ pub enum DepthParametrization {
     Polar,
 }
 
+/// Second-order measurement-update mode for the 3D IEKF.
+///
+/// Restores the dropped projective curvature so the reported covariance is
+/// honest at weak parallax: the first-order projection Jacobian drops the
+/// curvature of the inverse-depth map, which under-reports variance exactly
+/// where the baseline is short and the depth is least determined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SecondOrderMode {
+    /// First-order (iterated) EKF; `iekf_iterations` applies. Default.
+    #[default]
+    Off,
+    /// Analytic second-order EqF. Adds closed-form innovation inflation and
+    /// predicted-measurement bias correction.
+    Analytic,
+    // Option B (future): unscented / sigma-point EqF.
+    // Unscented,
+}
+
 #[derive(Debug, Clone)]
 pub struct SparseVogSettings {
     pub parametrization: DepthParametrization,
@@ -20,6 +38,12 @@ pub struct SparseVogSettings {
     pub init_depth_var: f64,
     pub init_invdepth_var: f64,
     pub sigma_pixel: f64,
+    /// Optional per-feature-age pixel-noise inflation used by Sparse3D's 2D
+    /// image-residual updates:
+    /// `sigma_eff^2 = sigma_pixel^2 + (flow_age_rate_px_per_frame * age)^2`.
+    /// The scalar 1D `SparseGBFilter` keeps its historical triangulated-depth
+    /// noise model and does not consume this setting.
+    pub flow_age_rate_px_per_frame: f64,
     pub uniform_z_max: f64,
     pub uniform_rho_max: f64,
     pub uniform_d_min: f64,
@@ -35,7 +59,79 @@ pub struct SparseVogSettings {
     pub min_cos_sim: f64,
     pub min_depth: f64,
     pub max_depth: f64,
-    pub reanchor_flow_px: f64,
+    /// Minimum pixel flow a feature must accumulate since first sight before it is
+    /// birthed. Two-view triangulation is severely biased toward the camera at low
+    /// parallax, so a feature is held pending until it has moved this far, then
+    /// triangulated and anchored in the frame where it is born. Despite the historical
+    /// name this never re-anchors an existing landmark: anchors are fixed at birth.
+    pub birth_min_flow_px: f64,
+    /// Average the perspective output Jacobian between the predicted and the
+    /// measured normalized image coords in the 3D bearing update, like the EqF
+    /// coordinate suite's `output_matrix_ci_star`. NOTE: experiments show this
+    /// *worsens* consistency when grafted onto `Sparse3DFilter` (a plain
+    /// chart-EKF) -- putting the measurement into H correlates it with the
+    /// measurement noise, which the EKF covariance update assumes away, so the
+    /// covariance collapses. The EqF avoids this via its equivariant error
+    /// coordinates + lifted innovation; the output approximation is not a
+    /// drop-in for a non-equivariant filter. Kept behind this flag (default
+    /// off) for experimentation. Only consumed by `Sparse3DFilter`.
+    pub use_equivariant_output: bool,
+    /// Number of measurement relinearizations in the 3D update (iterated EKF).
+    /// 1 = plain EKF (linearize once at the prior). >1 relinearizes the
+    /// projection at the posterior to cancel the bearing-only depth bias at weak
+    /// parallax (cf. ROVIO / the 1D sparse_vogiatzis iterated update). Only
+    /// consumed by `Sparse3DFilter`. Ignored when `second_order_mode` is not
+    /// `Off` (the second-order filter does the bias correction in closed form).
+    pub iekf_iterations: usize,
+    /// Second-order EqF measurement-update mode (covariance inflation + bias
+    /// correction). See `SecondOrderMode`. Only consumed by `Sparse3DFilter`.
+    pub second_order_mode: SecondOrderMode,
+    /// Per-step radial random-walk process noise for the 3D IEKF, as a fraction
+    /// of range squared added to the landmark covariance each update.
+    /// The IEKF has no propagation, so without a floor the static-landmark covariance
+    /// collapses below the un-modelled triangulation/range bias and NEES grows
+    /// with depth. Default 0 (off). Distinct from `process_depth_var` (the 1D
+    /// filter's un-scaled per-step term). Only consumed by `Sparse3DFilter`.
+    /// Scales with range^2 so the injected uncertainty is a fixed *relative*
+    /// depth uncertainty rather than an absolute one.
+    pub range_walk_var: f64,
+    /// Scale on the *pose-driven* range process noise (eq. 10-11 of the Sparse3D
+    /// formulation). When > 0 and per-frame incremental pose covariances (p_vv, p_ww)
+    /// are supplied to `update`, each frame injects a range (radial) process noise
+    /// q = scale * (r^2/b^2)(r^2 * sig_phi^2 + sig_t^2) along the line of sight, where
+    /// r is the current range, b the anchor->current baseline, and sig_.^2 the
+    /// incremental relative-pose variances. This is the channel that CAN inflate the
+    /// depth covariance (the measurement-noise term proj*P*proj^T is radial-blind:
+    /// d(pi)/dq * r_hat = 0). Per-landmark via the inverse-parallax r/b factor.
+    /// Default 0 (off). Only consumed by the `BearingInvDepthAdditive` update.
+    pub pose_range_scale: f64,
+    /// Coherent (bias-driven) companion to `pose_range_scale`, fixing its GROWTH RATE.
+    ///
+    /// `pose_range_scale` injects a near-constant increment each frame, so the variance it
+    /// accumulates grows ~linearly in track age N (a random walk). A *persistent* pose bias
+    /// instead makes the range error grow ~N, hence its variance ~N^2 -- a different power,
+    /// which no scalar multiplier can produce. Adding `2*N*c*x` per frame telescopes to
+    /// `N^2*c*x` (sum of 2n over n=1..N), so the total is `scale*x*N + coherent*x*N^2` and
+    /// the effective exponent interpolates between 1 and 2 via the ratio. Here
+    /// `x = (r^2/b^2)(r^2 sig_phi^2 + sig_t^2)` as for `pose_range_scale`.
+    ///
+    /// Default 0 (off). No constant value has been found that works across pose runs of
+    /// differing quality: the reported covariance is wrong in both level and growth rate,
+    /// and one constant cannot correct both.
+    pub pose_range_coherent: f64,
+    /// Per-frame random-walk variance (px^2) of a per-track 2D correspondence-bias
+    /// state augmented onto the landmark in the `BearingInvDepthAdditive` update.
+    /// Measurement model becomes `u = pi(P(s)) + b + eps`, `b_k = b_{k-1} + w_k`,
+    /// `w_k ~ N(0, bias_walk_var I)`. The bias absorbs the temporally-correlated
+    /// KLT/Rudolf correspondence drift so repeated same-track observations are not
+    /// over-counted (exact-GT MidAir shows this drift is a random walk, not a
+    /// constant offset). Default 0 (off) -> plain 3-DOF landmark EKF, exact prior
+    /// behavior. Only consumed by `Sparse3DFilter`'s bearing-invdepth chart.
+    /// Absorbs slow correspondence drift (the tracked pixel sliding off its
+    /// landmark) as a random-walk pixel bias, so it is not misread as parallax.
+    pub bias_walk_var: f64,
+    /// Experimental sigma-point rotation propagation for the additive chart.
+    pub rotation_unscented: bool,
 }
 
 impl Default for SparseVogSettings {
@@ -49,6 +145,7 @@ impl Default for SparseVogSettings {
             init_depth_var: 1.0,
             init_invdepth_var: 1.0,
             sigma_pixel: 0.5,
+            flow_age_rate_px_per_frame: 0.0,
             uniform_z_max: 20.0,
             uniform_rho_max: 10.0,
             uniform_d_min: -5.0,
@@ -64,7 +161,15 @@ impl Default for SparseVogSettings {
             min_cos_sim: 0.95,
             min_depth: 0.1,
             max_depth: 100.0,
-            reanchor_flow_px: 3.0,
+            birth_min_flow_px: 3.0,
+            use_equivariant_output: false,
+            iekf_iterations: 1,
+            second_order_mode: SecondOrderMode::Off,
+            range_walk_var: 0.0,
+            pose_range_scale: 0.0,
+            pose_range_coherent: 0.0,
+            bias_walk_var: 0.0,
+            rotation_unscented: false,
         }
     }
 }

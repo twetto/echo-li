@@ -1,4 +1,5 @@
 use clap::Parser;
+use camera_geometry::CameraProjection;
 use echo_li_core::config::VIOConfig;
 use echo_li_core::core_types::CameraIntrinsics;
 use echo_li_core::dataserver::ASLDatasetReader;
@@ -14,7 +15,6 @@ use echo_li_core::mathematical::*;
 use echo_li_core::trajectory_metrics::TrajectoryMetrics;
 use echo_li_core::{LandmarkDepthPrior, VIOFilter, VIOFilterSettings};
 use nalgebra::{Matrix3, Matrix4, Vector2};
-use rudolf_v::camera::CameraIntrinsics as RudolfCameraIntrinsics;
 use rudolf_v::camera::StereoRig;
 use rudolf_v::frontend::{Frontend, FrontendConfig, LbpPolicy};
 use rudolf_v::image::Image as RudolfImage;
@@ -611,7 +611,7 @@ fn send_rerun_blueprint(
 
 fn build_camera_model(
     reader: &ASLDatasetReader,
-) -> (Arc<dyn CameraModel>, Matrix3<f64>, usize, usize) {
+) -> Result<(Arc<dyn CameraModel>, Matrix3<f64>, usize, usize), Box<dyn std::error::Error>> {
     if let Some(intr) = &reader.intrinsics {
         println!(
             "Camera intrinsics: {}x{} fx={:.1} fy={:.1} cx={:.1} cy={:.1}",
@@ -630,29 +630,28 @@ fn build_camera_model(
         } else {
             println!("Distortion: none (pinhole)");
         }
-        let rudolf_cam = RudolfCameraIntrinsics {
-            fx: intr.fx,
-            fy: intr.fy,
-            cx: intr.cx,
-            cy: intr.cy,
-            resolution: [intr.width, intr.height],
-            distortion,
-        };
-        (
-            Arc::new(rudolf_cam) as Arc<dyn CameraModel>,
+        let projection = CameraProjection::from_kalibr_parts(
+            intr.camera_model.as_deref().unwrap_or("pinhole"),
+            intr.distortion_model.as_deref(),
+            [intr.fx, intr.fy, intr.cx, intr.cy],
+            &distortion,
+            [intr.width, intr.height],
+        )?;
+        Ok((
+            Arc::new(projection) as Arc<dyn CameraModel>,
             Matrix3::new(intr.fx, 0.0, intr.cx, 0.0, intr.fy, intr.cy, 0.0, 0.0, 1.0),
             intr.width,
             intr.height,
-        )
+        ))
     } else {
         println!("No intrinsics found, using EuRoC defaults");
-        let rudolf_cam = RudolfCameraIntrinsics::new(458.65, 457.3, 367.2, 248.3, 752, 480);
-        (
-            Arc::new(rudolf_cam) as Arc<dyn CameraModel>,
+        let projection = CameraProjection::pinhole([458.65, 457.3, 367.2, 248.3], [752, 480]);
+        Ok((
+            Arc::new(projection) as Arc<dyn CameraModel>,
             Matrix3::new(458.65, 0.0, 367.2, 0.0, 457.3, 248.3, 0.0, 0.0, 1.0),
             752,
             480,
-        )
+        ))
     }
 }
 
@@ -804,7 +803,7 @@ fn build_patch_depth_mapper(
             }
             t_c1_c0[(r, 3)] = rig.t_10[r];
         }
-        mapper.init_stereo_ref(&rig.cam1, t_c1_c0);
+        mapper.init_stereo_ref(&rig.cam1.projection(), t_c1_c0);
         println!(
             "Patch depth: stereo ref from cam1 (baseline={:.4}m)",
             rig.baseline_meters()
@@ -944,7 +943,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         settings.max_landmarks
     );
 
-    let (cam_model, k_matrix, img_w, img_h) = build_camera_model(&reader);
+    let (cam_model, k_matrix, img_w, img_h) = build_camera_model(&reader)?;
 
     let patch_depth_enabled = !args.no_patch_depth
         && (args.patch_depth
@@ -1305,7 +1304,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let state_hash = trace_determinism.then(|| hash_state(&state));
                     let t_wc = camera_pose_matrix(&state);
                     if let Some(sparse) = &mut sparse_filter {
-                        sparse.update(&sparse_measurement, &t_wc, None);
+                        let sparse_pose_cov = f.sparse_camera_pose_covariances();
+                        let (p_vv, p_ww) = sparse_pose_cov
+                            .as_ref()
+                            .map(|(p_vv, p_ww)| (Some(p_vv), Some(p_ww)))
+                            .unwrap_or((None, None));
+                        let sparse_meas =
+                            if sparse.chart() == Sparse3DChart::BearingInvDepthAdditive {
+                                &measurement
+                            } else {
+                                &sparse_measurement
+                            };
+                        sparse.update(sparse_meas, &t_wc, p_vv, p_ww);
                         if let Some(mapper) = &mut patch_depth_mapper {
                             if !patch_gray_data.is_empty() {
                                 let frame = FrameProducts {

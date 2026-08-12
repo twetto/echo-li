@@ -2,15 +2,15 @@ use echo_lie::SOT3;
 use nalgebra::{DMatrix, DVector, SMatrix, Vector2};
 use std::collections::HashMap;
 
+use crate::ImuBiasGroup;
 use crate::mathematical::bias_group_ops::BiasGroupOps;
 use crate::mathematical::camera::CameraModel;
 use crate::mathematical::eqf_matrices::EqFCoordinateSuite;
 use crate::mathematical::imu_velocity::IMUVelocity;
 use crate::mathematical::vio_group::{
-    lift_velocity, lift_velocity_discrete, state_group_action, vio_exp_with_bias_group, VIOGroup,
+    VIOGroup, lift_velocity, lift_velocity_discrete, state_group_action, vio_exp_with_bias_group,
 };
 use crate::mathematical::vio_state::{Landmark, VIOSensorState, VIOState};
-use crate::ImuBiasGroup;
 
 pub struct VIOEqF {
     pub xi0: VIOState,
@@ -21,13 +21,30 @@ pub struct VIOEqF {
     scratch_m: DMatrix<f64>,
     scratch_sigma: DMatrix<f64>,
     // `Faster` variant accumulator — the sub-frame transition Φ in block form
-    // (Phase 6, see docs/imu_optimization_plan.md). Identity when empty.
+    // (batched per IMU sub-frame instead of per sample). Identity when empty.
     phi_ss: SMatrix<f64, 21, 21>,
     phi_lm_s: DMatrix<f64>,
     phi_lm_s_scratch: DMatrix<f64>,
     phi_li_li: Vec<SMatrix<f64, 3, 3>>,
     accum_dt: f64,
     accum_count: usize,
+    // --- Observability Gramian over a sliding window (0 = disabled) ---------
+    // O = sum_k (C_k Psi_k)^T R_k^-1 (C_k Psi_k), restricted to the 21 sensor
+    // columns, where Psi_k is the accumulated transition from the window start.
+    // This measures how much information the filter has actually EARNED about
+    // each sensor direction, which is computable from the Jacobians alone --
+    // unlike the error itself. A direction whose reported covariance is smaller
+    // than the inverse of its accumulated information is provably over-confident.
+    // C has zeros in all 21 sensor columns (vision informs bearings only), so the
+    // sensor information arrives entirely through Psi_lm_s, the landmark-sensor
+    // coupling built during propagation.
+    gram_window: usize,
+    gram: DMatrix<f64>,
+    gpsi_ss: SMatrix<f64, 21, 21>,
+    gpsi_lm_s: DMatrix<f64>,
+    gram_ids: Vec<u64>,
+    gram_frames: usize,
+    gram_resets: usize,
     last_b_s: SMatrix<f64, 21, 12>,
     last_b_lm: DMatrix<f64>,
 }
@@ -61,6 +78,13 @@ impl VIOEqF {
             phi_li_li: vec![SMatrix::<f64, 3, 3>::identity(); n_lm],
             accum_dt: 0.0,
             accum_count: 0,
+            gram_window: 0,
+            gram: DMatrix::<f64>::zeros(21, 21),
+            gpsi_ss: SMatrix::<f64, 21, 21>::identity(),
+            gpsi_lm_s: DMatrix::<f64>::zeros(0, 21),
+            gram_ids: Vec::new(),
+            gram_frames: 0,
+            gram_resets: 0,
             last_b_s: SMatrix::<f64, 21, 12>::zeros(),
             last_b_lm: DMatrix::<f64>::zeros(3 * n_lm, 12),
         }
@@ -173,6 +197,43 @@ impl VIOEqF {
         let n_lm = (n - s) / 3;
         let f_ss_t = f_ss.transpose();
         let f_lm_s_t = f_lm_s.transpose();
+
+        // Psi <- Phi Psi, with Phi = [[F_ss, 0], [F_lm_s, F_li_li]]:
+        //   Psi_lm_s' = F_lm_s Psi_ss + F_li_li Psi_lm_s   (before Psi_ss is overwritten)
+        //   Psi_ss'   = F_ss Psi_ss
+        if self.gram_window > 0 {
+            // Landmarks are born and die every vision frame, so a reset on any
+            // dimension change would end the window immediately. Instead remap:
+            // surviving landmarks keep their accumulated coupling, new ones start
+            // at zero (a fresh landmark carries no dependence on the sensor state
+            // at the window start), dead ones are dropped. The window survives.
+            if self.gram_ids != self.x.id {
+                let mut remap = DMatrix::<f64>::zeros(3 * n_lm, 21);
+                for (i, id) in self.x.id.iter().enumerate().take(n_lm) {
+                    if let Some(j) = self.gram_ids.iter().position(|o| o == id) {
+                        if 3 * j + 3 <= self.gpsi_lm_s.nrows() {
+                            let src = self.gpsi_lm_s.view((3 * j, 0), (3, 21)).into_owned();
+                            remap.view_mut((3 * i, 0), (3, 21)).copy_from(&src);
+                        }
+                    }
+                }
+                self.gpsi_lm_s = remap;
+                self.gram_ids = self.x.id.clone();
+            }
+            {
+                // f_lm_s * gpsi_ss is Dyn x Const<21>; gpsi_lm_s is fully dynamic.
+                let prod = f_lm_s * self.gpsi_ss;
+                let mut lm_new =
+                    DMatrix::<f64>::from_column_slice(prod.nrows(), 21, prod.as_slice());
+                for (i, f_i) in f_li_li.iter().enumerate().take(n_lm) {
+                    let cur = lm_new.view((3 * i, 0), (3, 21)).into_owned();
+                    let blk = f_i * self.gpsi_lm_s.view((3 * i, 0), (3, 21)) + cur;
+                    lm_new.view_mut((3 * i, 0), (3, 21)).copy_from(&blk);
+                }
+                self.gpsi_lm_s = lm_new;
+                self.gpsi_ss = f_ss * self.gpsi_ss;
+            }
+        }
 
         // ---- Step 1: M = F · Σ ----
         {
@@ -300,7 +361,7 @@ impl VIOEqF {
     /// `Faster` variant — apply the batched sub-frame transition:
     /// Σ ← Φ·Σ·Φ^T + (Σ dt)·(B_last·InputGain·B_last^T + StateGain), then reset
     /// the accumulator. `B` is held at the sub-frame's last sample (the Phase 6
-    /// process-noise approximation — see docs/imu_optimization_plan.md). No-op
+    /// process-noise approximation: Q is held constant across the sub-frame). No-op
     /// when nothing is accumulated, so it is safe to call unconditionally.
     pub fn flush_riccati(&mut self, input_gain: &SMatrix<f64, 12, 12>, state_gain: &DMatrix<f64>) {
         if self.accum_count == 0 {
@@ -424,9 +485,152 @@ impl VIOEqF {
         self.perform_stacked_update(suite, &y_tilde, &ct, output_gain, use_discrete_correction);
     }
 
+    /// Bearing + optional stereo log-inverse-range measurement update.
+    ///
+    /// `stereo_meas` maps landmark id -> `(ell_obs, r_ell)`, where
+    /// `ell_obs = -ln(range_s)` (log-inverse-range; the single sign negation from
+    /// Rudolf-V's `+log range` lives at the binding, so this channel only ever
+    /// sees the canonical sign) and `r_ell = Var(range_s)/range_s^2`, the
+    /// first-order propagation of range variance through `ell = -ln(range)`.
+    /// Observed ids absent from the map get the usual 2-row bearing update; ids
+    /// present get an extra log-inverse-range row (Normal chart: `[0,0,+1]`).
+    /// An empty map — or no observed stereo id — is byte-identical to
+    /// `perform_vision_update`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn perform_vision_update_with_stereo<S: EqFCoordinateSuite + ?Sized>(
+        &mut self,
+        suite: &S,
+        y_ids: &[u64],
+        y_coords: &HashMap<u64, Vector2<f64>>,
+        cam: &dyn CameraModel,
+        output_gain: &DMatrix<f64>,
+        use_equivariance: bool,
+        use_discrete_correction: bool,
+        stereo_meas: &HashMap<u64, (f64, f64)>,
+        range_gate_chi2: f64,
+    ) {
+        if y_ids.is_empty() {
+            return;
+        }
+        // No observed stereo landmark -> exact bearing-only path.
+        if !y_ids.iter().any(|id| stereo_meas.contains_key(id)) {
+            self.perform_vision_update(
+                suite,
+                y_ids,
+                y_coords,
+                cam,
+                output_gain,
+                use_equivariance,
+                use_discrete_correction,
+            );
+            return;
+        }
+
+        let n = self.xi0.dim();
+        let xi_hat = self.state_estimate();
+        let sigma_bearing_sq = output_gain[(0, 0)];
+
+        // Row layout: 2 bearing rows per obs, +1 log-inv-range row for stereo obs.
+        let total_rows: usize = y_ids
+            .iter()
+            .map(|id| if stereo_meas.contains_key(id) { 3 } else { 2 })
+            .sum();
+
+        let mut y_tilde = DVector::<f64>::zeros(total_rows);
+        let mut ct = DMatrix::<f64>::zeros(total_rows, n);
+        let mut r_diag = DVector::<f64>::zeros(total_rows);
+
+        let mut row = 0usize;
+        for &id in y_ids {
+            let pos = self
+                .xi0
+                .camera_landmarks
+                .iter()
+                .position(|l| l.id == id)
+                .expect("Landmark ID must exist in state");
+            let q0 = self.xi0.camera_landmarks[pos].p;
+            let q_hat = &self.x.q[pos];
+            let q = &xi_hat.camera_landmarks[pos].p;
+            let uv = *y_coords.get(&id).expect("Observed ID must exist");
+            let col = VIOSensorState::CDIM + 3 * pos;
+
+            // Bearing block (2x3) — same selection as output_matrix_C.
+            let ci_star = if use_equivariance {
+                suite.output_matrix_ci_star(&q0, q_hat, cam, &uv)
+            } else {
+                let p_c = q_hat.inverse().act(&q0);
+                let y_hat = cam.project(&p_c);
+                suite.output_matrix_ci_star(&q0, q_hat, cam, &y_hat)
+            };
+            ct.fixed_view_mut::<2, 3>(row, col).copy_from(&ci_star);
+            y_tilde
+                .fixed_rows_mut::<2>(row)
+                .copy_from(&(uv - cam.project(q)));
+            r_diag[row] = sigma_bearing_sq;
+            r_diag[row + 1] = sigma_bearing_sq;
+            row += 2;
+
+            // Stereo log-inverse-range row (1x3): ell = -ln‖q‖. Gate on the 1-D
+            // innovation (chi²(1)): S = c_ell·Σ_ll·c_ellᵀ + r_ell; drop the row
+            // when (ell_obs - ell_pred)² > gate·S (heavy occlusion/depth-edge
+            // tail). Bearing rows for this landmark are kept regardless.
+            if let Some(&(ell_obs, r_ell)) = stereo_meas.get(&id) {
+                let range_row = suite.output_range_row(&q0);
+                let ell_pred = -q.norm().ln();
+                let d_ell = ell_obs - ell_pred;
+                let sigma_ll = self.sigma.fixed_view::<3, 3>(col, col).into_owned();
+                let s = (range_row * sigma_ll).dot(&range_row) + r_ell;
+                let gated = range_gate_chi2 > 0.0 && s > 0.0 && d_ell * d_ell > range_gate_chi2 * s;
+                if !gated {
+                    ct.fixed_view_mut::<1, 3>(row, col).copy_from(&range_row);
+                    y_tilde[row] = d_ell;
+                    r_diag[row] = r_ell;
+                }
+                // gated => leave the pre-zeroed row (skipped by perform_stacked_update).
+                row += 1;
+            }
+        }
+
+        if !ct.iter().all(|v| v.is_finite()) {
+            return;
+        }
+        let r_noise = DMatrix::from_diagonal(&r_diag);
+        self.perform_stacked_update(suite, &y_tilde, &ct, &r_noise, use_discrete_correction);
+    }
+
     // ------------------------------------------------------------------
     // Sequential scalar update (sparse C, symmetric rank-1 downdate)
     // ------------------------------------------------------------------
+
+    /// Restart the Gramian window at the current state dimension.
+    fn reset_gramian(&mut self, n_lm: usize) {
+        self.gram = DMatrix::<f64>::zeros(21, 21);
+        self.gpsi_ss = SMatrix::<f64, 21, 21>::identity();
+        self.gpsi_lm_s = DMatrix::<f64>::zeros(3 * n_lm, 21);
+        self.gram_ids = self.x.id.clone();
+        self.gram_frames = 0;
+        self.gram_resets += 1;
+    }
+
+    /// Enable (window > 0) or disable (0) observability-Gramian accumulation.
+    pub fn enable_gramian(&mut self, window: usize) {
+        self.gram_window = window;
+        let n_lm = (self.xi0.dim() - VIOSensorState::CDIM) / 3;
+        self.reset_gramian(n_lm);
+        self.gram_resets = 0;
+    }
+
+    /// Accumulated information about the 21-dim sensor state over the current
+    /// window, with the number of vision frames it covers. `None` until a full
+    /// window has accumulated, so callers never see a partially-filled Gramian.
+    pub fn observability_gramian(&self) -> Option<(DMatrix<f64>, usize, usize)> {
+        if self.gram_window == 0 {
+            return None;
+        }
+        // Always report, so callers can see how often the window is being cut
+        // short by state-dimension changes rather than silently getting nothing.
+        Some((self.gram.clone(), self.gram_frames, self.gram_resets))
+    }
 
     pub fn perform_stacked_update<S: EqFCoordinateSuite + ?Sized>(
         &mut self,
@@ -442,6 +646,31 @@ impl VIOEqF {
         }
 
         let n = self.xi0.dim();
+
+        // --- Observability Gramian: O += (C Psi)^T R^-1 (C Psi) ---------------
+        // C's 21 sensor columns are identically zero, so C Psi = C_lm Psi_lm_s.
+        if self.gram_window > 0 && self.gpsi_lm_s.nrows() == n - VIOSensorState::CDIM {
+            // (Psi is kept in step with the live landmark set by the remap in
+            // apply_transport, so this guard holds except on the very first frame.)
+            let s0 = VIOSensorState::CDIM;
+            let c_lm = c_star.view((0, s0), (m, n - s0));
+            let cpsi = c_lm * &self.gpsi_lm_s; // m x 21
+            for j in 0..m {
+                let r_j = r_noise[(j, j)];
+                if !(r_j > 0.0) {
+                    continue;
+                }
+                let row = cpsi.row(j);
+                let outer = row.transpose() * row / r_j;
+                self.gram += outer;
+            }
+            self.gram_frames += 1;
+            if self.gram_frames >= 2 * self.gram_window {
+                let n_lm = (n - s0) / 3;
+                self.reset_gramian(n_lm);
+            }
+        }
+
         let mut gamma = DVector::<f64>::zeros(n);
 
         for j in 0..m {

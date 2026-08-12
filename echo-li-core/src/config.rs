@@ -10,14 +10,76 @@ use crate::depth::sparse_gb::{DepthParametrization, SparseVogSettings};
 #[serde(rename_all = "camelCase")]
 pub struct RudolfVConfig {
     pub equalise_image_histogram: bool,
+    /// Histogram equalisation method: "none", "global", or "clahe". When
+    /// absent, falls back to `equaliseImageHistogram` (true => global).
+    #[serde(default)]
+    pub histeq: Option<String>,
+    /// CLAHE tile size in pixels (used when histeq == "clahe").
+    #[serde(default = "default_clahe_tile_size")]
+    pub clahe_tile_size: usize,
+    /// CLAHE clip limit (used when histeq == "clahe").
+    #[serde(default = "default_clahe_clip_limit")]
+    pub clahe_clip_limit: f32,
     pub feature_dist: f64,
     pub feature_search_threshold: f64,
     #[serde(default)]
     pub fast_threshold: Option<u8>,
+    /// Corner detector: "fast" (default), "harris", or "shi_tomasi".
+    #[serde(default)]
+    pub detector: Option<String>,
+    /// Shi-Tomasi minimum-eigenvalue floor (only used when detector == shi_tomasi).
+    #[serde(default)]
+    pub shi_tomasi_threshold: Option<f32>,
+    /// Shi-Tomasi structure-tensor block size (only used when detector == shi_tomasi).
+    #[serde(default)]
+    pub shi_tomasi_block_size: Option<usize>,
     #[serde(default)]
     pub lbp_policy: Option<String>,
+    /// Compute the level-0 patch residual per track to feed the KLT quality
+    /// term in the reservoir score (extra patch pass; off by default).
+    #[serde(default)]
+    pub klt_residual: bool,
+    /// Run the frontend essential-matrix RANSAC geometric verification. On by
+    /// default, but it degenerates under rotation-dominant motion (translation
+    /// ~0 => E ill-posed) and falsely rejects good tracks. Off => let the EqF's
+    /// soft outlier model handle outliers instead.
+    #[serde(default = "default_true")]
+    pub enable_ransac: bool,
+    /// Squared-Sampson threshold (normalized coords, like ransacParams.
+    /// inlierThreshold) for the pose-prior epipolar gate. Active only on
+    /// frames where a relative-pose prior is supplied (Frontend::
+    /// set_pose_prior); replaces RANSAC there. 0 disables.
+    #[serde(default)]
+    pub epipolar_gate_threshold: f64,
+    /// Consensus refit of the prior gate (kept only if it increases inliers).
+    #[serde(default)]
+    pub epipolar_refine: bool,
+    /// Skip the gate below this inter-frame baseline [m]: near-zero translation
+    /// makes the prior's E pure noise (detonated MH_02's slow segments).
+    #[serde(default = "default_epipolar_min_baseline")]
+    pub epipolar_min_baseline: f64,
+    /// Distrust the prior when it would reject more than this fraction of
+    /// tracks (breaks the reject->starve->diverge feedback loop).
+    #[serde(default = "default_epipolar_max_reject_frac")]
+    pub epipolar_max_reject_frac: f64,
     pub max_features: usize,
     pub max_level: usize,
+}
+
+fn default_epipolar_min_baseline() -> f64 {
+    1e-3
+}
+
+fn default_clahe_tile_size() -> usize {
+    256
+}
+
+fn default_clahe_clip_limit() -> f32 {
+    4.0
+}
+
+fn default_epipolar_max_reject_frac() -> f64 {
+    0.5
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +97,8 @@ pub struct EqfInitialVariance {
     pub camera_attitude: f64,
     pub camera_position: f64,
     pub point: f64,
+    #[serde(default)]
+    pub point_depth: Option<f64>,
     pub position: f64,
     pub velocity: f64,
 }
@@ -78,6 +142,12 @@ pub struct EqfSettings {
     /// (flushed when the next image frame arrives).
     #[serde(default)]
     pub riccati_variant: Option<String>,
+    /// Enable the stereo log-inverse-range measurement channel.
+    #[serde(default)]
+    pub stereo_measurement: bool,
+    /// Chi²(1) gate on the stereo range innovation; 0 disables.
+    #[serde(default)]
+    pub range_gate_chi2: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,6 +199,14 @@ pub struct SparseVogConfig {
     #[serde(default)]
     pub sigma_pixel: Option<f64>,
     #[serde(default)]
+    pub flow_age_rate_px_per_frame: Option<f64>,
+    #[serde(default)]
+    pub bias_walk_var: Option<f64>,
+    #[serde(default)]
+    pub pose_range_scale: Option<f64>,
+    #[serde(default)]
+    pub pose_range_coherent: Option<f64>,
+    #[serde(default)]
     pub uniform_z_max: Option<f64>,
     #[serde(default)]
     pub uniform_rho_max: Option<f64>,
@@ -158,8 +236,8 @@ pub struct SparseVogConfig {
     pub min_depth: Option<f64>,
     #[serde(default)]
     pub max_depth: Option<f64>,
-    #[serde(default)]
-    pub reanchor_flow_px: Option<f64>,
+    #[serde(default, alias = "reanchor_flow_px")]
+    pub birth_min_flow_px: Option<f64>,
     #[serde(default)]
     pub vis_min_depth: Option<f64>,
     #[serde(default)]
@@ -171,7 +249,7 @@ fn default_true() -> bool {
 }
 
 fn default_sparse_parametrization() -> String {
-    "invdepth3d".to_string()
+    "invdepth_additive3d".to_string()
 }
 
 impl SparseVogConfig {
@@ -202,6 +280,18 @@ impl SparseVogConfig {
         }
         if let Some(v) = self.sigma_pixel {
             settings.sigma_pixel = v;
+        }
+        if let Some(v) = self.flow_age_rate_px_per_frame {
+            settings.flow_age_rate_px_per_frame = v;
+        }
+        if let Some(v) = self.bias_walk_var {
+            settings.bias_walk_var = v;
+        }
+        if let Some(v) = self.pose_range_scale {
+            settings.pose_range_scale = v;
+        }
+        if let Some(v) = self.pose_range_coherent {
+            settings.pose_range_coherent = v;
         }
         if let Some(v) = self.uniform_z_max {
             settings.uniform_z_max = v;
@@ -248,8 +338,8 @@ impl SparseVogConfig {
         if let Some(v) = self.max_depth {
             settings.max_depth = v;
         }
-        if let Some(v) = self.reanchor_flow_px {
-            settings.reanchor_flow_px = v;
+        if let Some(v) = self.birth_min_flow_px {
+            settings.birth_min_flow_px = v;
         }
         settings
     }
@@ -474,8 +564,52 @@ pub struct VIOConfig {
     pub patch_depth: Option<PatchDepthConfig>,
     #[serde(rename = "Stereo", default)]
     pub stereo: Option<StereoConfig>,
+    #[serde(rename = "Rerun", default)]
+    pub rerun: RerunVisConfig,
     pub eqf: EqfConfig,
     pub main: MainConfig,
+}
+
+/// Per-entity toggles for the Rerun visualisation (`--vis`). Everything
+/// defaults to on; set an entry to false in the YAML `Rerun:` section to hide
+/// it. `histeq_image` shows the tracker's preprocessed (histogram-equalised)
+/// image instead of the raw frame when available.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RerunVisConfig {
+    pub image: bool,
+    pub histeq_image: bool,
+    pub features: bool,
+    pub sparse_image: bool,
+    pub patch_depth: bool,
+    pub patch_depth_cov: bool,
+    pub trajectory: bool,
+    pub groundtruth: bool,
+    pub landmarks: bool,
+    pub sparse_world: bool,
+    pub occupied_cells: bool,
+    pub free_cells: bool,
+    pub camera_axes: bool,
+}
+
+impl Default for RerunVisConfig {
+    fn default() -> Self {
+        Self {
+            image: true,
+            histeq_image: true,
+            features: true,
+            sparse_image: true,
+            patch_depth: true,
+            patch_depth_cov: true,
+            trajectory: true,
+            groundtruth: true,
+            landmarks: true,
+            sparse_world: true,
+            occupied_cells: true,
+            free_cells: true,
+            camera_axes: true,
+        }
+    }
 }
 
 impl VIOConfig {
@@ -488,9 +622,12 @@ impl VIOConfig {
     pub fn to_filter_settings(&self) -> crate::VIOFilterSettings {
         let mut settings = crate::VIOFilterSettings::default();
         settings.coordinate_choice = self.eqf.settings.coordinate_choice.clone();
+        settings.use_stereo_measurement = self.eqf.settings.stereo_measurement;
+        settings.range_gate_chi2 = self.eqf.settings.range_gate_chi2;
         settings.max_landmarks = self.eqf.max_features;
         settings.sigma_bearing = self.eqf.measurement_noise.feature;
         settings.initial_point_variance = self.eqf.initial_variance.point;
+        settings.initial_point_depth_variance = self.eqf.initial_variance.point_depth;
 
         // velocityNoise
         settings.sigma_gyroscope = self.eqf.velocity_noise.gyr;
@@ -538,5 +675,24 @@ impl VIOConfig {
         settings.initial_scene_depth = self.eqf.initial_value.scene_depth;
 
         settings
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn midair_stereo_config_parses_and_enables_measurement() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../configs/eqvio_midair_stereo.yaml"
+        );
+        let cfg = VIOConfig::from_yaml(path).expect("parse eqvio_midair_stereo.yaml");
+        assert!(cfg.eqf.settings.stereo_measurement);
+        assert!((cfg.eqf.settings.range_gate_chi2 - 6.63).abs() < 1e-9);
+        let settings = cfg.to_filter_settings();
+        assert!(settings.use_stereo_measurement);
+        assert!((settings.range_gate_chi2 - 6.63).abs() < 1e-9);
     }
 }

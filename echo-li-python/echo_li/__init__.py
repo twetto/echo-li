@@ -1,6 +1,7 @@
 from echo_li._echo_li import (
     PinholeCamera,
     RadTanCamera,
+    EquidistantCamera,
     Frontend,
     FrontendConfig,
     VIOFilter,
@@ -12,6 +13,7 @@ from echo_li._echo_li import (
 __all__ = [
     "PinholeCamera",
     "RadTanCamera",
+    "EquidistantCamera",
     "Frontend",
     "FrontendConfig",
     "VIOFilter",

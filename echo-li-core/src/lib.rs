@@ -84,6 +84,14 @@ pub struct VIOFilterSettings {
 
     // initialVariance
     pub initial_point_variance: f64,
+    /// Optional depth-coordinate birth variance, overriding `initial_point_variance` on the
+    /// third (range/inverse-range) chart coordinate only.
+    ///
+    /// Landmark birth uncertainty is intrinsically ANISOTROPIC: the bearing is measured
+    /// precisely by the pixel, the depth is essentially unknown. A single isotropic value
+    /// cannot express that. This is what a Civera-style "ρ₀ small, σ_ρ covering ρ=0" prior
+    /// needs — an uninformative depth with a tight bearing.
+    pub initial_point_depth_variance: Option<f64>,
     pub initial_attitude_variance: f64,
     pub initial_position_variance: f64,
     pub initial_velocity_variance: f64,
@@ -119,6 +127,13 @@ pub struct VIOFilterSettings {
     // Riccati propagation variant (Phase 6). false = `Fast` per-sample;
     // true = `Faster` (covariance transport batched per IMU sub-frame).
     pub use_faster_riccati: bool,
+
+    // Stereo log-inverse-range measurement channel. When true, observed
+    // landmarks that carry a valid per-frame stereo range prior get an extra
+    // l = -ln(range) measurement row.
+    pub use_stereo_measurement: bool,
+    // Chi²(1) gate on the stereo range innovation; 0 disables gating.
+    pub range_gate_chi2: f64,
 }
 
 impl Default for VIOFilterSettings {
@@ -130,6 +145,7 @@ impl Default for VIOFilterSettings {
             sigma_accelerometer_bias: 0.004462289865453429,
             sigma_bearing: 1.9297839969591413,
             initial_point_variance: 129.90415638150924,
+            initial_point_depth_variance: None,
             initial_attitude_variance: 0.13565029126052572,
             initial_position_variance: 0.1,
             initial_velocity_variance: 8.974852995731e-08,
@@ -154,6 +170,8 @@ impl Default for VIOFilterSettings {
             max_landmarks: 40,
             outlier_threshold: 5.0,
             use_faster_riccati: false,
+            use_stereo_measurement: false,
+            range_gate_chi2: 0.0,
         }
     }
 }
@@ -205,9 +223,11 @@ impl VIOFilterSettings {
 
         for i in 0..n_landmarks {
             let start = s + 3 * i;
-            sigma
-                .fixed_view_mut::<3, 3>(start, start)
-                .copy_from(&(Matrix3::identity() * self.initial_point_variance));
+            let mut blk = Matrix3::identity() * self.initial_point_variance;
+            if let Some(dv) = self.initial_point_depth_variance {
+                blk[(2, 2)] = dv;
+            }
+            sigma.fixed_view_mut::<3, 3>(start, start).copy_from(&blk);
         }
         sigma
     }
@@ -424,6 +444,7 @@ impl VIOFilter {
         );
 
         let mut new_landmarks = Vec::new();
+        let mut new_covs: Vec<Matrix3<f64>> = Vec::new();
         for &id in &new_ids {
             if self.eqf.x.id.len() + new_landmarks.len() >= self.settings.max_landmarks {
                 break;
@@ -440,31 +461,53 @@ impl VIOFilter {
                 .filter(|prior| valid_depth_prior(prior));
             let range = prior.map(|prior| prior.range).unwrap_or(fallback_range);
             let p = bearing * range;
-            if std::env::var_os("ECHO_LI_DEBUG_LANDMARK_INIT").is_some() {
-                let source = if prior.is_some() {
+            // Enable with RUST_LOG=echo_li_core=debug (needs a logger installed,
+            // e.g. env_logger in the CLI). Replaces ECHO_LI_DEBUG_LANDMARK_INIT.
+            log::debug!(
+                "eqf landmark init id={} source={} uv=({:.2},{:.2}) bearing=({:.6},{:.6},{:.6}) range={:.6} range_var={:.6e} p=({:.6},{:.6},{:.6}) fallback_range={:.6}",
+                id,
+                if prior.is_some() {
                     "sparse_range"
                 } else {
                     "fallback_scene_depth"
-                };
-                let range_var = prior.map(|prior| prior.range_var).unwrap_or(f64::INFINITY);
-                eprintln!(
-                    "eqf landmark init id={} source={} uv=({:.2},{:.2}) bearing=({:.6},{:.6},{:.6}) range={:.6} range_var={:.6e} p=({:.6},{:.6},{:.6}) fallback_range={:.6}",
-                    id,
-                    source,
-                    uv[0],
-                    uv[1],
-                    bearing[0],
-                    bearing[1],
-                    bearing[2],
-                    range,
-                    range_var,
-                    p[0],
-                    p[1],
-                    p[2],
-                    fallback_range,
-                );
+                },
+                uv[0],
+                uv[1],
+                bearing[0],
+                bearing[1],
+                bearing[2],
+                range,
+                prior.map(|prior| prior.range_var).unwrap_or(f64::INFINITY),
+                p[0],
+                p[1],
+                p[2],
+                fallback_range,
+            );
+            // Birth covariance (chart coords). Non-stereo births keep the
+            // isotropic default; a stereo-backed birth sets the depth chart
+            // coordinate from the stereo log-range variance
+            // Var(ell) = range_var / range^2, mapped through the chart's
+            // d(ell)/d(eps2) = output_range_row. Charts whose depth is a single
+            // coordinate (Normal, InvDepth) have the range row concentrated on
+            // coord 2; Euclidean spreads it and falls back to isotropic.
+            let mut cov_i = Matrix3::identity() * self.settings.initial_point_variance;
+            if let Some(dv) = self.settings.initial_point_depth_variance {
+                cov_i[(2, 2)] = dv;
+            }
+            if let Some(prior) = prior {
+                let c = self.suite.output_range_row(&p);
+                let var_ell = prior.range_var / (range * range);
+                if c[0].abs() < 1e-9
+                    && c[1].abs() < 1e-9
+                    && c[2].abs() > 1e-9
+                    && var_ell.is_finite()
+                    && var_ell > 0.0
+                {
+                    cov_i[(2, 2)] = var_ell / (c[2] * c[2]);
+                }
             }
             new_landmarks.push(Landmark { p, id });
+            new_covs.push(cov_i);
         }
 
         if !new_landmarks.is_empty() {
@@ -473,7 +516,7 @@ impl VIOFilter {
             for i in 0..n_new {
                 new_cov
                     .fixed_view_mut::<3, 3>(3 * i, 3 * i)
-                    .copy_from(&(Matrix3::identity() * self.settings.initial_point_variance));
+                    .copy_from(&new_covs[i]);
             }
             self.eqf.add_new_landmarks(new_landmarks, &new_cov);
             self.invalidate_gain_cache();
@@ -527,7 +570,30 @@ impl VIOFilter {
         }
 
         let output_gain = self.settings.output_gain_matrix(n_obs);
-        self.eqf.perform_vision_update(
+        // Stereo log-inverse-range measurements reuse the per-frame stereo range
+        // priors already supplied for landmark birth. THE single sign negation
+        // ell = -ln(range) lives here (Rudolf-V and the patch mapper use
+        // +log range; the EqF chart and this channel use log-inverse-range — see
+        // the canonical sign convention here). Built by iterating the
+        // sorted `y_ids` (never the prior map) to stay reproducible.
+        let stereo_meas: HashMap<u64, (f64, f64)> = if self.settings.use_stereo_measurement {
+            y_ids
+                .iter()
+                .filter_map(|&id| {
+                    let prior = depth_priors.get(&id).filter(|p| valid_depth_prior(p))?;
+                    if prior.range > 0.0 && prior.range_var.is_finite() && prior.range_var > 0.0 {
+                        let ell = -prior.range.ln();
+                        let r_ell = prior.range_var / (prior.range * prior.range);
+                        Some((id, (ell, r_ell)))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        };
+        self.eqf.perform_vision_update_with_stereo(
             self.suite.as_ref(),
             &y_ids,
             &y_coords,
@@ -535,6 +601,8 @@ impl VIOFilter {
             &output_gain,
             self.settings.use_equivariant_output,
             self.settings.use_discrete_correction,
+            &stereo_meas,
+            self.settings.range_gate_chi2,
         );
 
         self.vision_count += 1;
@@ -542,6 +610,88 @@ impl VIOFilter {
 
     pub fn state_estimate(&self) -> VIOState {
         self.eqf.state_estimate()
+    }
+
+    pub fn sparse_camera_pose_covariances(&self) -> Option<(Matrix3<f64>, Matrix3<f64>)> {
+        let state = self.eqf.state_estimate();
+        let cov = sparse_camera_pose_covariance(&state, &self.eqf.sigma)?;
+        if cov.iter().any(|v| !v.is_finite()) {
+            return None;
+        }
+        let p_ww = cov.fixed_view::<3, 3>(0, 0).into_owned();
+        let p_vv = cov.fixed_view::<3, 3>(3, 3).into_owned();
+        Some((p_vv, p_ww))
+    }
+
+    /// Full 3x3 body-velocity covariance block of the EqF Riccati matrix.
+    ///
+    /// Body-frame velocity is the gauge-FREE observable (global position and yaw are
+    /// unobservable by construction), so this is the block to score covariance
+    /// consistency against. Base-state layout is
+    /// `input_bias(6) | pose(6) | velocity(3) | camera_offset(6)` = 21, hence rows 12..15.
+    /// Turn on observability-Gramian accumulation over a sliding window of
+    /// `window` vision frames (0 disables). The Gramian measures information the
+    /// filter has actually earned per direction, which -- unlike the error -- is
+    /// computable from the Jacobians alone.
+    pub fn enable_gramian(&mut self, window: usize) {
+        self.eqf.enable_gramian(window);
+    }
+
+    /// `(gramian_21x21, frames_covered, resets_so_far)`, or None until a full
+    /// window has accumulated.
+    pub fn observability_gramian(&self) -> Option<(DMatrix<f64>, usize, usize)> {
+        self.eqf.observability_gramian()
+    }
+
+    pub fn velocity_covariance(&self) -> Option<Matrix3<f64>> {
+        let sigma = &self.eqf.sigma;
+        if sigma.nrows() < 15 || sigma.ncols() < 15 {
+            return None;
+        }
+        let cov = sigma.fixed_view::<3, 3>(12, 12).into_owned();
+        if cov.iter().any(|v| !v.is_finite()) {
+            return None;
+        }
+        Some(cov)
+    }
+}
+
+fn sparse_camera_pose_jacobian(state: &VIOState) -> SMatrix<f64, 6, 21> {
+    let adj = state.sensor.camera_offset.inverse().adjoint();
+    let mut j = SMatrix::<f64, 6, 21>::zeros();
+    j.fixed_view_mut::<6, 6>(0, 6).copy_from(&adj);
+    j.fixed_view_mut::<6, 6>(0, 15)
+        .copy_from(&SMatrix::<f64, 6, 6>::identity());
+    j
+}
+
+fn sparse_camera_pose_covariance(
+    state: &VIOState,
+    sigma: &DMatrix<f64>,
+) -> Option<SMatrix<f64, 6, 6>> {
+    if sigma.nrows() < 21 || sigma.ncols() < 21 {
+        return None;
+    }
+
+    let j = sparse_camera_pose_jacobian(state);
+    let mut cov = SMatrix::<f64, 6, 6>::zeros();
+    for r in 0..6 {
+        for c in 0..6 {
+            let mut v = 0.0;
+            for a in 0..21 {
+                for b in 0..21 {
+                    v += j[(r, a)] * sigma[(a, b)] * j[(c, b)];
+                }
+            }
+            cov[(r, c)] = v;
+        }
+    }
+
+    cov = 0.5 * (cov + cov.transpose());
+    if cov.iter().all(|v| v.is_finite()) {
+        Some(cov)
+    } else {
+        None
     }
 }
 
@@ -784,8 +934,14 @@ mod landmark_init_selection_tests {
         coords.insert(2, uv(80.0, 50.0));
 
         let deferred = HashSet::from([1]);
-        let selected =
-            select_new_landmark_ids(&coords, &HashSet::new(), &HashMap::new(), &deferred, true, 2);
+        let selected = select_new_landmark_ids(
+            &coords,
+            &HashSet::new(),
+            &HashMap::new(),
+            &deferred,
+            true,
+            2,
+        );
 
         assert_eq!(selected, vec![2]);
     }
@@ -843,15 +999,102 @@ mod landmark_init_selection_tests {
             },
         );
 
-        let selected = select_new_landmark_ids(
-            &coords,
-            &HashSet::new(),
-            &priors,
-            &HashSet::new(),
-            false,
-            1,
-        );
+        let selected =
+            select_new_landmark_ids(&coords, &HashSet::new(), &priors, &HashSet::new(), false, 1);
 
         assert_eq!(selected, vec![1]);
+    }
+}
+
+#[cfg(test)]
+mod sparse_camera_pose_covariance_tests {
+    use super::*;
+    use echo_lie::{SE3, SO3};
+    use nalgebra::{DMatrix, SVector, Vector6};
+
+    fn make_state() -> VIOState {
+        VIOState::new(
+            VIOSensorState {
+                input_bias: Vector6::zeros(),
+                pose: SE3::new(
+                    SO3::exp(&Vector3::new(0.13, -0.07, 0.19)),
+                    Vector3::new(1.2, -0.4, 0.8),
+                ),
+                velocity: Vector3::new(0.3, -0.2, 0.1),
+                camera_offset: SE3::new(
+                    SO3::exp(&Vector3::new(-0.04, 0.08, 0.03)),
+                    Vector3::new(0.12, -0.03, 0.04),
+                ),
+            },
+            Vec::new(),
+        )
+    }
+
+    fn camera_pose(state: &VIOState) -> SE3 {
+        state.sensor.pose.compose(&state.sensor.camera_offset)
+    }
+
+    #[test]
+    fn sparse_camera_pose_jacobian_matches_finite_difference() {
+        let state = make_state();
+        let base = camera_pose(&state);
+        let analytic = sparse_camera_pose_jacobian(&state);
+        let h = 1e-7;
+        let mut numeric = SMatrix::<f64, 6, 21>::zeros();
+
+        for col in 0..21 {
+            let mut perturbed = state.clone();
+            let mut dx = SVector::<f64, 6>::zeros();
+            if (6..12).contains(&col) {
+                dx[col - 6] = h;
+                perturbed.sensor.pose = perturbed.sensor.pose.compose(&SE3::exp(&dx));
+            } else if (15..21).contains(&col) {
+                dx[col - 15] = h;
+                perturbed.sensor.camera_offset =
+                    perturbed.sensor.camera_offset.compose(&SE3::exp(&dx));
+            } else {
+                continue;
+            }
+
+            let right_delta = base.inverse().compose(&camera_pose(&perturbed)).log() / h;
+            numeric.set_column(col, &right_delta);
+        }
+
+        let diff = analytic - numeric;
+        assert!(
+            diff.norm() < 1e-7,
+            "camera pose covariance Jacobian mismatch: norm={:.3e}\nanalytic={:?}\nnumeric={:?}",
+            diff.norm(),
+            analytic,
+            numeric
+        );
+    }
+
+    #[test]
+    fn sparse_camera_pose_covariance_is_j_sigma_jt() {
+        let state = make_state();
+        let mut sigma = DMatrix::<f64>::zeros(21, 21);
+        for r in 0..21 {
+            for c in 0..21 {
+                sigma[(r, c)] = ((r + 1) as f64 * 0.07).sin() * ((c + 2) as f64 * 0.11).cos();
+            }
+        }
+        sigma = &sigma * sigma.transpose() + DMatrix::<f64>::identity(21, 21) * 1e-6;
+
+        let got = sparse_camera_pose_covariance(&state, &sigma).unwrap();
+        let j = sparse_camera_pose_jacobian(&state);
+        let mut expected = SMatrix::<f64, 6, 6>::zeros();
+        for r in 0..6 {
+            for c in 0..6 {
+                for a in 0..21 {
+                    for b in 0..21 {
+                        expected[(r, c)] += j[(r, a)] * sigma[(a, b)] * j[(c, b)];
+                    }
+                }
+            }
+        }
+        expected = 0.5 * (expected + expected.transpose());
+
+        assert!((got - expected).norm() < 1e-10);
     }
 }

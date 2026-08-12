@@ -1,5 +1,5 @@
 use echo_lie::{SE3, SO3, SOT3};
-use nalgebra::{DMatrix, DVector, Matrix2x3, Matrix3, Matrix3x2, Vector2, Vector3};
+use nalgebra::{DMatrix, DVector, Matrix2x3, Matrix3, Matrix3x2, RowVector3, Vector2, Vector3};
 
 use crate::coordinate_suite::euclid::EuclideanSuite;
 use crate::coordinate_suite::{
@@ -9,7 +9,7 @@ use crate::coordinate_suite::{
 use crate::mathematical::camera::CameraModel;
 use crate::mathematical::eqf_matrices::{EqFCoordinateSuite, RiccatiPropagationBlocks};
 use crate::mathematical::imu_velocity::IMUVelocity;
-use crate::mathematical::vio_group::{state_group_action, VIOAlgebra, VIOGroup};
+use crate::mathematical::vio_group::{VIOAlgebra, VIOGroup, state_group_action};
 use crate::mathematical::vio_state::{Landmark, VIOSensorState, VIOState};
 
 // ===========================================================================
@@ -387,6 +387,11 @@ impl EqFCoordinateSuite for InvDepthSuite {
         // C*_invdepth = C*_euclid @ ind2euc
         let m_i2e = conv_ind2euc(q0);
         EuclideanSuite.output_matrix_ci_star(q0, q_hat, cam, y) * m_i2e
+    }
+
+    fn output_range_row(&self, q0: &Vector3<f64>) -> RowVector3<f64> {
+        // C_ℓ_invdepth = C_ℓ_euclid @ ind2euc  (= [0, 0, 1/ρ0])
+        (-q0.transpose() / q0.norm_squared()) * conv_ind2euc(q0)
     }
 
     fn lift_innovation(&self, total_innovation: &DVector<f64>, xi0: &VIOState) -> VIOAlgebra {

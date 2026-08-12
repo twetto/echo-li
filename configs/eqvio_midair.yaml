@@ -1,20 +1,46 @@
 RudolfV:
+  # Legacy bool (true => global histeq) — overridden by `histeq` when set.
   equaliseImageHistogram: true
+  # histeq: none | global | clahe. CLAHE knobs below apply to "clahe" only.
+  # histeq: clahe
+  # claheTileSize: 256     # tile size in pixels
+  # claheClipLimit: 4.0
   # useFastFeatures: false
   # featureDist: 64.0
   featureDist: 16.0
   featureSearchThreshold: 0.8
   fastThreshold: 20
   # Corner detector: fast (default) | harris | shi_tomasi
-  # detector: shi_tomasi
+  detector: shi_tomasi
+  # shiTomasiThreshold: 0.0      # min-eigenvalue floor (NMS/top-N pick the rest)
+  # shiTomasiBlockSize: 3        # structure-tensor block size
   # maxError: 50.0
   # maxFeatures: 40  # LK tracker pool (feeds sparse_vog). EqF cap is --max-features.
-  maxFeatures: 1410
-  # maxFeatures: 500
+  # maxFeatures: 1410
+  maxFeatures: 300
   maxLevel: 3
   lbpPolicy: HardReject
-  # lbpPolicy: SoftPenalty
+  # lbpPolicy: SoftPenalty  # tested: +7cm ATE regression on V1_03 vs HardReject
+  # kltResidual: feed the level-0 photometric residual into the reservoir
+  # quality term (otherwise klt_quality is a dead constant 1.0). Off: on V1_03
+  # the raw (unnormalized) residual is a weak, texture-confounded discriminator
+  # (RPE corr -0.14) and hurt the near-end wobble. Kept wired for later (needs
+  # NCC/gradient-energy normalization to be useful).
+  kltResidual: false
   # minHarrisQuality: 0.05
+  # enableRansac: frontend essential-matrix geometric verification. Tested off
+  # on V1_03 — ATE got WORSE (28.4->33.0 cm) and it was only ~10 rejects/frame,
+  # not the churn bulk. Hard outlier rejection helps ATE; keep on.
+  enableRansac: true
+  # Pose-prior epipolar gate: squared-Sampson threshold in normalized coords
+  # (like ransacParams.inlierThreshold; 1e-5 ~ 1.45 px). Gates tracks against
+  # the EqF's IMU-predicted essential matrix, replacing RANSAC on frames with a
+  # prior. V1_03: ATE 21.2 -> 18.1 cm, scale drift 3.4% -> 0.7%, outlier tail
+  # 11.8% -> 5.2%. Set 0 to disable.
+  epipolarGateThreshold: 1.0e-5
+  # epipolarRefine: guarded eight-point refit of the prior gate. Measured
+  # slightly WORSE (tail 5.9% vs 5.2%); keep off.
+  epipolarRefine: false
   ransacParams:
     inlierThreshold: 0.00001
     maxIterations: 200
@@ -26,7 +52,9 @@ RudolfV:
 eqf:
   maxFeatures: 40           # core EqF landmark cap
   initialValue:
-    sceneDepth: 3.0
+    # MidAir is aerial (~10-50 m scenes); EuRoC's 3 m indoor prior collapses the
+    # monocular scale ~5x. GT median depth on VO_test traj_2 is ~12-15 m.
+    sceneDepth: 24.0
   initialVariance:
     attitude: 0.13565029126052572
     biasAcc: 1.5813333765300104
@@ -35,7 +63,9 @@ eqf:
     cameraPosition: 0.023501400846134893
     point: 129.90415638150924
     position: 0.1
-    velocity: 8.974852995731e-08
+    # velocity: 8.974852995731e-08  # asserts v=0 (std 0.3 mm/s); only valid
+    # with a certified-stationary start. Loose value tolerates moving starts.
+    velocity: 1.0
   measurementNoise:
     feature: 2.0
     featureOutlierAbs: 5.0
@@ -77,15 +107,33 @@ eqf:
 main:
   writeState: true
   cameraLag: 0.00
+Rerun:
+  # Per-entity toggles for --vis (all default true when omitted).
+  # histeqImage: show the tracker's preprocessed (histogram-equalised) frame
+  # in camera/image instead of the raw one.
+  histeqImage: true
+  # image: true
+  # features: true
+  # sparseImage: true
+  # patchDepth: true
+  # patchDepthCov: true
+  # trajectory: true
+  # groundtruth: true
+  # landmarks: true
+  # sparseWorld: true
+  # cameraAxes: true
+  # occupiedCells: true
+  freeCells: false
 SparseVog:
   # Per-feature Vogiatzis filter.
   # parametrization: euclidean, invdepth, polar (1D scalar)
+  #                  invdepth3d, polar3d (3D static-anchor SOT(3) IEKF)
   #                  invdepth_additive3d (ρ-first additive inverse-depth EKF)
-  #                  bearing_invdepth_additive3d (camera-agnostic sibling)
-  parametrization: invdepth_additive3d
-  max_pool_size: 1410
+  # parametrization: invdepth_additive3d
+  parametrization: bearing_invdepth_additive3d
+  # max_pool_size: 1410
   # max_pool_size: 40
-  # max_pool_size: 500
+  max_pool_size: 300
   min_track_length: 5
   # conv_variance_threshold: 0.02 # var(z) gate for query()
   conv_variance_threshold: 2.0 # var(z) gate for query()
@@ -103,7 +151,10 @@ SparseVog:
   ab_max: 200.0
   min_inlier_ratio: 0.5         # gate for Mahalanobis stuck-outlier reset
   mahalanobis_reset_chi2: 0.2
+  bias_walk_var: 0.0
   process_depth_var: 0.01       # fallback when P_vv unavailable
+  pose_range_scale: 1.0
+  pose_range_coherent: 0.0
   min_parallax: 1.0e-4
   min_cos_sim: 0.95
   min_depth: 0.1
@@ -125,6 +176,7 @@ Stereo:
   knn_propagation: 5
   max_residual: 20.0
   histeq: global
+  # histeq: clahe
 PatchDepth:
   # per_patch_bearing: target-anchored per-patch tangent rectification (wide-FoV,
   # seamless). A/B against tiled_bearing by switching this line.
@@ -157,7 +209,7 @@ PatchDepth:
   cov_vis_min: 0.0
   cov_vis_max: 0.5
 LocalOccupancy:
-  enabled: false
+  enabled: true
   resolution: 0.10
   width_cells: 160
   height_cells: 160
@@ -165,5 +217,11 @@ LocalOccupancy:
   min_range: 0.25
   max_range: 12.0
   max_eta_std: 0.5
+  # v1 uncertainty-aware update: σ_m = range·sqrt(var(η)) shapes the log-odds
+  # (Gaussian occupied bump + confidence-weighted carve). Set to "fixed" for v0.
+  update_mode: uncertainty_aware
+  band_k: 2.0
+  sigma_floor_factor: 0.5
+  min_confidence_weight: 0.1
   min_obstacle_height: -1.0
   max_obstacle_height: 1.0

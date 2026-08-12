@@ -1,7 +1,7 @@
-use nalgebra::{Matrix3, UnitQuaternion, Quaternion, Vector3, Vector4, U3};
+use nalgebra::{Matrix3, Quaternion, U3, UnitQuaternion, Vector3, Vector4};
 use rand::Rng;
 
-use crate::base::{skew, vex, LieGroup};
+use crate::base::{LieGroup, skew, vex};
 
 /// SO(3) — Special Orthogonal Group in 3D (rotations).
 ///
@@ -40,11 +40,61 @@ impl SO3 {
         }
     }
 
-    /// From a 3×3 rotation matrix.
+    /// From a 3×3 rotation matrix (Shepperd's method).
+    ///
+    /// nalgebra's `UnitQuaternion::from_matrix` uses an iterative method
+    /// (Müller et al.) seeded from identity, which silently returns identity
+    /// for exact 180° rotations — identity is a cost-function maximum, so
+    /// the iteration converges there instead of to the target.
+    ///
+    /// Shepperd's method branches on the largest quaternion component,
+    /// guaranteeing a positive square-root argument for any valid rotation
+    /// matrix including exact 180°.
     pub fn from_matrix(m: &Matrix3<f64>) -> Self {
-        Self {
-            q: UnitQuaternion::from_matrix(m),
-        }
+        let t = m[(0, 0)] + m[(1, 1)] + m[(2, 2)]; // trace
+
+        // Four candidates proportional to 4w², 4x², 4y², 4z²; they sum to 4,
+        // so at least one is ≥ 1 — its sqrt is always well-conditioned.
+        let d0 = 1.0 + t;
+        let d1 = 1.0 + m[(0, 0)] - m[(1, 1)] - m[(2, 2)];
+        let d2 = 1.0 - m[(0, 0)] + m[(1, 1)] - m[(2, 2)];
+        let d3 = 1.0 - m[(0, 0)] - m[(1, 1)] + m[(2, 2)];
+
+        let (w, x, y, z) = if d0 >= d1 && d0 >= d2 && d0 >= d3 {
+            let s = 2.0 * d0.sqrt();
+            (
+                s / 4.0,
+                (m[(2, 1)] - m[(1, 2)]) / s,
+                (m[(0, 2)] - m[(2, 0)]) / s,
+                (m[(1, 0)] - m[(0, 1)]) / s,
+            )
+        } else if d1 >= d2 && d1 >= d3 {
+            let s = 2.0 * d1.sqrt();
+            (
+                (m[(2, 1)] - m[(1, 2)]) / s,
+                s / 4.0,
+                (m[(0, 1)] + m[(1, 0)]) / s,
+                (m[(0, 2)] + m[(2, 0)]) / s,
+            )
+        } else if d2 >= d3 {
+            let s = 2.0 * d2.sqrt();
+            (
+                (m[(0, 2)] - m[(2, 0)]) / s,
+                (m[(0, 1)] + m[(1, 0)]) / s,
+                s / 4.0,
+                (m[(1, 2)] + m[(2, 1)]) / s,
+            )
+        } else {
+            let s = 2.0 * d3.sqrt();
+            (
+                (m[(1, 0)] - m[(0, 1)]) / s,
+                (m[(0, 2)] + m[(2, 0)]) / s,
+                (m[(1, 2)] + m[(2, 1)]) / s,
+                s / 4.0,
+            )
+        };
+
+        Self::from_xyzw(x, y, z, w)
     }
 
     /// Uniform random rotation (Haar measure) via Shoemake's method.
@@ -223,7 +273,7 @@ impl SO3 {
     #[inline]
     pub fn compose(&self, other: &SO3) -> SO3 {
         SO3 {
-            q: self.q * other.q,
+            q: UnitQuaternion::new_normalize((self.q * other.q).into_inner()),
         }
     }
 
@@ -311,6 +361,21 @@ mod tests {
     }
 
     #[test]
+    fn compose_renormalizes_drifted_quaternion() {
+        // Regression: compose must restore unit length even if an operand has
+        // drifted off the unit sphere (it can, via repeated unchecked products).
+        // Without renormalisation a non-unit operand propagates: as_matrix()
+        // scales by ||q||^2, which detonated the EqVIO far-landmark covariance.
+        let drifted = SO3::from_quaternion(UnitQuaternion::new_unchecked(Quaternion::new(
+            1.2, 0.0, 0.0, 0.0,
+        ))); // ||q|| = 1.2
+        let out = drifted.compose(&SO3::identity());
+        assert_abs_diff_eq!(out.q.norm(), 1.0, epsilon = 1e-12);
+        // and the resulting rotation matrix is a proper rotation (||R||_F = sqrt(3))
+        assert_abs_diff_eq!(out.as_matrix().norm(), 3.0_f64.sqrt(), epsilon = 1e-12);
+    }
+
+    #[test]
     fn exp_log_roundtrip() {
         for _ in 0..100 {
             let w = Vector3::new(
@@ -332,6 +397,58 @@ mod tests {
             let id = r.compose(&r.inverse());
             assert_abs_diff_eq!(id.as_matrix(), Matrix3::identity(), epsilon = 1e-10);
         }
+    }
+
+    #[test]
+    fn from_matrix_exact_180_degrees() {
+        // Regression: nalgebra's iterative from_matrix returns identity for
+        // exact 180° rotations.  Shepperd's method must handle all axes.
+        let axes = [
+            Vector3::x(),
+            Vector3::y(),
+            Vector3::z(),
+            Vector3::new(1.0, 1.0, 0.0).normalize(),
+            Vector3::new(1.0, 0.0, 1.0).normalize(),
+            Vector3::new(0.0, 1.0, 1.0).normalize(),
+            Vector3::new(1.0, 1.0, 1.0).normalize(),
+        ];
+        for axis in &axes {
+            let w = axis * std::f64::consts::PI;
+            let r = SO3::exp(&w);
+            let m = r.as_matrix();
+            // Confirm trace = -1 (exact 180°)
+            assert_abs_diff_eq!(m.trace(), -1.0, epsilon = 1e-12);
+            let r2 = SO3::from_matrix(&m);
+            // Must reconstruct the same rotation (not identity!)
+            assert_abs_diff_eq!(r.as_matrix(), r2.as_matrix(), epsilon = 1e-10);
+        }
+    }
+
+    #[test]
+    fn from_matrix_tartanair_p006_regression() {
+        // Exact rotation that triggered the nalgebra bug: TartanAir P006
+        // NED→NWU conversion gives trace=-1, R[2,2]=-1.  nalgebra's
+        // iterative method returned identity; Shepperd's must not.
+        let r_nwu = Matrix3::new(
+            0.3420201433256688,
+            0.9396926207859084,
+            0.0,
+            0.9396926207859084,
+            -0.3420201433256688,
+            0.0,
+            0.0,
+            0.0,
+            -1.0,
+        );
+        assert_abs_diff_eq!(r_nwu.trace(), -1.0, epsilon = 1e-14);
+        let r = SO3::from_matrix(&r_nwu);
+        assert_abs_diff_eq!(r.as_matrix(), r_nwu, epsilon = 1e-10);
+        // Must NOT be identity
+        let angle = r.log().norm();
+        assert!(
+            angle > 3.0,
+            "from_matrix returned near-identity for 180° rotation"
+        );
     }
 
     #[test]
