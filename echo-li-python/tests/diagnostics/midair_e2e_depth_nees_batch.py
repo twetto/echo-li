@@ -35,6 +35,8 @@ def main():
     ap.add_argument("--pose-range-scale", type=float, default=0.003)
     ap.add_argument("--min-track", type=int, default=20)
     ap.add_argument("--pvv-scale", type=float, default=1.0)
+    ap.add_argument("--eqf-selection", choices=("grid", "existing-first"),
+                    default="grid")
     ap.add_argument("--out-dir", default="/tmp/midair_e2e_depth_nees_batch",
                     help="directory for per-trajectory .npz results")
     args = ap.parse_args()
@@ -68,11 +70,14 @@ def main():
             "--pose-range-scale", str(args.pose_range_scale),
             "--min-track", str(args.min_track),
             "--pvv-scale", str(args.pvv_scale),
+            "--eqf-selection", args.eqf_selection,
             "--vel-acc", str(params["sig_a"]),
             "--vel-gyr", str(params["sig_g"]),
             "--bias-acc", str(params["biasAcc"]),
             "--bias-gyr", str(params["biasGyr"]),
-            "--scene-depth", str(params["sceneDepth"]),
+            # sceneDepth: use the config default (200m) — large enough to
+            # suppress phantom parallax from sky features at infinity.
+            # "--scene-depth", str(params["sceneDepth"]),
             "--save-npz", str(npz_path),
             "--no-progress",
         ]

@@ -259,7 +259,7 @@ def prior_rel_sigma(prior):
     return float(rel) if np.isfinite(rel) else float("inf")
 
 
-def cap_eqf_observations(all_uvs, existing_ids, priors, max_obs, selection):
+def cap_eqf_observations(all_uvs, existing_ids, priors, max_obs, selection, W, H):
     if max_obs <= 0 or len(all_uvs) <= max_obs:
         return all_uvs
 
@@ -269,7 +269,27 @@ def cap_eqf_observations(all_uvs, existing_ids, priors, max_obs, selection):
     other_new = [fid for fid in ordered if fid not in existing_ids and fid not in priors]
     if selection == "prior_uncertainty":
         prior_new.sort(key=lambda fid: prior_rel_sigma(priors[fid]))
-    keep = (existing + prior_new + other_new)[:max_obs]
+    if selection != "grid":
+        keep = (existing + prior_new + other_new)[:max_obs]
+        return {fid: all_uvs[fid] for fid in keep}
+
+    import math
+    n_cols = n_rows = 5
+    per_cell = math.ceil(max_obs / (n_cols * n_rows))
+    cells = [[] for _ in range(n_cols * n_rows)]
+    for fid, (u, v) in all_uvs.items():
+        ci = min(max(int(u / (W / n_cols)), 0), n_cols - 1)
+        ri = min(max(int(v / (H / n_rows)), 0), n_rows - 1)
+        cells[ri * n_cols + ci].append(fid)
+    keep = []
+    for cell in cells:
+        cell.sort(key=lambda fid: (0 if fid in existing_ids else 1,
+                                   prior_rel_sigma(priors[fid]) if fid in priors else float("inf"),
+                                   fid))
+        keep.extend(cell[:per_cell])
+    if len(keep) > max_obs:
+        keep.sort(key=lambda fid: (0 if fid in existing_ids else 1, fid))
+        keep = keep[:max_obs]
     return {fid: all_uvs[fid] for fid in keep}
 
 
@@ -544,6 +564,7 @@ def run_once(mode, args, ds, f, cx, cy, W, H, ext, events, map_xy):
     prior_rel_sigmas = []
     seed_q = []  # (frame, prior_range, gt_range) for seeded births
     anchor_census = []  # (frame, n_live_features, n_distinct_anchors)
+    selection_geometry = []  # frame, existing fraction, occupied cells, GT range quantiles
     t_ned_to_nwu = np.diag([1.0, -1.0, -1.0])
     writer = None
     vpath = None
@@ -626,7 +647,7 @@ def run_once(mode, args, ds, f, cx, cy, W, H, ext, events, map_xy):
             existing = {int(x) for x in vio.get_landmarks().keys()}
             if mode == "baseline":
                 vio_uvs = cap_eqf_observations(
-                    all_uvs, existing, priors, args.eqf_max_obs, args.eqf_selection)
+                    all_uvs, existing, priors, args.eqf_max_obs, args.eqf_selection, W, H)
                 if args.true_depth_seed:
                     # Diagnostic: seed births with GT range (occlusion/depth-edge filtered)
                     # to separate "bad landmark init" from "bad covariance model".
@@ -652,7 +673,7 @@ def run_once(mode, args, ds, f, cx, cy, W, H, ext, events, map_xy):
                 births = set()
             elif mode in ("sparse3d_seeded", "stereo_seeded"):
                 vio_uvs = cap_eqf_observations(
-                    all_uvs, existing, priors, args.eqf_max_obs, args.eqf_selection)
+                    all_uvs, existing, priors, args.eqf_max_obs, args.eqf_selection, W, H)
                 _noprior = [int(f) for f in vio_uvs if int(f) not in priors]
                 n_noprior += len(_noprior)
                 n_tracked_noprior += sum(1 for f in _noprior if sparse is not None
@@ -696,7 +717,7 @@ def run_once(mode, args, ds, f, cx, cy, W, H, ext, events, map_xy):
                 keep = existing | allowed_new
                 vio_uvs = {fid: uv for fid, uv in all_uvs.items() if fid in keep}
                 vio_uvs = cap_eqf_observations(
-                    vio_uvs, existing, priors, args.eqf_max_obs, args.eqf_selection)
+                    vio_uvs, existing, priors, args.eqf_max_obs, args.eqf_selection, W, H)
                 _noprior = [int(f) for f in vio_uvs if int(f) not in priors]
                 n_noprior += len(_noprior)
                 n_tracked_noprior += sum(1 for f in _noprior if sparse is not None
@@ -712,6 +733,27 @@ def run_once(mode, args, ds, f, cx, cy, W, H, ext, events, map_xy):
                 births = after - existing
                 admitted_new += len(births)
                 prior_births += len(births & set(priors))
+
+            # Direct selector geometry against MidAir GT depth. Sky and depth-edge pixels
+            # are excluded from the range quantiles, but still count for image coverage.
+            _cells = set()
+            _ranges = []
+            _dmap = ds.depth(k); _hh, _ww = _dmap.shape
+            for _fid, (_u, _v) in vio_uvs.items():
+                _cells.add((min(max(int(_u / (W / 5)), 0), 4),
+                            min(max(int(_v / (H / 5)), 0), 4)))
+                _gx, _gy = int(round(_u)), int(round(_v))
+                if 2 <= _gx < _ww - 2 and 2 <= _gy < _hh - 2:
+                    _rr = float(_dmap[_gy, _gx])
+                    _pat = _dmap[_gy - 2:_gy + 3, _gx - 2:_gx + 3]
+                    _pv = _pat[(_pat > 1.0) & (_pat < md.SKY)]
+                    if (1.0 < _rr < md.SKY and _pv.size >= 9 and
+                            (_pv.max() - _pv.min()) / max(_rr, 1e-3) <= 0.15):
+                        _ranges.append(_rr)
+            _q = np.quantile(_ranges, [0.1, 0.5, 0.9]) if _ranges else [np.nan] * 3
+            selection_geometry.append((k,
+                sum(1 for _fid in vio_uvs if _fid in existing) / max(len(vio_uvs), 1),
+                len(_cells), len(_ranges), _q[0], _q[1], _q[2]))
 
             pos, quat = vio.get_pose()
             vel_est = np.asarray(vio.get_velocity(), float)
@@ -782,7 +824,7 @@ def run_once(mode, args, ds, f, cx, cy, W, H, ext, events, map_xy):
                 "prior_candidates": prior_candidates_total,
                 "prior_rel_sigma_p50": np.nan,
                 "seed_q": seed_q,
-                "rec": rec}
+                "selection_geometry": selection_geometry, "rec": rec}
     prior_rel_sigma_p50 = float(np.median(prior_rel_sigmas)) if prior_rel_sigmas else np.nan
     est = np.array([r[1] for r in rec])
     gtp = np.array([r[3] for r in rec])
@@ -795,7 +837,7 @@ def run_once(mode, args, ds, f, cx, cy, W, H, ext, events, map_xy):
     return {"mode": mode, "n": len(rec), "ate": ate, "path": path, "final": final,
             "prior_births": prior_births, "deferred_new": deferred_new,
             "admitted_new": admitted_new, "prior_candidates": prior_candidates_total,
-            "prior_rel_sigma_p50": prior_rel_sigma_p50, "seed_q": seed_q, "rec": rec}
+            "prior_rel_sigma_p50": prior_rel_sigma_p50, "seed_q": seed_q, "selection_geometry": selection_geometry, "rec": rec}
 
 
 def main():
@@ -819,7 +861,7 @@ def main():
     ap.add_argument("--eqf-max-obs", type=int, default=40,
                     help="maximum observations sent into EqF per image; <=0 sends the full reservoir")
     ap.add_argument("--eqf-selection", default="prior_uncertainty",
-                    choices=["prior_uncertainty", "preserve_order"],
+                    choices=["prior_uncertainty", "preserve_order", "grid"],
                     help="when capping EqF observations, rank prior-backed births by sigma/range "
                     "or keep Rudolf-V feature order")
     ap.add_argument("--sparse-min-track", type=int, default=5)
@@ -965,6 +1007,9 @@ def main():
             payload[r["mode"] + "_pcov_pos"] = np.array([x[16] for x in rec], float)
             payload[r["mode"] + "_pcov_att"] = np.array([x[17] for x in rec], float)
             payload[r["mode"] + "_vel_var"] = np.array([x[18] for x in rec], float)
+            sg = r.pop("selection_geometry", [])
+            payload[r["mode"] + "_selection_geometry"] = (np.array(sg, float) if sg
+                                                            else np.zeros((0, 7), float))
             sq = r.pop("seed_q", [])
             payload[r["mode"] + "_seed_q"] = (np.array(sq, float) if sq
                                               else np.zeros((0, 3), float))

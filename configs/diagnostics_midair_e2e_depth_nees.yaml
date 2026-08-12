@@ -4,16 +4,18 @@
 #   1. Bias priors matched to MidAir traj_0 measured IMU noise (biasAcc 1.58→4e-4,
 #      biasGyr 97162→4e-6). The loose factory priors made the EqF 3000x too uncertain
 #      about bias, collapsing the mono scale on low-jerk trajectories.
-#   2. Velocity noise matched to measured per-trajectory std (acc 0.0124→0.0328,
-#      gyr 0.00024→0.0394). MidAir's per-trajectory-randomized IMU noise is 4–8x
-#      wider than the base config's values on some trajectories.
+#   2. Velocity noise matched to measured per-trajectory std, converted to
+#      continuous-time noise density (σ_density = σ_sample · √dt, 100 Hz → ×0.1).
+#      Per-sample: σ_a=0.0328, σ_g=0.0394 → density: 0.00328, 0.00394.
+#      MidAir's per-trajectory-randomized IMU noise is 4–8x wider than the
+#      base config's values on some trajectories.
 #   3. Sparse3D sigma_pixel set to 1.0 (calibrated on GT pixel data), not 5.0.
 #
 # With these corrections, traj_0 ATE drops from ~8990 m to ~7.3 m (1.9%).
 # This config is for the filter_formulation.md Section X.1 excitation-gate evidence.
 #
 # Evidence script: echo-li-python/tests/diagnostics/midair_e2e_depth_nees.py
-# Config provenance: derived 2026-08-10, see ECHO-LI-notes memory
+# Config provenance: derived from the 2026-08 MidAir calibration runs.
 #   sparse3d-pose-surrogate-bounded-by-pvv.md for the full confound stripping.
 RudolfV:
   equaliseImageHistogram: true
@@ -37,7 +39,10 @@ RudolfV:
 eqf:
   maxFeatures: 40
   initialValue:
-    sceneDepth: 24.0
+    # Large initial value so that sky features (depth ≈ ∞) produce
+    # negligible phantom parallax in the first frames.  useMedianDepth
+    # converges the scale from any starting point once features mature.
+    sceneDepth: 200.0
   initialVariance:
     attitude: 0.13565029126052572
     # Principled bias priors: matched to MidAir measured per-traj noise.
@@ -74,9 +79,12 @@ eqf:
     imuBiasGroup: additive
   velocityNoise:
     # Matched to MidAir traj_0 measured IMU noise.
-    acc: 0.0328
+    # Per-sample σ at 100 Hz: σ_a=0.0328, σ_g=0.0394.
+    # EqF convention is continuous-time noise density (σ/√Hz):
+    #   σ_density = σ_sample · √dt = σ_sample · 0.1
+    acc: 0.00328
     accBias: 0.004462289865453429
-    gyr: 0.0394
+    gyr: 0.00394
     gyrBias: 0.00013372703521098622
 main:
   writeState: true

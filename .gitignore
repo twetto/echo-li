@@ -31,6 +31,7 @@ patch_status*.mp4
 patch_status*.png
 *_cache.npz
 cue_dumps/
+artifacts/
 # maturin/pip build artifacts dropped into the source package
 *.pyd
 *.pdb

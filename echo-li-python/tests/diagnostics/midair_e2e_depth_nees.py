@@ -22,14 +22,12 @@ To reproduce the VO_test table (≈3 min per run):
   $PY $S --root $ROOT --traj 0 --config $CFG --pose-range-scale 0.003 --min-track 20
   $PY $S --root $ROOT --traj 2 --config $CFG --pose-range-scale 0.003 --min-track 20
 
-Expected output (configs/diagnostics_midair_e2e_depth_nees.yaml):
+Expected output (configs/diagnostics_midair_e2e_depth_nees.yaml, noise-density fix):
 
   | traj | prs   | NEES med | %%>χ²₉₅ | %%>χ²₉₉ | σ_r (m) | err med |
   |------|-------|----------|---------|---------|---------|---------|
-  | 0    | 0     | 30.7     | 82.4%%  | 74.8%%  | 3.1     | −40%%   |
-  | 0    | 0.003 | 0.114    | 5.8%%   | 4.2%%   | 97      | −10%%   |
-  | 2    | 0     | 3.58     | 49.2%%  | 42.7%%  | 3.1     | −21%%   |
-  | 2    | 0.003 | 0.230    | 15.3%%  | 11.3%%  | 29      | −11%%   |
+  | 0    | 0.003 | 0.356    | 17.2%%  | 14.2%%  | 51      | −28%%   |
+  | 2    | 0.003 | 0.184    | 6.9%%   | 5.1%%   | 19      | −10%%   |
   | t(2.6) ref |  | 0.609   | 15.9%%  | 9.5%%   |         |         |
 
 For Kite_training cross-trajectory validation (≈90 min), see
@@ -62,6 +60,39 @@ SPARSE_KEYS = [
     "use_equivariant_output", "iekf_iterations", "rotation_unscented",
 ]
 R_MARGIN = 4  # pixels from image border to ignore when reading GT depth
+
+
+def _grid_select(all_uvs, existing, budget, W, H, n_cols=5, n_rows=5):
+    """Select up to *budget* feature IDs spread evenly across a grid.
+
+    Each cell gets at most ceil(budget / n_cells) features.  Within a cell,
+    existing landmarks (already in the EqF state) are kept first, then new
+    ones are added.  The overall result is truncated to *budget*.
+    """
+    import math
+    n_cells = n_cols * n_rows
+    per_cell = math.ceil(budget / n_cells)
+    cw, ch = W / n_cols, H / n_rows
+
+    # Bin features into grid cells.
+    cells = [[] for _ in range(n_cells)]
+    for fid, (u, v) in all_uvs.items():
+        ci = min(int(u / cw), n_cols - 1)
+        ri = min(int(v / ch), n_rows - 1)
+        cells[ri * n_cols + ci].append(fid)
+
+    selected = []
+    for cell in cells:
+        # Sort: existing first, then new.
+        cell.sort(key=lambda fid: (0 if fid in existing else 1, fid))
+        selected.extend(cell[:per_cell])
+
+    # If total exceeds budget (because many cells are sparse and a few dense),
+    # prefer existing landmarks globally.
+    if len(selected) > budget:
+        selected.sort(key=lambda fid: (0 if fid in existing else 1, fid))
+        selected = selected[:budget]
+    return selected
 
 
 def vio_body_pose(vio):
@@ -115,6 +146,12 @@ def main():
                     help="override SparseVog.sigma_pixel")
     ap.add_argument("--scene-depth", type=float, default=None,
                     help="override eqf.initialValue.sceneDepth")
+    ap.add_argument("--eqf-max-depth", type=float, default=500.0,
+                    help="reject features deeper than this from EqF input "
+                         "(sky features at infinity cause phantom parallax)")
+    ap.add_argument("--eqf-selection", choices=("grid", "existing-first"),
+                    default="grid",
+                    help="feature selection when --eqf-max-obs is exceeded")
     ap.add_argument("--save-npz", default="",
                     help="save raw results + provenance to this .npz path")
     ap.add_argument("--no-progress", action="store_true")
@@ -138,10 +175,14 @@ def main():
         cfg.setdefault("eqf", {}).setdefault("initialVariance", {})["biasAcc"] = args.bias_acc
     if args.bias_gyr is not None:
         cfg.setdefault("eqf", {}).setdefault("initialVariance", {})["biasGyr"] = args.bias_gyr
+    # --vel-acc / --vel-gyr are per-sample σ (from midair_measure_imu_noise.py).
+    # EqF expects continuous-time noise density: σ_density = σ_sample · √dt.
+    # MidAir IMU runs at 100 Hz → √dt = 0.1.
+    imu_sqrt_dt = 0.1
     if args.vel_acc is not None:
-        cfg.setdefault("eqf", {}).setdefault("velocityNoise", {})["acc"] = args.vel_acc
+        cfg.setdefault("eqf", {}).setdefault("velocityNoise", {})["acc"] = args.vel_acc * imu_sqrt_dt
     if args.vel_gyr is not None:
-        cfg.setdefault("eqf", {}).setdefault("velocityNoise", {})["gyr"] = args.vel_gyr
+        cfg.setdefault("eqf", {}).setdefault("velocityNoise", {})["gyr"] = args.vel_gyr * imu_sqrt_dt
     if args.scene_depth is not None:
         cfg.setdefault("eqf", {}).setdefault("initialValue", {})["sceneDepth"] = args.scene_depth
 
@@ -240,13 +281,18 @@ def main():
         feats, _stats = tracker.process(gray)
         all_uvs = {int(fd["id"]): (float(fd["x"]), float(fd["y"])) for fd in feats}
 
-        # Cap observations for EqF (must match config maxFeatures to avoid churn).
+        # Cap observations for EqF with spatial distribution.
+        # Grid-based selection: divide frame into cells, pick at most
+        # ceil(budget/n_cells) per cell, preferring existing landmarks.
         existing = {int(x) for x in vio.get_landmarks().keys()}
         obs_ids = sorted(all_uvs.keys())
         if args.eqf_max_obs > 0 and len(obs_ids) > args.eqf_max_obs:
-            keep_exist = [fid for fid in obs_ids if fid in existing]
-            keep_new = [fid for fid in obs_ids if fid not in existing]
-            obs_ids = (keep_exist + keep_new)[:args.eqf_max_obs]
+            if args.eqf_selection == "grid":
+                obs_ids = _grid_select(all_uvs, existing, args.eqf_max_obs, W, H)
+            else:
+                keep_exist = [fid for fid in obs_ids if fid in existing]
+                keep_new = [fid for fid in obs_ids if fid not in existing]
+                obs_ids = (keep_exist + keep_new)[:args.eqf_max_obs]
         vio_uvs = {fid: all_uvs[fid] for fid in obs_ids}
         vio.process_vision(stamp, vio_uvs)
 
