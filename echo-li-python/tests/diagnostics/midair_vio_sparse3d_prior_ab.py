@@ -127,6 +127,7 @@ def parse_modes(text):
         "sparse3d_seeded": ["sparse3d_seeded"],
         "stereo": ["stereo_seeded"],
         "stereo_seeded": ["stereo_seeded"],
+        "sparse_defer": ["sparse_defer"],
     }
     modes = []
     for raw in text.split(","):
@@ -291,6 +292,56 @@ def cap_eqf_observations(all_uvs, existing_ids, priors, max_obs, selection, W, H
         keep.sort(key=lambda fid: (0 if fid in existing_ids else 1, fid))
         keep = keep[:max_obs]
     return {fid: all_uvs[fid] for fid in keep}
+
+
+def live_median_depth(vio, ext, observed_ids):
+    """Median positive optical-axis depth of current EqF landmarks."""
+    landmarks = vio.get_landmarks()
+    if not landmarks:
+        return None
+    T_wc = vio_body_pose(vio) @ ext
+    R_cw = T_wc[:3, :3].T
+    p_wc = T_wc[:3, 3]
+    depths = []
+    for fid, p_w in landmarks.items():
+        if int(fid) not in observed_ids:
+            continue
+        z = float((R_cw @ (np.asarray(p_w, float) - p_wc))[2])
+        if np.isfinite(z) and z > 0.0:
+            depths.append(z)
+    return float(np.median(depths)) if depths else None
+
+
+def median_depth_birth_priors(vio_uvs, existing, median_depth, f, cx, cy, rel_sigma):
+    """Express an optical-axis median depth as per-feature metric ranges."""
+    if median_depth is None or not np.isfinite(median_depth) or median_depth <= 0.0:
+        return {}
+    priors = {}
+    for fid, (u, v) in vio_uvs.items():
+        if fid in existing:
+            continue
+        ray = np.array([(u - cx) / f, (v - cy) / f, 1.0], float)
+        bearing_z = 1.0 / np.linalg.norm(ray)
+        rng = median_depth / bearing_z
+        priors[fid] = [rng, (rel_sigma * rng) ** 2]
+    return priors
+
+
+def fallback_births_to_defer(vio_uvs, existing_ids, priors, wait_floor, W, H):
+    """Defer excess scene-depth births while preserving established tracks."""
+    if wait_floor <= 0:
+        return []
+    fallback_new = {
+        fid: uv for fid, uv in vio_uvs.items()
+        if fid not in existing_ids and fid not in priors
+    }
+    allowance = max(int(wait_floor) - len(existing_ids), 0)
+    if allowance >= len(fallback_new):
+        return []
+    allowed = cap_eqf_observations(
+        fallback_new, set(), {}, allowance, "grid", W, H
+    ) if allowance > 0 else {}
+    return [fid for fid in fallback_new if fid not in allowed]
 
 
 def open_writer(path, w, h, fps):
@@ -561,6 +612,8 @@ def run_once(mode, args, ds, f, cx, cy, W, H, ext, events, map_xy):
     deferred_new = 0
     admitted_new = 0
     prior_candidates_total = 0
+    wait_deferred_total = 0
+    live_landmark_counts = []
     prior_rel_sigmas = []
     seed_q = []  # (frame, prior_range, gt_range) for seeded births
     anchor_census = []  # (frame, n_live_features, n_distinct_anchors)
@@ -645,10 +698,20 @@ def run_once(mode, args, ds, f, cx, cy, W, H, ext, events, map_xy):
                         prior_rel_sigmas.append(np.sqrt(var_r) / rng)
 
             existing = {int(x) for x in vio.get_landmarks().keys()}
+            live_landmark_counts.append(len(existing))
             if mode == "baseline":
                 vio_uvs = cap_eqf_observations(
                     all_uvs, existing, priors, args.eqf_max_obs, args.eqf_selection, W, H)
-                if args.true_depth_seed:
+                if args.median_depth_fallback:
+                    _median_z = live_median_depth(vio, ext, set(vio_uvs))
+                    _median_priors = median_depth_birth_priors(
+                        vio_uvs, existing, _median_z, f, cx, cy,
+                        args.median_depth_rel_sigma)
+                else:
+                    _median_priors = {}
+                if args.median_depth_fallback and _median_priors:
+                    vio.process_vision_with_depth_priors(stamp, vio_uvs, _median_priors)
+                elif args.true_depth_seed:
                     # Diagnostic: seed births with GT range (occlusion/depth-edge filtered)
                     # to separate "bad landmark init" from "bad covariance model".
                     dmap = ds.depth(k); hh, ww = dmap.shape
@@ -678,8 +741,16 @@ def run_once(mode, args, ds, f, cx, cy, W, H, ext, events, map_xy):
                 n_noprior += len(_noprior)
                 n_tracked_noprior += sum(1 for f in _noprior if sparse is not None
                                          and sparse.has_track(f))
+                _defer = set()
                 if args.defer_fallback and sparse is not None:
-                    _defer = [f for f in _noprior if sparse.has_track(f)]
+                    _defer.update(f for f in _noprior if sparse.has_track(f))
+                if args.wait_floor > 0:
+                    _wait_defer = fallback_births_to_defer(
+                        vio_uvs, existing, priors, args.wait_floor, W, H)
+                    _defer.update(_wait_defer)
+                    wait_deferred_total += len(_wait_defer)
+                if _defer:
+                    _defer = sorted(_defer)
                     n_deferred += len(_defer)
                     vio.process_vision_with_depth_priors_and_deferred(
                         stamp, vio_uvs, priors, _defer)
@@ -877,12 +948,23 @@ def main():
                          "converged, instead of birthing them at the constant sceneDepth. "
                          "The CLI already does this; the Python path could not until the "
                          "deferred binding was exposed.")
+    ap.add_argument("--wait-floor", type=int, default=0,
+                    help="Python-only experiment: admit sceneDepth fallback births only "
+                         "to replenish this live-landmark floor; prior-backed births "
+                         "remain eligible and existing landmarks remain observed. 0 disables.")
     ap.add_argument("--far-gate", type=float, default=0.0,
                     help="reject Sparse3D priors farther than k x the frame median prior "
                     "range (scale-free far-outlier gate). 0 disables.")
     ap.add_argument("--seed-quality", action="store_true",
                     help="record (frame, prior_range, gt_range) for each prior-seeded birth "
                     "to measure seed quality directly against GT depth.")
+    ap.add_argument("--median-depth-fallback", action="store_true",
+                    help="baseline mode: bootstrap at configured sceneDepth, then seed new "
+                         "fallback landmarks at the median positive optical-axis depth of "
+                         "the current EqF landmarks (Python emulation of EqVIO median depth).")
+    ap.add_argument("--median-depth-rel-sigma", type=float, default=np.sqrt(129.90415638150924),
+                    help="synthetic relative range sigma; default reproduces the configured "
+                         "Normal-chart initial point variance, avoiding a covariance confound")
     ap.add_argument("--true-depth-seed", action="store_true",
                     help="baseline mode: seed births with GT range (occlusion/depth-edge "
                     "filtered) instead of the median-depth pin. Diagnostic only.")
