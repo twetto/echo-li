@@ -79,6 +79,7 @@ def run(mode, ds, est_pose, f, cx, cy, W, H, settings, args):
     filt = echo_li.Sparse3DFilter.bearing_invdepth_additive3d(
         echo_li.PinholeCamera(f, f, cx, cy), **settings)
     Xw, born = {}, {}
+    birth_ctr = {}   # track id -> (est cam-centre, gt cam-centre) at birth, for s_eff decomposition
     nid = 0
     rows = []
     prev_pvv = prev_pww = None
@@ -114,7 +115,7 @@ def run(mode, ds, est_pose, f, cx, cy, W, H, settings, args):
             uv = uv + pix_noise(i, j, args.pixel_noise)
             uvs[int(j)] = (float(uv[0]), float(uv[1]))
         for j in drop:
-            born.pop(j, None); Xw.pop(j, None)
+            born.pop(j, None); Xw.pop(j, None); birth_ctr.pop(j, None)
 
         # redetect on a grid using GT depth (truth births, mode-independent)
         if len(born) < args.redetect:
@@ -129,6 +130,7 @@ def run(mode, ds, est_pose, f, cx, cy, W, H, settings, args):
                         continue
                     Xw[nid] = md.backproject_world((float(gx), float(gy)), d_rng, T_wb, f, cx, cy)
                     born[nid] = i
+                    birth_ctr[nid] = (T_wc_filt[:3, 3].copy(), T_wc_gt[:3, 3].copy())
                     bn = np.array([gx, gy], float) + pix_noise(i, nid, args.pixel_noise)
                     uvs[int(nid)] = (float(bn[0]), float(bn[1]))
                     nid += 1
@@ -159,14 +161,26 @@ def run(mode, ds, est_pose, f, cx, cy, W, H, settings, args):
             if rng_true is None:
                 continue
             derr = re - rng_true
-            rows.append((i - born[j], tl, derr, rng_true, derr * derr / var_r, np.sqrt(var_r)))
+            # s_eff: est-vs-GT camera baseline scale ratio over THIS track's birth->current span
+            # (the baseline triangulation actually consumes). par: GT baseline/depth ~ parallax angle.
+            # With exact bearings, a pure baseline-scale error gives relerr == s_eff-1 exactly;
+            # any excess isolates parallax amplification / drift. GT mode -> s_eff==1 (control).
+            cb = birth_ctr.get(j)
+            if cb is None:
+                continue
+            d_est = float(np.linalg.norm(T_wc_filt[:3, 3] - cb[0]))
+            d_gt = float(np.linalg.norm(T_wc_gt[:3, 3] - cb[1]))
+            s_eff = d_est / d_gt if d_gt > 1e-6 else np.nan
+            par = d_gt / rng_true if rng_true > 1e-6 else np.nan
+            rows.append((i - born[j], tl, derr, rng_true, derr * derr / var_r, np.sqrt(var_r),
+                         s_eff, par))
     return np.array(rows, float)
 
 
 def summarize(name, A):
     if len(A) == 0:
         print(f"[{name}] no scored obs"); return
-    age, tl, derr, rng, nees, sig = A.T
+    age, tl, derr, rng, nees, sig, s_eff, par = A.T
     relerr = derr / rng
     print(f"\n=== {name} poses  ({len(A)} scored range obs) ===")
     print(f"range NEES-1D  mean/median: {np.mean(nees):8.2f} / {np.median(nees):8.3f}   "
@@ -177,6 +191,27 @@ def summarize(name, A):
     print(f"abs range err:              median {100*np.median(np.abs(relerr)):6.2f}%  "
           f"p90 {100*np.percentile(np.abs(relerr),90):6.2f}%")
     print(f"reported range sigma:       median {np.median(sig):6.3f} m   (filter's 1-sigma depth)")
+    # s_eff decomposition: does depth error == baseline-scale error (relerr == s_eff-1)?
+    b = s_eff - 1.0                                    # baseline-scale error fraction
+    resid = relerr - b                                 # excess depth error (amplification/drift)
+    g = np.isfinite(b) & np.isfinite(par) & (par > 0)
+    if g.sum() >= 10:
+        bb, rr, rs, pp, aa = b[g], relerr[g], resid[g], par[g], age[g]
+        print(f"baseline-scale err (s_eff-1): median {100*np.median(bb):+6.2f}%  "
+              f"abs-med {100*np.median(np.abs(bb)):6.2f}%")
+        print(f"relerr vs (s_eff-1):        signed-ratio median {np.median(rr[np.abs(bb)>1e-4]/bb[np.abs(bb)>1e-4]):+6.2f}  "
+              f"(1.0 == pure baseline scale)")
+        print(f"residual relerr-(s_eff-1):  median {100*np.median(rs):+6.2f}%  "
+              f"abs-med {100*np.median(np.abs(rs)):6.2f}%  (0 == no amplification)")
+        # is the excess parallax-driven? corr(|resid|, 1/par); and does |resid| grow with age?
+        c_par = float(np.corrcoef(np.abs(rs), 1.0 / pp)[0, 1])
+        c_age = float(np.corrcoef(np.abs(rs), aa)[0, 1])
+        print(f"corr(|residual|, 1/parallax): {c_par:+.3f}   corr(|residual|, track_age): {c_age:+.3f}")
+        for plo, phi, lbl in [(0, 0.02, "par<2%"), (0.02, 0.05, "2-5%"), (0.05, 1e9, "par>5%")]:
+            m = (pp >= plo) & (pp < phi)
+            if m.sum() >= 10:
+                print(f"  {lbl:>7}: n={int(m.sum()):5d}  |s_eff-1| med {100*np.median(np.abs(bb[m])):5.2f}%  "
+                      f"|resid| med {100*np.median(np.abs(rs[m])):5.2f}%")
     for lo, hi in [(10, 20), (20, 40), (40, 80), (80, 1e9)]:
         m = (tl >= lo) & (tl < hi)
         if m.sum() >= 10:
@@ -246,7 +281,7 @@ def main():
         out[pc] = summarize(f"VIO-ESTIMATED  pose_cov={pc}",
                             run("est", ds, est_pose, f, cx, cy, W, H, dict(settings), args))
     if args.save_npz:
-        np.savez(args.save_npz, cols=np.array(["age", "tl", "derr", "rng", "nees", "sig"]),
+        np.savez(args.save_npz, cols=np.array(["age", "tl", "derr", "rng", "nees", "sig", "s_eff", "par"]),
                  **{k: v for k, v in out.items() if v is not None})
         print("\nsaved ->", args.save_npz)
 
