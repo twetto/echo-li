@@ -2,7 +2,7 @@ use echo_li_core::config::VIOConfig;
 use numpy::ndarray::Array2;
 use numpy::{PyArray2, PyReadonlyArray2, PyUntypedArrayMethods};
 use pyo3::prelude::*;
-use rudolf_v::camera::CameraIntrinsics;
+use rudolf_v::camera::{CameraIntrinsics, DistortionModel};
 use rudolf_v::frontend::{self, Frontend, LbpPolicy};
 use rudolf_v::histeq::HistEqMethod;
 use rudolf_v::image::Image as RudolfImage;
@@ -49,7 +49,7 @@ pub struct FrontendConfig {
     pub clahe_tile_size: usize,
     #[pyo3(get, set)]
     pub clahe_clip_limit: f32,
-    intrinsics: Option<(f64, f64, f64, f64, usize, usize, Vec<f64>)>,
+    intrinsics: Option<(f64, f64, f64, f64, usize, usize, Vec<f64>, DistortionModel)>,
 }
 
 #[pymethods]
@@ -160,6 +160,10 @@ impl FrontendConfig {
         })
     }
 
+    #[pyo3(signature = (
+        fx, fy, cx, cy, width, height, distortion,
+        distortion_model = "radtan"
+    ))]
     fn set_camera(
         &mut self,
         fx: f64,
@@ -169,8 +173,20 @@ impl FrontendConfig {
         width: usize,
         height: usize,
         distortion: Vec<f64>,
-    ) {
-        self.intrinsics = Some((fx, fy, cx, cy, width, height, distortion));
+        distortion_model: &str,
+    ) -> PyResult<()> {
+        let model = match distortion_model.to_ascii_lowercase().as_str() {
+            "none" | "pinhole" => DistortionModel::None,
+            "radtan" | "radial-tangential" => DistortionModel::RadTan,
+            "equidistant" | "fisheye" => DistortionModel::Equidistant,
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "unsupported distortion model '{other}'; expected none, radtan, or equidistant"
+                )));
+            }
+        };
+        self.intrinsics = Some((fx, fy, cx, cy, width, height, distortion, model));
+        Ok(())
     }
 
     fn __repr__(&self) -> String {
@@ -222,12 +238,58 @@ impl FrontendConfig {
             },
             _ => HistEqMethod::None,
         };
-        if let Some((fx, fy, cx, cy, w, h, ref dist)) = self.intrinsics {
+        if let Some((fx, fy, cx, cy, w, h, ref dist, model)) = self.intrinsics {
             let mut cam = CameraIntrinsics::new(fx, fy, cx, cy, w, h);
             cam.distortion = dist.clone();
+            cam.model = model;
             cfg.camera = Some(cam);
         }
         cfg
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn python_frontend_preserves_equidistant_model() {
+        let mut config = FrontendConfig::new(
+            200,
+            20,
+            3,
+            64,
+            21,
+            30,
+            "translation".to_string(),
+            false,
+            0.0,
+            true,
+            0.0,
+            false,
+            1e-3,
+            0.5,
+            true,
+            "soft".to_string(),
+            "global".to_string(),
+            256,
+            4.0,
+        );
+        config
+            .set_camera(
+                462.4,
+                462.5,
+                670.4,
+                398.4,
+                1280,
+                800,
+                vec![0.068, 0.0022, 0.0046, -0.0033],
+                "equidistant",
+            )
+            .unwrap();
+
+        let camera = config.to_rust().camera.unwrap();
+        assert_eq!(camera.model, DistortionModel::Equidistant);
     }
 }
 
