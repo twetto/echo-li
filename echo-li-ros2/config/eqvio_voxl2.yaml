@@ -1,0 +1,58 @@
+RudolfV:
+  equaliseImageHistogram: true
+  histeq: global
+  featureDist: 16.0
+  featureSearchThreshold: 0.8
+  fastThreshold: 20
+  maxFeatures: 40
+  maxLevel: 3
+  lbpPolicy: SoftPenalty
+  enableRansac: true
+
+eqf:
+  maxFeatures: 40
+  initialValue:
+    sceneDepth: 3.0
+  initialVariance:
+    attitude: 0.13565029126052572
+    biasAcc: 1.5813333765300104
+    biasGyr: 97162.79515771076
+    cameraAttitude: 0.0010228558965517584
+    cameraPosition: 0.023501400846134893
+    point: 129.90415638150924
+    position: 0.1
+    velocity: 8.974852995731e-08
+  measurementNoise:
+    feature: 5.0
+    featureOutlierAbs: 5.0
+    featureOutlierProb: 0.03229809583062128
+    featureRetention: 0.18594708334486176
+  processVariance:
+    attitude: 6.025875320811407e-05
+    biasAcc: 0.0
+    biasGyr: 0.0
+    cameraAttitude: 5.075382174045239e-05
+    cameraPosition: 1.2188313140115635e-04
+    point: 0.00029845436136043135
+    position: 9.981466095928483e-06
+    velocity: 0.025317333863551263
+  settings:
+    coordinateChoice: Normal
+    fastRiccati: false
+    useDiscreteInnovationLift: false
+    useDiscreteVelocityLift: false
+    useEquivariantOutput: true
+    useFeaturePredictions: true
+    useMedianDepth: true
+    riccatiVariant: faster
+    imuBiasGroup: additive
+  velocityNoise:
+    acc: 0.012438843268295521
+    accBias: 0.004462289865453429
+    gyr: 0.000243153572917808
+    gyrBias: 0.00013372703521098622
+
+main:
+  writeState: false
+  # The ROS wrapper applies camera_time_offset_sec explicitly.
+  cameraLag: 0.0
