@@ -2,6 +2,8 @@ pub mod bias_group_ops;
 pub mod camera;
 pub mod eqf_matrices;
 pub mod imu_velocity;
+pub mod msceqf_filter;
+pub mod msckf;
 pub mod vio_eqf;
 pub mod vio_group;
 pub mod vio_state;
