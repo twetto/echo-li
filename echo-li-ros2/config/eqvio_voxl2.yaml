@@ -1,10 +1,17 @@
 RudolfV:
   equaliseImageHistogram: true
-  histeq: global
+  # CLAHE gives better local contrast in dark / low-light VOXL2 scenes.
+  # Matched to OpenVINS: cv::createCLAHE(10.0, cv::Size(8,8)).
+  # OpenVINS 8×8 grid on 1280×800 → ~160px tiles; 128px is the closest
+  # square-tile equivalent (10×7 grid, slightly finer).
+  histeq: clahe
+  clahe_tile_size: 128
+  clahe_clip_limit: 10.0
   featureDist: 16.0
   featureSearchThreshold: 0.8
-  fastThreshold: 20
-  maxFeatures: 40
+  # Lower threshold to pull more features from dark/noisy H.265 frames.
+  fastThreshold: 40
+  maxFeatures: 300
   maxLevel: 3
   lbpPolicy: SoftPenalty
   enableRansac: true
@@ -23,16 +30,23 @@ eqf:
     position: 0.1
     velocity: 8.974852995731e-08
   measurementNoise:
-    feature: 5.0
-    featureOutlierAbs: 5.0
+    # Wider pixel noise for H.265 compression artefacts and dark-scene jitter
+    # (matches OpenVINS sigma_px=4.0).  Now decoupled from the outlier gate.
+    feature: 4.0
+    # Outlier gate in pixels (was multiplied by sigma_bearing; now absolute).
+    # 10px ≈ the old 5.0 * 2.0 default.
+    featureOutlierAbs: 10.0
     featureOutlierProb: 0.03229809583062128
     featureRetention: 0.18594708334486176
   processVariance:
     attitude: 6.025875320811407e-05
     biasAcc: 0.0
     biasGyr: 0.0
-    cameraAttitude: 5.075382174045239e-05
-    cameraPosition: 1.2188313140115635e-04
+    # Frozen — with inflated bias random walk the extrinsics should not drift;
+    # any non-zero process noise here lets them absorb IMU errors and corrupts
+    # triangulation geometry, collapsing landmark depths toward the camera.
+    cameraAttitude: 0.0
+    cameraPosition: 0.0
     point: 0.00029845436136043135
     position: 9.981466095928483e-06
     velocity: 0.025317333863551263
@@ -48,9 +62,68 @@ eqf:
     imuBiasGroup: additive
   velocityNoise:
     acc: 0.012438843268295521
-    accBias: 0.004462289865453429
+    # Bias random walk inflated to let the EqF bias tracker follow real
+    # ICM42688P drift.  Same 5x (accel) / 3x (gyro) ratios that fixed
+    # OpenVINS on these bags.
+    accBias: 0.021595
     gyr: 0.000243153572917808
-    gyrBias: 0.00013372703521098622
+    gyrBias: 0.000421
+
+SparseVog:
+  parametrization: bearing_invdepth_additive3d
+  max_pool_size: 300
+  min_track_length: 5
+  conv_variance_threshold: 2.0
+  init_depth_var: 10.0
+  sigma_pixel: 5.0
+  uniform_z_max: 20.0
+  a_init: 100000000.0
+  b_init: 0.00000001
+  ab_min: 1.0
+  ab_max: 200.0
+  min_inlier_ratio: 0.5
+  mahalanobis_reset_chi2: 0.2
+  bias_walk_var: 0.0
+  process_depth_var: 0.01
+  pose_range_scale: 1.0
+  pose_range_coherent: 0.0
+  min_parallax: 0.0001
+  min_cos_sim: 0.95
+  min_depth: 0.1
+  max_depth: 12.0
+
+PatchDepth:
+  # per_patch_bearing: target-anchored per-patch tangent rectification for the
+  # equidistant fisheye.  Seamless and wide-FoV-correct.
+  camera_mode: per_patch_bearing
+  warp_mode: fast_translation
+  # Quarter-resolution for speed on battery.
+  scale: 0.25
+  patch_size: 8
+  patch_stride: 4
+  gn_eta_convergence_tol: 0.001
+  n_pyramid_levels: 1
+  seed_radius_px: 64
+  min_baseline_ratio: 0.005
+  max_baseline_ratio: 0.3
+  max_depth: 12.0
+  # min_structure_eigen: 1.0
+  min_structure_eigen: 0.0
+  vis_min_depth: 0.3
+  vis_max_depth: 8.0
+
+LocalOccupancy:
+  enabled: true
+  resolution: 0.10
+  width_cells: 160
+  height_cells: 160
+  sample_stride: 4
+  min_range: 0.25
+  max_range: 12.0
+  max_eta_std: 0.5
+  update_mode: fixed
+  min_obstacle_height: -1.0
+  max_obstacle_height: 1.0
 
 main:
   writeState: false

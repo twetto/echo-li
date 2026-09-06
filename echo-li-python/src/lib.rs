@@ -2,6 +2,7 @@ use pyo3::prelude::*;
 
 mod camera;
 mod frontend;
+mod occupancy;
 mod patch_depth;
 mod sparse_3d;
 mod stereo;
@@ -17,6 +18,7 @@ fn _echo_li(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<vio_filter::PyVIOFilter>()?;
     m.add_class::<sparse_3d::PySparse3DFilter>()?;
     m.add_class::<patch_depth::PyPatchDepthMapper>()?;
+    m.add_class::<occupancy::PyLocalOccupancyMap>()?;
     m.add_class::<stereo::PyStereo>()?;
     Ok(())
 }

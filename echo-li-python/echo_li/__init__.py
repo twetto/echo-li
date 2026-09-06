@@ -7,6 +7,7 @@ from echo_li._echo_li import (
     VIOFilter,
     Sparse3DFilter,
     PatchDepthMapper,
+    LocalOccupancyMap,
     Stereo,
 )
 
@@ -19,5 +20,6 @@ __all__ = [
     "VIOFilter",
     "Sparse3DFilter",
     "PatchDepthMapper",
+    "LocalOccupancyMap",
     "Stereo",
 ]
