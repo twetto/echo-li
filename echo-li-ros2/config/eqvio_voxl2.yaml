@@ -61,13 +61,18 @@ eqf:
     riccatiVariant: faster
     imuBiasGroup: additive
   velocityNoise:
-    acc: 0.012438843268295521
-    # Bias random walk inflated to let the EqF bias tracker follow real
-    # ICM42688P drift.  Same 5x (accel) / 3x (gyro) ratios that fixed
-    # OpenVINS on these bags.
-    accBias: 0.021595
-    gyr: 0.000243153572917808
-    gyrBias: 0.000421
+    # ICM42688P — Allan variance baseline × empirical multipliers.
+    # Baseline (2026-09-06, 2.13h static bag):
+    #   gyr_N=1.663e-4  gyr_RRW=2.399e-5  acc_N=4.622e-4  acc_RRW=6.442e-5
+    # Multipliers: gyr 2×, gyrBias 3×, acc 5×, accBias 20×
+    # NOT principled — chosen to land near previously-working values.
+    # Allan variance = static bench floor; real deployment adds vibration,
+    # temperature drift, timing jitter.  Properly: prop-on Allan, or tune
+    # against innovation whiteness, or grid-sweep vs MOCAP ground truth.
+    acc: 2.31095e-03      # 4.622e-4 × 5   [m/s²/√Hz]
+    accBias: 1.28842e-03  # 6.442e-5 × 20  [m/s³/√Hz]
+    gyr: 3.32660e-04      # 1.663e-4 × 2   [rad/s/√Hz]
+    gyrBias: 7.19700e-05  # 2.399e-5 × 3   [rad/s²/√Hz]
 
 SparseVog:
   parametrization: bearing_invdepth_additive3d
