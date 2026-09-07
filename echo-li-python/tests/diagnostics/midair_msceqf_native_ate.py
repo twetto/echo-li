@@ -43,10 +43,15 @@ def R_wb(q):
     ])
 
 
-def load_tracks(nimg):
-    """frame k -> {track_id: (un, vn)} normalized Z1 coords."""
+def load_tracks(nimg, tracks_path=TRACKS, t0=0.0):
+    """frame k -> {track_id: (un, vn)} normalized Z1 coords.
+
+    `t0` is the external bag epoch: external image k sits at ts = t0 + k/25,
+    so k = round((ts - t0) / (DT*IMU_PER_IMG)). Default t0=0 matches the
+    MSCEqF own-tracks file (starts at 0). For the OV KLT log pass t0=3.56.
+    """
     by_frame = defaultdict(dict)
-    with open(TRACKS) as f:
+    with open(tracks_path) as f:
         for line in f:
             if line.startswith("#"):
                 continue
@@ -54,8 +59,8 @@ def load_tracks(nimg):
             if len(p) < 5:
                 continue
             ts = float(p[0]); tid = int(p[2]); u = float(p[3]); v = float(p[4])
-            k = int(round(ts / (DT * IMU_PER_IMG)))
-            if k >= nimg:
+            k = int(round((ts - t0) / (DT * IMU_PER_IMG)))
+            if k < 0 or k >= nimg:
                 continue
             by_frame[k][tid] = ((u - CX) / FX, (v - CX) / FX)
     return by_frame
@@ -74,8 +79,12 @@ def align_umeyama(est, gt):
 
 
 def main():
+    global IMU_PER_IMG
     ap = argparse.ArgumentParser()
     ap.add_argument("--set", default="VO_test")
+    ap.add_argument("--imu-per-img", type=int, default=4,
+                    help="IMU samples per image = clone cadence. MSCEqF own tracks "
+                         "are 25 Hz (4); OV logged its KLT at 12.5 Hz, use 8.")
     ap.add_argument("--cond", default="sunny")
     ap.add_argument("--traj", type=int, default=2)
     ap.add_argument("--nframes", type=int, default=0)
@@ -83,12 +92,29 @@ def main():
     ap.add_argument("--max-track-len", type=int, default=200)
     ap.add_argument("--curvature", type=int, default=1)
     ap.add_argument("--chi2-mult", type=float, default=1.0)
+    # In-state (SLAM) landmarks. Default OFF (--max-slam 0 == pure structureless
+    # MSCKF, byte-identical to before). When > 0, long window-spanning tracks about
+    # to be marginalized are PROMOTED to persistent SOT3 landmarks (OV hybrid):
+    # birthed, reanchored to a surviving clone, and updated each frame with a single
+    # fresh bearing (anchor decoupled — no measurement reused).
+    ap.add_argument("--max-slam", type=int, default=0)
+    ap.add_argument("--slam-min-len", type=int, default=0,
+                    help="min track length to promote (0 => num_clones, full span)")
+    ap.add_argument("--slam-chi2-mult", type=float, default=0.0,
+                    help="χ² gate for SLAM birth/update (0 => reuse --chi2-mult)")
     ap.add_argument("--acc-density", type=float, default=1.6798e-3)
     ap.add_argument("--acc-rw", type=float, default=3.0e-3)
     ap.add_argument("--gyr-density", type=float, default=1.2724e-3)
     ap.add_argument("--gyr-rw", type=float, default=1.0e-4)
     ap.add_argument("--dump", default="", help="save est/gt/R/t/k npz for the video")
+    ap.add_argument("--tracks", default=str(TRACKS),
+                    help="feature-track log (ts cam id u v). Default = MSCEqF own "
+                         "KLT; pass the OV KLT log for a same-front-end comparison.")
+    ap.add_argument("--tracks-t0", type=float, default=0.0,
+                    help="external bag epoch: frame k = round((ts - t0)/0.04). "
+                         "OV log needs 3.56; MSCEqF own tracks 0.0.")
     args = ap.parse_args()
+    IMU_PER_IMG = args.imu_per_img
 
     base = f"{ROOT}/{args.set}/{args.cond}"
     tr = f"trajectory_{args.traj:04d}"
@@ -105,7 +131,7 @@ def main():
     nimg_all = m // IMU_PER_IMG
     nimg = nimg_all if args.nframes <= 0 else min(args.nframes, nimg_all)
 
-    by_frame = load_tracks(nimg)
+    by_frame = load_tracks(nimg, args.tracks, args.tracks_t0)
 
     # --- GT-seeded given-origin init (frame 0) ---
     R0 = Rwb[0]
@@ -128,13 +154,20 @@ def main():
         args.num_clones)
 
     pixel_std = 1.0 / FX
-    buf = {}                     # tid -> [(frame_k, un, vn)]
+    slam_min_len = args.slam_min_len if args.slam_min_len > 0 else args.num_clones
+    slam_chi2 = args.slam_chi2_mult if args.slam_chi2_mult > 0 else args.chi2_mult
+    buf = {}                     # tid -> [(frame_k, un, vn)]  (structureless only)
+    slam = set()                 # tids promoted to in-state landmarks
     est_p, gt_p = [], []
     n_upd = 0
+    n_slam_upd = 0               # accepted streaming SLAM updates
+    n_promoted = 0
 
     def add_frame(k):
         filt.clone_pose(k, k * DT * IMU_PER_IMG)
         for tid, (un, vn) in by_frame.get(k, {}).items():
+            if tid in slam:      # persistent feature: streamed, never buffered
+                continue
             buf.setdefault(tid, []).append((k, un, vn))
 
     add_frame(0)
@@ -153,6 +186,33 @@ def main():
         # discard most geometric constraints and let scale drift.
         cur = set(by_frame.get(k, {}).keys())
         marg = filt.clone_ids()[0] if filt.n_clones() > args.num_clones else None
+
+        # (0) PROMOTE long window-spanning tracks about to be marginalized to
+        # persistent in-state landmarks (OV hybrid). Only tracks still observed this
+        # frame (so they keep contributing fresh bearings) and reaching the marg clone
+        # (full-window span) qualify; the longest are preferred, up to the budget.
+        if args.max_slam > 0 and marg is not None and len(slam) < args.max_slam:
+            cand = [tid for tid, obs in buf.items()
+                    if tid in cur and len(obs) >= slam_min_len
+                    and any(fk == marg for (fk, _, _) in obs)]
+            cand.sort(key=lambda t: len(buf[t]), reverse=True)
+            for tid in cand[: args.max_slam - len(slam)]:
+                obs = [(fk, un, vn) for (fk, un, vn) in buf[tid]]
+                if filt.birth_landmark(tid, obs, pixel_std, slam_chi2):
+                    # Birth anchors to the oldest (marg) clone; move the anchor onto a
+                    # survivor (the newest clone, k) BEFORE the slide. Anchor is
+                    # decoupled, so it need not be re-observed.
+                    filt.reanchor_landmark(tid, k)
+                    slam.add(tid)
+                    del buf[tid]         # leaves the structureless path
+                    n_promoted += 1
+
+        # (1) Structureless MSCKF update. A track's full measurement set is consumed
+        # exactly ONCE (then the track is removed), triggered when it is (a) lost
+        # this frame, (b) at max length, or (c) about to lose its oldest
+        # observation to window marginalization (OpenVINS feats_lost/maxtracks/marg).
+        # Silently dropping a track's measurement at the marginalized clone would
+        # discard most geometric constraints and let scale drift.
         ready, done = {}, []
         for tid, obs in buf.items():
             lost = tid not in cur
@@ -168,8 +228,32 @@ def main():
         for tid in done:
             del buf[tid]
 
-        # Slide the window: every track touching the oldest clone was just
-        # consumed, so marginalization now drops no live measurements.
+        # (2) Streaming SLAM update: each in-state landmark gets ONLY its fresh
+        # bearing this frame (anchor decoupled ⇒ no measurement reused). Landmarks
+        # whose track ended are evicted (marginalized) — MidAir forward flight rarely
+        # re-observes, and this bounds the state.
+        if slam:
+            supd = {}
+            for tid in list(slam):
+                if tid in cur:
+                    un, vn = by_frame[k][tid]
+                    supd[tid] = [(k, un, vn)]
+                else:
+                    filt.marginalize_landmark(tid)
+                    slam.discard(tid)
+            if supd:
+                n_slam_upd += filt.landmark_stream_update(supd, pixel_std, slam_chi2)
+
+        # (3) Reanchor any surviving landmark whose anchor is the clone about to
+        # marginalize onto the newest live clone, keeping its anchor live.
+        if slam and marg is not None:
+            newest = filt.clone_ids()[-1]
+            for tid in list(slam):
+                if filt.landmark_anchor(tid) == marg:
+                    filt.reanchor_landmark(tid, newest)
+
+        # (4) Slide the window: every structureless track touching the oldest clone
+        # was just consumed, so marginalization now drops no live measurements.
         while filt.n_clones() > args.num_clones:
             old = filt.marginalize_oldest()
             for tid in list(buf):
@@ -190,7 +274,8 @@ def main():
     ate_rmse = np.sqrt((err ** 2).mean())
     est_len = np.linalg.norm(np.diff(est_p, axis=0), axis=1).sum()
 
-    print(f"frames={nimg}  accepted_updates={n_upd}")
+    print(f"frames={nimg}  accepted_updates={n_upd}  "
+          f"slam_promoted={n_promoted}  slam_updates={n_slam_upd}")
     print(f"GT path length   = {path:8.2f} m")
     print(f"est path length  = {est_len:8.2f} m   (est/gt = {est_len/path:.4f})")
     print(f"ATE RMSE (SE3)   = {ate_rmse:8.3f} m")

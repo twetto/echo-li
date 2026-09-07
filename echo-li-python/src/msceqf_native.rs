@@ -19,7 +19,7 @@ use std::collections::HashMap;
 
 use echo_li_core::mathematical::camera::PinholeModel;
 use echo_li_core::mathematical::msceqf_filter::{
-    Imu, MSCEqFFilter, MscTrack, MscTrackObs, ProcessNoise, SystemOrigin,
+    Imu, LmStreamUpdate, LmUpdate, MSCEqFFilter, MscTrack, MscTrackObs, ProcessNoise, SystemOrigin,
 };
 use echo_lie::{SE3, SE23, SO3};
 use nalgebra::{Matrix3, Matrix4, SMatrix, Vector2, Vector3, Vector6};
@@ -46,10 +46,32 @@ pub struct PyMSCEqFNativeFilter {
     filter: MSCEqFFilter,
     /// Frame-id of each live clone, parallel to `filter.x.clones` (ascending).
     clone_ids: Vec<u64>,
+    /// Track-id of each in-state landmark, parallel to `filter.x.landmarks`
+    /// (birth order). Gives the harness a STABLE handle: clone marginalization
+    /// shifts landmark cov columns but never their order, so a landmark keeps its
+    /// index (hence its track-id slot) until it is itself marginalized.
+    landmark_ids: Vec<u64>,
     /// Normalized (Z1) projection model: the harness pre-normalizes pixels, so
     /// `fx=fy=1, cx=cy=0` and `pixel_std` is in normalized units.
     cam: PinholeModel,
     max_clones: usize,
+}
+
+impl PyMSCEqFNativeFilter {
+    /// Translate `[(clone_id, u_n, v_n)]` into `MscTrackObs` on live clones.
+    /// (Private — kept out of `#[pymethods]` so pyo3 does not try to export it.)
+    fn obs_on_live_clones(&self, obs_list: &[(u64, f64, f64)]) -> Vec<MscTrackObs> {
+        let mut obs: Vec<MscTrackObs> = Vec::new();
+        for &(cid, un, vn) in obs_list {
+            if let Some(pos) = self.clone_ids.iter().position(|&c| c == cid) {
+                obs.push(MscTrackObs {
+                    clone: pos,
+                    uvn: Vector2::new(un, vn),
+                });
+            }
+        }
+        obs
+    }
 }
 
 #[pymethods]
@@ -110,6 +132,7 @@ impl PyMSCEqFNativeFilter {
         Self {
             filter,
             clone_ids: Vec::new(),
+            landmark_ids: Vec::new(),
             cam: PinholeModel {
                 fx: 1.0,
                 fy: 1.0,
@@ -212,6 +235,182 @@ impl PyMSCEqFNativeFilter {
         }
         self.filter
             .msc_update(&msc_tracks, &self.cam, pixel_std, chi2_mult, curvature)
+    }
+
+    // ---- In-state (SLAM) landmarks --------------------------------------------
+
+    /// Promote a structureless track to an in-state landmark. `obs` is
+    /// `[(clone_id, u_n, v_n)]` (normalized). Triangulates in the oldest observing
+    /// clone's frame, χ²-gates the geometry, and augments the state with a
+    /// correlated SOT3 landmark. Returns True if the landmark was born (tagged by
+    /// `track_id` for later `landmark_update`/`reanchor`/`marginalize`).
+    #[pyo3(signature = (track_id, obs, pixel_std, chi2_mult=1.0))]
+    fn birth_landmark(
+        &mut self,
+        track_id: u64,
+        obs: Vec<(u64, f64, f64)>,
+        pixel_std: f64,
+        chi2_mult: f64,
+    ) -> bool {
+        if self.landmark_ids.contains(&track_id) {
+            return false; // already in-state
+        }
+        let obs = self.obs_on_live_clones(&obs);
+        if obs.len() < 2 {
+            return false;
+        }
+        let track = MscTrack { obs };
+        match self
+            .filter
+            .birth_landmark(&track, &self.cam, pixel_std, chi2_mult)
+        {
+            Some(j) => {
+                debug_assert_eq!(j, self.landmark_ids.len(), "birth appends at tail");
+                self.landmark_ids.push(track_id);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// EKF update of in-state landmarks. `updates` maps `track_id ->
+    /// [(clone_id, u_n, v_n)]`. Each landmark is updated jointly with its anchor
+    /// clone (no nullspace projection — the feature is a state). Observations on
+    /// dead clones are dropped; a landmark whose anchor is not among the live
+    /// observations, or with <2 live observations, is skipped. Returns the number
+    /// of accepted landmark updates.
+    #[pyo3(signature = (updates, pixel_std, chi2_mult=1.0))]
+    fn landmark_update(
+        &mut self,
+        updates: HashMap<u64, Vec<(u64, f64, f64)>>,
+        pixel_std: f64,
+        chi2_mult: f64,
+    ) -> usize {
+        let mut lm_updates: Vec<LmUpdate> = Vec::new();
+        for (tid, obs_list) in &updates {
+            let j = match self.landmark_ids.iter().position(|&t| t == *tid) {
+                Some(j) => j,
+                None => continue,
+            };
+            let obs = self.obs_on_live_clones(obs_list);
+            if obs.len() < 2 {
+                continue;
+            }
+            lm_updates.push(LmUpdate { j, obs });
+        }
+        if lm_updates.is_empty() {
+            return 0;
+        }
+        self.filter
+            .landmark_update(&lm_updates, &self.cam, pixel_std, chi2_mult)
+    }
+
+    /// Streaming (per-frame) SLAM update: update each in-state landmark with only
+    /// its NEW observations, the anchor decoupled (never re-observed) so no
+    /// measurement is used twice. `updates` maps `track_id -> [(clone_id, u_n, v_n)]`
+    /// where the obs are the landmark's fresh observations at NON-anchor clones
+    /// (anchor obs, if present, are ignored). Returns the accepted count. This is the
+    /// update the driver calls every frame for persistent features; `landmark_update`
+    /// (batch, anchor re-observed) is only for one-shot re-triangulation.
+    #[pyo3(signature = (updates, pixel_std, chi2_mult=1.0))]
+    fn landmark_stream_update(
+        &mut self,
+        updates: HashMap<u64, Vec<(u64, f64, f64)>>,
+        pixel_std: f64,
+        chi2_mult: f64,
+    ) -> usize {
+        let mut lm_updates: Vec<LmStreamUpdate> = Vec::new();
+        for (tid, obs_list) in &updates {
+            let j = match self.landmark_ids.iter().position(|&t| t == *tid) {
+                Some(j) => j,
+                None => continue,
+            };
+            let obs = self.obs_on_live_clones(obs_list);
+            if obs.is_empty() {
+                continue;
+            }
+            lm_updates.push(LmStreamUpdate { j, obs });
+        }
+        if lm_updates.is_empty() {
+            return 0;
+        }
+        self.filter
+            .landmark_stream_update(&lm_updates, &self.cam, pixel_std, chi2_mult)
+    }
+
+    /// Move landmark `track_id`'s anchor to clone `new_clone_id` (covariance-
+    /// consistent change of variables; the world point is invariant). Call this
+    /// before the current anchor clone marginalizes. Returns True on success.
+    fn reanchor_landmark(&mut self, track_id: u64, new_clone_id: u64) -> bool {
+        let j = match self.landmark_ids.iter().position(|&t| t == track_id) {
+            Some(j) => j,
+            None => return false,
+        };
+        let pos = match self.clone_ids.iter().position(|&c| c == new_clone_id) {
+            Some(p) => p,
+            None => return false,
+        };
+        self.filter.reanchor_landmark(j, pos)
+    }
+
+    /// Marginalize (drop) landmark `track_id` from the state. Returns True if live.
+    fn marginalize_landmark(&mut self, track_id: u64) -> bool {
+        if let Some(j) = self.landmark_ids.iter().position(|&t| t == track_id) {
+            self.filter.marginalize_landmark(j);
+            self.landmark_ids.remove(j);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn n_landmarks(&self) -> usize {
+        self.filter.n_landmarks()
+    }
+    fn landmark_ids(&self) -> Vec<u64> {
+        self.landmark_ids.clone()
+    }
+
+    /// Clone-id of landmark `track_id`'s current anchor, or None if the track is not
+    /// in-state or its anchor clone is no longer live. The driver uses this to
+    /// reanchor a landmark BEFORE its anchor clone marginalizes.
+    fn landmark_anchor(&self, track_id: u64) -> Option<u64> {
+        let j = self.landmark_ids.iter().position(|&t| t == track_id)?;
+        let stamp = self.filter.x.landmarks[j].anchor;
+        let pos = self.filter.x.clones.iter().position(|c| c.stamp == stamp)?;
+        self.clone_ids.get(pos).copied()
+    }
+
+    /// World-frame point estimate of landmark `track_id` (anchor_pose · q·origin),
+    /// or None if the track is not in-state or its anchor is not live.
+    fn landmark_world<'py>(
+        &self,
+        py: Python<'py>,
+        track_id: u64,
+    ) -> Option<Bound<'py, PyArray1<f64>>> {
+        let j = self.landmark_ids.iter().position(|&t| t == track_id)?;
+        let lm = &self.filter.x.landmarks[j];
+        let anchor = self.filter.x.clones.iter().find(|c| c.stamp == lm.anchor)?;
+        let w = anchor.pose.act(&lm.point());
+        Some(PyArray1::from_slice(py, w.as_slice()))
+    }
+
+    /// The 3x3 covariance block (chart tangent) of landmark `track_id`, or None if
+    /// the track is not in-state.
+    fn landmark_cov<'py>(
+        &self,
+        py: Python<'py>,
+        track_id: u64,
+    ) -> Option<Bound<'py, PyArray2<f64>>> {
+        let j = self.landmark_ids.iter().position(|&t| t == track_id)?;
+        let li = self.filter.landmark_idx(j);
+        let mut m = Array2::<f64>::zeros((3, 3));
+        for r in 0..3 {
+            for c in 0..3 {
+                m[[r, c]] = self.filter.cov[(li + r, li + c)];
+            }
+        }
+        Some(PyArray2::from_array(py, &m))
     }
 
     /// Current nav (body-in-world) state via the `phi` action: returns
