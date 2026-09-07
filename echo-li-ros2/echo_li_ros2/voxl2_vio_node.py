@@ -76,24 +76,23 @@ def _jet_depth_image(depth, valid, vis_min, vis_max):
     return rgb
 
 
-def _pose_to_t_wc(position, quaternion):
-    """Build a 4×4 T_wc (world ← camera) from position + xyzw quaternion."""
+def _quat_to_se3(position, quaternion):
+    """Build a 4×4 SE(3) matrix from position + xyzw quaternion."""
     x, y, z, w = quaternion
-    t_wc = np.eye(4, dtype=np.float64)
-    # Rotation from quaternion (xyzw convention).
-    t_wc[0, 0] = 1.0 - 2.0 * (y * y + z * z)
-    t_wc[0, 1] = 2.0 * (x * y - z * w)
-    t_wc[0, 2] = 2.0 * (x * z + y * w)
-    t_wc[1, 0] = 2.0 * (x * y + z * w)
-    t_wc[1, 1] = 1.0 - 2.0 * (x * x + z * z)
-    t_wc[1, 2] = 2.0 * (y * z - x * w)
-    t_wc[2, 0] = 2.0 * (x * z - y * w)
-    t_wc[2, 1] = 2.0 * (y * z + x * w)
-    t_wc[2, 2] = 1.0 - 2.0 * (x * x + y * y)
-    t_wc[0, 3] = position[0]
-    t_wc[1, 3] = position[1]
-    t_wc[2, 3] = position[2]
-    return t_wc
+    m = np.eye(4, dtype=np.float64)
+    m[0, 0] = 1.0 - 2.0 * (y * y + z * z)
+    m[0, 1] = 2.0 * (x * y - z * w)
+    m[0, 2] = 2.0 * (x * z + y * w)
+    m[1, 0] = 2.0 * (x * y + z * w)
+    m[1, 1] = 1.0 - 2.0 * (x * x + z * z)
+    m[1, 2] = 2.0 * (y * z - x * w)
+    m[2, 0] = 2.0 * (x * z - y * w)
+    m[2, 1] = 2.0 * (y * z + x * w)
+    m[2, 2] = 1.0 - 2.0 * (x * x + y * y)
+    m[0, 3] = position[0]
+    m[1, 3] = position[1]
+    m[2, 3] = position[2]
+    return m
 
 
 class Voxl2EchoLi(Node):
@@ -195,8 +194,11 @@ class Voxl2EchoLi(Node):
             frontend_config, self.width, self.height)
         self.vio = echo_li.VIOFilter(
             self.config_path, self.camera, n_init_samples=self.n_init)
-        self.vio.set_camera_extrinsics(
-            np.asarray(t_bs_values, dtype=np.float64).reshape(4, 4))
+        t_bs = np.asarray(t_bs_values, dtype=np.float64).reshape(4, 4)
+        self.vio.set_camera_extrinsics(t_bs)
+        # get_pose() returns T_wb (body/IMU frame). Camera pose is
+        # T_wc = T_wb @ T_bc where T_bc = T_bs (body-to-sensor).
+        self.t_bc = t_bs.copy()
 
         # ── Sparse 3D filter (out-of-state depth pool for patch mapper seeds) ──
         self.sparse_3d = None
@@ -473,8 +475,9 @@ class Voxl2EchoLi(Node):
         self.publish_odometry(stamp_ns, position, quaternion, velocity)
 
         # ── Update sparse 3D filter (out-of-state depth pool) every frame ──
+        # get_pose() returns T_wb (body/IMU); camera pose = T_wb @ T_bc.
+        t_wc = _quat_to_se3(position, quaternion) @ self.t_bc
         if self.sparse_3d is not None:
-            t_wc = _pose_to_t_wc(position, quaternion)
             feature_uvs = {
                 int(f['id']): [float(f['x']), float(f['y'])]
                 for f in features}
@@ -493,7 +496,7 @@ class Voxl2EchoLi(Node):
         if (self.patch_depth_mapper is not None and
                 self.images_processed % self.mapping_stride == 0):
             depth_result, occupancy_cells = self.run_mapping(
-                stamp_ns, gray, position, quaternion, features)
+                stamp_ns, gray, t_wc, features)
 
         world = None
         if self.rr is not None:
@@ -504,15 +507,18 @@ class Voxl2EchoLi(Node):
             depth_result=depth_result,
             occupancy_cells=occupancy_cells)
 
-    def run_mapping(self, stamp_ns, gray, position, quaternion, features):
+    def run_mapping(self, stamp_ns, gray, t_wc, features):
         """Run the patch depth mapper and optionally the occupancy map.
+
+        `t_wc` is the 4×4 camera pose (world ← camera), already composing
+        T_wb @ T_bc from the EqF body pose and the camera extrinsic.
 
         Returns (depth_result, occupancy_cells) where depth_result is the dict
         from PatchDepthMapper.update() (or None), and occupancy_cells is an
         (N,3) float32 array of occupied voxel centres (or None).
         """
-        t_wc = _pose_to_t_wc(position, quaternion)
         t_wc_list = t_wc.tolist()
+        cam_pos = t_wc[:3, 3]
 
         # Build sparse depth priors.  Prefer Sparse3DFilter (tighter
         # variance when converged); fill remaining features from EqF
@@ -535,7 +541,6 @@ class Voxl2EchoLi(Node):
 
         # Fill from EqF landmarks for features sparse3d hasn't converged.
         landmarks = self.vio.get_landmarks()
-        cam_pos = position
         for feat in features:
             fid = int(feat['id'])
             if fid in sparse3d_fids or fid not in landmarks:
