@@ -84,7 +84,17 @@ impl PySparse3DFilter {
         })
     }
 
-    #[pyo3(signature = (stamp, feature_uvs, t_wc, p_vv=None, p_ww=None))]
+    /// `current_clone_id` tags landmarks born this frame with their anchor clone;
+    /// `rel_cov_by_clone` maps a clone id to that anchor→current relative-pose
+    /// covariance as FOUR 3×3 blocks `(full_v, full_w, inc_v, inc_w)`: the
+    /// accumulated `Cov(T_clone⁻¹ T_curr)` (fed to §V-D's per-frame measurement
+    /// term) and its per-frame increment (fed to the accumulating range injection).
+    /// When given, each landmark's §V-D term uses its own honest gauge-cancelled
+    /// relative cov instead of the shared absolute `p_vv`/`p_ww`. Omitting the map
+    /// is exactly the legacy absolute-covariance update.
+    #[pyo3(signature = (stamp, feature_uvs, t_wc, p_vv=None, p_ww=None,
+                        current_clone_id=None, rel_cov_by_clone=None))]
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn update(
         &mut self,
         stamp: f64,
@@ -92,6 +102,10 @@ impl PySparse3DFilter {
         t_wc: [[f64; 4]; 4],
         p_vv: Option<[[f64; 3]; 3]>,
         p_ww: Option<[[f64; 3]; 3]>,
+        current_clone_id: Option<u64>,
+        rel_cov_by_clone: Option<
+            HashMap<u64, ([[f64; 3]; 3], [[f64; 3]; 3], [[f64; 3]; 3], [[f64; 3]; 3])>,
+        >,
     ) {
         let cam_coords: HashMap<u64, Vector2<f32>> = feature_uvs
             .into_iter()
@@ -101,8 +115,30 @@ impl PySparse3DFilter {
         let t = array_to_matrix4(&t_wc);
         let p_vv_mat = p_vv.map(|m| array_to_matrix3(&m));
         let p_ww_mat = p_ww.map(|m| array_to_matrix3(&m));
-        self.inner
-            .update(&measurement, &t, p_vv_mat.as_ref(), p_ww_mat.as_ref());
+        let rel_map: Option<echo_li_core::depth::sparse_3d::CloneRelCov> =
+            rel_cov_by_clone.map(|m| {
+                m.into_iter()
+                    .map(|(cid, (fv, fw, iv, iw))| {
+                        (
+                            cid,
+                            (
+                                array_to_matrix3(&fv),
+                                array_to_matrix3(&fw),
+                                array_to_matrix3(&iv),
+                                array_to_matrix3(&iw),
+                            ),
+                        )
+                    })
+                    .collect()
+            });
+        self.inner.update_with_clones(
+            &measurement,
+            &t,
+            p_vv_mat.as_ref(),
+            p_ww_mat.as_ref(),
+            current_clone_id,
+            rel_map.as_ref(),
+        );
     }
 
     fn query(&self, feature_id: u64) -> (f64, f64) {

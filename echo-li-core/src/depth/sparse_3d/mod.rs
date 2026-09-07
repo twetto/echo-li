@@ -93,6 +93,11 @@ pub struct FeatureState3D {
     pub bias: Vector2<f64>,   // estimated 2D pixel bias b
     pub p_sb: Matrix3x2<f64>, // cross-covariance cov(inv_s, bias)
     pub p_bb: Matrix2<f64>,   // bias covariance cov(bias, bias)
+    /// Id of the EqF pose clone this landmark is anchored at (its birth frame),
+    /// when the caller drives the honest clone-relative pose-covariance feed.
+    /// `None` for the legacy absolute-covariance path. Used only to route the
+    /// §V-D pose-range term to this feature's own anchor→current relative cov.
+    pub anchor_clone_id: Option<u64>,
 }
 
 impl FeatureState3D {
@@ -237,6 +242,27 @@ impl Sparse3DFilter {
         p_vv: Option<&Matrix3<f64>>,
         p_ww: Option<&Matrix3<f64>>,
     ) {
+        self.update_with_clones(measurement, t_wc, p_vv, p_ww, None, None);
+    }
+
+    /// Honest clone-relative variant of [`update`]. `current_clone_id` tags any
+    /// landmark born this frame with its anchor clone. `rel_cov_by_clone` maps a
+    /// clone id to that anchor→current relative-pose covariance as FOUR 3×3 blocks
+    /// `(full_v, full_w, inc_v, inc_w)`: the accumulated `Cov(T_clone⁻¹ T_curr)`
+    /// (fed to §V-D's per-frame MEASUREMENT term) and its per-frame INCREMENT (fed
+    /// to the accumulating range injection) — see [`resolve_pose_cov`]. Each
+    /// landmark is then driven by its own honest gauge-cancelled relative cov
+    /// instead of the shared absolute `p_vv`/`p_ww`. Passing `None` for the map is
+    /// exactly [`update`] (legacy absolute path — both consumers use `p_vv`/`p_ww`).
+    pub fn update_with_clones(
+        &mut self,
+        measurement: &VisionMeasurement,
+        t_wc: &Matrix4<f64>,
+        p_vv: Option<&Matrix3<f64>>,
+        p_ww: Option<&Matrix3<f64>>,
+        current_clone_id: Option<u64>,
+        rel_cov_by_clone: Option<&CloneRelCov>,
+    ) {
         let stamp = measurement.stamp;
         let curr_uvs: HashMap<u64, Vector2<f64>> = measurement
             .cam_coordinates
@@ -270,8 +296,11 @@ impl Sparse3DFilter {
                         return None;
                     }
                     let uv_curr = curr_uvs.get(&fid)?;
+                    let (pvv_m, pww_m, pvv_i, pww_i) =
+                        resolve_pose_cov(rel_cov_by_clone, feat.anchor_clone_id, p_vv, p_ww);
                     (!update_feature_3d(
-                        chart, &k, cam, &settings, feat, uv_curr, &t_cw_curr, p_vv, p_ww, dt,
+                        chart, &k, cam, &settings, feat, uv_curr, &t_cw_curr, pvv_m, pww_m, pvv_i,
+                        pww_i, dt,
                     ))
                     .then_some(fid)
                 })
@@ -292,6 +321,8 @@ impl Sparse3DFilter {
                     continue;
                 };
 
+                let (pvv_m, pww_m, pvv_i, pww_i) =
+                    resolve_pose_cov(rel_cov_by_clone, feat.anchor_clone_id, p_vv, p_ww);
                 if !update_feature_3d(
                     self.chart,
                     &self.k,
@@ -300,8 +331,10 @@ impl Sparse3DFilter {
                     feat,
                     uv_curr,
                     &t_cw_curr,
-                    p_vv,
-                    p_ww,
+                    pvv_m,
+                    pww_m,
+                    pvv_i,
+                    pww_i,
                     dt,
                 ) {
                     reset_features.push(fid);
@@ -410,6 +443,9 @@ impl Sparse3DFilter {
                     bias: Vector2::zeros(),
                     p_sb: Matrix3x2::zeros(),
                     p_bb: Matrix2::zeros(),
+                    // Bearing chart anchors at the CURRENT frame (anchor_t_wc =
+                    // *t_wc), so the anchor clone is this frame's clone.
+                    anchor_clone_id: current_clone_id,
                 };
                 self.insert_feature(feat);
                 self.pending.remove(&fid);
@@ -495,6 +531,8 @@ impl Sparse3DFilter {
                 bias: Vector2::zeros(),
                 p_sb: Matrix3x2::zeros(),
                 p_bb: Matrix2::zeros(),
+                // Non-bearing charts also anchor at the current frame here.
+                anchor_clone_id: current_clone_id,
             };
             self.insert_feature(feat);
             self.pending.remove(&fid);
@@ -632,6 +670,44 @@ fn apply_chart_delta(chart: Sparse3DChart, q: &Vector3<f64>, delta: &Vector3<f64
     }
 }
 
+/// Per-clone relative-pose covariance feed for §V-D. For each live clone the map
+/// carries FOUR 3×3 blocks: the accumulated `Cov(T_clone⁻¹ T_curr)` translation /
+/// rotation (`full_v`, `full_w`) and the per-frame INCREMENT of that same quantity
+/// (`inc_v`, `inc_w`). The two are consumed differently (see [`resolve_pose_cov`]).
+pub type CloneRelCov = HashMap<u64, (Matrix3<f64>, Matrix3<f64>, Matrix3<f64>, Matrix3<f64>)>;
+
+/// Route a landmark to the pose covariances its §V-D update should use, splitting
+/// the two distinct consumers of pose uncertainty:
+///   - **measurement term** `r_meas += proj·P·projᵀ` — rebuilt fresh every frame, so
+///     it wants the FULL anchor→current relative uncertainty `Cov(T_clone⁻¹ T_curr)`;
+///   - **range injection** `q_range ∝ Pᵥᵥ.trace()` — ACCUMULATES into `inv_p` over the
+///     track, so it wants the per-frame INCREMENT (feeding the full each frame would
+///     integrate to ~N× the intended total).
+/// Returns `(pvv_meas, pww_meas, pvv_inc, pww_inc)`. When the landmark is anchored at
+/// a live clone the four blocks come from that clone's relative cov; otherwise (legacy
+/// / absolute path, or `None` map) both consumers fall back to the shared absolute
+/// `(p_vv, p_ww)` — identical to the pre-clone behaviour.
+#[inline]
+#[allow(clippy::type_complexity)]
+fn resolve_pose_cov<'a>(
+    rel_cov_by_clone: Option<&'a CloneRelCov>,
+    anchor_clone_id: Option<u64>,
+    p_vv: Option<&'a Matrix3<f64>>,
+    p_ww: Option<&'a Matrix3<f64>>,
+) -> (
+    Option<&'a Matrix3<f64>>,
+    Option<&'a Matrix3<f64>>,
+    Option<&'a Matrix3<f64>>,
+    Option<&'a Matrix3<f64>>,
+) {
+    if let (Some(map), Some(cid)) = (rel_cov_by_clone, anchor_clone_id) {
+        if let Some((fv, fw, iv, iw)) = map.get(&cid) {
+            return (Some(fv), Some(fw), Some(iv), Some(iw));
+        }
+    }
+    (p_vv, p_ww, p_vv, p_ww)
+}
+
 /// Per-landmark measurement update, dispatched by chart: the SOT(3) IEKF for
 /// `Polar`/`InvDepth`, the additive inverse-depth EKF for `InvDepthAdditive`.
 #[allow(clippy::too_many_arguments)]
@@ -645,20 +721,24 @@ fn update_feature_3d(
     t_cw_curr: &Matrix4<f64>,
     p_vv: Option<&Matrix3<f64>>,
     p_ww: Option<&Matrix3<f64>>,
+    p_vv_inc: Option<&Matrix3<f64>>,
+    p_ww_inc: Option<&Matrix3<f64>>,
     dt: f64,
 ) -> bool {
     match chart {
-        Sparse3DChart::InvDepthAdditive => {
-            invdepth_additive_update_3d(k, settings, feat, uv_obs, t_cw_curr, p_vv, p_ww, dt)
-        }
+        Sparse3DChart::InvDepthAdditive => invdepth_additive_update_3d(
+            k, settings, feat, uv_obs, t_cw_curr, p_vv, p_ww, p_vv_inc, p_ww_inc, dt,
+        ),
         Sparse3DChart::BearingInvDepthAdditive => match cam {
             Some(cam) => bearing_invdepth_additive_update_3d(
-                cam, k, settings, feat, uv_obs, t_cw_curr, p_vv, p_ww, dt,
+                cam, k, settings, feat, uv_obs, t_cw_curr, p_vv, p_ww, p_vv_inc, p_ww_inc, dt,
             ),
             // No camera attached: cannot project. Drop the track.
             None => false,
         },
-        _ => iekf_update_3d(chart, k, settings, feat, uv_obs, t_cw_curr, p_vv, p_ww, dt),
+        _ => iekf_update_3d(
+            chart, k, settings, feat, uv_obs, t_cw_curr, p_vv, p_ww, p_vv_inc, p_ww_inc, dt,
+        ),
     }
 }
 
@@ -685,6 +765,10 @@ fn invdepth_additive_update_3d(
     t_cw_curr: &Matrix4<f64>,
     p_vv: Option<&Matrix3<f64>>,
     p_ww: Option<&Matrix3<f64>>,
+    // This chart has no accumulating range injection; the incremental pose cov
+    // (used only by the pose-range term of the bearing charts) is unused here.
+    _p_vv_inc: Option<&Matrix3<f64>>,
+    _p_ww_inc: Option<&Matrix3<f64>>,
     dt: f64,
 ) -> bool {
     let fx = k[(0, 0)];
@@ -835,12 +919,18 @@ fn bearing_invdepth_additive_update_3d(
     feat: &mut FeatureState3D,
     uv_obs: &Vector2<f64>,
     t_cw_curr: &Matrix4<f64>,
+    // Measurement-side (full anchor→current relative) pose cov: `r_meas`, fresh/frame.
     p_vv: Option<&Matrix3<f64>>,
     p_ww: Option<&Matrix3<f64>>,
+    // Range-injection (per-frame increment) pose cov: accumulates into `inv_p`.
+    p_vv_inc: Option<&Matrix3<f64>>,
+    p_ww_inc: Option<&Matrix3<f64>>,
     dt: f64,
 ) -> bool {
     if settings.bias_walk_var > 0.0 {
-        return bearing_bias_update_3d(cam, k, settings, feat, uv_obs, t_cw_curr, p_vv, p_ww, dt);
+        return bearing_bias_update_3d(
+            cam, k, settings, feat, uv_obs, t_cw_curr, p_vv, p_ww, p_vv_inc, p_ww_inc, dt,
+        );
     }
     let fx = k[(0, 0)];
     let fy = k[(1, 1)];
@@ -861,7 +951,7 @@ fn bearing_invdepth_additive_update_3d(
     // (the measurement term proj*P*proj^T below is radial-blind, d(pi)/dq * r_hat = 0).
     // Combines the fixed range-walk floor with the pose-driven, parallax-scaled term
     // (eq. 10-11 of the formulation) when per-frame incremental pose covariances are supplied.
-    let pose_range_on = settings.pose_range_scale > 0.0 && p_vv.is_some() && p_ww.is_some();
+    let pose_range_on = settings.pose_range_scale > 0.0 && p_vv_inc.is_some() && p_ww_inc.is_some();
     if dt > 0.0 && (settings.range_walk_var > 0.0 || pose_range_on) {
         let (pa, jpa) = pj_of(&feat.inv_s);
         let q_c = r_ca * pa + t_ca_t;
@@ -871,8 +961,8 @@ fn bearing_invdepth_additive_update_3d(
             if pose_range_on {
                 // baseline (anchor->current) with a 1%-parallax floor bounding 1/b^2.
                 let b2 = t_ca_t.norm_squared().max(1e-4 * r2);
-                let sig_t2 = p_vv.unwrap().trace() / 3.0; // incremental translation var (m^2)
-                let sig_phi2 = p_ww.unwrap().trace() / 3.0; // incremental rotation var (rad^2)
+                let sig_t2 = p_vv_inc.unwrap().trace() / 3.0; // incremental translation var (m^2)
+                let sig_phi2 = p_ww_inc.unwrap().trace() / 3.0; // incremental rotation var (rad^2)
                 let x = (r2 / b2) * (r2 * sig_phi2 + sig_t2);
                 // Diffusive part: constant per frame -> accumulates ~N (random walk).
                 let mut pose_q = settings.pose_range_scale * x;
@@ -994,8 +1084,12 @@ fn bearing_bias_update_3d(
     feat: &mut FeatureState3D,
     uv_obs: &Vector2<f64>,
     t_cw_curr: &Matrix4<f64>,
+    // Measurement-side (full anchor→current relative) pose cov: `r_meas`, fresh/frame.
     p_vv: Option<&Matrix3<f64>>,
     p_ww: Option<&Matrix3<f64>>,
+    // Range-injection (per-frame increment) pose cov: accumulates into `inv_p`.
+    p_vv_inc: Option<&Matrix3<f64>>,
+    p_ww_inc: Option<&Matrix3<f64>>,
     dt: f64,
 ) -> bool {
     let fx = k[(0, 0)];
@@ -1016,7 +1110,7 @@ fn bearing_bias_update_3d(
     // (the measurement term proj*P*proj^T below is radial-blind, d(pi)/dq * r_hat = 0).
     // Combines the fixed range-walk floor with the pose-driven, parallax-scaled term
     // (eq. 10-11 of the formulation) when per-frame incremental pose covariances are supplied.
-    let pose_range_on = settings.pose_range_scale > 0.0 && p_vv.is_some() && p_ww.is_some();
+    let pose_range_on = settings.pose_range_scale > 0.0 && p_vv_inc.is_some() && p_ww_inc.is_some();
     if dt > 0.0 && (settings.range_walk_var > 0.0 || pose_range_on) {
         let (pa, jpa) = pj_of(&feat.inv_s);
         let q_c = r_ca * pa + t_ca_t;
@@ -1026,8 +1120,8 @@ fn bearing_bias_update_3d(
             if pose_range_on {
                 // baseline (anchor->current) with a 1%-parallax floor bounding 1/b^2.
                 let b2 = t_ca_t.norm_squared().max(1e-4 * r2);
-                let sig_t2 = p_vv.unwrap().trace() / 3.0; // incremental translation var (m^2)
-                let sig_phi2 = p_ww.unwrap().trace() / 3.0; // incremental rotation var (rad^2)
+                let sig_t2 = p_vv_inc.unwrap().trace() / 3.0; // incremental translation var (m^2)
+                let sig_phi2 = p_ww_inc.unwrap().trace() / 3.0; // incremental rotation var (rad^2)
                 let x = (r2 / b2) * (r2 * sig_phi2 + sig_t2);
                 // Diffusive part: constant per frame -> accumulates ~N (random walk).
                 let mut pose_q = settings.pose_range_scale * x;
@@ -1169,6 +1263,8 @@ fn iekf_update_3d(
     t_cw_curr: &Matrix4<f64>,
     _p_vv: Option<&Matrix3<f64>>,
     _p_ww: Option<&Matrix3<f64>>,
+    _p_vv_inc: Option<&Matrix3<f64>>,
+    _p_ww_inc: Option<&Matrix3<f64>>,
     dt: f64,
 ) -> bool {
     let fx = k[(0, 0)];
@@ -1834,6 +1930,7 @@ mod tests {
             bias: Vector2::zeros(),
             p_sb: Matrix3x2::zeros(),
             p_bb: Matrix2::zeros(),
+            anchor_clone_id: None,
         }
     }
 
