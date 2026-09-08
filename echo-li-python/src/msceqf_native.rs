@@ -216,7 +216,13 @@ impl PyMSCEqFNativeFilter {
             .map(|(i, &c)| (c, i))
             .collect();
         let mut msc_tracks: Vec<MscTrack> = Vec::new();
-        for obs_list in tracks.values() {
+        // Iterate in sorted track-id order: pyo3 hands us a Rust HashMap whose
+        // iteration order is randomized per process, and the stacking order feeds
+        // the update, so a HashMap walk makes the filter non-deterministic run to run.
+        let mut track_keys: Vec<u64> = tracks.keys().copied().collect();
+        track_keys.sort_unstable();
+        for key in &track_keys {
+            let obs_list = &tracks[key];
             let mut obs: Vec<MscTrackObs> = Vec::new();
             for &(cid, un, vn) in obs_list {
                 if let Some(&pos) = pos_of.get(&cid) {
@@ -287,7 +293,11 @@ impl PyMSCEqFNativeFilter {
         chi2_mult: f64,
     ) -> usize {
         let mut lm_updates: Vec<LmUpdate> = Vec::new();
-        for (tid, obs_list) in &updates {
+        // Sorted iteration for run-to-run determinism (see msc_update note).
+        let mut ukeys: Vec<u64> = updates.keys().copied().collect();
+        ukeys.sort_unstable();
+        for tid in &ukeys {
+            let obs_list = &updates[tid];
             let j = match self.landmark_ids.iter().position(|&t| t == *tid) {
                 Some(j) => j,
                 None => continue,
@@ -320,7 +330,11 @@ impl PyMSCEqFNativeFilter {
         chi2_mult: f64,
     ) -> usize {
         let mut lm_updates: Vec<LmStreamUpdate> = Vec::new();
-        for (tid, obs_list) in &updates {
+        // Sorted iteration for run-to-run determinism (see msc_update note).
+        let mut ukeys: Vec<u64> = updates.keys().copied().collect();
+        ukeys.sort_unstable();
+        for tid in &ukeys {
+            let obs_list = &updates[tid];
             let j = match self.landmark_ids.iter().position(|&t| t == *tid) {
                 Some(j) => j,
                 None => continue,
