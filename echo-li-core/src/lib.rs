@@ -135,42 +135,6 @@ pub struct VIOFilterSettings {
     // Chi²(1) gate on the stereo range innovation; 0 disables gating.
     pub range_gate_chi2: f64,
 
-    // Additive MSCKF structureless vision update (OpenVINS mirror). Default OFF
-    // => exact current behavior (`msc_update` is never invoked). The pose-clone
-    // window and per-track observation buffer are driven by the harness; these
-    // knobs parametrize the update itself.
-    pub enable_msckf: bool,
-    // Clone-window length (frames kept before marginalization).
-    pub msckf_window: usize,
-    // Minimum live observations for a track to be used (clamped to >=2).
-    pub msckf_min_track: usize,
-    // Multiplier on the 95% chi² innovation gate.
-    pub msckf_chi2_mult: f64,
-    // Pixel measurement noise for the MSC update ONLY (S = H P Hᵀ + σ²I). 0.0 =>
-    // fall back to `sigma_bearing` (the base EqF feature noise), preserving the
-    // pre-knob behavior. Kept separate so the structureless update can be weighted
-    // independently of the in-state EqF vision update.
-    pub msckf_sigma_pix: f64,
-    // DIAGNOSTIC: suppress the MSC sensor(21) and/or in-state-landmark(3·n_lm)
-    // mean-correction. Both true ⇒ clones only. Isolates a nav-chart regression
-    // from the sceneDepth-prior landmark correction and the clone feedback.
-    pub msckf_suppress_sensor: bool,
-    pub msckf_suppress_landmarks: bool,
-
-    // Delayed in-state landmark initialization (OpenVINS `StateHelper::initialize`
-    // mirror). When ON, `delayed_init` births each ready track as an in-state EqF
-    // landmark with a GEOMETRY-DERIVED correlated covariance (multi-view
-    // triangulation + `initialize_invertible`), replacing the guessed-diagonal
-    // birth in the normal `process_vision` path. Default OFF => exact current
-    // behavior (`delayed_init` is never invoked; births stay diagonal).
-    pub enable_delayed_init: bool,
-    // Minimum live observations for a track to be delay-initialized (clamped >=2).
-    pub delayed_init_min_obs: usize,
-    // Multiplier on the 95% chi² gate for the delayed-init update rows.
-    pub delayed_init_chi2_mult: f64,
-    // Pixel measurement noise for the delayed-init augment. 0.0 => fall back to
-    // `msckf_sigma_pix` if set, else `sigma_bearing`.
-    pub delayed_init_sigma_pix: f64,
 }
 
 impl Default for VIOFilterSettings {
@@ -209,17 +173,6 @@ impl Default for VIOFilterSettings {
             use_faster_riccati: false,
             use_stereo_measurement: false,
             range_gate_chi2: 0.0,
-            enable_msckf: false,
-            msckf_window: 10,
-            msckf_min_track: 3,
-            msckf_chi2_mult: 1.0,
-            msckf_sigma_pix: 0.0,
-            msckf_suppress_sensor: false,
-            msckf_suppress_landmarks: false,
-            enable_delayed_init: false,
-            delayed_init_min_obs: 3,
-            delayed_init_chi2_mult: 1.0,
-            delayed_init_sigma_pix: 0.0,
         }
     }
 }
@@ -812,39 +765,6 @@ impl VIOFilter {
         self.eqf.marginalize_clone(clone_id);
     }
 
-    /// Additive MSCKF structureless vision update over ready tracks
-    /// (`track_id -> [(clone_id, uv)]`). Flushes any pending Riccati integration
-    /// first (so the clone cross-covariance is current), then delegates to
-    /// [`VIOEqF::msc_update`], which triangulates each track over its observing
-    /// clones, projects the feature out, gates, and corrects nav+clone poses.
-    /// No-op returning 0 when MSCKF is disabled, there are no clones, or no track
-    /// survives. Returns the number of accepted tracks.
-    pub fn msc_update(
-        &mut self,
-        tracks: &HashMap<u64, Vec<(u64, Vector2<f64>)>>,
-        cam: &dyn CameraModel,
-    ) -> usize {
-        if !self.settings.enable_msckf {
-            return 0;
-        }
-        self.eqf.flush_riccati(&self.input_gain, &self.state_gain);
-        self.eqf.msc_update(
-            self.suite.as_ref(),
-            cam,
-            tracks,
-            self.settings.msckf_min_track,
-            self.settings.msckf_chi2_mult,
-            if self.settings.msckf_sigma_pix > 0.0 {
-                self.settings.msckf_sigma_pix
-            } else {
-                self.settings.sigma_bearing
-            },
-            self.settings.use_discrete_correction,
-            self.settings.msckf_suppress_sensor,
-            self.settings.msckf_suppress_landmarks,
-        )
-    }
-
     /// De-confound diagnostic: body-velocity pseudo-measurement through the gain
     /// machinery (see [`VIOEqF::velocity_pseudo_update`]). Flushes pending Riccati
     /// so the clone cross-covariance is current, then applies the update.
@@ -852,92 +772,6 @@ impl VIOFilter {
         self.eqf.flush_riccati(&self.input_gain, &self.state_gain);
         self.eqf
             .velocity_pseudo_update(self.suite.as_ref(), v_gt_body, sigma_v, sign);
-    }
-
-    /// c94: stash current-frame GT BODY velocity so the next vision `msc_update`
-    /// emits the within-echo vision-vs-pseudo γ_v comparison. `None` disables.
-    pub fn set_dbg_v_gt_body(&mut self, v: Option<Vector3<f64>>) {
-        self.eqf.set_dbg_v_gt_body(v);
-    }
-
-    /// Like [`Self::msc_update`] but also returns per-track diagnostics (H1/H2
-    /// localization). No-op returning `(0, empty)` when MSCKF is disabled.
-    pub fn msc_update_debug(
-        &mut self,
-        tracks: &HashMap<u64, Vec<(u64, Vector2<f64>)>>,
-        cam: &dyn CameraModel,
-    ) -> (usize, Vec<crate::mathematical::vio_eqf::MscTrackDebug>) {
-        if !self.settings.enable_msckf {
-            return (0, Vec::new());
-        }
-        self.eqf.flush_riccati(&self.input_gain, &self.state_gain);
-        self.eqf.msc_update_debug(
-            self.suite.as_ref(),
-            cam,
-            tracks,
-            self.settings.msckf_min_track,
-            self.settings.msckf_chi2_mult,
-            if self.settings.msckf_sigma_pix > 0.0 {
-                self.settings.msckf_sigma_pix
-            } else {
-                self.settings.sigma_bearing
-            },
-            self.settings.use_discrete_correction,
-            self.settings.msckf_suppress_sensor,
-            self.settings.msckf_suppress_landmarks,
-        )
-    }
-
-    /// Delayed in-state landmark initialization over ready tracks
-    /// (`track_id -> [(clone_id, uv)]`), the OpenVINS `StateHelper::initialize`
-    /// mirror. Flushes any pending Riccati integration first (so the clone
-    /// cross-covariance is current), then births each track that is not already an
-    /// in-state landmark via [`VIOEqF::add_landmark_delayed`] — multi-view
-    /// triangulate, geometry-derived correlated covariance augment, chi² gate, and
-    /// a nav+clone update from the residual rows. No-op returning 0 when delayed
-    /// init is disabled, there are no clones, or no track qualifies. Returns the
-    /// number of landmarks born.
-    pub fn delayed_init(
-        &mut self,
-        tracks: &HashMap<u64, Vec<(u64, Vector2<f64>)>>,
-        cam: &dyn CameraModel,
-    ) -> usize {
-        if !self.settings.enable_delayed_init {
-            return 0;
-        }
-        self.eqf.flush_riccati(&self.input_gain, &self.state_gain);
-        let sigma_pix = if self.settings.delayed_init_sigma_pix > 0.0 {
-            self.settings.delayed_init_sigma_pix
-        } else if self.settings.msckf_sigma_pix > 0.0 {
-            self.settings.msckf_sigma_pix
-        } else {
-            self.settings.sigma_bearing
-        };
-        let mut born = 0usize;
-        for (tid, obs) in tracks.iter() {
-            if self
-                .eqf
-                .add_landmark_delayed(
-                    self.suite.as_ref(),
-                    cam,
-                    *tid,
-                    obs,
-                    self.settings.delayed_init_min_obs,
-                    self.settings.delayed_init_chi2_mult,
-                    sigma_pix,
-                    self.settings.use_discrete_correction,
-                )
-                .is_some()
-            {
-                born += 1;
-                // A birth grows the physical landmark block, so the cached
-                // `state_gain` (sized to the old n_lm) is stale. Rebuild it now,
-                // otherwise the next `flush_riccati` slices `state_gain` out of
-                // bounds against the grown `xi0.dim()`.
-                self.invalidate_gain_cache();
-            }
-        }
-        born
     }
 
     /// Number of live pose clones in the covariance window.
@@ -958,16 +792,6 @@ impl VIOFilter {
     /// Current (post-update) stored world<-camera pose of a live clone, or None.
     pub fn clone_pose_value(&self, clone_id: u64) -> Option<SE3> {
         self.eqf.clone_pose_value(clone_id)
-    }
-
-    /// Enable/disable first-estimate Jacobians (FEJ) for the MSC update. Default off.
-    pub fn set_msc_fej(&mut self, on: bool) {
-        self.eqf.set_msc_fej(on);
-    }
-
-    /// Whether FEJ is enabled for the MSC update.
-    pub fn msc_fej(&self) -> bool {
-        self.eqf.msc_fej()
     }
 
     /// Full 3x3 body-velocity covariance block of the EqF Riccati matrix.

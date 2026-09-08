@@ -406,10 +406,6 @@ impl EqFCoordinateSuite for NormalSuite {
         (-q0.transpose() / q0.norm_squared()) * conv_normal2euc(q0)
     }
 
-    fn conv_chart_to_euclidean(&self, q0: &Vector3<f64>) -> Matrix3<f64> {
-        conv_normal2euc(q0)
-    }
-
     fn lift_innovation(&self, total_innovation: &DVector<f64>, xi0: &VIOState) -> VIOAlgebra {
         // Continuous lift: convert normal-coord innovation to Euclidean coords block-wise,
         // then call the Euclidean lift.
