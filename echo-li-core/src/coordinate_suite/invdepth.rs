@@ -394,6 +394,10 @@ impl EqFCoordinateSuite for InvDepthSuite {
         (-q0.transpose() / q0.norm_squared()) * conv_ind2euc(q0)
     }
 
+    fn conv_chart_to_euclidean(&self, q0: &Vector3<f64>) -> Matrix3<f64> {
+        conv_ind2euc(q0)
+    }
+
     fn lift_innovation(&self, total_innovation: &DVector<f64>, xi0: &VIOState) -> VIOAlgebra {
         // Sensor part is identical to Euclidean.
         // Landmark part converts InvDepth perturbation to Euclidean first.

@@ -190,13 +190,18 @@ fn build_m_sensor(xi0: &VIOState) -> nalgebra::SMatrix<f64, 21, 21> {
     let mut m = nalgebra::SMatrix::<f64, 21, 21>::identity();
 
     // v_A(12:15) <- theta_pose(6:9): -skew(vel0)
-    let vel0 = xi0.sensor.velocity;
-    m[(12, 7)] = vel0[2];
-    m[(12, 8)] = -vel0[1];
-    m[(13, 6)] = -vel0[2];
-    m[(13, 8)] = vel0[0];
-    m[(14, 6)] = vel0[1];
-    m[(14, 7)] = -vel0[0];
+    // DIAGNOSTIC (default-off): ECHO_MSC_NO_MS drops this vel<-att coupling to test
+    // the recipe's unverified claim that this term is what makes Normal worse than
+    // Euclidean. Tests M_s attribution before committing to the eps-suite rewrite.
+    if std::env::var("ECHO_MSC_NO_MS").is_err() {
+        let vel0 = xi0.sensor.velocity;
+        m[(12, 7)] = vel0[2];
+        m[(12, 8)] = -vel0[1];
+        m[(13, 6)] = -vel0[2];
+        m[(13, 8)] = vel0[0];
+        m[(14, 6)] = vel0[1];
+        m[(14, 7)] = -vel0[0];
+    }
 
     // SE3.log(B) (15:21) <- (theta_pose, x_pose) (6:12): Ad_{Tc0^{-1}}
     let ad_tc_inv = xi0.sensor.camera_offset.inverse().adjoint();
@@ -399,6 +404,10 @@ impl EqFCoordinateSuite for NormalSuite {
     fn output_range_row(&self, q0: &Vector3<f64>) -> RowVector3<f64> {
         // C_ℓ_normal = C_ℓ_euclid @ normal2euc  (= [0, 0, +1]: ε₂ = log(1/‖q‖) = ℓ + const)
         (-q0.transpose() / q0.norm_squared()) * conv_normal2euc(q0)
+    }
+
+    fn conv_chart_to_euclidean(&self, q0: &Vector3<f64>) -> Matrix3<f64> {
+        conv_normal2euc(q0)
     }
 
     fn lift_innovation(&self, total_innovation: &DVector<f64>, xi0: &VIOState) -> VIOAlgebra {

@@ -76,9 +76,20 @@ impl EqFCoordinateSuite for EuclideanSuite {
         // Pose pos -> vel
         a0t.fixed_view_mut::<3, 3>(9, 12)
             .copy_from(&Matrix3::identity());
-        // Vel -> Orientation (Gravity)
+        // Vel -> Orientation (Gravity). This vel←att coupling (−g[ĝ]×) is the gravity
+        // leak that builds the Σ[att,vel] correlation used to route a vision-corrected
+        // velocity back into an attitude correction. It enters ONLY the covariance
+        // Riccati (state_matrix_a), NOT the mean lift — so its sign/orientation sets the
+        // DIRECTION of the attitude correction without touching mean physics. TRAJDUMP
+        // cos_dir≈−0.10 (correction ⊥/slightly-wrong to tilt) is the symptom a wrong
+        // sign/orientation here would cause. ECHO_MSC_VELATT_SIGN=-1 flips the sign to
+        // test whether the routing is a sign error (gate on TRAJDUMP cos_dir>0 & ATE).
+        let velatt_sign: f64 = std::env::var("ECHO_MSC_VELATT_SIGN")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1.0);
         a0t.fixed_view_mut::<3, 3>(12, 6)
-            .copy_from(&(-GRAVITY_CONSTANT * base_skew(&xi0.sensor.gravity_dir())));
+            .copy_from(&(velatt_sign * -GRAVITY_CONSTANT * base_skew(&xi0.sensor.gravity_dir())));
 
         let xi_hat = state_group_action(x, xi0);
         let v_est = imu_vel.gyr - xi_hat.sensor.gyro_bias();
@@ -168,6 +179,83 @@ impl EqFCoordinateSuite for EuclideanSuite {
                 .copy_from(&(-x.a.rotation.as_matrix().transpose() * m_g));
             let beta_pose = m_beta * u_b_pose;
             a0t.fixed_view_mut::<6, 3>(0, 6).copy_from(&beta_pose);
+
+            // MSCEqF SE23 pos<-att coupling (propagator.cpp:284), ABSENT from echo's
+            // Euclidean nav block. MSCEqF: A[D+6,D] = wedge(R0Tv0) - wedge(D.p)*wedge(b_g),
+            // Dd order [att,vel,pos]. echo order [att 6:9, pos 9:12, vel 12:15] -> a0t[9:12,6:9].
+            // echo velocity is body-frame (= R0^T v0), gravity_dir already carries R0^T -> same chart.
+            let se23_a = std::env::var("ECHO_MSC_SE23_A").ok();
+            if se23_a.as_deref() == Some("1") || se23_a.as_deref() == Some("2") {
+                let r0t_v0 = xi0.sensor.velocity; // body-frame origin velocity = R0^T v0
+                let d_p = x.a.translation; // group position ~ X.D().p()
+                let b_g = xi0.sensor.gyro_bias(); // origin gyro bias
+                let pos_att = base_skew(&r0t_v0) - base_skew(&d_p) * base_skew(&b_g);
+                a0t.fixed_view_mut::<3, 3>(9, 6).copy_from(&pos_att);
+            }
+            if se23_a.as_deref() == Some("2")
+                || se23_a.as_deref() == Some("3")
+                || se23_a.as_deref() == Some("4")
+                || se23_a.as_deref() == Some("5")
+            {
+                // Full MSCEqF D-block: A[D,D] = Psi - adb0 (propagator.cpp:283). Beyond the
+                // vel<-att=grav echo already has, this adds att<-att=-R_b, vel<-vel=-R_b from
+                // -adb0 (adb0 = SE3::adjoint(origin bias)). Bias ~1e-3 => R_b ~= I, so -R_b ~= -I.
+                // echo order: att 6:9, vel 12:15. att<-vel stays 0 (SE3 adjoint upper-right = 0).
+                // ISOLATION: =3 adds ONLY these -I self-terms (skips pos<-att via the guard
+                // below); =4 att<-att only; =5 vel<-vel only. Identifies which SE23 self-
+                // coupling flips cos_dir>0 (the =2 breakthrough) to scope the wholesale suite.
+                let neg_i = -Matrix3::identity();
+                if se23_a.as_deref() != Some("5") {
+                    a0t.fixed_view_mut::<3, 3>(6, 6).copy_from(&neg_i); // att<-att
+                }
+                if se23_a.as_deref() != Some("4") {
+                    a0t.fixed_view_mut::<3, 3>(12, 12).copy_from(&neg_i); // vel<-vel
+                }
+            }
+            // =3/4/5 skip the pos<-att graft (only the -I self-terms), so undo it here.
+            if se23_a.as_deref() == Some("3")
+                || se23_a.as_deref() == Some("4")
+                || se23_a.as_deref() == Some("5")
+            {
+                a0t.fixed_view_mut::<3, 3>(9, 6).fill(0.0);
+            }
+            // =6: the EXACT MSCEqF -adb0 (NOT the -I approximation of =2..5). The algebra
+            // adjoint ad_{[b_g,b_a]} = [[b_g^,0],[b_a^,b_g^]] in {R,v} order, so att<-att and
+            // vel<-vel are -[b_g]x (tiny skew, bias~1e-3 => ~=0), and vel<-att ADDS -[b_a]x to
+            // the gravity term. If =6 ~= baseline (ATE 364.8%, cos_dir -0.10) it PROVES the
+            // A[D,D] block already matches MSCEqF (both ~=0) and =4's -I win is artificial
+            // damping, not a MSCEqF port. echo order: att 6:9, vel 12:15.
+            if se23_a.as_deref() == Some("6") {
+                let b_g = xi0.sensor.gyro_bias();
+                let b_a = xi0.sensor.accel_bias();
+                a0t.fixed_view_mut::<3, 3>(6, 6)
+                    .copy_from(&(-base_skew(&b_g))); // att<-att = -[b_g]x
+                a0t.fixed_view_mut::<3, 3>(12, 12)
+                    .copy_from(&(-base_skew(&b_g))); // vel<-vel = -[b_g]x
+                let mut vel_att = a0t.fixed_view::<3, 3>(12, 6).into_owned();
+                vel_att += -base_skew(&b_a); // vel<-att += -[b_a]x
+                a0t.fixed_view_mut::<3, 3>(12, 6).copy_from(&vel_att);
+            }
+        }
+
+        // MSCEqF A2 (propagator.cpp:288-289): the EQUIVARIANT bias->pose coupling is IDENTITY.
+        // echo's Euclidean chart instead carries A[att,gyrobias] = -R_a (input_matrix_b:255 +
+        // sign at :72, then rotated by SDB ad_b_inv :162). R_a is ORTHOGONAL => transport
+        // preserves ||Sigma[nav,clone]||_F but ROTATES its direction -> exactly the c143
+        // signature (magnitude matched, align rotated att 1.27x over / vel 0.77x under).
+        // DISTINGUISHING TEST for the R_a-shear mechanism: flatten to MSCEqF's I and check if
+        // U0 att-align moves 0.00157 -> 0.00124 (MSCEqF) at still-matched magnitude. Covariance
+        // -only (A enters the Riccati, not the mean lift) so the byte-identical mean is intact.
+        // echo order: att 6:9, pos 9:12, vel 12:15; bias gyro 0:3, accel 3:6. delta=(gyro,accel).
+        if std::env::var("ECHO_MSC_A2_IDENT").ok().as_deref() == Some("1") {
+            a0t.fixed_view_mut::<3, 3>(6, 0).copy_from(&Matrix3::identity()); // att<-gyrobias = I
+            a0t.fixed_view_mut::<3, 3>(6, 3).fill(0.0); // att<-accbias = 0
+            a0t.fixed_view_mut::<3, 3>(12, 0).fill(0.0); // vel<-gyrobias = 0
+            a0t.fixed_view_mut::<3, 3>(12, 3)
+                .copy_from(&Matrix3::identity()); // vel<-accbias = I
+            a0t.fixed_view_mut::<3, 3>(9, 0)
+                .copy_from(&base_skew(&x.a.translation)); // pos<-gyrobias = wedge(D.p)
+            a0t.fixed_view_mut::<3, 3>(9, 3).fill(0.0); // pos<-accbias = 0
         }
 
         a0t
@@ -384,7 +472,18 @@ impl EqFCoordinateSuite for EuclideanSuite {
 
         let gamma_v = total_innovation.fixed_rows::<3>(12).into_owned();
         let omega_a = delta.u_a.fixed_rows::<3>(0).into_owned();
-        delta.u_w = -gamma_v - base_skew(&omega_a) * xi0.sensor.velocity;
+        // DIAGNOSTIC (ECHO_MSC_SDBVEL=1, default-off): drop the `-skew(omega_a)·v0`
+        // term that pre-CANCELS the semidirect attitude→velocity coupling `compose`
+        // re-applies (`w ← delta.w + R_δ·v_x`, vio_group.rs:55). With it, echo's
+        // velocity correction is ADDITIVE (`v ← v − gamma_v`); MSCEqF's plain
+        // `SDB::exp(inn)·Dd` (updateLeft) is MULTIPLICATIVE (`v ← R_δ·v + u_w`,
+        // attitude rotates velocity). Dropping it makes echo's nav correction
+        // identical to MSCEqF's SDB left action in the att↔vel coupling.
+        if std::env::var("ECHO_MSC_SDBVEL").as_deref() == Ok("1") {
+            delta.u_w = -gamma_v;
+        } else {
+            delta.u_w = -gamma_v - base_skew(&omega_a) * xi0.sensor.velocity;
+        }
 
         for i in 0..n {
             let gamma_qi = total_innovation.fixed_rows::<3>(s + 3 * i).into_owned();

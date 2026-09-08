@@ -100,9 +100,9 @@ eqf:
     position: 0.0
     velocity: 0.0
   settings:
-    # coordinateChoice: Euclidean
+    # coordinateChoice: Normal   # aka Polar (sphere-normal bearing + log-depth)
     # coordinateChoice: InvDepth
-    coordinateChoice: Normal   # aka Polar (sphere-normal bearing + log-depth)
+    coordinateChoice: Euclidean   # A/B variant: group/SDB chart, matches MSCEqF (no M_s mixing)
     # fastRiccati: true
     fastRiccati: false
     useDiscreteInnovationLift: false

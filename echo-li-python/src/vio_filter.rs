@@ -119,6 +119,183 @@ impl PyVIOFilter {
         Ok(())
     }
 
+    /// Faithful seed from an external estimator's DYNAMIC-init state (e.g. OpenVINS
+    /// DynamicInitializer output), bypassing echo-li's stationary auto-init so the two
+    /// filters start from the SAME state on a mid-flight start. Differs from
+    /// `set_initial_state` in two ways required for a faithful transfer:
+    ///   * `velocity_world` is expressed in the WORLD frame (OV dumps v_IinG); it is
+    ///     rotated into echo-li's body frame internally (`v_body = R_WB^T v_world`),
+    ///     because `VIOSensorState.velocity` is the SE(3) body velocity.
+    ///   * `gyro_bias` / `accel_bias` seed `input_bias = [gyro; accel]` instead of zero.
+    /// `rotation` is 3x3 body->world (already in echo-li's world frame — the caller is
+    /// responsible for the OV-global -> echo-world gauge alignment). Call after
+    /// `set_camera_extrinsics`.
+    #[pyo3(signature = (position, rotation, velocity_world, gyro_bias, accel_bias))]
+    fn set_initial_state_full(
+        &mut self,
+        position: [f64; 3],
+        rotation: PyReadonlyArray2<'_, f64>,
+        velocity_world: [f64; 3],
+        gyro_bias: [f64; 3],
+        accel_bias: [f64; 3],
+    ) -> PyResult<()> {
+        let shape = rotation.shape();
+        if shape[0] != 3 || shape[1] != 3 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "rotation must be 3x3",
+            ));
+        }
+        let r = SO3::from_matrix(&Matrix3::from_row_slice(rotation.as_slice()?));
+        let pose = SE3::new(r.clone(), Vector3::new(position[0], position[1], position[2]));
+        // World-frame velocity -> body frame (VIOSensorState.velocity is SE(3) body velocity).
+        let v_world = Vector3::new(velocity_world[0], velocity_world[1], velocity_world[2]);
+        let v_body = r.inverse().act(&v_world);
+        let mut input_bias = Vector6::zeros();
+        input_bias.fixed_rows_mut::<3>(0).copy_from(&Vector3::new(
+            gyro_bias[0],
+            gyro_bias[1],
+            gyro_bias[2],
+        ));
+        input_bias.fixed_rows_mut::<3>(3).copy_from(&Vector3::new(
+            accel_bias[0],
+            accel_bias[1],
+            accel_bias[2],
+        ));
+        let cam_offset = self.camera_extrinsics.clone().unwrap_or_else(SE3::identity);
+        let sensor = VIOSensorState {
+            input_bias,
+            pose,
+            velocity: v_body,
+            camera_offset: cam_offset,
+        };
+        let xi0 = VIOState::new(sensor, vec![]);
+        self.filter = VIOFilter::new(self.filter.settings.clone(), xi0);
+        if self.gram_window > 0 {
+            self.filter.enable_gramian(self.gram_window);
+        }
+        self.imu_buffer.clear();
+        self.initialized = true;
+        Ok(())
+    }
+
+    /// DIAGNOSTIC ONLY (gravity-leak causal test). Overwrite the nav-state MEAN
+    /// in place — pin the estimate's attitude (and optionally body velocity) to a
+    /// supplied reference — WITHOUT touching the covariance or the clone window.
+    ///
+    /// The EqF estimate is `state_group_action(x, xi0)`:
+    ///   pose      = xi0.pose ∘ x.a
+    ///   v_body    = x.a.R⁻¹ · (xi0.v − x.w)
+    ///   camoff    = x.a⁻¹ ∘ xi0.camoff ∘ x.b
+    /// We invert these to set the desired estimate while preserving the current
+    /// POSITION and CAMOFF exactly, mutating only `x.a` and `x.w`. Existing
+    /// setters (`set_initial_state*`) REBUILD the filter and wipe Σ + clones, so
+    /// they cannot be used for a per-frame mean reset. This is a mean-only nudge:
+    /// Σ is left un-transported (small per-frame resets ⇒ negligible mismatch),
+    /// which is acceptable for the causal test of whether bounding attitude tilt
+    /// bounds the velocity runaway.
+    fn overwrite_nav_mean(
+        &mut self,
+        rotation: PyReadonlyArray2<'_, f64>,
+        velocity_world: [f64; 3],
+        set_att: bool,
+        set_vel: bool,
+    ) -> PyResult<()> {
+        if !self.initialized {
+            return Ok(());
+        }
+        let shape = rotation.shape();
+        if shape[0] != 3 || shape[1] != 3 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "rotation must be 3x3",
+            ));
+        }
+        // Current estimate (owned) — read before mutating x.
+        let est = self.filter.state_estimate();
+        let cur_pos = est.sensor.pose.translation;
+        let cur_rot = est.sensor.pose.rotation.clone();
+        let cur_v_body = est.sensor.velocity;
+        let cur_camoff = est.sensor.camera_offset.clone();
+
+        let r_target = if set_att {
+            SO3::from_matrix(&Matrix3::from_row_slice(rotation.as_slice()?))
+        } else {
+            cur_rot.clone()
+        };
+        let pose_d = SE3::new(r_target.clone(), cur_pos);
+
+        // Target body velocity: GT (world->body via r_target) or keep current.
+        let v_body_target = if set_vel {
+            let v_world = Vector3::new(velocity_world[0], velocity_world[1], velocity_world[2]);
+            r_target.inverse().act(&v_world)
+        } else {
+            cur_v_body
+        };
+
+        // x.a = xi0.pose⁻¹ ∘ pose_d   (sets estimate.pose = pose_d)
+        let new_a = self.filter.eqf.xi0.sensor.pose.inverse().compose(&pose_d);
+        // x.w = xi0.v − x.a.R · v_body_target   (sets estimate.v_body = v_body_target)
+        let new_w =
+            self.filter.eqf.xi0.sensor.velocity - new_a.rotation.act(&v_body_target);
+        // x.b = xi0.camoff⁻¹ ∘ x.a ∘ camoff_cur   (preserves estimate.camoff exactly)
+        let new_b = self
+            .filter
+            .eqf
+            .xi0
+            .sensor
+            .camera_offset
+            .inverse()
+            .compose(&new_a)
+            .compose(&cur_camoff);
+
+        self.filter.eqf.x.a = new_a;
+        self.filter.eqf.x.w = new_w;
+        self.filter.eqf.x.b = new_b;
+        Ok(())
+    }
+
+    /// De-confound diagnostic (c92): body-velocity pseudo-measurement through the
+    /// gain machinery (updates mean AND covariance), given GT world velocity. The
+    /// harness converts world→body with the current attitude. `sign` (+1/−1) flips
+    /// the velocity-tangent selector for empirical convergence validation.
+    fn velocity_pseudo_update(
+        &mut self,
+        velocity_world: [f64; 3],
+        sigma_v: f64,
+        sign: f64,
+    ) -> f64 {
+        if !self.initialized {
+            return 0.0;
+        }
+        let est = self.filter.state_estimate();
+        let r_est = est.sensor.pose.rotation.clone();
+        let v_world = Vector3::new(velocity_world[0], velocity_world[1], velocity_world[2]);
+        let v_gt_body = r_est.inverse().act(&v_world);
+        let before = (v_gt_body - est.sensor.velocity).norm();
+        self.filter.velocity_pseudo_update(v_gt_body, sigma_v, sign);
+        // Return post-update residual norm so the harness can validate the sign
+        // (residual MUST shrink; `before` printed alongside for the 1-frame check).
+        let est2 = self.filter.state_estimate();
+        let v_gt_body2 = est2.sensor.pose.rotation.inverse().act(&v_world);
+        let after = (v_gt_body2 - est2.sensor.velocity).norm();
+        before - after // >0 ⇒ residual shrank ⇒ correct sign
+    }
+
+    /// c94: stash current-frame GT WORLD velocity (converted to body via current
+    /// attitude) so the NEXT vision `msc_update` prints the GAMMACMP comparison of
+    /// the vision γ_v against the known-good pseudo γ_v. Pass None to disable.
+    fn set_dbg_v_gt_body(&mut self, velocity_world: Option<[f64; 3]>) {
+        match velocity_world {
+            Some(vw) if self.initialized => {
+                let est = self.filter.state_estimate();
+                let r_est = est.sensor.pose.rotation.clone();
+                let v_world = Vector3::new(vw[0], vw[1], vw[2]);
+                let v_gt_body = r_est.inverse().act(&v_world);
+                self.filter.set_dbg_v_gt_body(Some(v_gt_body));
+            }
+            _ => self.filter.set_dbg_v_gt_body(None),
+        }
+    }
+
     fn process_imu(&mut self, stamp: f64, gyro: [f64; 3], accel: [f64; 3]) {
         let imu = IMUVelocity::new(
             stamp,
@@ -307,6 +484,238 @@ impl PyVIOFilter {
             .map(|(p_vv, p_ww)| (mat3(&p_vv), mat3(&p_ww)))
     }
 
+    /// Stochastically clone the current camera pose into the EqF covariance window,
+    /// tagged `clone_id` (flushes pending Riccati first). No-op if already live.
+    fn clone_pose(&mut self, clone_id: u64, time: f64) {
+        self.filter.clone_current_pose(clone_id, time);
+    }
+
+    /// Drop clone `clone_id` from the covariance window (exact block deletion).
+    fn marginalize_clone(&mut self, clone_id: u64) {
+        self.filter.marginalize_clone(clone_id);
+    }
+
+    /// DIAGNOSTIC: overwrite a live clone's stored world←camera pose value (4x4),
+    /// leaving its covariance untouched. Lets the harness inject GT-relative clone
+    /// geometry to separate an update-mechanics bug from EqVIO pose inconsistency.
+    /// Returns True if the clone was live.
+    fn set_clone_pose_value(&mut self, clone_id: u64, pose: PyReadonlyArray2<'_, f64>) -> PyResult<bool> {
+        let shape = pose.shape();
+        if shape[0] != 4 || shape[1] != 4 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "pose must be a 4x4 matrix",
+            ));
+        }
+        let m = Matrix4::from_row_slice(pose.as_slice()?);
+        Ok(self.filter.set_clone_pose_value(clone_id, SE3::from_matrix(&m)))
+    }
+
+    /// Current (post-update) stored world←camera pose (4x4) of a live clone, or None.
+    /// Companion to set_clone_pose_value: reads back echo-li's own estimate of the
+    /// clone pose after any MSC correction, for the shared-track filter comparison.
+    fn clone_pose_value<'py>(
+        &self,
+        py: Python<'py>,
+        clone_id: u64,
+    ) -> Option<Bound<'py, PyArray2<f64>>> {
+        self.filter.clone_pose_value(clone_id).map(|p| {
+            let m = p.as_matrix();
+            let data: Vec<f64> = (0..4).flat_map(|r| (0..4).map(move |c| m[(r, c)])).collect();
+            PyArray2::from_owned_array(py, Array2::from_shape_vec((4, 4), data).unwrap())
+        })
+    }
+
+    /// Enable/disable first-estimate Jacobians (FEJ) for the MSC update. When on,
+    /// each clone-pose Jacobian is linearized at the clone's frozen birth pose while
+    /// the residual stays at the current pose (OpenVINS-style). Default off ⇒ the
+    /// MSC update is byte-identical to current-estimate linearization.
+    fn set_msc_fej(&mut self, on: bool) {
+        self.filter.set_msc_fej(on);
+    }
+
+    /// Whether FEJ is enabled for the MSC update.
+    fn msc_fej(&self) -> bool {
+        self.filter.msc_fej()
+    }
+
+    /// Additive MSCKF structureless vision update over ready tracks.
+    ///
+    /// `tracks` maps `track_id -> [(clone_id, [u, v]), ...]` — each track's pixel
+    /// observations at the clone frames buffered by the harness. Triangulates each
+    /// track over its observing clones, projects the feature out, chi²-gates, and
+    /// corrects the nav state + clone poses through the clone cross-covariance.
+    /// No-op returning 0 when MSCKF is disabled in the config, there are no clones,
+    /// or no track survives the gate. Returns the number of accepted tracks.
+    fn msc_update(&mut self, tracks: HashMap<u64, Vec<(u64, [f64; 2])>>) -> usize {
+        if !self.initialized {
+            return 0;
+        }
+        let converted: HashMap<u64, Vec<(u64, Vector2<f64>)>> = tracks
+            .into_iter()
+            .map(|(tid, obs)| {
+                (
+                    tid,
+                    obs.into_iter()
+                        .map(|(cid, uv)| (cid, Vector2::new(uv[0], uv[1])))
+                        .collect(),
+                )
+            })
+            .collect();
+        self.filter.msc_update(&converted, self.camera.as_ref())
+    }
+
+    /// Delayed in-state landmark initialization over ready tracks (OpenVINS
+    /// `StateHelper::initialize` mirror). `tracks` maps
+    /// `track_id -> [(clone_id, [u, v]), ...]`. Births each qualifying track as an
+    /// in-state EqF landmark with a geometry-derived correlated covariance
+    /// (multi-view triangulation + `initialize_invertible`), chi²-gated. No-op
+    /// returning 0 when delayed init is disabled in the config, there are no
+    /// clones, or no track qualifies. Returns the number of landmarks born.
+    fn delayed_init(&mut self, tracks: HashMap<u64, Vec<(u64, [f64; 2])>>) -> usize {
+        if !self.initialized {
+            return 0;
+        }
+        let converted: HashMap<u64, Vec<(u64, Vector2<f64>)>> = tracks
+            .into_iter()
+            .map(|(tid, obs)| {
+                (
+                    tid,
+                    obs.into_iter()
+                        .map(|(cid, uv)| (cid, Vector2::new(uv[0], uv[1])))
+                        .collect(),
+                )
+            })
+            .collect();
+        self.filter.delayed_init(&converted, self.camera.as_ref())
+    }
+
+    /// Like [`Self::msc_update`] but also returns per-track diagnostics for H1/H2
+    /// localization. Returns `(accepted, rows)` where each row is
+    /// `(track_id, n_obs, raw_rms_px, chi2, dof, tri_depth, tri_range, accepted,
+    /// s_geom, s_full, dx_rot, dx_pos, dx_vel)`: `raw_rms_px` = pre-projection
+    /// reprojection RMS, `chi2` = post-projection innovation, `tri_depth`/`tri_range`
+    /// = triangulated point in the latest clone's camera frame, `s_geom`/`s_full` =
+    /// mean pose-induced / total innovation variance (px²), `dx_rot`/`dx_pos`/`dx_vel` =
+    /// batch-gain nav attitude/position/velocity correction (rad / m / m·s⁻¹) — the
+    /// K·r this track implies. dx_vel isolates the scale/velocity channel.
+    #[allow(clippy::type_complexity)]
+    fn msc_update_debug(
+        &mut self,
+        tracks: HashMap<u64, Vec<(u64, [f64; 2])>>,
+    ) -> (usize, Vec<Vec<f64>>) {
+        // Each row is a flat f64 vector (PyO3 caps tuple conversions at 12 fields
+        // and we need 13 including dx_vel): index layout
+        // [tid, n_obs, raw_rms, chi2, dof, tri_depth, tri_range, accepted,
+        //  s_geom, s_full, dx_rot, dx_pos, dx_vel]. Integer/bool fields ride as f64
+        // (ids small, accepted 0.0/1.0) — lossless at these magnitudes.
+        if !self.initialized {
+            return (0, Vec::new());
+        }
+        let converted: HashMap<u64, Vec<(u64, Vector2<f64>)>> = tracks
+            .into_iter()
+            .map(|(tid, obs)| {
+                (
+                    tid,
+                    obs.into_iter()
+                        .map(|(cid, uv)| (cid, Vector2::new(uv[0], uv[1])))
+                        .collect(),
+                )
+            })
+            .collect();
+        let (accepted, dbg) = self.filter.msc_update_debug(&converted, self.camera.as_ref());
+        let rows = dbg
+            .into_iter()
+            .map(|d| {
+                vec![
+                    d.track_id as f64, d.n_obs as f64, d.raw_rms, d.chi2, d.dof as f64,
+                    d.tri_depth, d.tri_range, if d.accepted { 1.0 } else { 0.0 },
+                    d.s_geom, d.s_full, d.dx_rot, d.dx_pos, d.dx_vel,
+                ]
+            })
+            .collect();
+        (accepted, rows)
+    }
+
+    /// Number of live pose clones in the covariance window.
+    fn n_clones(&self) -> usize {
+        self.filter.n_clones()
+    }
+
+    /// Ids of the live pose clones (block order).
+    fn clone_ids(&self) -> Vec<u64> {
+        self.filter.clone_ids()
+    }
+
+    /// Honest, gauge-cancelled relative-pose covariance between clone `clone_id`
+    /// (the depth anchor, whose camera->world pose is `t_wc_clone`, a 4x4 array) and
+    /// the current camera pose: returns (P_vv_rel, P_ww_rel) as two 3x3 arrays, a
+    /// drop-in replacement for get_camera_pose_covariance when feeding Sparse3DFilter's
+    /// pose-range term for a landmark anchored at that clone. None if the clone is not
+    /// live or the covariance is non-finite.
+    fn get_relative_pose_covariance<'py>(
+        &self,
+        py: Python<'py>,
+        clone_id: u64,
+        t_wc_clone: PyReadonlyArray2<f64>,
+    ) -> Option<(Bound<'py, PyArray2<f64>>, Bound<'py, PyArray2<f64>>)> {
+        let arr = t_wc_clone.as_array();
+        if arr.shape() != [4, 4] {
+            return None;
+        }
+        let mut m = Matrix4::<f64>::zeros();
+        for r in 0..4 {
+            for c in 0..4 {
+                m[(r, c)] = arr[[r, c]];
+            }
+        }
+        let t_clone = SE3::from_matrix(&m);
+        let mat3 = |m: &Matrix3<f64>| {
+            let data: Vec<f64> = (0..3)
+                .flat_map(|r| (0..3).map(move |c| m[(r, c)]))
+                .collect();
+            PyArray2::from_owned_array(py, Array2::from_shape_vec((3, 3), data).unwrap())
+        };
+        self.filter
+            .sparse_relative_pose_covariances(clone_id, &t_clone)
+            .map(|(p_vv, p_ww)| (mat3(&p_vv), mat3(&p_ww)))
+    }
+
+    /// DIAGNOSTIC: rotation-channel term-decomposition of the relative-pose cov,
+    /// `(term_curr, term_clone, term_cross)` 3×3 each, with
+    /// `term_curr + term_clone − term_cross == p_ww`. Localizes the lag^0.47
+    /// sub-linear attitude-cov growth to a specific propagation term.
+    fn get_relative_pose_cov_terms_rot<'py>(
+        &self,
+        py: Python<'py>,
+        clone_id: u64,
+        t_wc_clone: PyReadonlyArray2<f64>,
+    ) -> Option<(
+        Bound<'py, PyArray2<f64>>,
+        Bound<'py, PyArray2<f64>>,
+        Bound<'py, PyArray2<f64>>,
+    )> {
+        let arr = t_wc_clone.as_array();
+        if arr.shape() != [4, 4] {
+            return None;
+        }
+        let mut m = Matrix4::<f64>::zeros();
+        for r in 0..4 {
+            for c in 0..4 {
+                m[(r, c)] = arr[[r, c]];
+            }
+        }
+        let t_clone = SE3::from_matrix(&m);
+        let mat3 = |m: &Matrix3<f64>| {
+            let data: Vec<f64> = (0..3)
+                .flat_map(|r| (0..3).map(move |c| m[(r, c)]))
+                .collect();
+            PyArray2::from_owned_array(py, Array2::from_shape_vec((3, 3), data).unwrap())
+        };
+        self.filter
+            .sparse_relative_pose_cov_terms_rot(clone_id, &t_clone)
+            .map(|(curr, clone, cross)| (mat3(&curr), mat3(&clone), mat3(&cross)))
+    }
+
     /// Enable observability-Gramian accumulation over `window` vision frames (0 = off).
     fn enable_gramian(&mut self, window: usize) {
         self.gram_window = window;
@@ -355,6 +764,17 @@ impl PyVIOFilter {
             diag.push(sigma[(i, i)]);
         }
         PyArray1::from_owned_array(py, Array1::from_vec(diag))
+    }
+
+    /// Full EqF covariance matrix (n×n). Sensor tangent order (vio_eqf.rs:861):
+    /// [0:6]=input_bias (gyro[0:3], accel[3:6]), [6:9]=att, [9:12]=pos, [12:15]=vel,
+    /// [15:21]=camoff; then landmarks (3 each); then clones (6 each, [rot3|trans3]).
+    /// Lets Python slice cross-cov blocks e.g. Σ[gyro_bias, clone] = rows[0:3].
+    fn get_full_covariance<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
+        let sigma = &self.filter.eqf.sigma;
+        let n = sigma.nrows();
+        let data: Vec<f64> = (0..n).flat_map(|r| (0..n).map(move |c| sigma[(r, c)])).collect();
+        PyArray2::from_owned_array(py, Array2::from_shape_vec((n, n), data).unwrap())
     }
 
     #[getter]

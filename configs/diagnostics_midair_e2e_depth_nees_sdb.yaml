@@ -1,0 +1,120 @@
+# Principled mono config for MidAir depth NEES evidence.
+#
+# Derived from eqvio_midair.yaml with three corrections:
+#   1. Bias priors matched to MidAir traj_0 measured IMU noise (biasAcc 1.58→4e-4,
+#      biasGyr 97162→4e-6). The loose factory priors made the EqF 3000x too uncertain
+#      about bias, collapsing the mono scale on low-jerk trajectories.
+#   2. Velocity noise matched to measured per-trajectory std, converted to
+#      continuous-time noise density (σ_density = σ_sample · √dt, 100 Hz → ×0.1).
+#      Per-sample: σ_a=0.0328, σ_g=0.0394 → density: 0.00328, 0.00394.
+#      MidAir's per-trajectory-randomized IMU noise is 4–8x wider than the
+#      base config's values on some trajectories.
+#   3. Sparse3D sigma_pixel set to 1.0 (calibrated on GT pixel data), not 5.0.
+#
+# With these corrections, traj_0 ATE drops from ~8990 m to ~7.3 m (1.9%).
+# This config is for the filter_formulation.md Section X.1 excitation-gate evidence.
+#
+# Evidence script: echo-li-python/tests/diagnostics/midair_e2e_depth_nees.py
+# Config provenance: derived from the 2026-08 MidAir calibration runs.
+#   sparse3d-pose-surrogate-bounded-by-pvv.md for the full confound stripping.
+RudolfV:
+  equaliseImageHistogram: true
+  featureDist: 16.0
+  featureSearchThreshold: 0.8
+  fastThreshold: 20
+  detector: shi_tomasi
+  maxFeatures: 300
+  maxLevel: 3
+  lbpPolicy: HardReject
+  kltResidual: false
+  enableRansac: true
+  epipolarGateThreshold: 1.0e-5
+  epipolarRefine: false
+  ransacParams:
+    inlierThreshold: 0.00001
+    maxIterations: 200
+    minDataPoints: 5
+    minInliers: 15
+  trackedFeatureDist: 16.0
+eqf:
+  maxFeatures: 40
+  initialValue:
+    # Large initial value so that sky features (depth ≈ ∞) produce
+    # negligible phantom parallax in the first frames.  useMedianDepth
+    # converges the scale from any starting point once features mature.
+    sceneDepth: 200.0
+  initialVariance:
+    attitude: 0.13565029126052572
+    # Principled bias priors: matched to MidAir measured per-traj noise.
+    biasAcc: 0.0004
+    biasGyr: 0.000004
+    cameraAttitude: 0.0010228558965517584
+    cameraPosition: 0.023501400846134893
+    point: 129.90415638150924
+    position: 0.1
+    velocity: 1.0
+  measurementNoise:
+    feature: 2.0
+    featureOutlierAbs: 5.0
+    featureOutlierProb: 0.03229809583062128
+    featureRetention: 0.18594708334486176
+  processVariance:
+    attitude: 6.025875320811407e-05
+    biasAcc: 0.0
+    biasGyr: 0.0
+    cameraAttitude: 5.075382174045239e-06
+    cameraPosition: 1.2188313140115635e-05
+    point: 0.00029845436136043135
+    position: 9.981466095928483e-06
+    velocity: 0.025
+  settings:
+    coordinateChoice: Normal
+    fastRiccati: false
+    useDiscreteInnovationLift: false
+    useDiscreteVelocityLift: false
+    useEquivariantOutput: true
+    useFeaturePredictions: true
+    useMedianDepth: true
+    riccatiVariant: faster
+    imuBiasGroup: sdb
+  velocityNoise:
+    # Matched to MidAir traj_0 measured IMU noise.
+    # Per-sample σ at 100 Hz: σ_a=0.0328, σ_g=0.0394.
+    # EqF convention is continuous-time noise density (σ/√Hz):
+    #   σ_density = σ_sample · √dt = σ_sample · 0.1
+    acc: 0.00328
+    accBias: 0.004462289865453429
+    gyr: 0.00394
+    gyrBias: 0.00013372703521098622
+main:
+  writeState: true
+  cameraLag: 0.00
+SparseVog:
+  parametrization: bearing_invdepth_additive3d
+  max_pool_size: 300
+  min_track_length: 5
+  conv_variance_threshold: 2.0
+  init_depth_var: 10.0
+  # Calibrated on GT pixel data (filter_formulation.md Section IX).
+  sigma_pixel: 1.0
+  uniform_z_max: 20.0
+  a_init: 100000000.0
+  b_init: 0.00000001
+  ab_min: 1.0
+  ab_max: 200.0
+  min_inlier_ratio: 0.5
+  mahalanobis_reset_chi2: 0.2
+  bias_walk_var: 0.0
+  process_depth_var: 0.01
+  # Pose-range-process noise (Eq. 10–11 of filter_formulation.md).
+  # Must be >0 for P_vv to reach the radial range channel.
+  # pose_range_scale controls the per-frame diffusive increment;
+  # the excitation gate multiplies P_vv by γ² via --pvv-scale.
+  pose_range_scale: 1.0
+  pose_range_coherent: 0.0
+  min_parallax: 1.0e-4
+  min_cos_sim: 0.95
+  min_depth: 0.1
+  max_depth: 150.0
+Stereo:
+  enabled: false

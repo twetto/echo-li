@@ -110,6 +110,19 @@ pub trait EqFCoordinateSuite: Send + Sync {
         -q0.transpose() / q0.norm_squared()
     }
 
+    /// 3×3 Jacobian `∂(euclidean point)/∂(landmark chart tangent)` at the point
+    /// `q0`, i.e. `dp/dε`. This is the chart-to-Euclidean coordinate-change
+    /// Jacobian each suite already builds internally (`conv_ind2euc` /
+    /// `conv_normal2euc`); the default is the identity (Euclidean suite, whose
+    /// landmark chart IS the euclidean tangent). Exposed generically so the
+    /// delayed-init routine can map a euclidean feature Jacobian
+    /// `H_f_euclid = ∂pixel/∂p` into the suite's landmark chart via
+    /// `H_L_chart = H_f_euclid · conv_chart_to_euclidean(q0)` — the same
+    /// composition `output_matrix_ci_star` performs (`C*_euclid · ind2euc`).
+    fn conv_chart_to_euclidean(&self, _q0: &Vector3<f64>) -> nalgebra::Matrix3<f64> {
+        nalgebra::Matrix3::identity()
+    }
+
     fn lift_innovation(&self, total_innovation: &DVector<f64>, xi0: &VIOState) -> VIOAlgebra;
     fn lift_innovation_discrete(&self, total_innovation: &DVector<f64>, xi0: &VIOState)
     -> VIOGroup;

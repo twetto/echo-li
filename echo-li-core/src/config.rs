@@ -149,6 +149,42 @@ pub struct EqfSettings {
     /// Chi²(1) gate on the stereo range innovation; 0 disables.
     #[serde(default)]
     pub range_gate_chi2: f64,
+    /// Enable the additive MSCKF structureless vision update (default OFF =>
+    /// exact current behavior; the update is never invoked).
+    #[serde(default)]
+    pub enable_msckf: bool,
+    /// Clone-window length (frames kept before marginalization).
+    #[serde(default)]
+    pub msckf_window: Option<usize>,
+    /// Minimum live observations per track (clamped to >=2).
+    #[serde(default)]
+    pub msckf_min_track: Option<usize>,
+    /// Multiplier on the 95% chi² innovation gate.
+    #[serde(default)]
+    pub msckf_chi2_mult: Option<f64>,
+    /// Pixel measurement noise for the MSC update ONLY (0 / absent => reuse the
+    /// base-EqF `sigma_bearing`). Weights the structureless update independently.
+    #[serde(default)]
+    pub msckf_sigma_pix: Option<f64>,
+    /// DIAGNOSTIC: suppress the MSC sensor / in-state-landmark mean-correction.
+    #[serde(default)]
+    pub msckf_suppress_sensor: bool,
+    #[serde(default)]
+    pub msckf_suppress_landmarks: bool,
+    /// Enable delayed in-state landmark initialization (OpenVINS
+    /// `StateHelper::initialize` mirror; default OFF => guessed-diagonal births).
+    #[serde(default)]
+    pub enable_delayed_init: bool,
+    /// Minimum live observations for a track to be delay-initialized (>=2).
+    #[serde(default)]
+    pub delayed_init_min_obs: Option<usize>,
+    /// Multiplier on the 95% chi² gate for the delayed-init update rows.
+    #[serde(default)]
+    pub delayed_init_chi2_mult: Option<f64>,
+    /// Pixel measurement noise for the delayed-init augment (0 / absent => reuse
+    /// `msckf_sigma_pix` if set, else `sigma_bearing`).
+    #[serde(default)]
+    pub delayed_init_sigma_pix: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -751,6 +787,31 @@ impl VIOConfig {
         settings.coordinate_choice = self.eqf.settings.coordinate_choice.clone();
         settings.use_stereo_measurement = self.eqf.settings.stereo_measurement;
         settings.range_gate_chi2 = self.eqf.settings.range_gate_chi2;
+        settings.enable_msckf = self.eqf.settings.enable_msckf;
+        if let Some(v) = self.eqf.settings.msckf_window {
+            settings.msckf_window = v;
+        }
+        if let Some(v) = self.eqf.settings.msckf_min_track {
+            settings.msckf_min_track = v;
+        }
+        settings.msckf_suppress_sensor = self.eqf.settings.msckf_suppress_sensor;
+        settings.msckf_suppress_landmarks = self.eqf.settings.msckf_suppress_landmarks;
+        if let Some(v) = self.eqf.settings.msckf_chi2_mult {
+            settings.msckf_chi2_mult = v;
+        }
+        if let Some(v) = self.eqf.settings.msckf_sigma_pix {
+            settings.msckf_sigma_pix = v;
+        }
+        settings.enable_delayed_init = self.eqf.settings.enable_delayed_init;
+        if let Some(v) = self.eqf.settings.delayed_init_min_obs {
+            settings.delayed_init_min_obs = v;
+        }
+        if let Some(v) = self.eqf.settings.delayed_init_chi2_mult {
+            settings.delayed_init_chi2_mult = v;
+        }
+        if let Some(v) = self.eqf.settings.delayed_init_sigma_pix {
+            settings.delayed_init_sigma_pix = v;
+        }
         settings.max_landmarks = self.eqf.max_features;
         settings.sigma_bearing = self.eqf.measurement_noise.feature;
         settings.initial_point_variance = self.eqf.initial_variance.point;

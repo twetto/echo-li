@@ -11,7 +11,7 @@ pub mod trajectory_metrics;
 #[cfg(test)]
 pub mod tests;
 
-use echo_lie::SO3;
+use echo_lie::{SE3, SO3};
 use nalgebra::{DMatrix, Matrix3, SMatrix, Vector2, Vector3};
 use std::collections::{HashMap, HashSet};
 
@@ -134,6 +134,43 @@ pub struct VIOFilterSettings {
     pub use_stereo_measurement: bool,
     // Chi²(1) gate on the stereo range innovation; 0 disables gating.
     pub range_gate_chi2: f64,
+
+    // Additive MSCKF structureless vision update (OpenVINS mirror). Default OFF
+    // => exact current behavior (`msc_update` is never invoked). The pose-clone
+    // window and per-track observation buffer are driven by the harness; these
+    // knobs parametrize the update itself.
+    pub enable_msckf: bool,
+    // Clone-window length (frames kept before marginalization).
+    pub msckf_window: usize,
+    // Minimum live observations for a track to be used (clamped to >=2).
+    pub msckf_min_track: usize,
+    // Multiplier on the 95% chi² innovation gate.
+    pub msckf_chi2_mult: f64,
+    // Pixel measurement noise for the MSC update ONLY (S = H P Hᵀ + σ²I). 0.0 =>
+    // fall back to `sigma_bearing` (the base EqF feature noise), preserving the
+    // pre-knob behavior. Kept separate so the structureless update can be weighted
+    // independently of the in-state EqF vision update.
+    pub msckf_sigma_pix: f64,
+    // DIAGNOSTIC: suppress the MSC sensor(21) and/or in-state-landmark(3·n_lm)
+    // mean-correction. Both true ⇒ clones only. Isolates a nav-chart regression
+    // from the sceneDepth-prior landmark correction and the clone feedback.
+    pub msckf_suppress_sensor: bool,
+    pub msckf_suppress_landmarks: bool,
+
+    // Delayed in-state landmark initialization (OpenVINS `StateHelper::initialize`
+    // mirror). When ON, `delayed_init` births each ready track as an in-state EqF
+    // landmark with a GEOMETRY-DERIVED correlated covariance (multi-view
+    // triangulation + `initialize_invertible`), replacing the guessed-diagonal
+    // birth in the normal `process_vision` path. Default OFF => exact current
+    // behavior (`delayed_init` is never invoked; births stay diagonal).
+    pub enable_delayed_init: bool,
+    // Minimum live observations for a track to be delay-initialized (clamped >=2).
+    pub delayed_init_min_obs: usize,
+    // Multiplier on the 95% chi² gate for the delayed-init update rows.
+    pub delayed_init_chi2_mult: f64,
+    // Pixel measurement noise for the delayed-init augment. 0.0 => fall back to
+    // `msckf_sigma_pix` if set, else `sigma_bearing`.
+    pub delayed_init_sigma_pix: f64,
 }
 
 impl Default for VIOFilterSettings {
@@ -172,6 +209,17 @@ impl Default for VIOFilterSettings {
             use_faster_riccati: false,
             use_stereo_measurement: false,
             range_gate_chi2: 0.0,
+            enable_msckf: false,
+            msckf_window: 10,
+            msckf_min_track: 3,
+            msckf_chi2_mult: 1.0,
+            msckf_sigma_pix: 0.0,
+            msckf_suppress_sensor: false,
+            msckf_suppress_landmarks: false,
+            enable_delayed_init: false,
+            delayed_init_min_obs: 3,
+            delayed_init_chi2_mult: 1.0,
+            delayed_init_sigma_pix: 0.0,
         }
     }
 }
@@ -243,8 +291,16 @@ impl VIOFilterSettings {
         for k in 3..6 {
             q[(k, k)] = self.process_bias_acc;
         }
+        // Diagnostic sweep: ECHO_MSC_PROCATT overrides the additive attitude
+        // process-noise (per-step Q[att]) to test whether a self-consistent
+        // attitude-cov inflation (gain AND cov co-grow) robustly bounds the
+        // tilt runaway (=> cov held too tight) or is razor-thin (=> mis-route).
+        let proc_att = std::env::var("ECHO_MSC_PROCATT")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(self.process_attitude);
         for k in 6..9 {
-            q[(k, k)] = self.process_attitude;
+            q[(k, k)] = proc_att;
         }
         for k in 9..12 {
             q[(k, k)] = self.process_position;
@@ -325,9 +381,34 @@ impl VIOFilter {
             return;
         }
 
+        // DIAGNOSTIC (ECHO_IMU_LEFT_HOLD=1, default-off): integrate the interval
+        // [current_time, imu.stamp] using the PREVIOUS sample's (gyr,acc) held
+        // constant (left-endpoint) instead of the current sample (right-endpoint,
+        // default). MSCEqF's propagator uses the left-endpoint hold. This is an
+        // identity-ladder confound remover for the per-clone attitude increment
+        // (see cont.48/49): echo right-hold under-rotates ~1.4% vs MSCEqF left-hold.
+        // Env-gated so the shipped behaviour and covariance path are unchanged.
+        let prop = if std::env::var("ECHO_IMU_LEFT_HOLD")
+            .map(|s| s == "1")
+            .unwrap_or(false)
+        {
+            match self.pending_imu.last() {
+                Some(prev) => IMUVelocity {
+                    stamp: imu.stamp,
+                    gyr: prev.gyr,
+                    acc: prev.acc,
+                    gyr_bias_vel: prev.gyr_bias_vel,
+                    acc_bias_vel: prev.acc_bias_vel,
+                },
+                None => imu,
+            }
+        } else {
+            imu
+        };
+
         // 1. Propagate observer state (updates X)
         self.eqf
-            .integrate_observer_state(&imu, dt, self.settings.use_discrete_velocity_lift);
+            .integrate_observer_state(&prop, dt, self.settings.use_discrete_velocity_lift);
 
         // 2. Propagate covariance.
         if self.settings.use_faster_riccati {
@@ -341,7 +422,7 @@ impl VIOFilter {
                 self.invalidate_gain_cache();
             }
             self.eqf
-                .accumulate_transition(self.suite.as_ref(), &imu, dt);
+                .accumulate_transition(self.suite.as_ref(), &prop, dt);
         } else {
             // `Fast` variant — per-sample transport. Remove landmarks that
             // became degenerate during propagation, then propagate Riccati.
@@ -352,7 +433,7 @@ impl VIOFilter {
             }
             self.eqf.integrate_riccati_fast(
                 self.suite.as_ref(),
-                &imu,
+                &prop,
                 dt,
                 &self.input_gain,
                 &self.state_gain,
@@ -623,6 +704,272 @@ impl VIOFilter {
         Some((p_vv, p_ww))
     }
 
+    /// Honest, gauge-cancelled relative-pose covariance between clone `clone_id`
+    /// (the depth anchor, pose value `t_wc_clone`) and the current camera pose,
+    /// as `(p_vv_rel, p_ww_rel)` — a drop-in replacement for the absolute pair
+    /// from [`sparse_camera_pose_covariances`] when feeding §V-D. `None` if the
+    /// clone is not live or the covariance is non-finite.
+    pub fn sparse_relative_pose_covariances(
+        &self,
+        clone_id: u64,
+        t_wc_clone: &SE3,
+    ) -> Option<(Matrix3<f64>, Matrix3<f64>)> {
+        let state = self.eqf.state_estimate();
+        let clone_start = self.eqf.clone_block_start(clone_id)?;
+        let t_wc_curr = state.sensor.pose.compose(&state.sensor.camera_offset);
+        let cov = sparse_relative_pose_covariance(
+            &state,
+            &self.eqf.sigma,
+            clone_start,
+            t_wc_clone,
+            &t_wc_curr,
+        )?;
+        let p_ww = cov.fixed_view::<3, 3>(0, 0).into_owned();
+        let p_vv = cov.fixed_view::<3, 3>(3, 3).into_owned();
+        Some((p_vv, p_ww))
+    }
+
+    /// DIAGNOSTIC term-decomposition of [`Self::sparse_relative_pose_covariances`].
+    /// Returns the ROTATION (3×3) blocks of the three additive constituents
+    /// `(term_curr, term_clone, term_cross)` (see [`sparse_relative_pose_cov_terms`]);
+    /// `term_curr + term_clone − term_cross == p_ww`. Lets a harness localize the
+    /// `lag^0.47` sub-linear attitude-cov growth to a specific term. Read-only.
+    pub fn sparse_relative_pose_cov_terms_rot(
+        &self,
+        clone_id: u64,
+        t_wc_clone: &SE3,
+    ) -> Option<(Matrix3<f64>, Matrix3<f64>, Matrix3<f64>)> {
+        let state = self.eqf.state_estimate();
+        let clone_start = self.eqf.clone_block_start(clone_id)?;
+        let t_wc_curr = state.sensor.pose.compose(&state.sensor.camera_offset);
+        let (curr, clone, cross) = sparse_relative_pose_cov_terms(
+            &state,
+            &self.eqf.sigma,
+            clone_start,
+            t_wc_clone,
+            &t_wc_curr,
+        )?;
+        Some((
+            curr.fixed_view::<3, 3>(0, 0).into_owned(),
+            clone.fixed_view::<3, 3>(0, 0).into_owned(),
+            cross.fixed_view::<3, 3>(0, 0).into_owned(),
+        ))
+    }
+
+    /// Stochastically clone the current camera pose into the EqF covariance window,
+    /// tagged `clone_id`. Flushes any pending Riccati integration first so the copied
+    /// cross-covariance reflects the current sensor block. The clone is a frozen SE3
+    /// pose (identity self-dynamics); its 6x6 self-block and cross-covariance to every
+    /// live column come from `J Σ Jᵀ` with `J = sparse_camera_pose_jacobian`. No-op if
+    /// `clone_id` is already live. Pair with [`sparse_relative_pose_covariances`] and
+    /// [`marginalize_clone`].
+    pub fn clone_current_pose(&mut self, clone_id: u64, time: f64) {
+        self.eqf.flush_riccati(&self.input_gain, &self.state_gain);
+        let state = self.eqf.state_estimate();
+        let mut j = sparse_camera_pose_jacobian(&state);
+        // DIAGNOSTIC (ECHO_MSC_CLONE_NAVPOSE=1, default-off): drop the camera-offset
+        // (camoff, cols 15:21) block from the clone birth Jacobian so the clone copies
+        // ONLY the IMU-pose uncertainty (Ad_{T_ic⁻¹}·Σ_pose), NOT the separately-tracked
+        // extrinsic variance. Stage-diff finding: echo's camoff-translation variance
+        // spuriously grows to ≈ pos-scale and, folded in here alongside the pose, makes a
+        // just-born clone's translation cov 3.5-4.5× the sensor position variance (MSCEqF's
+        // single-element E clone is exactly 1.0×). This over-uncertain clone inflates
+        // Σ[vel,clone] ~2× → Kalman gain ~2× → velocity/scale over-correction → divergence.
+        // Mirrors MSCEqF (clones one camera-pose element; ext applied in the measurement).
+        if std::env::var("ECHO_MSC_CLONE_NAVPOSE").map(|s| s == "1").unwrap_or(false) {
+            j.fixed_view_mut::<6, 6>(0, 15).fill(0.0);
+        }
+        // DIAGNOSTIC (ECHO_MSC_JPOSE, default = current behaviour): scan the
+        // pose-column (body-pose, cols 6:12) map used to build the clone cross-cov.
+        // Hypothesis (cont.34): echo's sensor covariance lives in a global/left
+        // perturbation (correction applied LEFT, `x ← delta·x`), but `j` uses
+        // `Ad_{T_bc⁻¹}` — the RIGHT/body→right-camera adjoint — for the pose block.
+        // For the ~120° MidAir extrinsic that is a large, uncompensated rotation of
+        // the clone cross-cov (the leftchart flag toggles only the clone-COLUMN
+        // chart via `ad_t`, never this offset adjoint inside `j`). A global-chart
+        // covariance should map the pose columns by IDENTITY. Scan {adinv (current),
+        // eye, ad} and read which gives the MSCEqF-like nav-att cos_dir (~+0.62).
+        match std::env::var("ECHO_MSC_JPOSE").as_deref() {
+            Ok("eye") => j
+                .fixed_view_mut::<6, 6>(0, 6)
+                .copy_from(&SMatrix::<f64, 6, 6>::identity()),
+            Ok("ad") => {
+                let ad = state.sensor.camera_offset.adjoint();
+                j.fixed_view_mut::<6, 6>(0, 6).copy_from(&ad);
+            }
+            _ => {} // "adinv" / unset: keep Ad_{T_bc⁻¹} (current)
+        }
+        // Snapshot the world←camera pose value the covariance block linearizes
+        // around, so the clone is a first-class pose the MSC update can read and
+        // mean-correct (not merely a covariance mirror).
+        let t_wc = state.sensor.pose.compose(&state.sensor.camera_offset);
+        self.eqf.clone_pose(clone_id, time, &j, t_wc);
+    }
+
+    /// Drop clone `clone_id` from the covariance window (exact 6-dim block deletion,
+    /// survivor cross-covariance preserved). No-op if the clone is not live.
+    pub fn marginalize_clone(&mut self, clone_id: u64) {
+        self.eqf.marginalize_clone(clone_id);
+    }
+
+    /// Additive MSCKF structureless vision update over ready tracks
+    /// (`track_id -> [(clone_id, uv)]`). Flushes any pending Riccati integration
+    /// first (so the clone cross-covariance is current), then delegates to
+    /// [`VIOEqF::msc_update`], which triangulates each track over its observing
+    /// clones, projects the feature out, gates, and corrects nav+clone poses.
+    /// No-op returning 0 when MSCKF is disabled, there are no clones, or no track
+    /// survives. Returns the number of accepted tracks.
+    pub fn msc_update(
+        &mut self,
+        tracks: &HashMap<u64, Vec<(u64, Vector2<f64>)>>,
+        cam: &dyn CameraModel,
+    ) -> usize {
+        if !self.settings.enable_msckf {
+            return 0;
+        }
+        self.eqf.flush_riccati(&self.input_gain, &self.state_gain);
+        self.eqf.msc_update(
+            self.suite.as_ref(),
+            cam,
+            tracks,
+            self.settings.msckf_min_track,
+            self.settings.msckf_chi2_mult,
+            if self.settings.msckf_sigma_pix > 0.0 {
+                self.settings.msckf_sigma_pix
+            } else {
+                self.settings.sigma_bearing
+            },
+            self.settings.use_discrete_correction,
+            self.settings.msckf_suppress_sensor,
+            self.settings.msckf_suppress_landmarks,
+        )
+    }
+
+    /// De-confound diagnostic: body-velocity pseudo-measurement through the gain
+    /// machinery (see [`VIOEqF::velocity_pseudo_update`]). Flushes pending Riccati
+    /// so the clone cross-covariance is current, then applies the update.
+    pub fn velocity_pseudo_update(&mut self, v_gt_body: Vector3<f64>, sigma_v: f64, sign: f64) {
+        self.eqf.flush_riccati(&self.input_gain, &self.state_gain);
+        self.eqf
+            .velocity_pseudo_update(self.suite.as_ref(), v_gt_body, sigma_v, sign);
+    }
+
+    /// c94: stash current-frame GT BODY velocity so the next vision `msc_update`
+    /// emits the within-echo vision-vs-pseudo γ_v comparison. `None` disables.
+    pub fn set_dbg_v_gt_body(&mut self, v: Option<Vector3<f64>>) {
+        self.eqf.set_dbg_v_gt_body(v);
+    }
+
+    /// Like [`Self::msc_update`] but also returns per-track diagnostics (H1/H2
+    /// localization). No-op returning `(0, empty)` when MSCKF is disabled.
+    pub fn msc_update_debug(
+        &mut self,
+        tracks: &HashMap<u64, Vec<(u64, Vector2<f64>)>>,
+        cam: &dyn CameraModel,
+    ) -> (usize, Vec<crate::mathematical::vio_eqf::MscTrackDebug>) {
+        if !self.settings.enable_msckf {
+            return (0, Vec::new());
+        }
+        self.eqf.flush_riccati(&self.input_gain, &self.state_gain);
+        self.eqf.msc_update_debug(
+            self.suite.as_ref(),
+            cam,
+            tracks,
+            self.settings.msckf_min_track,
+            self.settings.msckf_chi2_mult,
+            if self.settings.msckf_sigma_pix > 0.0 {
+                self.settings.msckf_sigma_pix
+            } else {
+                self.settings.sigma_bearing
+            },
+            self.settings.use_discrete_correction,
+            self.settings.msckf_suppress_sensor,
+            self.settings.msckf_suppress_landmarks,
+        )
+    }
+
+    /// Delayed in-state landmark initialization over ready tracks
+    /// (`track_id -> [(clone_id, uv)]`), the OpenVINS `StateHelper::initialize`
+    /// mirror. Flushes any pending Riccati integration first (so the clone
+    /// cross-covariance is current), then births each track that is not already an
+    /// in-state landmark via [`VIOEqF::add_landmark_delayed`] — multi-view
+    /// triangulate, geometry-derived correlated covariance augment, chi² gate, and
+    /// a nav+clone update from the residual rows. No-op returning 0 when delayed
+    /// init is disabled, there are no clones, or no track qualifies. Returns the
+    /// number of landmarks born.
+    pub fn delayed_init(
+        &mut self,
+        tracks: &HashMap<u64, Vec<(u64, Vector2<f64>)>>,
+        cam: &dyn CameraModel,
+    ) -> usize {
+        if !self.settings.enable_delayed_init {
+            return 0;
+        }
+        self.eqf.flush_riccati(&self.input_gain, &self.state_gain);
+        let sigma_pix = if self.settings.delayed_init_sigma_pix > 0.0 {
+            self.settings.delayed_init_sigma_pix
+        } else if self.settings.msckf_sigma_pix > 0.0 {
+            self.settings.msckf_sigma_pix
+        } else {
+            self.settings.sigma_bearing
+        };
+        let mut born = 0usize;
+        for (tid, obs) in tracks.iter() {
+            if self
+                .eqf
+                .add_landmark_delayed(
+                    self.suite.as_ref(),
+                    cam,
+                    *tid,
+                    obs,
+                    self.settings.delayed_init_min_obs,
+                    self.settings.delayed_init_chi2_mult,
+                    sigma_pix,
+                    self.settings.use_discrete_correction,
+                )
+                .is_some()
+            {
+                born += 1;
+                // A birth grows the physical landmark block, so the cached
+                // `state_gain` (sized to the old n_lm) is stale. Rebuild it now,
+                // otherwise the next `flush_riccati` slices `state_gain` out of
+                // bounds against the grown `xi0.dim()`.
+                self.invalidate_gain_cache();
+            }
+        }
+        born
+    }
+
+    /// Number of live pose clones in the covariance window.
+    pub fn n_clones(&self) -> usize {
+        self.eqf.n_clones()
+    }
+
+    /// Ids of the live pose clones (block order).
+    pub fn clone_ids(&self) -> Vec<u64> {
+        self.eqf.clone_ids()
+    }
+
+    /// DIAGNOSTIC: overwrite a live clone's stored pose value (covariance kept).
+    pub fn set_clone_pose_value(&mut self, clone_id: u64, pose: SE3) -> bool {
+        self.eqf.set_clone_pose_value(clone_id, pose)
+    }
+
+    /// Current (post-update) stored world<-camera pose of a live clone, or None.
+    pub fn clone_pose_value(&self, clone_id: u64) -> Option<SE3> {
+        self.eqf.clone_pose_value(clone_id)
+    }
+
+    /// Enable/disable first-estimate Jacobians (FEJ) for the MSC update. Default off.
+    pub fn set_msc_fej(&mut self, on: bool) {
+        self.eqf.set_msc_fej(on);
+    }
+
+    /// Whether FEJ is enabled for the MSC update.
+    pub fn msc_fej(&self) -> bool {
+        self.eqf.msc_fej()
+    }
+
     /// Full 3x3 body-velocity covariance block of the EqF Riccati matrix.
     ///
     /// Body-frame velocity is the gauge-FREE observable (global position and yaw are
@@ -690,6 +1037,96 @@ fn sparse_camera_pose_covariance(
     cov = 0.5 * (cov + cov.transpose());
     if cov.iter().all(|v| v.is_finite()) {
         Some(cov)
+    } else {
+        None
+    }
+}
+
+/// Relative-pose covariance `Cov(T_clone⁻¹ T_curr)` in the SE3 right-perturbation
+/// tangent `[ω; v]`, from the joint covariance of the clone's (stored) camera-pose
+/// error `δ_c` and the current camera-pose error `δ_k`.
+///
+/// With both camera poses right-perturbed (`T = T̄ exp(δ^)`, camera frame — the
+/// convention of `sparse_camera_pose_jacobian`),
+///   `δ_rel = −A δ_c + δ_k`,  `A = Ad_{T̄_rel⁻¹}`,  `T̄_rel = T_clone⁻¹ T_curr`,
+/// so `Cov_rel = A Σ_cc Aᵀ + Σ_kk − A Σ_ckᵀ_kc − Σ_kc Aᵀ` where
+///   `Σ_cc` = the clone block (already in camera-pose-error coords),
+///   `Σ_kk = J Σ_ss Jᵀ` (current camera-pose cov), and
+///   `Σ_kc = J Σ[0:21, clone]` (current↔clone cross).
+/// The common-mode (unobservable global gauge) part cancels — this is the honest,
+/// gauge-cancelled relative uncertainty §V-D wants in place of the absolute pair.
+fn sparse_relative_pose_covariance(
+    state: &VIOState,
+    sigma: &DMatrix<f64>,
+    clone_start: usize,
+    t_wc_clone: &SE3,
+    t_wc_curr: &SE3,
+) -> Option<SMatrix<f64, 6, 6>> {
+    let n = sigma.nrows();
+    if clone_start < 21 || sigma.ncols() != n || n < clone_start + 6 {
+        return None;
+    }
+
+    let j = sparse_camera_pose_jacobian(state); // 6×21 (current)
+    let sig_cc = sigma
+        .fixed_view::<6, 6>(clone_start, clone_start)
+        .into_owned();
+    let sig_ss = sigma.fixed_view::<21, 21>(0, 0).into_owned();
+    let sig_kk = j * sig_ss * j.transpose();
+    let sig_s_c = sigma.view((0, clone_start), (21, 6)).into_owned(); // 21×6
+    let sig_kc = j * sig_s_c; // 6×6  = Cov(δ_k, δ_c)
+
+    let t_rel = t_wc_clone.inverse().compose(t_wc_curr);
+    let a = t_rel.inverse().adjoint(); // Ad_{T_rel⁻¹}, 6×6
+
+    let mut cov =
+        a * sig_cc * a.transpose() + sig_kk - a * sig_kc.transpose() - sig_kc * a.transpose();
+    cov = 0.5 * (cov + cov.transpose());
+    if cov.iter().all(|v| v.is_finite()) {
+        Some(cov)
+    } else {
+        None
+    }
+}
+
+/// Per-lag DIAGNOSTIC decomposition of [`sparse_relative_pose_covariance`] into its
+/// three additive constituents, so a harness can see WHICH term drives (or fails to
+/// grow) the relative-pose uncertainty as clone lag increases:
+///   term_curr  = `sig_kk`               (current camera-pose cov `j·Σ_ss·jᵀ`)
+///   term_clone = `a·sig_cc·aᵀ`          (transported frozen clone self-cov)
+///   term_cross = `a·sig_kcᵀ + sig_kc·aᵀ` (the SUBTRACTED cross term; the relative
+///                cov is `term_curr + term_clone − term_cross`)
+/// Each returned as a 6×6 (rot 0:3, trans 3:6) so the caller slices the channel it
+/// needs. `term_curr + term_clone − term_cross == sparse_relative_pose_covariance`
+/// (a built-in consistency check for the harness). Read-only; not on the ship path.
+fn sparse_relative_pose_cov_terms(
+    state: &VIOState,
+    sigma: &DMatrix<f64>,
+    clone_start: usize,
+    t_wc_clone: &SE3,
+    t_wc_curr: &SE3,
+) -> Option<(SMatrix<f64, 6, 6>, SMatrix<f64, 6, 6>, SMatrix<f64, 6, 6>)> {
+    let n = sigma.nrows();
+    if clone_start < 21 || sigma.ncols() != n || n < clone_start + 6 {
+        return None;
+    }
+    let j = sparse_camera_pose_jacobian(state);
+    let sig_cc = sigma
+        .fixed_view::<6, 6>(clone_start, clone_start)
+        .into_owned();
+    let sig_ss = sigma.fixed_view::<21, 21>(0, 0).into_owned();
+    let sig_kk = j * sig_ss * j.transpose();
+    let sig_s_c = sigma.view((0, clone_start), (21, 6)).into_owned();
+    let sig_kc = j * sig_s_c;
+
+    let t_rel = t_wc_clone.inverse().compose(t_wc_curr);
+    let a = t_rel.inverse().adjoint();
+
+    let term_curr = sig_kk;
+    let term_clone = a * sig_cc * a.transpose();
+    let term_cross = a * sig_kc.transpose() + sig_kc * a.transpose();
+    if term_curr.iter().chain(term_clone.iter()).chain(term_cross.iter()).all(|v| v.is_finite()) {
+        Some((term_curr, term_clone, term_cross))
     } else {
         None
     }
@@ -1096,5 +1533,76 @@ mod sparse_camera_pose_covariance_tests {
         expected = 0.5 * (expected + expected.transpose());
 
         assert!((got - expected).norm() < 1e-10);
+    }
+
+    #[test]
+    fn zero_motion_relative_cov_is_zero() {
+        // Right after cloning the current pose (no propagation, no update), the
+        // clone and the current camera pose ARE the same pose with fully
+        // correlated error, so Cov(T_clone⁻¹ T_curr) must be exactly zero. This
+        // exercises clone_pose's copied cross-cov, the relative formula, and the
+        // perturbation convention (A = Ad_I = I here) end-to-end.
+        let state = make_state();
+        let n = state.dim();
+        let mut sigma = DMatrix::<f64>::zeros(n, n);
+        for r in 0..n {
+            for c in 0..n {
+                sigma[(r, c)] = ((r + 1) as f64 * 0.07).sin() * ((c + 2) as f64 * 0.11).cos();
+            }
+        }
+        sigma = &sigma * sigma.transpose() + DMatrix::<f64>::identity(n, n) * 1e-6;
+
+        let mut eqf = VIOEqF::new(state.clone(), &sigma);
+        let j = sparse_camera_pose_jacobian(&state);
+        let t_wc = camera_pose(&state); // T_clone == T_curr
+        eqf.clone_pose(42, 0.0, &j, t_wc.clone());
+
+        let clone_start = eqf.clone_block_start(42).unwrap();
+        let cov =
+            sparse_relative_pose_covariance(&state, &eqf.sigma, clone_start, &t_wc, &t_wc).unwrap();
+        assert!(
+            cov.norm() < 1e-9,
+            "zero-motion relative cov not ~0: norm={:.3e}\n{cov:?}",
+            cov.norm()
+        );
+    }
+
+    #[test]
+    fn relative_cov_jacobian_matches_finite_difference() {
+        // Validate the A = Ad_{T_rel⁻¹} linearization + convention for a NONZERO
+        // relative motion: the map g(δ_c, δ_k) = log(T̄_rel⁻¹ (T̄_clone e^δ_c)⁻¹
+        // (T̄_curr e^δ_k)) must have Jacobian [−A | I] (6×12).
+        let t_clone = SE3::new(
+            SO3::exp(&Vector3::new(0.05, 0.11, -0.03)),
+            Vector3::new(0.4, -0.2, 1.1),
+        );
+        let t_curr = SE3::new(
+            SO3::exp(&Vector3::new(-0.09, 0.02, 0.14)),
+            Vector3::new(0.7, 0.3, 0.9),
+        );
+        let t_rel = t_clone.inverse().compose(&t_curr);
+        let a = t_rel.inverse().adjoint();
+
+        let mut j_analytic = SMatrix::<f64, 6, 12>::zeros();
+        j_analytic.fixed_view_mut::<6, 6>(0, 0).copy_from(&(-a));
+        j_analytic
+            .fixed_view_mut::<6, 6>(0, 6)
+            .copy_from(&SMatrix::<f64, 6, 6>::identity());
+
+        let h = 1e-7;
+        let mut j_numeric = SMatrix::<f64, 6, 12>::zeros();
+        for col in 0..12 {
+            let mut d = SVector::<f64, 6>::zeros();
+            d[col % 6] = h;
+            let (tc, tk) = if col < 6 {
+                (t_clone.compose(&SE3::exp(&d)), t_curr.clone())
+            } else {
+                (t_clone.clone(), t_curr.compose(&SE3::exp(&d)))
+            };
+            let g = t_rel.inverse().compose(&tc.inverse().compose(&tk)).log() / h;
+            j_numeric.set_column(col, &g);
+        }
+        let diff = (j_analytic - j_numeric).amax();
+        assert!(diff < 1e-6, "relative-cov Jacobian mismatch amax={diff:e}");
     }
 }
