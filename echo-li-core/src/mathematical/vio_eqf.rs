@@ -230,37 +230,10 @@ impl VIOEqF {
         let n_lm = self.n_landmarks();
         let n_phys = self.xi0.dim(); // sensor + landmarks (clone tail excluded)
 
-        // DIAGNOSTIC (default-off): MSCEqF-exact Van-Loan discrete process noise.
-        // MSCEqF (propagator.cpp:225) forms H=[[A, BWBᵀ],[0,-Aᵀ]], Hd=expm(H·dt),
-        // Φ=Hd[0:n,0:n], G=Hd[0:n,n:2n], and Qd = G·Φᵀ (symmetrized). echo's
-        // Q=dt·BWBᵀ keeps only the zeroth-order term and DROPS the A-coupled cross
-        // terms (dt²·A·BWBᵀ+…) that DECORRELATE velocity from pose. Missing them
-        // leaves the nav-vel↔clone correlation ~2× too tight ⇒ over-large
-        // structureless nav gain. ECHO_MSC_VANLOAN_Q=1 tests the exact Qd on the
-        // 21×21 core (msckf-only ⇒ n_lm=0; falls through to Euler when landmarks
-        // are present, which this stage-diff never has).
-        if n_lm == 0 && std::env::var("ECHO_MSC_VANLOAN_Q").map(|s| s == "1").unwrap_or(false) {
-            let a = blocks.a_ss; // 21×21
-            let bwbt: SMatrix<f64, 21, 21> = blocks.b_s * input_gain * blocks.b_s.transpose();
-            let mut hmat = DMatrix::<f64>::zeros(42, 42);
-            hmat.view_mut((0, 0), (21, 21)).copy_from(&a);
-            hmat.view_mut((21, 21), (21, 21)).copy_from(&(-a.transpose()));
-            hmat.view_mut((0, 21), (21, 21)).copy_from(&bwbt);
-            let hd = echo_lie::matfn::expm(&(hmat * dt));
-            let phi = hd.view((0, 0), (21, 21)).into_owned();
-            let g = hd.view((0, 21), (21, 21)).into_owned();
-            let mut qd = &g * phi.transpose();
-            qd = 0.5 * (&qd + qd.transpose()); // symmetrize (MSCEqF selfadjointView)
-            let f_ss = SMatrix::<f64, 21, 21>::from_column_slice(phi.as_slice());
-            let q_total = self.pad_process_noise(qd);
-            self.apply_transport(&f_ss, &DMatrix::<f64>::zeros(0, s), &[], &q_total);
-            return;
-        }
-
         // F = I + A·dt has the same block-sparsity as A across all coordinate
         // suites: F_ss (21×21), F_li_s (3×21) per landmark, F_li_li (3×3) per
         // landmark; sensor←landmark and cross-landmark blocks are exactly zero.
-        let f_ss: SMatrix<f64, 21, 21> = expm_f_ss(&blocks.a_ss, dt); // ECHO_MSC_EXPM_F diagnostic
+        let f_ss: SMatrix<f64, 21, 21> = SMatrix::identity() + blocks.a_ss * dt;
         let mut f_lm_s = DMatrix::<f64>::zeros(3 * n_lm, s);
         let mut f_li_li: Vec<SMatrix<f64, 3, 3>> = Vec::with_capacity(n_lm);
         for i in 0..n_lm {
@@ -425,18 +398,7 @@ impl VIOEqF {
         // The physical block [0:cs, 0:cs] was fully written above; here we only
         // fill the clone rows/cols that the landmark path leaves stale.
         if nc6 > 0 {
-            // DIAGNOSTIC (birth-vs-propagation discriminator): when
-            // ECHO_MSC_FREEZE_CLONE_XCOV=1, skip the Φ_nav application to the
-            // nav↔clone cross-cov and keep the OLD (birth) value instead of the
-            // transported M[0:cs, clone]. Copying old→new each step preserves the
-            // cross-cov at whatever it was when the clone was born. The nav block
-            // [0:cs,0:cs] still evolves normally. If the att/vel gain split stays
-            // ~2.42× the skew is BORN at clone creation; if it collapses toward
-            // 1.0 the skew ACCUMULATES in propagation.
-            let freeze = std::env::var("ECHO_MSC_FREEZE_CLONE_XCOV")
-                .map(|v| v == "1")
-                .unwrap_or(false);
-            let src = if freeze { &self.sigma } else { &self.scratch_m };
+            let src = &self.scratch_m;
             // Σ_new[0:cs, clone] ← src[0:cs, clone]
             self.scratch_sigma
                 .view_mut((0, cs), (cs, nc6))
@@ -471,14 +433,7 @@ impl VIOEqF {
         let blocks = suite.propagation_blocks(&self.x, &self.xi0, imu);
         let n_lm = (self.xi0.dim() - VIOSensorState::CDIM) / 3;
 
-        // DIAGNOSTIC (default-off): Euler F=I+A·dt vs exact Van-Loan Φ=expm(A·dt).
-        // MSCEqF discretizes the state-transition with the matrix exponential; the
-        // Euler first-order form accumulates O(dt²) error that is REFRESHED away in
-        // the Q-damped nav auto-cov but survives UNDAMPED in the low-process-noise
-        // cross terms (Σ[vel, extrinsics/clone]). ECHO_MSC_EXPM_F=1 swaps in the
-        // exact transition to test whether that discretization is the source of the
-        // ~2× inflated nav↔clone cross-cov (⇒ over-large structureless nav gain).
-        let f_ss: SMatrix<f64, 21, 21> = expm_f_ss(&blocks.a_ss, dt);
+        let f_ss: SMatrix<f64, 21, 21> = SMatrix::identity() + blocks.a_ss * dt;
 
         // Φ ← F · Φ. Both are block lower-triangular and the product keeps that
         // structure, so the composition is exact and stays block-sparse:
@@ -1504,158 +1459,6 @@ impl VIOEqF {
             }
         }
 
-        // DIAGNOSTIC (ECHO_MSC_SCALELEAK=1): the monocular MSC constraint is
-        // provably scale-invariant (Jπ·q=0), so a consistent update must place
-        // ZERO body-velocity correction along the velocity direction (the
-        // scale channel). Project γ's velocity block [12:15] onto v̂ (leak =
-        // scale injection) vs perpendicular (legitimate, observable). Prints
-        // one line/fire: |along| |perp| |along/mag|. Aggregate downstream.
-        if std::env::var("ECHO_MSC_SCALELEAK").as_deref() == Ok("1") {
-            let vel = self.state_estimate().sensor.velocity;
-            let vn = vel.norm();
-            if vn > 1e-6 {
-                let vhat = vel / vn;
-                let gv = gamma.fixed_rows::<3>(12).into_owned();
-                let along = gv.dot(&vhat);
-                let perp = (gv - vhat * along).norm();
-                let mag = gv.norm();
-                let frac = if mag > 1e-12 { along.abs() / mag } else { 0.0 };
-                eprintln!(
-                    "SCALELEAK along={:.6e} perp={:.6e} frac_along={:.4} |gv|={:.6e} |v|={:.4}",
-                    along, perp, frac, mag, vn
-                );
-            }
-        }
-
-        // CAUSAL TEST (ECHO_MSC_KILLSCALELEAK=1): project the along-v̂ component out
-        // of γ's body-velocity block [12:15], i.e. subtract (γ_v·v̂)v̂. The
-        // monocular MSC constraint carries no scale information, so removing the
-        // scale-direction velocity correction turns the SCALELEAK measurement into
-        // an intervention — if est/gt returns to ~1, the along-v̂ leak IS the
-        // divergence driver; if it still runs away, attitude/position share blame.
-        if std::env::var("ECHO_MSC_KILLSCALELEAK").as_deref() == Ok("1") {
-            let vel = self.state_estimate().sensor.velocity;
-            let vn = vel.norm();
-            if vn > 1e-6 {
-                let vhat = vel / vn;
-                let gv = gamma.fixed_rows::<3>(12).into_owned();
-                let along = gv.dot(&vhat);
-                let gv_perp = gv - vhat * along;
-                gamma.fixed_rows_mut::<3>(12).copy_from(&gv_perp);
-            }
-        }
-
-        // POSITION-SCALE PROJECTION (ECHO_MSC_KILLPOSSCALE=1): the c121 seed is a
-        // DIRECTION-CLEAN positive per-step POSITION over-length (step-ratio 1.01→1.20
-        // fr1-120, cos-to-GT 0.989) — a pure scale injection by the update, which
-        // KILLSCALELEAK removes from velocity only. Over one frame the position
-        // displacement ≈ v·dt, so v̂ is (to first order) the scale direction of the
-        // position correction too. This projects the along-v̂ component out of γ's
-        // position block [9:12], i.e. subtract (γ_p·v̂)v̂. Use WITH KILLSCALELEAK to
-        // remove scale from the FULL nav correction (pos+vel). TEST: if fr1-120
-        // step-ratio returns to ~1.0 and full-run est/gt collapses toward MSCEqF's
-        // 1.10×, the update-injected scale-gauge leak IS the divergence seed and the
-        // principled fix is scale-gauge projection; if the step-ratio persists, the
-        // scale direction is NOT along-v̂ (e.g. position-relative-to-anchor) and the
-        // next step re-derives q from the measurement nullspace. Diagnostic only.
-        if std::env::var("ECHO_MSC_KILLPOSSCALE").as_deref() == Ok("1") {
-            let vel = self.state_estimate().sensor.velocity;
-            let vn = vel.norm();
-            if vn > 1e-6 {
-                let vhat = vel / vn;
-                let gp = gamma.fixed_rows::<3>(9).into_owned();
-                let along = gp.dot(&vhat);
-                let gp_perp = gp - vhat * along;
-                gamma.fixed_rows_mut::<3>(9).copy_from(&gp_perp);
-            }
-        }
-
-        // CHANNEL DECOMPOSITION (ECHO_MSC_ZERO_ATT/POS/VEL=1): zero one sensor
-        // sub-block of the nav mean-correction to localize which channel carries
-        // the divergence. Attitude [6:9], position [9:12], velocity [12:15].
-        // Independent of KILLSCALELEAK (which removes only the scale DIRECTION of
-        // velocity); ZERO_VEL removes the whole velocity correction.
-        if std::env::var("ECHO_MSC_ZERO_ATT").as_deref() == Ok("1") {
-            gamma.fixed_rows_mut::<3>(6).fill(0.0);
-        }
-        if std::env::var("ECHO_MSC_ZERO_POS").as_deref() == Ok("1") {
-            gamma.fixed_rows_mut::<3>(9).fill(0.0);
-        }
-        if std::env::var("ECHO_MSC_ZERO_VEL").as_deref() == Ok("1") {
-            gamma.fixed_rows_mut::<3>(12).fill(0.0);
-        }
-        // CAUSALITY TEST (ECHO_MSC_VELSCALE=f): scale the whole velocity mean-correction
-        // gamma[12:15] by f every update. cont.115 measured UPD0 corr_vel ≈0.80× MSCEqF
-        // but sitting on a near-total cancellation (coherence ~0.10, hypersensitive to
-        // sub-5% cov diffs). This intervention tests whether that deficit is the ATE
-        // driver: if boosting velocity correction (f≈1.25) collapses full-traj est/gt
-        // toward MSCEqF's ~1.1, corr_vel IS causal → target vel-block cov propagation;
-        // if est/gt is unchanged, corr_vel is a RED HERRING. Diagnostic only, never shipped.
-        if let Ok(vs) = std::env::var("ECHO_MSC_VELSCALE") {
-            if let Ok(f) = vs.parse::<f64>() {
-                let gv = gamma.fixed_rows::<3>(12).into_owned();
-                gamma.fixed_rows_mut::<3>(12).copy_from(&(gv * f));
-            }
-        }
-        // GYRO-BIAS TEST (ECHO_MSC_ZERO_BG=1): zero only the gyro-bias mean-correction
-        // gamma[0:3], leaving the prior/covariance intact (unlike freezing biasGyr
-        // initVar→0). NOTE (cont.9,12,14): the gyro-bias channel was EXONERATED as a
-        // divergence driver — echo's per-update |Δb_w| MATCHES MSCEqF (med 2.4e-4 vs
-        // 2.9e-4, both low-coherence random-walk); the earlier "spurious ≈0.03 rad/s /
-        // true ≈0.0005 / 365%→12.6%" story is REFUTED. The localized root is the
-        // ATTITUDE correction gamma[6:9] (see ATTSCALE below and the topic-file log),
-        // not this channel. Kept only as a control ablation.
-        if std::env::var("ECHO_MSC_ZERO_BG").as_deref() == Ok("1") {
-            gamma.fixed_rows_mut::<3>(0).fill(0.0);
-        }
-        // ACCEL-BIAS FREEZE (ECHO_MSC_ZERO_BA=1): zero the accel-bias mean-correction
-        // gamma[3:6]. Companion to ZERO_BG. cont.7 measured echo's |b_a| runs to 0.7
-        // (12x MSCEqF 0.044) — the attitude-independent velocity-PROPAGATION scale
-        // driver. ZERO_BG alone worsens (residual floods b_a+vel); this tests whether
-        // freezing BOTH bias channels together collapses the runaway toward GTVEL's
-        // 1.9% → would prove the bias-channel UPDATE GAIN is the whole bug.
-        if std::env::var("ECHO_MSC_ZERO_BA").as_deref() == Ok("1") {
-            gamma.fixed_rows_mut::<3>(3).fill(0.0);
-        }
-
-        // MACRO CAUSAL TEST (ECHO_MSC_CORRSCALE=<f>): scale the whole nav
-        // mean-correction (attitude[6:9], position[9:12], velocity[12:15]) by f.
-        // At U0 the Euclidean-chart correction is ~0.5–0.58× MSCEqF (att 0.46, vel
-        // 0.58, pos 0.51) — a ~uniform under-correction that compounds into the
-        // est_len/gt_len 14.5× scale runaway. If f≈1.7 collapses the ATE toward
-        // MSCEqF's, the per-update under-correction IS the divergence driver; if not,
-        // the 365% is dominated by track-set drift / feedback, not gain magnitude.
-        if let Ok(s) = std::env::var("ECHO_MSC_CORRSCALE") {
-            if let Ok(f) = s.parse::<f64>() {
-                for i in 6..15 {
-                    gamma[i] *= f;
-                }
-            }
-        }
-
-        // ATTITUDE-CHANNEL CAUSAL TEST (ECHO_MSC_ATTSCALE=<f>): scale ONLY the
-        // attitude sub-block gamma[6:9] by f (position/velocity untouched). The
-        // GT-attitude-reset ladder proved that a PERFECT attitude correction
-        // collapses the runaway (ATE 52%→4.3% @1500f). This asks the follow-up:
-        // does boosting echo's OWN attitude correction (no GT) bound the tilt? If
-        // f>1 recovers most of the GTATT benefit, the deficit is attitude-channel
-        // MAGNITUDE (corr_att 0.46× under at U0); if it doesn't help / worsens, the
-        // attitude correction is DIRECTIONALLY wrong (routing/align_att) and a scalar
-        // boost can't fix it — needs the mis-route fix.
-        // RESULT (cont.14): DIRECTIONAL. Sign-flip (f=-1) stays anti-corrective and
-        // scale-down (f=0.5) just fades toward ZERO_ATT — echo's gamma[6:9] ADDS
-        // gravity-tilt where MSCEqF's reduces/holds it (~45× tilt-growth gap), so
-        // gamma[6:9] is ~ORTHOGONAL to the tilt-reducing direction. A scalar can't fix
-        // it; the fix is in the gain routing (residual r / clone att-Jacobian C /
-        // Σ[att,clone]).
-        if let Ok(s) = std::env::var("ECHO_MSC_ATTSCALE") {
-            if let Ok(f) = s.parse::<f64>() {
-                for i in 6..9 {
-                    gamma[i] *= f;
-                }
-            }
-        }
-
         // Physical block [sensor | landmarks] drives the EqF innovation lift.
         let gamma_phys = if gamma.len() == self.xi0.dim() {
             gamma.clone()
@@ -1664,32 +1467,7 @@ impl VIOEqF {
         };
         let delta = self.left_correction_increment(suite, &gamma_phys, use_discrete_correction);
 
-        // FILTER-FORM PROBE. The EqF correction `x ← delta·x` is a LEFT group
-        // action, so the accumulated pose translation transforms as
-        // `t_x ← R_δ·t_x + t_δ` (SE3::compose): the attitude correction R_δ ROTATES
-        // the whole accumulated position vector t_x (distance-from-origin), a term
-        // `(R_δ−I)·t_x ≈ |ω_att|·|t_x|` that OpenVINS's ADDITIVE boxplus
-        // `p ← p + δp` does NOT have and that GROWS as the drone travels.
-        // ECHO_MSC_POSJUMP=1 measures it; ECHO_MSC_ADDITIVE_POS=1 removes it
-        // (keeps the additive translation `t_x + t_δ`) to test causality — the
-        // one-term discriminator between the EqF-lift and the OV additive form.
-        let mut composed = delta.compose(&self.x);
-        if std::env::var("ECHO_MSC_POSJUMP").as_deref() == Ok("1") {
-            let t_x = self.x.a.translation;
-            let rot_jump = delta.a.rotation.act(&t_x) - t_x; // (R_δ − I)·t_x
-            let ang = delta.a.rotation.log().norm();
-            eprintln!(
-                "POSJUMP dist={:.4} rot_jump={:.6e} direct={:.6e} ang={:.6e}",
-                t_x.norm(),
-                rot_jump.norm(),
-                delta.a.translation.norm(),
-                ang
-            );
-        }
-        if std::env::var("ECHO_MSC_ADDITIVE_POS").as_deref() == Ok("1") {
-            composed.a.translation = self.x.a.translation + delta.a.translation;
-        }
-        self.x = composed;
+        self.x = delta.compose(&self.x);
 
         // Faithful OpenVINS mirror: mean-correct each stored clone pose by its own
         // 6-dof increment in the clone tail. The clone chart is the right camera-
@@ -1985,86 +1763,6 @@ impl VIOEqF {
             .view_mut((old, old), (6, 6))
             .copy_from(&clone_self);
 
-        // DIAGNOSTIC (default-off, byte-identical at 1.0): inflate this clone's
-        // marginal covariance by ECHO_MSC_CLONE_INFLATE (a σ-factor f). Self-block
-        // ×f², cross-cov ×f — a similarity scaling that makes the clone f× more
-        // uncertain while preserving every correlation coefficient (so the gauge-
-        // cancelling relative-pose structure is untouched). Forward form of the
-        // validated k×-under-statement diagnostic: field clone NEES ⇒ the stored
-        // clone cov under-states true clone inconsistency by ~6-7×σ (attitude-
-        // driven over-confidence propagated from the EqF pose cov). Tests whether
-        // the active-MSC over-tightening (K too large ⇐ S too small) is purely
-        // clone-cov MAGNITUDE. Cross view spans cols 0..old (disjoint from the
-        // self block at col `old`), so f and f² never compound on one entry.
-        let env_f = |k: &str, d: f64| {
-            std::env::var(k).ok().and_then(|s| s.parse::<f64>().ok()).unwrap_or(d)
-        };
-        let iso = env_f("ECHO_MSC_CLONE_INFLATE", 1.0);
-        // Per-channel σ-factors on the clone [ω(0..3); v(3..6)] tangent: rotation
-        // ×f_r, translation ×f_t (each falls back to the isotropic factor). Lets a
-        // sweep test whether the residual is a clone-cov SHAPE issue (translation
-        // over-confident at long lag while rotation is fine) vs a deeper live-nav-
-        // cov-growth ceiling that birth-time inflation can't reach.
-        let f_r = env_f("ECHO_MSC_CLONE_INFLATE_ROT", iso);
-        let f_t = env_f("ECHO_MSC_CLONE_INFLATE_TRANS", iso);
-        if f_r != 1.0 || f_t != 1.0 {
-            let d = [f_r, f_r, f_r, f_t, f_t, f_t]; // per-dof σ-factor
-            // cross-cov rows (clone ↔ rest): scale row i by d[i].
-            let mut cr = sigma_new.view((old, 0), (6, old)).into_owned();
-            for i in 0..6 {
-                cr.row_mut(i).scale_mut(d[i]);
-            }
-            sigma_new.view_mut((old, 0), (6, old)).copy_from(&cr);
-            sigma_new.view_mut((0, old), (old, 6)).copy_from(&cr.transpose());
-            // self-block: entry (i,j) scales by d[i]·d[j] (σ-similarity ⇒ variance
-            // ×d²; preserves correlation coefficients within the block).
-            let mut cs = sigma_new.view((old, old), (6, 6)).into_owned();
-            for i in 0..6 {
-                for j in 0..6 {
-                    cs[(i, j)] *= d[i] * d[j];
-                }
-            }
-            sigma_new.view_mut((old, old), (6, 6)).copy_from(&cs);
-        }
-
-        // DIAGNOSTIC (default-off, byte-identical at 1.0): ECHO_MSC_CLONE_INTER_TRANS
-        // (g_t) scales ONLY the clone↔clone translation coupling — the clone-tail
-        // columns (>=21) of this clone's cross row by g_t on the trans dofs, and the
-        // self-block trans×trans by g_t² — while LEAVING the nav↔clone cross
-        // (cols 0..21, matched to MSCEqF c65-67) untouched. This isolates the
-        // cont.86 finding (cross-clone xtrans_fro ~1.4x MSCEqF) from the nav↔clone
-        // confound that made ECHO_MSC_CLONE_INFLATE_TRANS inconclusive (deflating it
-        // guts every nav correction since nav is corrected ONLY via Σ[nav,clone]).
-        // Since Σ[nav,clone], C, and S's C-part all match MSCEqF, Σ_cc (clone self +
-        // clone↔clone) is the ONLY thing the persistent-E port would change — so this
-        // knob is a cheap proxy for the E-port's entire gain effect. g_t≈0.71 pulls
-        // echo's clone↔clone trans down to ≈MSCEqF's level.
-        let g_t = env_f("ECHO_MSC_CLONE_INTER_TRANS", 1.0);
-        if g_t != 1.0 {
-            let base = self.xi0.dim(); // 21: nav+bias (nav↔clone cols kept at 1.0)
-            if old > base {
-                // clone-tail cross rows: scale this clone's TRANS rows (3..6) vs the
-                // earlier-clone cols (base..old) by g_t.
-                let ncols = old - base;
-                let mut ct = sigma_new.view((old, base), (6, ncols)).into_owned();
-                for i in 3..6 {
-                    ct.row_mut(i).scale_mut(g_t);
-                }
-                sigma_new.view_mut((old, base), (6, ncols)).copy_from(&ct);
-                sigma_new
-                    .view_mut((base, old), (ncols, 6))
-                    .copy_from(&ct.transpose());
-            }
-            // self-block trans×trans by g_t² (preserves rot and rot-trans coupling).
-            let mut cs = sigma_new.view((old, old), (6, 6)).into_owned();
-            for i in 3..6 {
-                for j in 3..6 {
-                    cs[(i, j)] *= g_t * g_t;
-                }
-            }
-            sigma_new.view_mut((old, old), (6, 6)).copy_from(&cs);
-        }
-
         self.sigma = sigma_new;
         self.clone_ids.push(clone_id);
         self.clone_times.push(time);
@@ -2230,23 +1928,6 @@ impl VIOEqF {
             .position(|lm| lm.id == lm_id)?;
         let start = VIOSensorState::CDIM + 3 * idx;
         Some(self.sigma.fixed_view::<3, 3>(start, start).into_owned())
-    }
-}
-
-/// Sensor state-transition block for one propagation sample.
-///
-/// Default: Euler first-order `F = I + A_ss·dt`. When `ECHO_MSC_EXPM_F=1`, the
-/// exact matrix exponential `Φ = expm(A_ss·dt)` (MSCEqF's Van-Loan transition) —
-/// a DIAGNOSTIC to isolate Euler-vs-Van-Loan discretization error as the source
-/// of the inflated nav↔clone cross-covariance. Env is read per call (only the
-/// short stage-diff runs enable it; the O(21³) expm is negligible there).
-fn expm_f_ss(a_ss: &SMatrix<f64, 21, 21>, dt: f64) -> SMatrix<f64, 21, 21> {
-    let a_dt = a_ss * dt;
-    if std::env::var("ECHO_MSC_EXPM_F").map(|s| s == "1").unwrap_or(false) {
-        let e = echo_lie::matfn::expm(&DMatrix::from_column_slice(21, 21, a_dt.as_slice()));
-        SMatrix::<f64, 21, 21>::from_column_slice(e.as_slice())
-    } else {
-        SMatrix::<f64, 21, 21>::identity() + a_dt
     }
 }
 
