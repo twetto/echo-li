@@ -166,8 +166,7 @@ def main():
                     help="feed Sparse3D's §V-D pose-range term the HONEST, "
                          "gauge-cancelled anchor→current relative-pose covariance "
                          "from an EqF pose-clone window (instead of the absolute "
-                         "per-frame cov). Phase-0 validation of the MSCKF clone "
-                         "extension; default off = exact absolute-cov behaviour.")
+                         "per-frame cov); default off = exact absolute-cov behaviour.")
     ap.add_argument("--clone-window", type=int, default=120,
                     help="rolling clone-window length (frames); clones older than "
                          "this are marginalized. Must exceed the longest scored "
@@ -180,60 +179,8 @@ def main():
                          "(sparse3d-depth-error-is-pose-scale-1to1). Compose with "
                          "--clone-relative (attitude channel) to test Verif #3. "
                          "sigma_s(E)=max(0.02, 0.0072*E^-0.710); Kite t0 -> 0.0395.")
-    ap.add_argument("--msckf", action="store_true",
-                    help="Enable the ACTIVE MSCKF structureless update: clone every "
-                         "frame, buffer per-track observations, and on track "
-                         "termination triangulate + nullspace-project + gate + "
-                         "correct nav+clone poses (vio.msc_update). Implies the "
-                         "clone-relative cov feed so Sparse3D §V-D sees the "
-                         "ACTIVE-updated clone-relative covariance — the decisive "
-                         "re-test of the gate Phase-0 (passive mirror) failed.")
-    ap.add_argument("--msckf-min-track", type=int, default=3,
-                    help="min live observations for a track to enter msc_update.")
-    ap.add_argument("--msckf-chi2-mult", type=float, default=1.0,
-                    help="multiplier on the 95%% chi² innovation gate in msc_update.")
-    ap.add_argument("--msckf-clone-only", action="store_true",
-                    help="DIAGNOSTIC: suppress BOTH the sensor and in-state-landmark "
-                         "mean-corrections so only the clone poses are corrected.")
-    ap.add_argument("--msckf-suppress-sensor", action="store_true",
-                    help="DIAGNOSTIC: suppress the MSC sensor(21) nav mean-correction "
-                         "only (in-state landmarks + clones still corrected).")
-    ap.add_argument("--msckf-suppress-landmarks", action="store_true",
-                    help="DIAGNOSTIC: suppress the MSC in-state-landmark(3·n_lm) "
-                         "mean-correction only (sensor + clones still corrected). "
-                         "Tests whether the guessed sceneDepth-prior landmark "
-                         "correction is the source of the nav regression.")
-    ap.add_argument("--msckf-debug", action="store_true",
-                    help="DIAGNOSTIC (H1/H2): call msc_update_debug and, per accepted "
-                         "constraint, log pre-projection reprojection RMS (geometry "
-                         "consistency), post-projection chi², and triangulated range "
-                         "vs GT range at the latest obs — plus the per-update navErr "
-                         "change. Distinguishes mono-scale (clean geometry, wrong nav; "
-                         "H1) from contaminated triangulation (bad geometry; H2).")
-    ap.add_argument("--msckf-debug-until", type=int, default=120,
-                    help="only collect --msckf-debug records for frames k<=this "
-                         "(early, before divergence compounds).")
-    ap.add_argument("--msckf-gt-clones", action="store_true",
-                    help="DIAGNOSTIC (architecture vs data): just before each "
-                         "msc_update, overwrite every live clone's stored pose with "
-                         "GT *relative* geometry anchored to the CURRENT EqVIO camera "
-                         "pose (frame-consistent, no truth-injection). Perfect "
-                         "relative geometry ⇒ ~0 residual ⇒ a correct update should "
-                         "make ~0 correction and leave nav healthy. If nav still "
-                         "diverges, the fault is the update's covariance/observability "
-                         "handling (the additive-bolt-on gap vs OpenVINS/MSCEqF joint "
-                         "estimation), NOT the EqVIO clone geometry.")
-    ap.add_argument("--fej", action="store_true",
-                    help="Enable first-estimate Jacobians (FEJ) in the MSC update: "
-                         "linearize each clone-pose Jacobian at the clone's frozen "
-                         "birth pose (residual stays at the current pose), mirroring "
-                         "OpenVINS. Default off ⇒ current-estimate linearization.")
     ap.add_argument("--no-progress", action="store_true")
     args = ap.parse_args()
-    # The active MSCKF update needs the pose-clone window; its whole point for the
-    # depth-NEES test is feeding the ACTIVE clone-relative cov into Sparse3D §V-D.
-    if args.msckf:
-        args.clone_relative = True
 
     # --- Dataset ---
     ds = md.MidAir(args.root, args.subset, args.cond, args.traj, args.scale)
@@ -263,18 +210,6 @@ def main():
         cfg.setdefault("eqf", {}).setdefault("velocityNoise", {})["gyr"] = args.vel_gyr * imu_sqrt_dt
     if args.scene_depth is not None:
         cfg.setdefault("eqf", {}).setdefault("initialValue", {})["sceneDepth"] = args.scene_depth
-    if args.msckf:
-        # Turn the additive MSCKF update ON in the Rust core (default OFF).
-        eqf_settings = cfg.setdefault("eqf", {}).setdefault("settings", {})
-        eqf_settings["enableMsckf"] = True
-        eqf_settings["msckfWindow"] = args.clone_window
-        eqf_settings["msckfMinTrack"] = args.msckf_min_track
-        eqf_settings["msckfChi2Mult"] = args.msckf_chi2_mult
-        eqf_settings["msckfSuppressSensor"] = (
-            args.msckf_suppress_sensor or args.msckf_clone_only)
-        eqf_settings["msckfSuppressLandmarks"] = (
-            args.msckf_suppress_landmarks or args.msckf_clone_only)
-
     # Write merged config to a temp file for VIOFilter (which takes a path).
     import tempfile
     with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as tf:
@@ -318,8 +253,6 @@ def main():
     # --- VIO ---
     vio = echo_li.VIOFilter(merged_config_path, cam)
     vio.set_camera_extrinsics(np.ascontiguousarray(ext))
-    if args.fej:
-        vio.set_msc_fej(True)
     gt0 = ds.pose(args.start)
     v0 = np.asarray(ds.db[ds.traj]["groundtruth"]["velocity"][args.start * 4])
     R0 = t_ned_to_nwu @ gt0[:3, :3]
@@ -351,31 +284,11 @@ def main():
     rows = []
     t0 = time.time()
     n_frames = 0
-    # Clone-window bookkeeping (Phase-0 clone-relative pose covariance).
+    # Clone-window bookkeeping (clone-relative pose covariance for Sparse3D §V-D).
     clone_pose = {}       # clone_id (= frame k) -> T_wc (4x4) anchor pose
     clone_rel_prev = {}   # clone_id -> (P_vv, P_ww) accumulated Cov_rel(k→t−1)
     if args.clone_relative:
         print(f"Clone-relative pose cov ON  (window={args.clone_window} frames)")
-    # Active-MSCKF bookkeeping: per-track observation buffer at clone frames, and
-    # the set of tracks seen on the previous frame (to detect termination).
-    track_obs = {}        # track_id -> list[(clone_id, (u, v))]
-    eqf_ever = set()      # ids that were EVER in-state EqF landmarks (disjoint
-                          # from MSCKF: those are already estimated by the nav
-                          # filter via process_vision — reusing them as a
-                          # structureless constraint double-counts the same pixels)
-    msckf_accepted = 0
-    msckf_dbg_rows = []   # (k, tid, n_obs, raw_rms, chi2, dof, tri_range, gt_range, accepted)
-    msckf_navstep = []    # (k, n_applied, navErr_before, navErr_after)
-    _depth_cache = {}     # frame -> GT depth map (small cache for latest-obs lookups)
-    if args.msckf:
-        supp = []
-        if args.msckf_suppress_sensor or args.msckf_clone_only:
-            supp.append("sensor")
-        if args.msckf_suppress_landmarks or args.msckf_clone_only:
-            supp.append("landmarks")
-        supp_s = f", SUPPRESS[{'+'.join(supp)}]" if supp else ""
-        print(f"ACTIVE MSCKF update ON  (min_track={args.msckf_min_track}, "
-              f"chi2_mult={args.msckf_chi2_mult}, window={args.clone_window}{supp_s})")
 
     for stamp, et, data in events:
         if et == "imu":
@@ -422,7 +335,7 @@ def main():
         else:
             pvv_arg = pww_arg = None
 
-        # --- Clone-relative pose covariance (Phase-0) ---
+        # --- Clone-relative pose covariance ---
         # Clone THIS frame's pose (= anchor for any landmark born now), roll the
         # window, then feed Sparse3D the honest per-clone INCREMENTAL relative-pose
         # covariance so each landmark's §V-D term uses its own anchor→current cov.
@@ -431,87 +344,6 @@ def main():
         if args.clone_relative:
             vio.clone_pose(int(k), stamp)
             clone_pose[int(k)] = T_wc.copy()
-
-            # --- Active MSCKF structureless update ---
-            # Buffer this frame's observations at the fresh clone k, then flush
-            # terminated tracks (present before, absent now) through msc_update,
-            # which triangulates + nullspace-projects + gates + corrects nav+clone
-            # poses. Done BEFORE marginalization so a terminating track's anchor
-            # clones are still live. Correcting the nav pose here means T_wc/pcov
-            # fed to Sparse3D below must be re-read post-update.
-            if args.msckf:
-                eqf_ever.update(existing)  # `existing` = current EqF landmark ids
-                seen = set()
-                for fid, uv in all_uvs.items():
-                    track_obs.setdefault(int(fid), []).append(
-                        (int(k), (float(uv[0]), float(uv[1]))))
-                    seen.add(int(fid))
-                live_ids = {int(c) for c in vio.clone_ids()}
-                ready = {}
-                for tid in [t for t in track_obs if t not in seen]:
-                    obs = [(c, uv) for (c, uv) in track_obs.pop(tid) if c in live_ids]
-                    # Disjoint-set: skip tracks the EqF ever held in-state.
-                    if tid in eqf_ever:
-                        continue
-                    if len(obs) >= args.msckf_min_track:
-                        ready[tid] = obs
-                if ready:
-                    if args.msckf_gt_clones:
-                        # Overwrite each live clone's stored pose with GT *relative*
-                        # geometry anchored to the CURRENT EqVIO camera pose. The
-                        # relative camera transform ΔGT(k→cid)=ext⁻¹·P(k)⁻¹·P(cid)·ext
-                        # is frame-independent (the NED→NWU world flip cancels), so no
-                        # world-frame conversion is needed; anchoring at C_k keeps the
-                        # cluster consistent with the nav pose being corrected.
-                        C_k = vio_body_pose(vio) @ ext
-                        Pk_inv = np.linalg.inv(ds.pose(k))
-                        ext_inv = np.linalg.inv(ext)
-                        for cid in vio.clone_ids():
-                            cid = int(cid)
-                            dgt = ext_inv @ Pk_inv @ ds.pose(cid) @ ext
-                            clone_wc = C_k @ dgt
-                            vio.set_clone_pose_value(
-                                cid, np.ascontiguousarray(clone_wc))
-                    dbg_on = args.msckf_debug and k <= args.msckf_debug_until
-                    if dbg_on:
-                        # navErr BEFORE the update (H1: does a clean constraint
-                        # push nav the wrong way?).
-                        p_gt_k = t_ned_to_nwu @ ds.pose(k)[:3, 3]
-                        nav_before = float(np.linalg.norm(
-                            vio_body_pose(vio)[:3, 3] - p_gt_k))
-                        n_acc, dbg_rows = vio.msc_update_debug(ready)
-                        msckf_accepted += n_acc
-                        nav_after = float(np.linalg.norm(
-                            vio_body_pose(vio)[:3, 3] - p_gt_k))
-                        msckf_navstep.append((k, n_acc, nav_before, nav_after))
-                        for (tid, n_obs, raw_rms, chi2, dof, _td, tri_range, acc) in dbg_rows:
-                            # GT range at the LATEST observation (frame=clone_id, px=uv).
-                            lat_cid, (lu, lv) = ready[tid][-1]
-                            dmap = _depth_cache.get(lat_cid)
-                            if dmap is None:
-                                dmap = ds.depth(lat_cid)
-                                if len(_depth_cache) < 200:
-                                    _depth_cache[lat_cid] = dmap
-                            gu, gv = int(round(lu)), int(round(lv))
-                            if not (R_MARGIN < gu < W - R_MARGIN
-                                    and R_MARGIN < gv < H - R_MARGIN):
-                                continue
-                            gt_r = float(dmap[gv, gu])
-                            if not (0.5 < gt_r < md.SKY):
-                                continue
-                            msckf_dbg_rows.append(
-                                (k, tid, n_obs, raw_rms, chi2, dof, tri_range, gt_r, acc))
-                    else:
-                        msckf_accepted += vio.msc_update(ready)
-                    # Re-read the (now corrected + tightened) camera pose & cov.
-                    T_wc = vio_body_pose(vio) @ ext
-                    pcov = vio.get_camera_pose_covariance()
-                    if pcov is not None:
-                        pvv = np.asarray(pcov[0], float) * args.pvv_scale
-                        pww = np.asarray(pcov[1], float)
-                        pvv_arg, pww_arg = pvv.tolist(), pww.tolist()
-                    else:
-                        pvv_arg = pww_arg = None
 
             for cid in list(clone_pose):
                 if cid < k - args.clone_window:
@@ -551,8 +383,8 @@ def main():
             tls = [int(fd["track_length"]) for fd in sf.values()]
             maxtl = max(tls) if tls else 0
             n_ge = sum(t >= args.min_track for t in tls)
-            # Nav position error vs GT (NWU world), to localize whether msc_update
-            # improves or corrupts the nav pose itself.
+            # Nav position error vs GT (NWU world), to localize the nav pose the
+            # clone-relative covariance is read against.
             gt_k = ds.pose(k)
             p_gt = t_ned_to_nwu @ gt_k[:3, 3]
             p_est = vio_body_pose(vio)[:3, 3]
@@ -611,43 +443,6 @@ def main():
     import os
     os.unlink(merged_config_path)
 
-    # --- H1/H2 MSCKF constraint diagnostic (printed BEFORE the depth report so it
-    # survives a divergence that zeroes scored obs) ---
-    if args.msckf_debug and msckf_dbg_rows:
-        D = np.array([(r[3], r[4], r[5], r[6], r[7], float(r[8]))
-                      for r in msckf_dbg_rows], float)
-        raw_rms, chi2, dof, tri_r, gt_r, acc = D.T
-        acc_m = acc > 0.5
-        rel = (tri_r - gt_r) / gt_r
-        print(f"\n{'=' * 72}")
-        print(f"MSCKF constraint diagnostic (H1 vs H2)  traj {args.traj}  "
-              f"frames k<={args.msckf_debug_until}")
-        print(f"{'=' * 72}")
-        print(f"  {len(D)} constraints logged, {int(acc_m.sum())} accepted (passed χ² gate)")
-        print(f"  pre-projection reprojection RMS (px):  "
-              f"median {np.median(raw_rms):.3f}  p90 {np.percentile(raw_rms, 90):.3f}  "
-              f"max {raw_rms.max():.3f}")
-        print(f"  post-projection χ² / dof:  median {np.median(chi2):.2f} / "
-              f"{np.median(dof):.0f}   (accepted median "
-              f"{np.median(chi2[acc_m]) if acc_m.any() else float('nan'):.2f})")
-        print(f"  triangulated range vs GT range (accepted):")
-        if acc_m.any():
-            print(f"     signed relerr: median {100 * np.median(rel[acc_m]):+.1f}%  "
-                  f"mean {100 * np.mean(rel[acc_m]):+.1f}%")
-            print(f"     abs relerr:    median {100 * np.median(np.abs(rel[acc_m])):.1f}%  "
-                  f"p90 {100 * np.percentile(np.abs(rel[acc_m]), 90):.1f}%")
-        # H1 signal: per-update navErr change on accepted constraints.
-        if msckf_navstep:
-            N = np.array([(s[1], s[2], s[3]) for s in msckf_navstep if s[1] > 0], float)
-            if len(N):
-                d_nav = N[:, 2] - N[:, 1]  # after - before
-                print(f"  per-update navErr change (n={len(N)} updates w/ ≥1 accepted):")
-                print(f"     median Δ {np.median(d_nav):+.4f} m  mean Δ {np.mean(d_nav):+.4f} m"
-                      f"   worsened {100 * np.mean(d_nav > 0):.0f}% of updates")
-        print("  ── Read: LOW rms + LOW χ² + navErr WORSENS + tri≈GT  ⇒ H1 (mono-scale, "
-              "\n     scale-free-consistent geometry, wrong metric).  HIGH rms / tri≠GT "
-              "\n     ⇒ H2 (contaminated triangulation).")
-
     # --- Report ---
     A = np.array(rows, float) if rows else np.empty((0, 7))
     if len(A) == 0:
@@ -662,8 +457,6 @@ def main():
           f"prs={eff_prs}  γ²={args.pvv_scale}")
     print(f"{'=' * 72}")
     print(f"  {len(A)} scored range obs  ({nimg} frames, {len(A) / nimg:.0f} obs/frame)")
-    if args.msckf:
-        print(f"  ACTIVE MSCKF: {msckf_accepted} track constraints applied")
     print(f"  range NEES-1D  median / mean: {np.median(nees):.3f} / {np.mean(nees):.1f}"
           f"   (ideal median 0.455, mean 1)")
     print(f"  %>3.84 / %>6.63:  {100 * np.mean(nees > 3.84):.1f}% / "
