@@ -753,6 +753,7 @@ impl VIOConfig {
         settings.range_gate_chi2 = self.eqf.settings.range_gate_chi2;
         settings.max_landmarks = self.eqf.max_features;
         settings.sigma_bearing = self.eqf.measurement_noise.feature;
+        settings.outlier_threshold = self.eqf.measurement_noise.feature_outlier_abs;
         settings.initial_point_variance = self.eqf.initial_variance.point;
         settings.initial_point_depth_variance = self.eqf.initial_variance.point_depth;
 

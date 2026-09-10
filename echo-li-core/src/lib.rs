@@ -168,7 +168,8 @@ impl Default for VIOFilterSettings {
             use_discrete_correction: false,
             use_discrete_velocity_lift: true,
             max_landmarks: 40,
-            outlier_threshold: 5.0,
+            // Outlier gate in absolute pixels (decoupled from sigma_bearing).
+            outlier_threshold: 10.0,
             use_faster_riccati: false,
             use_stereo_measurement: false,
             range_gate_chi2: 0.0,
@@ -524,7 +525,7 @@ impl VIOFilter {
 
         // --- Innovation-based outlier rejection ---
         let xi_hat = self.eqf.state_estimate();
-        let threshold_px = self.settings.outlier_threshold * self.settings.sigma_bearing;
+        let threshold_px = self.settings.outlier_threshold;
         let mut outlier_ids = Vec::new();
         {
             let state_ids: HashSet<u64> = self.eqf.x.id.iter().cloned().collect();
