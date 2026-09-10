@@ -153,7 +153,12 @@ impl PyVIOFilter {
         self.filter.process_imu(imu);
     }
 
-    fn process_vision(&mut self, stamp: f64, feature_uvs: HashMap<u64, [f32; 2]>) {
+    fn process_vision(
+        &mut self,
+        py: Python<'_>,
+        stamp: f64,
+        feature_uvs: HashMap<u64, [f32; 2]>,
+    ) {
         if !self.initialized {
             return;
         }
@@ -163,8 +168,10 @@ impl PyVIOFilter {
             .map(|(id, uv)| (id, Vector2::new(uv[0], uv[1])))
             .collect();
         let measurement = VisionMeasurement::new(stamp, cam_coords);
-        self.filter
-            .process_vision(measurement, self.camera.as_ref());
+        py.allow_threads(|| {
+            self.filter
+                .process_vision(measurement, self.camera.as_ref());
+        });
     }
 
     /// Vision update with per-landmark range priors. Use this to seed new

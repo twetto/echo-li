@@ -138,7 +138,7 @@ impl FrontendConfig {
         let defaults = frontend::FrontendConfig::default();
         Ok(Self {
             max_features: rv.max_features,
-            fast_threshold: defaults.fast_threshold,
+            fast_threshold: rv.fast_threshold.unwrap_or(defaults.fast_threshold),
             pyramid_levels: rv.max_level,
             cell_size: rv.feature_dist as usize,
             klt_window: defaults.klt_window,
@@ -336,7 +336,8 @@ impl PyFrontend {
         }
         let data = image.as_slice()?;
         let rudolf_img = RudolfImage::from_vec(self.width, self.height, data.to_vec());
-        let (features, stats) = self.inner.process(&rudolf_img);
+        let (features, stats) =
+            py.allow_threads(|| self.inner.process(&rudolf_img));
 
         let feat_list = pyo3::types::PyList::empty(py);
         for f in features {
