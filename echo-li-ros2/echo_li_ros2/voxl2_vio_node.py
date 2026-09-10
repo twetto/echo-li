@@ -10,7 +10,7 @@ import time
 import numpy as np
 import rclpy
 from ament_index_python.packages import get_package_share_directory
-from geometry_msgs.msg import TransformStamped
+from geometry_msgs.msg import PoseStamped, TransformStamped
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from rclpy.qos import (
@@ -23,6 +23,8 @@ from sensor_msgs.msg import Image, Imu
 from tf2_ros import TransformBroadcaster
 
 import echo_li
+
+from echo_li_ros2.dis_depth import from_config as dis_from_config
 
 
 NSEC_PER_SEC = 1_000_000_000
@@ -95,6 +97,71 @@ def _quat_to_se3(position, quaternion):
     return m
 
 
+def _umeyama_se3(src, dst):
+    """Compute the SE(3) transform T that minimises ‖T·src − dst‖².
+
+    Parameters
+    ----------
+    src, dst : (N, 3) arrays of matched 3D positions (N ≥ 3).
+
+    Returns
+    -------
+    T : (4, 4) SE(3) matrix  (dst ≈ T @ src).
+    """
+    assert src.shape == dst.shape and src.shape[0] >= 3
+    mu_s = src.mean(axis=0)
+    mu_d = dst.mean(axis=0)
+    s_centered = src - mu_s
+    d_centered = dst - mu_d
+    H = s_centered.T @ d_centered  # 3×3 cross-covariance
+    U, _, Vt = np.linalg.svd(H)
+    d = np.linalg.det(Vt.T @ U.T)
+    S = np.diag([1.0, 1.0, np.sign(d)])  # correct reflection
+    R = Vt.T @ S @ U.T
+    t = mu_d - R @ mu_s
+    T = np.eye(4, dtype=np.float64)
+    T[:3, :3] = R
+    T[:3, 3] = t
+    return T
+
+
+def _align_to_estimate(ref_stamps, ref_positions, est_stamps, est_positions):
+    """Compute the SE(3) transform that maps reference positions into the
+    estimate frame:  T @ ref_pos ≈ est_pos.
+
+    Handles different clock epochs (e.g. VOXL monotonic vs wall-clock mocap)
+    by matching on elapsed time from each trajectory's start.
+
+    Returns T (4×4) or None if insufficient overlap.
+    """
+    if len(ref_positions) < 10 or len(est_positions) < 10:
+        return None
+
+    ref_t = np.asarray(ref_stamps, dtype=np.float64)
+    est_t = np.asarray(est_stamps, dtype=np.float64)
+    est_p = np.asarray(est_positions, dtype=np.float64)  # (M, 3)
+    ref_p = np.asarray(ref_positions, dtype=np.float64)  # (N, 3)
+
+    # Convert to elapsed time from each trajectory's own start so that
+    # trajectories on different clock epochs can still be matched.
+    ref_elapsed = ref_t - ref_t[0]
+    est_elapsed = est_t - est_t[0]
+
+    # Keep reference samples that fall within the estimate's elapsed range.
+    overlap = (ref_elapsed >= est_elapsed[0]) & (ref_elapsed <= est_elapsed[-1])
+    if overlap.sum() < 10:
+        return None
+
+    ref_e_in = ref_elapsed[overlap]
+    ref_p_in = ref_p[overlap]
+
+    # Interpolate estimated positions at reference elapsed times.
+    est_interp = np.column_stack([
+        np.interp(ref_e_in, est_elapsed, est_p[:, i]) for i in range(3)])
+
+    return _umeyama_se3(ref_p_in, est_interp)
+
+
 class Voxl2EchoLi(Node):
     def __init__(self):
         super().__init__('echo_li_voxl2')
@@ -137,6 +204,9 @@ class Voxl2EchoLi(Node):
         self.declare_parameter('patch_depth_enabled', True)
         self.declare_parameter('occupancy_enabled', True)
         self.declare_parameter('mapping_stride', 1)
+        self.declare_parameter('depth_backend', 'dis')  # 'dis' or 'patch'
+        self.declare_parameter('mocap_topic', '')  # e.g. /vrpn_mocap/drone_01/pose
+        self.declare_parameter('vio_topic', '')    # e.g. /qvio/odom
 
         self.config_path = self.get_parameter(
             'echo_config_path').value
@@ -169,6 +239,13 @@ class Voxl2EchoLi(Node):
             'occupancy_enabled').value
         self.mapping_stride = max(
             1, self.get_parameter('mapping_stride').value)
+        self.depth_backend = self.get_parameter('depth_backend').value
+        self.mocap_topic = self.get_parameter('mocap_topic').value or ''
+        self.vio_topic = self.get_parameter('vio_topic').value or ''
+        if self.depth_backend not in ('dis', 'patch'):
+            raise ValueError(
+                f"depth_backend must be 'dis' or 'patch', "
+                f"got '{self.depth_backend}'")
 
         if len(intrinsics) != 4 or len(distortion) != 4:
             raise ValueError(
@@ -222,28 +299,43 @@ class Voxl2EchoLi(Node):
             self.get_logger().warn(
                 f'Sparse3DFilter not available: {exc}')
 
-        # ── Patch depth mapper (dense monocular depth from photometric patches) ──
-        self.patch_depth_mapper = None
+        # ── Dense depth mapper ──
+        # depth_backend='dis' → DIS optical flow + two-ray triangulation (Python)
+        # depth_backend='patch' → photometric 1D GN along epipolar lines (Rust)
+        self.depth_mapper = None
+        self._depth_mapper_is_rust = False
         self.occupancy_map = None
         if self.patch_depth_enabled:
             try:
-                self.patch_depth_mapper = echo_li.PatchDepthMapper(
-                    self.camera, fx, fy, cx, cy, self.width, self.height,
-                    config=self.config_path)
-                self.get_logger().info(
-                    f'PatchDepthMapper: enabled '
-                    f'(seeds={self.patch_depth_mapper.seed_coordinates})')
+                if self.depth_backend == 'dis':
+                    self.depth_mapper = dis_from_config(
+                        fx, fy, cx, cy, self.width, self.height,
+                        distortion, config_path=self.config_path)
+                    self.get_logger().info(
+                        f'DISDepthMapper: enabled '
+                        f'(scale={self.depth_mapper.scale}, '
+                        f'{self.depth_mapper.work_w}x'
+                        f'{self.depth_mapper.work_h})')
+                else:  # 'patch'
+                    self.depth_mapper = echo_li.PatchDepthMapper(
+                        self.camera, fx, fy, cx, cy,
+                        self.width, self.height,
+                        config=self.config_path)
+                    self._depth_mapper_is_rust = True
+                    self.get_logger().info(
+                        f'PatchDepthMapper: enabled '
+                        f'(seeds={self.depth_mapper.seed_coordinates})')
                 if self.occupancy_enabled:
                     self.occupancy_map = echo_li.LocalOccupancyMap(
                         self.camera, fx, fy, cx, cy, self.width, self.height,
                         config=self.config_path,
                         seed_coordinates=(
-                            self.patch_depth_mapper.seed_coordinates))
+                            self.depth_mapper.seed_coordinates))
                     self.get_logger().info('LocalOccupancyMap: enabled')
             except Exception as exc:
                 self.get_logger().error(
                     f'Failed to create mapping pipeline: {exc}')
-                self.patch_depth_mapper = None
+                self.depth_mapper = None
                 self.occupancy_map = None
         self.patch_depth_times_ms = deque(maxlen=300)
         self.occupancy_times_ms = deque(maxlen=300)
@@ -304,6 +396,30 @@ class Voxl2EchoLi(Node):
         self.create_subscription(Imu, self.imu_topic, self.on_imu, imu_qos)
         self.create_subscription(
             Image, self.image_topic, self.on_image, image_qos)
+
+        # ── Reference trajectory subscriptions (mocap / external VIO) ──
+        # Accumulated as (stamp_sec, [x, y, z]) for SE(3) alignment + Rerun.
+        self.mocap_stamps = []
+        self.mocap_positions = []
+        self.vio_stamps = []
+        self.vio_positions = []
+        self.estimated_stamps = []   # parallel to estimated_positions
+        self.mocap_align = None      # 4×4 SE(3): mocap → estimate frame
+        self.vio_align = None        # 4×4 SE(3): vio → estimate frame
+        self._align_counter = 0
+        ref_qos = QoSProfile(
+            history=QoSHistoryPolicy.KEEP_LAST, depth=200,
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            durability=QoSDurabilityPolicy.VOLATILE)
+        if self.mocap_topic:
+            self.create_subscription(
+                PoseStamped, self.mocap_topic, self.on_mocap, ref_qos)
+            self.get_logger().info(f'Mocap: subscribing to {self.mocap_topic}')
+        if self.vio_topic:
+            self.create_subscription(
+                Odometry, self.vio_topic, self.on_vio, ref_qos)
+            self.get_logger().info(f'VIO ref: subscribing to {self.vio_topic}')
+
         self.create_timer(
             self.get_parameter('statistics_period_sec').value,
             self.report_statistics)
@@ -332,7 +448,7 @@ class Voxl2EchoLi(Node):
         world_view = rrb.Spatial3DView(
             name='Estimated world', origin='world',
             contents=['world/**'])
-        if self.patch_depth_mapper is not None:
+        if self.depth_mapper is not None:
             depth_view = rrb.Spatial2DView(
                 name='Depth', origin='depth',
                 contents=['depth/**'])
@@ -394,6 +510,20 @@ class Voxl2EchoLi(Node):
             self.image_queue.popleft()
             self.dropped_images += 1
         self.drain_queues()
+
+    def on_mocap(self, msg):
+        t = _stamp_ns(msg.header.stamp) / NSEC_PER_SEC
+        p = msg.pose
+        self.mocap_stamps.append(t)
+        self.mocap_positions.append([
+            p.position.x, p.position.y, p.position.z])
+
+    def on_vio(self, msg):
+        t = _stamp_ns(msg.header.stamp) / NSEC_PER_SEC
+        p = msg.pose.pose
+        self.vio_stamps.append(t)
+        self.vio_positions.append([
+            p.position.x, p.position.y, p.position.z])
 
     def drain_queues(self):
         if self._draining:
@@ -490,10 +620,10 @@ class Voxl2EchoLi(Node):
                 stamp_ns / NSEC_PER_SEC,
                 feature_uvs, t_wc.tolist(), p_vv, p_ww)
 
-        # ── Dense mapping: patch depth → occupancy ──
+        # ── Dense mapping: DIS flow depth → occupancy ──
         depth_result = None
         occupancy_cells = None
-        if (self.patch_depth_mapper is not None and
+        if (self.depth_mapper is not None and
                 self.images_processed % self.mapping_stride == 0):
             depth_result, occupancy_cells = self.run_mapping(
                 stamp_ns, gray, t_wc, features)
@@ -508,13 +638,13 @@ class Voxl2EchoLi(Node):
             occupancy_cells=occupancy_cells)
 
     def run_mapping(self, stamp_ns, gray, t_wc, features):
-        """Run the patch depth mapper and optionally the occupancy map.
+        """Run the dense depth mapper and optionally the occupancy map.
 
         `t_wc` is the 4×4 camera pose (world ← camera), already composing
         T_wb @ T_bc from the EqF body pose and the camera extrinsic.
 
         Returns (depth_result, occupancy_cells) where depth_result is the dict
-        from PatchDepthMapper.update() (or None), and occupancy_cells is an
+        from the active depth backend (or None), and occupancy_cells is an
         (N,3) float32 array of occupied voxel centres (or None).
         """
         t_wc_list = t_wc.tolist()
@@ -557,10 +687,13 @@ class Voxl2EchoLi(Node):
         self.seed_counts.append(len(priors))
         self.patch_depth_frame_count += 1
         pd_start = time.monotonic()
-        depth_result = self.patch_depth_mapper.update(
+        # Rust PatchDepthMapper expects t_wc as a nested list;
+        # Python DISDepthMapper accepts ndarray directly.
+        t_wc_arg = t_wc_list if self._depth_mapper_is_rust else t_wc
+        depth_result = self.depth_mapper.update(
             stamp_ns / NSEC_PER_SEC,
             self.patch_depth_frame_count,
-            gray, t_wc_list, priors)
+            gray, t_wc_arg, priors)
         self.patch_depth_times_ms.append(
             (time.monotonic() - pd_start) * 1000.0)
 
@@ -700,7 +833,9 @@ class Voxl2EchoLi(Node):
         if world is None:
             return
         position = world['position']
+        stamp_sec = payload['stamp_ns'] / NSEC_PER_SEC
         self.estimated_positions.append(position)
+        self.estimated_stamps.append(stamp_sec)
         if world['points'].size:
             rr.log(
                 'world/landmarks',
@@ -726,6 +861,61 @@ class Voxl2EchoLi(Node):
                 rr.LineStrips3D(
                     [list(self.estimated_positions)],
                     colors=[255, 80, 40], radii=0.02))
+
+        # ── Reference trajectories (mocap / VIO), SE(3)-aligned ──
+        self._align_counter += 1
+        n_est = len(self.estimated_stamps)
+        if n_est >= 50 and self._align_counter % 10 == 0:
+            est_s = list(self.estimated_stamps)
+            est_p = list(self.estimated_positions)
+            if self.mocap_stamps:
+                self.mocap_align = _align_to_estimate(
+                    list(self.mocap_stamps), list(self.mocap_positions),
+                    est_s, est_p)
+            if self.vio_stamps:
+                self.vio_align = _align_to_estimate(
+                    list(self.vio_stamps), list(self.vio_positions),
+                    est_s, est_p)
+        # Elapsed time since estimate start — used to mask reference
+        # trajectories to "up to now" even when clocks differ.
+        est_elapsed_now = (stamp_sec - self.estimated_stamps[0]
+                           if len(self.estimated_stamps) > 1 else 0.0)
+        if self.mocap_align is not None and len(self.mocap_positions) > 1:
+            mp = np.asarray(self.mocap_positions, dtype=np.float64)
+            mt = np.asarray(self.mocap_stamps, dtype=np.float64)
+            n = min(len(mp), len(mt))   # snapshot race guard
+            mp, mt = mp[:n], mt[:n]
+            m_elapsed = mt - mt[0]
+            mask = m_elapsed <= est_elapsed_now
+            mp = mp[mask]
+            if len(mp) > 1:
+                step = max(1, len(mp) // 500)
+                pts = mp[::step]
+                ones = np.ones((len(pts), 1), dtype=np.float64)
+                aligned = (self.mocap_align @ np.hstack([pts, ones]).T).T[:, :3]
+                rr.log(
+                    'world/mocap_trajectory',
+                    rr.LineStrips3D(
+                        [aligned.tolist()],
+                        colors=[255, 255, 255], radii=0.015))
+        if self.vio_align is not None and len(self.vio_positions) > 1:
+            vp = np.asarray(self.vio_positions, dtype=np.float64)
+            vt = np.asarray(self.vio_stamps, dtype=np.float64)
+            n = min(len(vp), len(vt))   # snapshot race guard
+            vp, vt = vp[:n], vt[:n]
+            v_elapsed = vt - vt[0]
+            mask = v_elapsed <= est_elapsed_now
+            vp = vp[mask]
+            if len(vp) > 1:
+                step = max(1, len(vp) // 500)
+                pts = vp[::step]
+                ones = np.ones((len(pts), 1), dtype=np.float64)
+                aligned = (self.vio_align @ np.hstack([pts, ones]).T).T[:, :3]
+                rr.log(
+                    'world/vio_trajectory',
+                    rr.LineStrips3D(
+                        [aligned.tolist()],
+                        colors=[80, 160, 255], radii=0.015))
 
         # ── Dense depth map (JET colormap, matching echo-li-cli) ──
         depth_result = payload.get('depth_result')

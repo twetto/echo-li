@@ -19,7 +19,8 @@ RudolfV:
 eqf:
   maxFeatures: 40
   initialValue:
-    sceneDepth: 3.0
+    # sceneDepth: 3.0
+    sceneDepth: 20.0
   initialVariance:
     attitude: 0.13565029126052572
     biasAcc: 1.5813333765300104
@@ -116,6 +117,16 @@ PatchDepth:
   min_structure_eigen: 0.0
   vis_min_depth: 0.3
   vis_max_depth: 8.0
+
+DISDepth:
+  # DIS optical flow preset: ultrafast / fast / medium.
+  preset: medium
+  # Assumed flow noise in pixels — drives depth uncertainty.
+  sigma_flow_px: 1.0
+  # Minimum sin²(parallax angle) for triangulation.
+  min_parallax_sin2: 1.0e-5
+  # Number of keyframes to keep for baseline selection.
+  max_keyframes: 5
 
 LocalOccupancy:
   enabled: true
