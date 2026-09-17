@@ -299,6 +299,7 @@ struct VioNode {
     patch_depth_frame_count: u64,
 
     // Timing stats
+    imu_times_us: VecDeque<f64>,
     gray_times_ms: VecDeque<f64>,
     frontend_times_ms: VecDeque<f64>,
     vision_times_ms: VecDeque<f64>,
@@ -497,6 +498,7 @@ impl VioNode {
             dropped_images: 0,
             bad_images: 0,
             patch_depth_frame_count: 0,
+            imu_times_us: VecDeque::with_capacity(300),
             gray_times_ms: VecDeque::with_capacity(300),
             frontend_times_ms: VecDeque::with_capacity(300),
             vision_times_ms: VecDeque::with_capacity(300),
@@ -643,7 +645,13 @@ impl VioNode {
             }
             return;
         }
+        let imu_t = Instant::now();
         self.filter.process_imu(imu);
+        push_capped(
+            &mut self.imu_times_us,
+            imu_t.elapsed().as_secs_f64() * 1e6,
+            300,
+        );
     }
 
     fn process_image(
@@ -984,6 +992,7 @@ impl VioNode {
 
     fn report_statistics(&self) {
         let elapsed = self.started_at.elapsed().as_secs_f64().max(1e-9);
+        let imu_us = median_deque(&self.imu_times_us).unwrap_or(0.0);
         let gray_ms = median_deque(&self.gray_times_ms).unwrap_or(0.0);
         let frontend_ms = median_deque(&self.frontend_times_ms).unwrap_or(0.0);
         let vision_ms = median_deque(&self.vision_times_ms).unwrap_or(0.0);
@@ -1021,7 +1030,7 @@ impl VioNode {
              processed: imu={} image={}; \
              queues: imu={} image={}; \
              dropped: imu={} image={}; \
-             gray_med={gray_ms:.1}ms frontend_med={frontend_ms:.1}ms \
+             imu_med={imu_us:.0}us gray_med={gray_ms:.1}ms frontend_med={frontend_ms:.1}ms \
              vision_med={vision_ms:.1}ms total_med={total_ms:.1}ms \
              tracks_med={tracks}{mapping_part}",
             self.imu_received as f64 / elapsed,
