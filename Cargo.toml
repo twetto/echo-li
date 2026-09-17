@@ -6,6 +6,7 @@ members = [
     "echo-lie",
     "echo-li-core",
     "echo-li-python",
+    "echo-li-ros2-rs",
 ]
 
 [workspace.dependencies]

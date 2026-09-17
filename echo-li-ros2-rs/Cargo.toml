@@ -1,0 +1,31 @@
+[package]
+name = "echo-li-ros2"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+rerun = ["dep:rerun"]
+parallel = ["echo-li-core/parallel", "rudolf-v/parallel"]
+
+[dependencies]
+echo-li-core = { path = "../echo-li-core" }
+echo-lie = { path = "../echo-lie" }
+rudolf-v.workspace = true
+camera-geometry.workspace = true
+nalgebra.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true
+log.workspace = true
+env_logger.workspace = true
+rerun = { workspace = true, optional = true }
+r2r = "0.9"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+futures = "0.3"
+
+[[bin]]
+name = "voxl2_vio_node"
+path = "src/bin/voxl2_vio_node.rs"
+
+[[bin]]
+name = "bag_time_relay"
+path = "src/bin/bag_time_relay.rs"
