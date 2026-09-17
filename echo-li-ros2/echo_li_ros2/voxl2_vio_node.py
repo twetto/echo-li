@@ -125,41 +125,76 @@ def _umeyama_se3(src, dst):
     return T
 
 
-def _align_to_estimate(ref_stamps, ref_positions, est_stamps, est_positions):
+def _align_to_estimate(ref_t, ref_p, est_stamps, est_positions):
     """Compute the SE(3) transform that maps reference positions into the
     estimate frame:  T @ ref_pos ≈ est_pos.
 
-    Handles different clock epochs (e.g. VOXL monotonic vs wall-clock mocap)
-    by matching on elapsed time from each trajectory's start.
-
-    Returns T (4×4) or None if insufficient overlap.
+    `ref_t` must already be on the estimate's (IMU) clock; see
+    _ReferenceTrack. Returns T (4×4) or None if insufficient overlap.
     """
-    if len(ref_positions) < 10 or len(est_positions) < 10:
+    n = min(len(est_stamps), len(est_positions))   # snapshot race guard
+    if len(ref_p) < 10 or n < 10:
         return None
+    est_t = np.asarray(list(est_stamps)[:n], dtype=np.float64)
+    est_p = np.asarray(list(est_positions)[:n], dtype=np.float64)
 
-    ref_t = np.asarray(ref_stamps, dtype=np.float64)
-    est_t = np.asarray(est_stamps, dtype=np.float64)
-    est_p = np.asarray(est_positions, dtype=np.float64)  # (M, 3)
-    ref_p = np.asarray(ref_positions, dtype=np.float64)  # (N, 3)
-
-    # Convert to elapsed time from each trajectory's own start so that
-    # trajectories on different clock epochs can still be matched.
-    ref_elapsed = ref_t - ref_t[0]
-    est_elapsed = est_t - est_t[0]
-
-    # Keep reference samples that fall within the estimate's elapsed range.
-    overlap = (ref_elapsed >= est_elapsed[0]) & (ref_elapsed <= est_elapsed[-1])
-    if overlap.sum() < 10:
+    inside = (ref_t >= est_t[0]) & (ref_t <= est_t[-1])
+    if inside.sum() < 10:
         return None
-
-    ref_e_in = ref_elapsed[overlap]
-    ref_p_in = ref_p[overlap]
-
-    # Interpolate estimated positions at reference elapsed times.
     est_interp = np.column_stack([
-        np.interp(ref_e_in, est_elapsed, est_p[:, i]) for i in range(3)])
+        np.interp(ref_t[inside], est_t, est_p[:, i]) for i in range(3)])
+    return _umeyama_se3(ref_p[inside], est_interp)
 
-    return _umeyama_se3(ref_p_in, est_interp)
+
+class _ReferenceTrack:
+    """A reference trajectory (mocap / external VIO) on its own clock.
+
+    Header stamps can come from another machine: VRPN stamps carry the mocap
+    PC clock (~687066 s ahead of the VOXL clock in the handheld bags), and
+    the estimate only starts once the H.265 stream reaches a keyframe, so
+    neither the absolute stamps nor "elapsed since first sample" line up.
+    Instead each message is paired with the newest IMU stamp at arrival;
+    the median difference is the clock offset, good to the transport latency
+    (~10-20 ms) in live use and in bag playback at any rate.
+
+    Poses bit-identical to their predecessor (VRPN re-sends every pose and
+    repeats the last one during dropouts) and out-of-order stamps (the
+    vision_pose topic has two interleaved publishers) are dropped.
+    """
+
+    def __init__(self):
+        self.stamps_ns = []
+        self.positions = []
+        self._offsets_ns = deque(maxlen=2000)
+        self._last_stamp_ns = None
+        self._last_pose = None
+
+    def add(self, stamp_ns, position, orientation, latest_imu_ns):
+        pose = tuple(position) + tuple(orientation)
+        if self._last_stamp_ns is not None and (
+                stamp_ns <= self._last_stamp_ns or pose == self._last_pose):
+            return
+        self._last_stamp_ns = stamp_ns
+        self._last_pose = pose
+        if latest_imu_ns is not None:
+            self._offsets_ns.append(stamp_ns - latest_imu_ns)
+        self.stamps_ns.append(stamp_ns)
+        self.positions.append(tuple(position))
+
+    def offset_ns(self):
+        """Reference clock minus IMU clock [ns], or None before any IMU."""
+        if not self._offsets_ns:
+            return None
+        return int(np.median(np.asarray(self._offsets_ns, dtype=np.int64)))
+
+    def snapshot(self):
+        """(stamps on the IMU clock [s], positions (N, 3)) or None."""
+        offset = self.offset_ns()
+        n = min(len(self.stamps_ns), len(self.positions))
+        if offset is None or n < 2:
+            return None
+        t = (np.asarray(self.stamps_ns[:n], dtype=np.int64) - offset) / NSEC_PER_SEC
+        return t, np.asarray(self.positions[:n], dtype=np.float64)
 
 
 class Voxl2EchoLi(Node):
@@ -205,6 +240,7 @@ class Voxl2EchoLi(Node):
         self.declare_parameter('occupancy_enabled', True)
         self.declare_parameter('mapping_stride', 1)
         self.declare_parameter('depth_backend', 'dis')  # 'dis' or 'patch'
+        self.declare_parameter('camera_model', 'equidistant')
         self.declare_parameter('mocap_topic', '')  # e.g. /vrpn_mocap/drone_01/pose
         self.declare_parameter('vio_topic', '')    # e.g. /qvio/odom
 
@@ -261,12 +297,19 @@ class Voxl2EchoLi(Node):
                 'image_qos_reliability must be best_effort or reliable')
 
         fx, fy, cx, cy = intrinsics
-        self.camera = echo_li.EquidistantCamera(
-            fx, fy, cx, cy, *distortion)
+        camera_model = self.get_parameter('camera_model').value
+        if camera_model in ('radtan', 'radial-tangential', 'plumb_bob'):
+            self.camera = echo_li.RadTanCamera(
+                fx, fy, cx, cy, *distortion)
+            distortion_model = 'radtan'
+        else:
+            self.camera = echo_li.EquidistantCamera(
+                fx, fy, cx, cy, *distortion)
+            distortion_model = 'equidistant'
         frontend_config = echo_li.FrontendConfig.from_yaml(self.config_path)
         frontend_config.set_camera(
             fx, fy, cx, cy, self.width, self.height, distortion,
-            distortion_model='equidistant')
+            distortion_model=distortion_model)
         self.frontend = echo_li.Frontend(
             frontend_config, self.width, self.height)
         self.vio = echo_li.VIOFilter(
@@ -398,14 +441,12 @@ class Voxl2EchoLi(Node):
             Image, self.image_topic, self.on_image, image_qos)
 
         # ── Reference trajectory subscriptions (mocap / external VIO) ──
-        # Accumulated as (stamp_sec, [x, y, z]) for SE(3) alignment + Rerun.
-        self.mocap_stamps = []
-        self.mocap_positions = []
-        self.vio_stamps = []
-        self.vio_positions = []
-        self.estimated_stamps = []   # parallel to estimated_positions
-        self.mocap_align = None      # 4×4 SE(3): mocap → estimate frame
-        self.vio_align = None        # 4×4 SE(3): vio → estimate frame
+        # Mapped onto the IMU clock for SE(3) alignment + Rerun.
+        self.mocap_track = _ReferenceTrack()
+        self.vio_track = _ReferenceTrack()
+        # Parallel to estimated_positions (same maxlen).
+        self.estimated_stamps = deque(maxlen=self.estimated_positions.maxlen)
+        self.ref_align = {}          # name → 4×4 SE(3): reference → estimate
         self._align_counter = 0
         ref_qos = QoSProfile(
             history=QoSHistoryPolicy.KEEP_LAST, depth=200,
@@ -426,7 +467,7 @@ class Voxl2EchoLi(Node):
 
         self.get_logger().info(
             f'ECHO-LI ready: imu={self.imu_topic}, image={self.image_topic}, '
-            f'camera={self.width}x{self.height} equidistant, '
+            f'camera={self.width}x{self.height} {distortion_model}, '
             f'camera_time_offset={offset_sec:+.6f}s, '
             f'image_qos={self.image_qos_reliability}, '
             f'rerun={self.rerun_enabled}')
@@ -512,18 +553,16 @@ class Voxl2EchoLi(Node):
         self.drain_queues()
 
     def on_mocap(self, msg):
-        t = _stamp_ns(msg.header.stamp) / NSEC_PER_SEC
-        p = msg.pose
-        self.mocap_stamps.append(t)
-        self.mocap_positions.append([
-            p.position.x, p.position.y, p.position.z])
+        p, o = msg.pose.position, msg.pose.orientation
+        self.mocap_track.add(
+            _stamp_ns(msg.header.stamp), (p.x, p.y, p.z),
+            (o.x, o.y, o.z, o.w), self.latest_imu_ns)
 
     def on_vio(self, msg):
-        t = _stamp_ns(msg.header.stamp) / NSEC_PER_SEC
-        p = msg.pose.pose
-        self.vio_stamps.append(t)
-        self.vio_positions.append([
-            p.position.x, p.position.y, p.position.z])
+        p, o = msg.pose.pose.position, msg.pose.pose.orientation
+        self.vio_track.add(
+            _stamp_ns(msg.header.stamp), (p.x, p.y, p.z),
+            (o.x, o.y, o.z, o.w), self.latest_imu_ns)
 
     def drain_queues(self):
         if self._draining:
@@ -863,59 +902,35 @@ class Voxl2EchoLi(Node):
                     colors=[255, 80, 40], radii=0.02))
 
         # ── Reference trajectories (mocap / VIO), SE(3)-aligned ──
+        # Both are mapped onto the IMU clock, so "up to now" is simply
+        # reference stamps <= this frame's stamp.
         self._align_counter += 1
-        n_est = len(self.estimated_stamps)
-        if n_est >= 50 and self._align_counter % 10 == 0:
-            est_s = list(self.estimated_stamps)
-            est_p = list(self.estimated_positions)
-            if self.mocap_stamps:
-                self.mocap_align = _align_to_estimate(
-                    list(self.mocap_stamps), list(self.mocap_positions),
-                    est_s, est_p)
-            if self.vio_stamps:
-                self.vio_align = _align_to_estimate(
-                    list(self.vio_stamps), list(self.vio_positions),
-                    est_s, est_p)
-        # Elapsed time since estimate start — used to mask reference
-        # trajectories to "up to now" even when clocks differ.
-        est_elapsed_now = (stamp_sec - self.estimated_stamps[0]
-                           if len(self.estimated_stamps) > 1 else 0.0)
-        if self.mocap_align is not None and len(self.mocap_positions) > 1:
-            mp = np.asarray(self.mocap_positions, dtype=np.float64)
-            mt = np.asarray(self.mocap_stamps, dtype=np.float64)
-            n = min(len(mp), len(mt))   # snapshot race guard
-            mp, mt = mp[:n], mt[:n]
-            m_elapsed = mt - mt[0]
-            mask = m_elapsed <= est_elapsed_now
-            mp = mp[mask]
-            if len(mp) > 1:
-                step = max(1, len(mp) // 500)
-                pts = mp[::step]
-                ones = np.ones((len(pts), 1), dtype=np.float64)
-                aligned = (self.mocap_align @ np.hstack([pts, ones]).T).T[:, :3]
-                rr.log(
-                    'world/mocap_trajectory',
-                    rr.LineStrips3D(
-                        [aligned.tolist()],
-                        colors=[255, 255, 255], radii=0.015))
-        if self.vio_align is not None and len(self.vio_positions) > 1:
-            vp = np.asarray(self.vio_positions, dtype=np.float64)
-            vt = np.asarray(self.vio_stamps, dtype=np.float64)
-            n = min(len(vp), len(vt))   # snapshot race guard
-            vp, vt = vp[:n], vt[:n]
-            v_elapsed = vt - vt[0]
-            mask = v_elapsed <= est_elapsed_now
-            vp = vp[mask]
-            if len(vp) > 1:
-                step = max(1, len(vp) // 500)
-                pts = vp[::step]
-                ones = np.ones((len(pts), 1), dtype=np.float64)
-                aligned = (self.vio_align @ np.hstack([pts, ones]).T).T[:, :3]
-                rr.log(
-                    'world/vio_trajectory',
-                    rr.LineStrips3D(
-                        [aligned.tolist()],
-                        colors=[80, 160, 255], radii=0.015))
+        realign = (len(self.estimated_stamps) >= 50 and
+                   self._align_counter % 10 == 0)
+        for name, track, color in (
+                ('mocap', self.mocap_track, [255, 255, 255]),
+                ('vio', self.vio_track, [80, 160, 255])):
+            snapshot = track.snapshot()
+            if snapshot is None:
+                continue
+            ref_t, ref_p = snapshot
+            if realign:
+                align = _align_to_estimate(
+                    ref_t, ref_p, self.estimated_stamps,
+                    self.estimated_positions)
+                if align is not None:
+                    self.ref_align[name] = align
+            align = self.ref_align.get(name)
+            pts = ref_p[ref_t <= stamp_sec]
+            if align is None or len(pts) < 2:
+                continue
+            pts = pts[::max(1, len(pts) // 500)]
+            ones = np.ones((len(pts), 1), dtype=np.float64)
+            aligned = (align @ np.hstack([pts, ones]).T).T[:, :3]
+            rr.log(
+                f'world/{name}_trajectory',
+                rr.LineStrips3D(
+                    [aligned.tolist()], colors=color, radii=0.015))
 
         # ── Dense depth map (JET colormap, matching echo-li-cli) ──
         depth_result = payload.get('depth_result')
@@ -1051,6 +1066,13 @@ class Voxl2EchoLi(Node):
                     f' (unk={u} free={f} occ={o})')
             else:
                 mapping_part += f' occupancy_med={occ_ms:.1f}ms'
+        for name, track in (('mocap', self.mocap_track),
+                            ('vio', self.vio_track)):
+            offset = track.offset_ns()
+            if offset is not None:
+                mapping_part += (f'; {name}_clock_offset='
+                                 f'{offset / NSEC_PER_SEC:+.3f}s '
+                                 f'n={len(track.stamps_ns)}')
         self.get_logger().info(
             f'input: imu={self.imu_received / elapsed:.1f}Hz '
             f'image={self.images_received / elapsed:.1f}Hz; '
