@@ -55,6 +55,8 @@ struct NodeParams {
     patch_depth_enabled: bool,
     occupancy_enabled: bool,
     mapping_stride: usize,
+    image_scale: f64,
+    trajectory_output: String,
     mocap_topic: String,
     vio_topic: String,
     #[cfg(feature = "rerun")]
@@ -172,6 +174,8 @@ fn load_params(node: &r2r::Node) -> NodeParams {
         stats_period_sec: get_f64(node, "statistics_period_sec", 5.0),
         patch_depth_enabled: get_bool(node, "patch_depth_enabled", true),
         occupancy_enabled: get_bool(node, "occupancy_enabled", true),
+        image_scale: get_f64(node, "image_scale", 1.0).clamp(0.25, 1.0),
+        trajectory_output: get_str(node, "trajectory_output", ""),
         mapping_stride: (get_i64(node, "mapping_stride", 1) as usize).max(1),
         mocap_topic: get_str(node, "mocap_topic", ""),
         vio_topic: get_str(node, "vio_topic", ""),
@@ -308,16 +312,21 @@ struct VioNode {
     patch_depth_times_ms: VecDeque<f64>,
     occupancy_times_ms: VecDeque<f64>,
     seed_counts: VecDeque<usize>,
+    landmark_counts: VecDeque<usize>,
 
     // Reference trajectories
     mocap_track: ReferenceTrack,
     vio_track: ReferenceTrack,
     estimated_stamps: VecDeque<f64>,
     estimated_positions: VecDeque<[f64; 3]>,
+    estimated_quaternions: VecDeque<[f64; 4]>,
 
     // Image parameters
+    input_width: usize,
+    input_height: usize,
     width: usize,
     height: usize,
+    image_scale: f64,
     intrinsics: CameraIntrinsics,
 
     // Frame IDs
@@ -330,10 +339,16 @@ struct VioNode {
 
 impl VioNode {
     fn new(params: &NodeParams) -> Self {
-        let [fx, fy, cx, cy] = params.intrinsics;
+        let s = params.image_scale;
+        let [fx, fy, cx, cy] = [
+            params.intrinsics[0] * s,
+            params.intrinsics[1] * s,
+            params.intrinsics[2] * s,
+            params.intrinsics[3] * s,
+        ];
         let [k1, k2, k3, k4] = params.distortion;
-        let w = params.width;
-        let h = params.height;
+        let w = (params.width as f64 * s).round() as usize;
+        let h = (params.height as f64 * s).round() as usize;
 
         // Camera model
         let mut cam_intrinsics = RudolfCameraIntrinsics::new(fx, fy, cx, cy, w, h);
@@ -507,12 +522,17 @@ impl VioNode {
             patch_depth_times_ms: VecDeque::with_capacity(300),
             occupancy_times_ms: VecDeque::with_capacity(300),
             seed_counts: VecDeque::with_capacity(300),
+            landmark_counts: VecDeque::with_capacity(300),
             mocap_track: ReferenceTrack::new(),
             vio_track: ReferenceTrack::new(),
             estimated_stamps: VecDeque::with_capacity(20000),
             estimated_positions: VecDeque::with_capacity(20000),
+            estimated_quaternions: VecDeque::with_capacity(20000),
+            input_width: params.width,
+            input_height: params.height,
             width: w,
             height: h,
+            image_scale: s,
             intrinsics: CameraIntrinsics { fx, fy, cx, cy },
             odom_frame: params.odom_frame.clone(),
             body_frame: params.body_frame.clone(),
@@ -570,6 +590,7 @@ impl VioNode {
         &mut self,
         odom_pub: &r2r::Publisher<r2r::nav_msgs::msg::Odometry>,
         tf_pub: Option<&r2r::Publisher<r2r::tf2_msgs::msg::TFMessage>>,
+        landmark_pub: &r2r::Publisher<r2r::sensor_msgs::msg::PointCloud2>,
     ) {
         while !self.image_queue.is_empty() && !self.imu_queue.is_empty() {
             let (image_ns, _) = &self.image_queue[0];
@@ -613,7 +634,7 @@ impl VioNode {
                 continue;
             }
             let (ns, msg) = self.image_queue.pop_front().unwrap();
-            self.process_image(ns, &msg, odom_pub, tf_pub);
+            self.process_image(ns, &msg, odom_pub, tf_pub, landmark_pub);
         }
     }
 
@@ -660,6 +681,7 @@ impl VioNode {
         msg: &r2r::sensor_msgs::msg::Image,
         odom_pub: &r2r::Publisher<r2r::nav_msgs::msg::Odometry>,
         tf_pub: Option<&r2r::Publisher<r2r::tf2_msgs::msg::TFMessage>>,
+        landmark_pub: &r2r::Publisher<r2r::sensor_msgs::msg::PointCloud2>,
     ) {
         let started = Instant::now();
         let gray = match self.to_gray(msg) {
@@ -733,8 +755,20 @@ impl VioNode {
             tf_pub,
         );
 
+        let n_lm = state.camera_landmarks.len();
+        push_capped_usize(&mut self.landmark_counts, n_lm, 300);
+        let (global_landmarks, _, _) = landmarks_to_global(&state);
+
         // Camera pose: T_wc = T_wb @ T_bc
         let t_wc = quat_to_se3(&position, &quaternion) * self.t_bc;
+        let cam_origin = [t_wc[(0, 3)], t_wc[(1, 3)], t_wc[(2, 3)]];
+        Self::publish_landmarks(
+            stamp_ns,
+            &self.odom_frame,
+            &global_landmarks,
+            &cam_origin,
+            landmark_pub,
+        );
 
         // Update sparse 3D filter
         if let Some(ref mut sparse) = self.sparse_3d {
@@ -760,8 +794,10 @@ impl VioNode {
         if self.estimated_positions.len() >= 20000 {
             self.estimated_positions.pop_front();
             self.estimated_stamps.pop_front();
+            self.estimated_quaternions.pop_front();
         }
         self.estimated_positions.push_back(position);
+        self.estimated_quaternions.push_back(quaternion);
         self.estimated_stamps.push_back(stamp);
     }
 
@@ -868,21 +904,21 @@ impl VioNode {
     fn to_gray(&self, msg: &r2r::sensor_msgs::msg::Image) -> Result<Vec<u8>, String> {
         let w = msg.width as usize;
         let h = msg.height as usize;
-        if w != self.width || h != self.height {
+        if w != self.input_width || h != self.input_height {
             return Err(format!(
                 "unexpected image size {w}x{h}; expected {}x{}",
-                self.width, self.height
+                self.input_width, self.input_height
             ));
         }
         let encoding = msg.encoding.to_lowercase();
-        match encoding.as_str() {
+        let full = match encoding.as_str() {
             "mono8" | "8uc1" => {
                 let step = msg.step as usize;
                 let mut gray = Vec::with_capacity(w * h);
                 for row in 0..h {
                     gray.extend_from_slice(&msg.data[row * step..row * step + w]);
                 }
-                Ok(gray)
+                gray
             }
             "rgb8" | "bgr8" => {
                 let step = msg.step as usize;
@@ -900,7 +936,7 @@ impl VioNode {
                         gray.push((0.299 * r as f64 + 0.587 * g as f64 + 0.114 * b as f64) as u8);
                     }
                 }
-                Ok(gray)
+                gray
             }
             "rgba8" | "bgra8" => {
                 let step = msg.step as usize;
@@ -918,10 +954,26 @@ impl VioNode {
                         gray.push((0.299 * r as f64 + 0.587 * g as f64 + 0.114 * b as f64) as u8);
                     }
                 }
-                Ok(gray)
+                gray
             }
-            _ => Err(format!("unsupported image encoding: {}", msg.encoding)),
+            _ => return Err(format!("unsupported image encoding: {}", msg.encoding)),
+        };
+        if self.image_scale >= 1.0 {
+            return Ok(full);
         }
+        let ow = self.width;
+        let oh = self.height;
+        let inv = 1.0 / self.image_scale;
+        let mut out = Vec::with_capacity(ow * oh);
+        for oy in 0..oh {
+            let sy = ((oy as f64 + 0.5) * inv) as usize;
+            let row = sy.min(h - 1) * w;
+            for ox in 0..ow {
+                let sx = ((ox as f64 + 0.5) * inv) as usize;
+                out.push(full[row + sx.min(w - 1)]);
+            }
+        }
+        Ok(out)
     }
 
     fn publish_odometry(
@@ -966,6 +1018,93 @@ impl VioNode {
                 let _ = tf_pub.publish(&tf_msg);
             }
         }
+    }
+
+    fn publish_landmarks(
+        stamp_ns: i64,
+        frame_id: &str,
+        landmarks: &HashMap<u64, Vector3<f64>>,
+        cam_origin: &[f64; 3],
+        pub_: &r2r::Publisher<r2r::sensor_msgs::msg::PointCloud2>,
+    ) {
+        if landmarks.is_empty() {
+            return;
+        }
+        let stamp = to_stamp(stamp_ns);
+        let point_step: u32 = 16; // x, y, z, depth — 4 × f32
+        let n = landmarks.len() as u32;
+        let mut data = Vec::with_capacity(point_step as usize * n as usize);
+        for pos in landmarks.values() {
+            data.extend_from_slice(&(pos[0] as f32).to_le_bytes());
+            data.extend_from_slice(&(pos[1] as f32).to_le_bytes());
+            data.extend_from_slice(&(pos[2] as f32).to_le_bytes());
+            let dx = pos[0] - cam_origin[0];
+            let dy = pos[1] - cam_origin[1];
+            let dz = pos[2] - cam_origin[2];
+            let depth = (dx * dx + dy * dy + dz * dz).sqrt() as f32;
+            data.extend_from_slice(&depth.to_le_bytes());
+        }
+        let fields = vec![
+            r2r::sensor_msgs::msg::PointField {
+                name: "x".into(),
+                offset: 0,
+                datatype: 7,
+                count: 1,
+            },
+            r2r::sensor_msgs::msg::PointField {
+                name: "y".into(),
+                offset: 4,
+                datatype: 7,
+                count: 1,
+            },
+            r2r::sensor_msgs::msg::PointField {
+                name: "z".into(),
+                offset: 8,
+                datatype: 7,
+                count: 1,
+            },
+            r2r::sensor_msgs::msg::PointField {
+                name: "intensity".into(),
+                offset: 12,
+                datatype: 7,
+                count: 1,
+            },
+        ];
+        let msg = r2r::sensor_msgs::msg::PointCloud2 {
+            header: r2r::std_msgs::msg::Header {
+                stamp,
+                frame_id: frame_id.to_string(),
+            },
+            height: 1,
+            width: n,
+            fields,
+            is_bigendian: false,
+            point_step,
+            row_step: point_step * n,
+            data,
+            is_dense: true,
+        };
+        let _ = pub_.publish(&msg);
+    }
+
+    fn save_trajectory(&self, path: &str) {
+        use std::io::Write;
+        let Ok(mut f) = std::fs::File::create(path) else {
+            log::error!("Cannot write trajectory to {path}");
+            return;
+        };
+        let _ = writeln!(f, "# TUM format: timestamp x y z qx qy qz qw");
+        for i in 0..self.estimated_stamps.len() {
+            let t = self.estimated_stamps[i];
+            let p = self.estimated_positions[i];
+            let q = self.estimated_quaternions[i];
+            let _ = writeln!(
+                f,
+                "{t:.9} {:.6} {:.6} {:.6} {:.9} {:.9} {:.9} {:.9}",
+                p[0], p[1], p[2], q[0], q[1], q[2], q[3]
+            );
+        }
+        log::info!("Saved {} poses to {path}", self.estimated_stamps.len());
     }
 
     fn on_mocap(&mut self, msg: &r2r::geometry_msgs::msg::PoseStamped) {
@@ -1032,7 +1171,7 @@ impl VioNode {
              dropped: imu={} image={}; \
              imu_med={imu_us:.0}us gray_med={gray_ms:.1}ms frontend_med={frontend_ms:.1}ms \
              vision_med={vision_ms:.1}ms total_med={total_ms:.1}ms \
-             tracks_med={tracks}{mapping_part}",
+             tracks_med={tracks} lm_med={}{mapping_part}",
             self.imu_received as f64 / elapsed,
             self.images_received as f64 / elapsed,
             self.imu_processed,
@@ -1041,6 +1180,7 @@ impl VioNode {
             self.image_queue.len(),
             self.dropped_imu,
             self.dropped_images,
+            median_deque_usize(&self.landmark_counts).unwrap_or(0),
         );
     }
 }
@@ -1124,6 +1264,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             None
         };
+    let landmark_pub = node.create_publisher::<r2r::sensor_msgs::msg::PointCloud2>(
+        "/echo_li/landmarks",
+        r2r::QosProfile::default(),
+    )?;
 
     // Subscribers
     let mut imu_sub = node.subscribe::<r2r::sensor_msgs::msg::Imu>(&params.imu_topic, imu_qos)?;
@@ -1150,12 +1294,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut stats_timer = node.create_wall_timer(stats_dur)?;
 
     log::info!(
-        "ECHO-LI ready: imu={}, image={}, camera={}x{} {}, \
+        "ECHO-LI ready: imu={}, image={}, camera={}x{} (scale={}) {}, \
          camera_time_offset={:+.6}s, image_qos={}",
         params.imu_topic,
         params.image_topic,
-        params.width,
-        params.height,
+        (params.width as f64 * params.image_scale).round() as usize,
+        (params.height as f64 * params.image_scale).round() as usize,
+        params.image_scale,
         params.camera_model,
         params.camera_offset_ns as f64 / NSEC_PER_SEC as f64,
         if params.image_qos_reliable {
@@ -1166,6 +1311,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let mut state = VioNode::new(&params);
+    let traj_output = params.trajectory_output.clone();
 
     // Spin the underlying rcl node in a background thread
     let _spin = tokio::task::spawn_blocking(move || {
@@ -1174,15 +1320,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+
     loop {
         tokio::select! {
             Some(msg) = imu_sub.next() => {
                 state.on_imu(&msg);
-                state.drain_queues(&odom_pub, tf_pub.as_ref());
+                state.drain_queues(&odom_pub, tf_pub.as_ref(), &landmark_pub);
             }
             Some(msg) = image_sub.next() => {
                 state.on_image(msg);
-                state.drain_queues(&odom_pub, tf_pub.as_ref());
+                state.drain_queues(&odom_pub, tf_pub.as_ref(), &landmark_pub);
             }
             msg = async {
                 match mocap_sub.as_mut() {
@@ -1207,6 +1356,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ = stats_timer.tick() => {
                 state.report_statistics();
             }
+            _ = sigint.recv() => { break; }
+            _ = sigterm.recv() => { break; }
         }
     }
+
+    state.report_statistics();
+    if !traj_output.is_empty() {
+        state.save_trajectory(&traj_output);
+    }
+
+    Ok(())
 }
