@@ -58,15 +58,33 @@ pub struct PyMSCEqFNativeFilter {
 }
 
 impl PyMSCEqFNativeFilter {
-    /// Translate `[(clone_id, u_n, v_n)]` into `MscTrackObs` on live clones.
+    /// Translate `[(clone_id, u_n, v_n)]` into `MscTrackObs` on live clones (mono).
     /// (Private — kept out of `#[pymethods]` so pyo3 does not try to export it.)
     fn obs_on_live_clones(&self, obs_list: &[(u64, f64, f64)]) -> Vec<MscTrackObs> {
+        self.obs_with_range(obs_list, None)
+    }
+
+    /// Like `obs_on_live_clones`, but attaches each observation's metric log-inverse-
+    /// range measurement `(ell_obs, r_ell)` when a match (same `clone_id`) is present
+    /// in `range` (`[(clone_id, ell_obs, r_ell)]`). This is EqVIO's stereo channel:
+    /// `ell_obs = -ln(range_metric)` from the rectified stereo depth, `r_ell` its
+    /// variance in log-range. Left obs without a range match keep `stereo_range = None`
+    /// (bearing row only). The filter adds one 1-D range row per obs that carries it.
+    fn obs_with_range(
+        &self,
+        obs_list: &[(u64, f64, f64)],
+        range: Option<&[(u64, f64, f64)]>,
+    ) -> Vec<MscTrackObs> {
+        let range_map: HashMap<u64, (f64, f64)> = range
+            .map(|r| r.iter().map(|&(cid, ell, rv)| (cid, (ell, rv))).collect())
+            .unwrap_or_default();
         let mut obs: Vec<MscTrackObs> = Vec::new();
         for &(cid, un, vn) in obs_list {
             if let Some(pos) = self.clone_ids.iter().position(|&c| c == cid) {
                 obs.push(MscTrackObs {
                     clone: pos,
                     uvn: Vector2::new(un, vn),
+                    stereo_range: range_map.get(&cid).copied(),
                 });
             }
         }
@@ -143,6 +161,30 @@ impl PyMSCEqFNativeFilter {
         }
     }
 
+    /// Enable rectified-stereo metric births/updates with the given baseline (m).
+    /// Once set, `birth_landmark`/`landmark_stream_update` consume the right-camera
+    /// normalized coordinates passed via their `right` argument: a stereo pair fixes
+    /// SCALE (metric depth) at birth. Pass `None`/omit `right` to stay mono.
+    fn set_stereo_baseline(&mut self, baseline: f64) {
+        self.filter.stereo_baseline = Some(baseline);
+    }
+
+    /// Disable stereo (revert to mono births/updates).
+    fn clear_stereo_baseline(&mut self) {
+        self.filter.stereo_baseline = None;
+    }
+
+    #[getter]
+    fn stereo_baseline(&self) -> Option<f64> {
+        self.filter.stereo_baseline
+    }
+
+
+
+
+
+
+
     /// Propagate one IMU step (covariance then mean). `gyro`/`accel` are body-frame.
     fn process_imu(
         &mut self,
@@ -188,6 +230,7 @@ impl PyMSCEqFNativeFilter {
     fn n_clones(&self) -> usize {
         self.filter.x.clones.len()
     }
+
     fn clone_ids(&self) -> Vec<u64> {
         self.clone_ids.clone()
     }
@@ -229,6 +272,7 @@ impl PyMSCEqFNativeFilter {
                     obs.push(MscTrackObs {
                         clone: pos,
                         uvn: Vector2::new(un, vn),
+                        stereo_range: None, // structureless MSC update is mono (bearing)
                     });
                 }
             }
@@ -246,17 +290,22 @@ impl PyMSCEqFNativeFilter {
     // ---- In-state (SLAM) landmarks --------------------------------------------
 
     /// Promote a structureless track to an in-state landmark. `obs` is
-    /// `[(clone_id, u_n, v_n)]` (normalized). Triangulates in the oldest observing
-    /// clone's frame, χ²-gates the geometry, and augments the state with a
+    /// `[(clone_id, u_n, v_n)]` (normalized). Triangulates (mono) in the oldest
+    /// observing clone's frame, χ²-gates the geometry, and augments the state with a
     /// correlated SOT3 landmark. Returns True if the landmark was born (tagged by
     /// `track_id` for later `landmark_update`/`reanchor`/`marginalize`).
-    #[pyo3(signature = (track_id, obs, pixel_std, chi2_mult=1.0))]
+    /// `range_prior = (range, r_ell)` births the depth TIGHT+METRIC from the measured
+    /// stereo range (see `MSCEqFFilter::birth_landmark`); `None` = mono birth. Tight
+    /// birth replaces the earlier per-frame range-STREAM channel — a loose mono depth
+    /// absorbs a streamed range before it can move the trajectory baseline.
+    #[pyo3(signature = (track_id, obs, pixel_std, chi2_mult=1.0, range_prior=None))]
     fn birth_landmark(
         &mut self,
         track_id: u64,
         obs: Vec<(u64, f64, f64)>,
         pixel_std: f64,
         chi2_mult: f64,
+        range_prior: Option<(f64, f64)>,
     ) -> bool {
         if self.landmark_ids.contains(&track_id) {
             return false; // already in-state
@@ -268,7 +317,7 @@ impl PyMSCEqFNativeFilter {
         let track = MscTrack { obs };
         match self
             .filter
-            .birth_landmark(&track, &self.cam, pixel_std, chi2_mult)
+            .birth_landmark(&track, &self.cam, pixel_std, chi2_mult, range_prior)
         {
             Some(j) => {
                 debug_assert_eq!(j, self.landmark_ids.len(), "birth appends at tail");
@@ -322,12 +371,18 @@ impl PyMSCEqFNativeFilter {
     /// (anchor obs, if present, are ignored). Returns the accepted count. This is the
     /// update the driver calls every frame for persistent features; `landmark_update`
     /// (batch, anchor re-observed) is only for one-shot re-triangulation.
-    #[pyo3(signature = (updates, pixel_std, chi2_mult=1.0))]
+    /// `stereo` (optional) maps `track_id -> [(clone_id, ell_obs, r_ell)]`: each
+    /// streamed obs with a matching entry adds EqVIO's metric log-inverse-range row
+    /// (`ell_obs = -ln(range_metric)`, `r_ell` = log-range variance), so persistent
+    /// landmarks get per-frame absolute-scale refinement. This is the channel that
+    /// pins scale (birth is mono).
+    #[pyo3(signature = (updates, pixel_std, chi2_mult=1.0, stereo=None))]
     fn landmark_stream_update(
         &mut self,
         updates: HashMap<u64, Vec<(u64, f64, f64)>>,
         pixel_std: f64,
         chi2_mult: f64,
+        stereo: Option<HashMap<u64, Vec<(u64, f64, f64)>>>,
     ) -> usize {
         let mut lm_updates: Vec<LmStreamUpdate> = Vec::new();
         // Sorted iteration for run-to-run determinism (see msc_update note).
@@ -339,7 +394,8 @@ impl PyMSCEqFNativeFilter {
                 Some(j) => j,
                 None => continue,
             };
-            let obs = self.obs_on_live_clones(obs_list);
+            let range_list = stereo.as_ref().and_then(|r| r.get(tid));
+            let obs = self.obs_with_range(obs_list, range_list.map(|v| v.as_slice()));
             if obs.is_empty() {
                 continue;
             }
@@ -409,6 +465,29 @@ impl PyMSCEqFNativeFilter {
         Some(PyArray1::from_slice(py, w.as_slice()))
     }
 
+    /// Metric range of landmark `track_id` in its OWN anchor camera frame
+    /// (`|q·origin|`), or None if the track is not in-state. Frame-clean (no world
+    /// / phi mismatch): this is exactly the depth the filter assigns the landmark.
+    fn landmark_range_anchor(&self, track_id: u64) -> Option<f64> {
+        let j = self.landmark_ids.iter().position(|&t| t == track_id)?;
+        Some(self.filter.x.landmarks[j].point().norm())
+    }
+
+    /// Predicted range `‖q_k‖` of landmark `track_id` as seen from live clone
+    /// `clone_id` (q_k = clone_k⁻¹ · anchor · point, the LIFTED-frame range the stereo
+    /// channel compares against the metric measurement). None if the track/clone/anchor
+    /// is not live. Diagnostic: `ln(pred/D)` is the stream range innovation, telling
+    /// whether the lifted map is metric at NON-anchor clones (vs only at birth).
+    fn landmark_pred_range(&self, track_id: u64, clone_id: u64) -> Option<f64> {
+        let j = self.landmark_ids.iter().position(|&t| t == track_id)?;
+        let lm = &self.filter.x.landmarks[j];
+        let anchor = self.filter.x.clones.iter().find(|c| c.stamp == lm.anchor)?;
+        let kpos = self.clone_ids.iter().position(|&c| c == clone_id)?;
+        let clone_k = &self.filter.x.clones[kpos].pose;
+        let g = anchor.pose.act(&lm.point());
+        Some(clone_k.inverse().act(&g).norm())
+    }
+
     /// The 3x3 covariance block (chart tangent) of landmark `track_id`, or None if
     /// the track is not in-state.
     fn landmark_cov<'py>(
@@ -458,8 +537,40 @@ impl PyMSCEqFNativeFilter {
         PyArray1::from_slice(py, nav.b.as_slice())
     }
 
+    /// The 21x21 core-state covariance block (chart/algebra tangent), ordered
+    /// [Dd: att(0:3) vel(3:6) pos(6:9) delta(9:15) | E: att(15:18) pos(18:21)].
+    /// Diagnostic only: lets Python read the scale/velocity-direction variance
+    /// `v̂ᵀ P_vv v̂` and the att↔vel / bias↔vel cross-terms over time.
+    fn nav_cov<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
+        let n = 21usize;
+        let mut m = Array2::<f64>::zeros((n, n));
+        for r in 0..n {
+            for c in 0..n {
+                m[[r, c]] = self.filter.cov[(r, c)];
+            }
+        }
+        PyArray2::from_array(py, &m)
+    }
+
     /// Total covariance dimension (`21 + 6*n_clones`).
     fn cov_dim(&self) -> usize {
         self.filter.dim()
+    }
+
+
+    /// DIAGNOSTIC: per-accepted-landmark-update nav-correction-vs-baseline log,
+    /// as an (N, 9) array. Columns: `[baseline_m, range_m, yaw_inc,
+    /// vel_along_vhat_inc, att_inc_norm, vel_inc_norm, pos_inc_norm, chi2_d, rows]`.
+    /// Distinguishing test for the current-estimate relinearization long-baseline
+    /// leak (nav correction growing with anchor baseline). See core `lm_upd_diag`.
+    fn lm_upd_diag<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
+        let rows = self.filter.lm_upd_diag.len();
+        let mut m = Array2::<f64>::zeros((rows, 9));
+        for (i, r) in self.filter.lm_upd_diag.iter().enumerate() {
+            for c in 0..9 {
+                m[[i, c]] = r[c];
+            }
+        }
+        PyArray2::from_array(py, &m)
     }
 }

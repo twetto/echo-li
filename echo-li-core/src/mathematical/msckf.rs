@@ -24,7 +24,7 @@
 //! because a right perturbation moves the point as `q(δ) ≈ q + [q]× ω − v`.
 
 use echo_lie::SE3;
-use nalgebra::{DMatrix, DVector, Matrix3, Vector2, Vector3};
+use nalgebra::{DMatrix, DVector, Matrix2x3, Matrix3, Vector2, Vector3};
 
 use crate::mathematical::camera::CameraModel;
 
@@ -46,6 +46,153 @@ pub struct MscObs {
 #[inline]
 fn skew3(v: &Vector3<f64>) -> Matrix3<f64> {
     Matrix3::new(0.0, -v[2], v[1], v[2], 0.0, -v[0], -v[1], v[0], 0.0)
+}
+
+/// Orthonormal tangent basis `B = [e1 e2]` (3×2) of the plane ⊥ `b` (unit).
+/// Deterministic: seed with the world axis least aligned with `b`, Gram-Schmidt,
+/// then `e2 = b × e1`. Right-handed `(e1, e2, b)`.
+#[inline]
+/// `ECHO_MSC_PIXEL_WHITEN=1`: make the S²-bearing measurement noise consistent with
+/// the sensor's ACTUAL noise, which is isotropic in PIXELS (KLT/detector), not on the
+/// sphere.
+///
+/// The residual is `r = Bᵀ(b_meas − b̂)` with `b_meas = g(x,y) = (x,y,1)/‖(x,y,1)‖`
+/// the normalized-plane point lifted to S². Isotropic pixel noise `σ_n` on `(x,y)`
+/// therefore induces `Σ_r = σ_n² M Mᵀ`, `M = Bᵀ ∂g/∂(x,y)` (2×2) — NOT `σ_n² I`, which
+/// is what an isotropic-on-bearing `R` assumes. `M`'s singular values are
+/// `1/(1+r²)` (radial) and `1/√(1+r²)` (tangential) for normalized radius `r`, so the
+/// isotropic assumption UNDER-weights off-axis observations by `(1+r²)²` / `(1+r²)` in
+/// information. On this 90° MidAir camera the median observation sits at `r≈0.68`
+/// (2.15× radial, 1.47× tangential) and 34% sit beyond `r>0.8`, so the mis-weighting
+/// is the typical case, not a corner case — and it is ANISOTROPIC, so it distorts the
+/// DIRECTION of the information, not just its magnitude.
+///
+/// Fix: left-multiply this observation's residual and Jacobian rows by
+/// `W = (M Mᵀ)^{-1/2}`, which turns the effective noise back into `σ_n² I` — the same
+/// noise model OpenVINS gets for free by residualing in the pixel plane. This changes
+/// the NOISE MODEL only; the S²/equivariant geometry is untouched.
+/// `ECHO_MSC_Z1_CHART=1`: use the UNIT-PLANE (Z1) measurement chart instead of the S²
+/// bearing chart — restoring fidelity to BOTH the paper and the reference C++.
+///
+/// MSCEqF paper Eq. (2) defines the output map with `πZ1(v) := v/z`, and the reference
+/// C++ ships `measurement_projection_method: unit_plane` in every config while its
+/// `ProjectionHelperS2::residualJacobianBlock` throws `"not implemented yet"`. Our
+/// `feature_jacobians_anchored_left` nonetheless implements an S² bearing residual
+/// while its own doc-comment claims to mirror `ProjectionHelperZ1`. S² is exactly a
+/// per-observation 2×2 left preconditioner of the Z1 rows, so with an isotropic `R` it
+/// silently reweights each observation by the local `∂b/∂(x,y)` — on this 90° camera
+/// that under-weights the median feature ~2.15× radially. OpenVINS residuals in the
+/// pixel plane too, so this also removes a real echo-vs-OV difference.
+///
+/// Z1 form (mirroring `updater_helper.cpp`):
+///   `r   = uvn_meas − (q_x/q_z, q_y/q_z)`
+///   `Jπ  = [[1/z, 0, −x/z²], [0, 1/z, −y/z²]]`   (`ProjectionHelperZ1::dpi`)
+/// Everything downstream (`H_f = Jπ R_kᵀ R_a`, clone band, anchor = −clone, nullspace
+/// projection) is unchanged — only the chart of the 2 rows per observation differs.
+fn z1_chart_enabled() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("ECHO_MSC_Z1_CHART").as_deref() == Ok("1"))
+}
+
+/// `ProjectionHelperZ1::dpi` — derivative of the unit-plane projection at `f`.
+fn dpi_z1(f: &Vector3<f64>) -> Matrix2x3<f64> {
+    let z = f[2];
+    let zi = 1.0 / z;
+    let zi2 = zi * zi;
+    Matrix2x3::new(zi, 0.0, -f[0] * zi2, 0.0, zi, -f[1] * zi2)
+}
+
+fn pixel_whiten_enabled() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("ECHO_MSC_PIXEL_WHITEN").as_deref() == Ok("1"))
+}
+
+/// `W = (M Mᵀ)^{-1/2}` for the observation whose normalized-plane point is `uv` and
+/// whose Jacobian/residual rows live in the tangent basis `(e1, e2)` at `bhat`.
+/// Returns `None` if the geometry is degenerate (caller then skips whitening).
+fn pixel_whitener(
+    uv: &Vector2<f64>,
+    bhat: &Vector3<f64>,
+    e1: &Vector3<f64>,
+    e2: &Vector3<f64>,
+) -> Option<nalgebra::Matrix2<f64>> {
+    let _ = bhat;
+    // b_meas = v/‖v‖, v = (x, y, 1);  ∂b/∂(x,y) = ((I − b bᵀ)/‖v‖)[:, 0:2]
+    let v = Vector3::new(uv[0], uv[1], 1.0);
+    let vn = v.norm();
+    if !(vn > 1e-9) {
+        return None;
+    }
+    let b = v / vn;
+    let pb = (Matrix3::identity() - b * b.transpose()) / vn;
+    // M = [e1ᵀ; e2ᵀ] · ∂b/∂(x,y)   (2×2)
+    let m = nalgebra::Matrix2::new(
+        e1.dot(&pb.column(0)),
+        e1.dot(&pb.column(1)),
+        e2.dot(&pb.column(0)),
+        e2.dot(&pb.column(1)),
+    );
+    let mmt = m * m.transpose();
+    // (M Mᵀ)^{-1/2} via symmetric eigendecomposition (2×2 SPD).
+    let eig = mmt.symmetric_eigen();
+    let (l0, l1) = (eig.eigenvalues[0], eig.eigenvalues[1]);
+    if !(l0 > 1e-18) || !(l1 > 1e-18) {
+        return None;
+    }
+    let d = nalgebra::Matrix2::new(1.0 / l0.sqrt(), 0.0, 0.0, 1.0 / l1.sqrt());
+    Some(eig.eigenvectors * d * eig.eigenvectors.transpose())
+}
+
+fn tangent_basis(b: &Vector3<f64>) -> (Vector3<f64>, Vector3<f64>) {
+    // Least-aligned axis => the seed is never (near-)parallel to b.
+    let (ax, ay, az) = (b[0].abs(), b[1].abs(), b[2].abs());
+    let seed = if ax <= ay && ax <= az {
+        Vector3::new(1.0, 0.0, 0.0)
+    } else if ay <= az {
+        Vector3::new(0.0, 1.0, 0.0)
+    } else {
+        Vector3::new(0.0, 0.0, 1.0)
+    };
+    let e1 = (seed - b * b.dot(&seed)).normalize();
+    let e2 = b.cross(&e1);
+    (e1, e2)
+}
+
+/// Bearing measurement on S² (replaces the perspective/pinhole residual).
+///
+/// The prediction is the unit bearing `b̂ = q/|q|` of the camera-frame point `q`;
+/// `b_meas` is the measured unit bearing. With an orthonormal tangent basis
+/// `B = [e1 e2]` at `b̂` (columns ⊥ b̂), this returns
+/// - residual `r = Bᵀ(b_meas − b̂)`   (2-vector, tangent-plane `z − h`), and
+/// - Jacobian `∂b̂/∂q = Bᵀ (I − b̂b̂ᵀ)/|q| = Bᵀ/|q|`  (2×3, since `eᵢ ⊥ b̂`).
+///
+/// Same `(res: 2, J: 2×3)` shape as the pinhole `(uv − project, projection_jacobian)`
+/// pair, so every pose chain-rule downstream is untouched — only the 2×3 block and
+/// the residual change. Noise is angular (rad); for a pinhole at focal `f` the old
+/// normalized-pixel `σ = σ_px/f` is the small-angle bearing σ, so the same numeric
+/// `pixel_std` carries over. Returns `None` if `q` is degenerate (|q|→0).
+pub fn bearing_meas(q: &Vector3<f64>, b_meas: &Vector3<f64>) -> Option<(Vector2<f64>, Matrix2x3<f64>)> {
+    let n = q.norm();
+    if n < 1e-9 {
+        return None;
+    }
+    let bhat = q / n;
+    let (e1, e2) = tangent_basis(&bhat);
+    let d = b_meas - bhat;
+    let res = Vector2::new(e1.dot(&d), e2.dot(&d));
+    let mut j = Matrix2x3::zeros();
+    j.row_mut(0).copy_from(&(e1.transpose() / n));
+    j.row_mut(1).copy_from(&(e2.transpose() / n));
+    Some((res, j))
+}
+
+/// Unit bearing implied by a normalized (z=1-plane) observation `uv` — the lossless
+/// map `(u,v) → normalize(u, v, 1)` used to feed [`bearing_meas`] from the existing
+/// `MscObs.uv` interface. For a true bearing camera the caller supplies the unit
+/// vector directly and skips this.
+#[inline]
+pub fn bearing_of_uv(uv: &Vector2<f64>) -> Vector3<f64> {
+    Vector3::new(uv[0], uv[1], 1.0).normalize()
 }
 
 /// Triangulation quality gates, mirroring OpenVINS `FeatureInitializerOptions`
@@ -632,19 +779,46 @@ pub fn feature_jacobians_anchored_left(
         .view_mut((0, 3), (3, 3))
         .copy_from(&(-Matrix3::identity()));
 
+    let _ = cam; // bearing residual needs no projection model (uv is normalized)
     for (k, o) in obs.iter().enumerate() {
         let inv = o.pose.inverse();
         let q = inv.act(x_f); // feature in clone-k camera frame
         if q[2] <= 1e-6 {
             return None;
         }
-        let jpi = cam.projection_jacobian(&q); // 2×3 (D)
+        // Measurement chart: S² bearing by default, or the paper/reference Z1 unit plane
+        // under `ECHO_MSC_Z1_CHART=1` (see `z1_chart_enabled`).
+        let z1 = z1_chart_enabled();
+        let (r, jpi) = if z1 {
+            (
+                Vector2::new(o.uv[0] - q[0] / q[2], o.uv[1] - q[1] / q[2]),
+                dpi_z1(&q),
+            )
+        } else {
+            bearing_meas(&q, &bearing_of_uv(&o.uv))?
+        };
         let rt_k = o.pose.rotation.inverse().as_matrix(); // R_kᵀ (world→cam k)
 
         // H_f = Jπ · R_kᵀ R_a  (∂q_k/∂f_a) — identical to the right-chart form.
-        let hf = jpi * rt_k * r_a;
+        let mut hf = jpi * rt_k * r_a;
+        // LEFT/global clone col = Jπ · R_kᵀ · [ [G0]× | −I ]; anchor band = −clone.
+        let mut clone_col = (jpi * rt_k) * a_mat.clone(); // 2×6
+        let mut r = r;
 
-        let r = o.uv - cam.project(&q);
+        // Whiten this observation's rows so the effective noise matches isotropic
+        // PIXEL noise instead of isotropic bearing noise (see `pixel_whiten_enabled`).
+        // Whitening only makes sense for the S² chart (it un-does S²'s preconditioner);
+        // under Z1 the rows are already in the chart the noise model assumes.
+        if pixel_whiten_enabled() && !z1 {
+            let bhat_j = q / q.norm();
+            let (e1, e2) = tangent_basis(&bhat_j);
+            if let Some(w) = pixel_whitener(&o.uv, &bhat_j, &e1, &e2) {
+                hf = w * hf;
+                clone_col = w * clone_col;
+                r = w * r;
+            }
+        }
+
         for a in 0..2 {
             for c in 0..3 {
                 h_f[(2 * k + a, c)] = hf[(a, c)];
@@ -656,8 +830,6 @@ pub fn feature_jacobians_anchored_left(
             continue; // anchor obs: +clone − clone = 0 net pose Jacobian
         }
 
-        // LEFT/global clone col = Jπ · R_kᵀ · [ [G0]× | −I ]; anchor band = −clone.
-        let clone_col = (jpi * rt_k) * a_mat.clone(); // 2×6
         for a in 0..2 {
             for c in 0..6 {
                 h_x[(2 * k + a, 6 * k + c)] = clone_col[(a, c)]; // band k (clone)
@@ -672,6 +844,143 @@ pub fn feature_jacobians_anchored_left(
         return None;
     }
     Some((h_f, h_x, res))
+}
+
+/// Stereo-augmented anchored-left bearing Jacobians for a rectified pair.
+///
+/// Same anchored-left formulation as [`feature_jacobians_anchored_left`], but each
+/// observation `k` with a present `right[k]` (the right-camera normalized bearing)
+/// contributes an EXTRA 2-row bearing block at the rectified right camera
+/// `q_r = q − [baseline, 0, 0]` (R_lr = I, t_lr = [b,0,0] = left→right). Because the
+/// right camera is a fixed rigid offset, `dq_r/dq = I`, so the pose/feature chain
+/// factors (`R_kᵀ`, `R_a`, `A = [[G]×|−I]`) are the SAME as the left row — only the
+/// projection point and measured bearing change. Rows are ordered
+/// `[left_0, (right_0?), left_1, (right_1?), …]`. The right block is what injects
+/// METRIC SCALE: at the anchor (`k==0`) it carries a feature Jacobian (through the
+/// anchor-frame point) with zero clone Jacobian, so even a single stereo clone gives
+/// a full-rank 3-D depth constraint. `right.len()` must equal `obs.len()`.
+pub fn feature_jacobians_anchored_left_stereo(
+    x_f: &Vector3<f64>,
+    obs: &[MscObs],
+    right: &[Option<Vector2<f64>>],
+    baseline: f64,
+) -> Option<(DMatrix<f64>, DMatrix<f64>, DVector<f64>)> {
+    let n = obs.len();
+    if n < 2 || right.len() != n {
+        return None;
+    }
+    let anchor = &obs[0].pose;
+    let r_a = anchor.rotation.as_matrix();
+    let g0 = *x_f;
+    let mut a_mat = DMatrix::<f64>::zeros(3, 6);
+    a_mat.view_mut((0, 0), (3, 3)).copy_from(&skew3(&g0));
+    a_mat
+        .view_mut((0, 3), (3, 3))
+        .copy_from(&(-Matrix3::identity()));
+    let t_lr = Vector3::new(baseline, 0.0, 0.0);
+
+    let n_right = right.iter().filter(|r| r.is_some()).count();
+    let rows = 2 * (n + n_right);
+    let mut h_f = DMatrix::<f64>::zeros(rows, 3);
+    let mut h_x = DMatrix::<f64>::zeros(rows, 6 * n);
+    let mut res = DVector::<f64>::zeros(rows);
+
+    let mut row = 0usize;
+    for (k, o) in obs.iter().enumerate() {
+        let inv = o.pose.inverse();
+        let q = inv.act(x_f); // left-cam point
+        if q[2] <= 1e-6 {
+            return None;
+        }
+        let rt_k = o.pose.rotation.inverse().as_matrix(); // R_kᵀ
+
+        // --- LEFT bearing row ---
+        {
+            let b_meas = bearing_of_uv(&o.uv);
+            let (r, jpi) = bearing_meas(&q, &b_meas)?;
+            let hf = jpi * rt_k * r_a;
+            for a in 0..2 {
+                for c in 0..3 {
+                    h_f[(row + a, c)] = hf[(a, c)];
+                }
+                res[row + a] = r[a];
+            }
+            if k > 0 {
+                let clone_col = (jpi * rt_k) * a_mat.clone();
+                for a in 0..2 {
+                    for c in 0..6 {
+                        h_x[(row + a, 6 * k + c)] = clone_col[(a, c)];
+                        h_x[(row + a, c)] -= clone_col[(a, c)];
+                    }
+                }
+            }
+            row += 2;
+        }
+
+        // --- RIGHT bearing row (rectified: q_r = q − [b,0,0], dq_r/dq = I) ---
+        if let Some(uvr) = right[k] {
+            let q_r = q - t_lr;
+            if q_r[2] <= 1e-6 {
+                return None;
+            }
+            let b_meas = bearing_of_uv(&uvr);
+            let (r, jpi) = bearing_meas(&q_r, &b_meas)?;
+            let hf = jpi * rt_k * r_a; // dq_r/dq = I ⇒ same chain as left
+            for a in 0..2 {
+                for c in 0..3 {
+                    h_f[(row + a, c)] = hf[(a, c)];
+                }
+                res[row + a] = r[a];
+            }
+            if k > 0 {
+                let clone_col = (jpi * rt_k) * a_mat.clone();
+                for a in 0..2 {
+                    for c in 0..6 {
+                        h_x[(row + a, 6 * k + c)] = clone_col[(a, c)];
+                        h_x[(row + a, c)] -= clone_col[(a, c)];
+                    }
+                }
+            }
+            row += 2;
+        }
+    }
+    if !h_f.iter().all(|v| v.is_finite())
+        || !h_x.iter().all(|v| v.is_finite())
+        || !res.iter().all(|v| v.is_finite())
+    {
+        return None;
+    }
+    Some((h_f, h_x, res))
+}
+
+/// Metric multi-view triangulation for a rectified stereo track. Appends each
+/// present right observation as an extra view at the right-camera pose
+/// `pose · SE3(I, [baseline,0,0])` (world←rightcam), so the fixed baseline fixes
+/// SCALE — the whole point of stereo birth.
+pub fn triangulate_stereo(
+    obs: &[MscObs],
+    right: &[Option<Vector2<f64>>],
+    baseline: f64,
+    cam: &dyn CameraModel,
+) -> Option<Vector3<f64>> {
+    let t_lr = SE3::new(echo_lie::SO3::identity(), Vector3::new(baseline, 0.0, 0.0));
+    let mut aug: Vec<MscObs> = Vec::with_capacity(obs.len() * 2);
+    for (k, o) in obs.iter().enumerate() {
+        aug.push(MscObs {
+            pose: o.pose.clone(),
+            pose_fej: o.pose.clone(),
+            uv: o.uv,
+        });
+        if let Some(uvr) = right.get(k).copied().flatten() {
+            let pose_r = o.pose.compose(&t_lr);
+            aug.push(MscObs {
+                pose: pose_r.clone(),
+                pose_fej: pose_r,
+                uv: uvr,
+            });
+        }
+    }
+    triangulate(&aug, cam)
 }
 
 /// Orthonormal basis (`2N×(2N−3)`) of the LEFT nullspace of `h_f` (`2N×3`).
@@ -832,6 +1141,52 @@ mod tests {
         }
     }
 
+    /// Z1 normalized model (project → (x/z, y/z)); bearing_of_uv assumes this.
+    fn norm_cam_local() -> PinholeModel {
+        PinholeModel {
+            fx: 1.0,
+            fy: 1.0,
+            cx: 0.0,
+            cy: 0.0,
+        }
+    }
+
+    /// The bearing Jacobian `∂b̂/∂q` matches central finite differences, and the
+    /// residual is a pure tangent vector (⊥ b̂) that vanishes when b_meas == b̂.
+    #[test]
+    fn bearing_jacobian_matches_numeric() {
+        for q in [
+            Vector3::new(0.3, -0.2, 1.4),
+            Vector3::new(-1.1, 0.7, 2.0),
+            Vector3::new(0.05, 0.02, 0.9),
+        ] {
+            let bm = Vector3::new(0.31, -0.18, 1.41).normalize();
+            let (res, j) = bearing_meas(&q, &bm).unwrap();
+            // Analytic J vs central differences of res(q) w.r.t. q (basis fixed at q0).
+            let bhat0 = q.normalize();
+            let (e1, e2) = tangent_basis(&bhat0);
+            let h = 1e-6;
+            for c in 0..3 {
+                let mut qp = q;
+                let mut qm = q;
+                qp[c] += h;
+                qm[c] -= h;
+                // res = Bᵀ(b_meas − b̂); dres/dq = −Bᵀ dbhat/dq (B held at q0).
+                let rp = Vector2::new(e1.dot(&(bm - qp.normalize())), e2.dot(&(bm - qp.normalize())));
+                let rm = Vector2::new(e1.dot(&(bm - qm.normalize())), e2.dot(&(bm - qm.normalize())));
+                let num = (rp - rm) / (2.0 * h); // = −J column c
+                for a in 0..2 {
+                    assert!((num[a] + j[(a, c)]).abs() < 1e-4, "J mismatch at q={q:?} c={c} a={a}: num {} ana {}", num[a], j[(a, c)]);
+                }
+            }
+            // Zero residual when the measurement equals the prediction.
+            let (r0, _) = bearing_meas(&q, &bhat0).unwrap();
+            assert!(r0.norm() < 1e-12, "res should vanish at b_meas=b̂: {}", r0.norm());
+            // Residual is finite and consistent with the tangent projection.
+            assert!(res.iter().all(|v| v.is_finite()));
+        }
+    }
+
     /// A synthetic 3-D point seen from a few poses triangulates back to itself.
     #[test]
     fn triangulation_recovers_synthetic_point() {
@@ -861,6 +1216,143 @@ mod tests {
             (x_hat - x_true).norm() < 1e-6,
             "triangulated {x_hat:?} vs {x_true:?}"
         );
+    }
+
+    /// Stereo births are METRIC: a single stereo pair (one clone, left+right obs of
+    /// a rectified rig with a KNOWN baseline) recovers the true depth — where a mono
+    /// single-view triangulation is rank-deficient (a whole ray of solutions). This
+    /// is the geometric basis of the scale claim for stereo births.
+    #[test]
+    fn triangulate_stereo_recovers_metric_depth_single_view() {
+        let c = cam();
+        let baseline = 0.25;
+        let x_true = Vector3::new(0.7, -0.4, 6.0); // world point (world == left cam here)
+        let pose = SE3::identity(); // single clone at origin (world←left)
+        let q_l = pose.inverse().act(&x_true);
+        // Right cam is at +baseline in x (world←right = world←left · SE3(I,[b,0,0])).
+        let t_lr = SE3::new(SO3::identity(), Vector3::new(baseline, 0.0, 0.0));
+        let q_r = pose.compose(&t_lr).inverse().act(&x_true);
+        let obs = vec![MscObs {
+            pose: pose.clone(),
+            pose_fej: pose.clone(),
+            uv: c.project(&q_l),
+        }];
+        let right = vec![Some(c.project(&q_r))];
+        // Mono single view cannot triangulate (needs ≥2 views); stereo pins metric depth.
+        assert!(
+            triangulate(&obs, &c).is_none(),
+            "single mono view must be rank-deficient"
+        );
+        let x_hat =
+            triangulate_stereo(&obs, &right, baseline, &c).expect("stereo triangulation");
+        assert!(
+            (x_hat - x_true).norm() < 1e-6,
+            "stereo point {x_hat:?} vs {x_true:?} — depth is metric"
+        );
+        // A WRONG baseline moves the recovered depth ∝ baseline (proves scale is set
+        // by the baseline, not an accident): 2× baseline ⇒ ~2× the range from the rig.
+        let x_2b = triangulate_stereo(&obs, &right, 2.0 * baseline, &c).unwrap();
+        let r_true = (x_true - pose.translation).norm();
+        let r_2b = (x_2b - pose.translation).norm();
+        assert!(
+            (r_2b / r_true - 2.0).abs() < 1e-3,
+            "range should scale with baseline: {r_2b} vs {}",
+            2.0 * r_true
+        );
+    }
+
+    /// The stereo feature Jacobian (left + right rows) matches central finite
+    /// differences w.r.t. the feature position, and the residual vanishes on exact
+    /// (noise-free) stereo observations.
+    #[test]
+    fn stereo_jacobian_matches_numeric() {
+        let c = norm_cam_local();
+        let baseline = 0.25;
+        let x_f = Vector3::new(0.3, -0.2, 5.0);
+        let poses = [
+            SE3::identity(),
+            SE3::new(
+                SO3::exp(&Vector3::new(0.0, 0.04, 0.0)),
+                Vector3::new(1.0, 0.1, -0.2),
+            ),
+        ];
+        let t_lr = SE3::new(SO3::identity(), Vector3::new(baseline, 0.0, 0.0));
+        let obs: Vec<MscObs> = poses
+            .iter()
+            .map(|p| {
+                let q = p.inverse().act(&x_f);
+                MscObs {
+                    pose: p.clone(),
+                    pose_fej: p.clone(),
+                    uv: c.project(&q),
+                }
+            })
+            .collect();
+        let right: Vec<Option<Vector2<f64>>> = poses
+            .iter()
+            .map(|p| {
+                let q_r = p.compose(&t_lr).inverse().act(&x_f);
+                Some(c.project(&q_r))
+            })
+            .collect();
+        let (h_f, _h_x, res) =
+            feature_jacobians_anchored_left_stereo(&x_f, &obs, &right, baseline)
+                .expect("stereo jacobians");
+        // Exact obs ⇒ zero residual.
+        assert!(res.norm() < 1e-9, "exact stereo residual should vanish: {}", res.norm());
+        // rows = 2*(n + n_right) = 2*(2+2) = 8; h_f is 8×3.
+        assert_eq!(h_f.nrows(), 8);
+        // Central-diff each column of h_f: perturb x_f, re-predict, read the residual
+        // (basis held fixed at the unperturbed prediction, matching bearing_meas).
+        let h = 1e-6;
+        for cc in 0..3 {
+            let mut xp = x_f;
+            let mut xm = x_f;
+            xp[cc] += h;
+            xm[cc] -= h;
+            let res_p = stereo_res_at(&xp, &obs, &right, baseline, &c);
+            let res_m = stereo_res_at(&xm, &obs, &right, baseline, &c);
+            let num = (&res_p - &res_m) / (2.0 * h); // = −dh_f column (res = meas−pred)
+            for a in 0..h_f.nrows() {
+                assert!(
+                    (num[a] + h_f[(a, cc)]).abs() < 1e-3,
+                    "h_f mismatch row {a} col {cc}: num {} ana {}",
+                    num[a],
+                    h_f[(a, cc)]
+                );
+            }
+        }
+    }
+
+    /// Stacked left+right bearing residual at a hypothesized feature position, with
+    /// each row's tangent basis held at that same position (matches how the analytic
+    /// Jacobian is linearized — so central differences recover −h_f).
+    fn stereo_res_at(
+        x_f: &Vector3<f64>,
+        obs: &[MscObs],
+        right: &[Option<Vector2<f64>>],
+        baseline: f64,
+        _cam: &PinholeModel,
+    ) -> DVector<f64> {
+        let t_lr = Vector3::new(baseline, 0.0, 0.0);
+        let n_right = right.iter().filter(|r| r.is_some()).count();
+        let mut out = DVector::<f64>::zeros(2 * (obs.len() + n_right));
+        let mut row = 0usize;
+        for (k, o) in obs.iter().enumerate() {
+            let q = o.pose.inverse().act(x_f);
+            let (r, _) = bearing_meas(&q, &bearing_of_uv(&o.uv)).unwrap();
+            out[row] = r[0];
+            out[row + 1] = r[1];
+            row += 2;
+            if let Some(uvr) = right[k] {
+                let q_r = q - t_lr;
+                let (r, _) = bearing_meas(&q_r, &bearing_of_uv(&uvr)).unwrap();
+                out[row] = r[0];
+                out[row + 1] = r[1];
+                row += 2;
+            }
+        }
+        out
     }
 
     /// FEJ: `feature_jacobians` evaluates `h_f`/`h_x` at `pose_fej` (first estimate)
@@ -924,6 +1416,95 @@ mod tests {
             "pose A and B must differ (non-vacuous)"
         );
     }
+
+
+    /// `W = (M Mᵀ)^{-1/2}` must turn the pixel-induced bearing noise `σ² M Mᵀ` into
+    /// `σ² I` — i.e. `W M (W M)ᵀ = I` — and must be a no-op on-axis (r = 0), where
+    /// bearing and pixel-plane noise already coincide.
+    #[test]
+    fn pixel_whitener_equalizes_bearing_noise() {
+        for uv in [
+            Vector2::new(0.0, 0.0),   // on axis
+            Vector2::new(0.68, 0.0),  // median MidAir radius
+            Vector2::new(0.7, 0.7),   // near corner
+            Vector2::new(-0.9, 0.45), // off-axis, mixed sign
+        ] {
+            let bhat = bearing_of_uv(&uv);
+            let (e1, e2) = tangent_basis(&bhat);
+            let w = pixel_whitener(&uv, &bhat, &e1, &e2).expect("whitener");
+            // Rebuild M the same way the whitener does.
+            let v = Vector3::new(uv[0], uv[1], 1.0);
+            let vn = v.norm();
+            let b = v / vn;
+            let pb = (Matrix3::identity() - b * b.transpose()) / vn;
+            let m = nalgebra::Matrix2::new(
+                e1.dot(&pb.column(0)),
+                e1.dot(&pb.column(1)),
+                e2.dot(&pb.column(0)),
+                e2.dot(&pb.column(1)),
+            );
+            let wm = w * m;
+            let id = wm * wm.transpose();
+            assert!(
+                (id - nalgebra::Matrix2::identity()).norm() < 1e-9,
+                "W M (W M)^T must be I at uv={uv:?}, got {id:?}"
+            );
+            if uv.norm() < 1e-12 {
+                assert!(
+                    (w - nalgebra::Matrix2::identity()).norm() < 1e-9,
+                    "whitening must be a no-op on-axis"
+                );
+            }
+        }
+        // Off-axis the whitener must be a genuine (non-identity) reweighting, and it
+        // must AMPLIFY (recover under-weighted information), i.e. eigenvalues > 1.
+        let uv = Vector2::new(1.0, 0.0);
+        let bhat = bearing_of_uv(&uv);
+        let (e1, e2) = tangent_basis(&bhat);
+        let w = pixel_whitener(&uv, &bhat, &e1, &e2).unwrap();
+        let ev = w.symmetric_eigen().eigenvalues;
+        assert!(
+            ev[0] > 1.0 + 1e-6 && ev[1] > 1.0 + 1e-6,
+            "off-axis whitener must amplify both directions, got {ev:?}"
+        );
+    }
+
+    /// `dpi_z1` must equal the reference `ProjectionHelperZ1::dpi`
+    /// (`updater_helper.cpp:50-53`), and the Z1 residual must be
+    /// `uvn_meas − (x/z, y/z)`. Also checks the two charts share a row space (S² is a
+    /// left preconditioner of Z1), which is why swapping them changes weighting but not
+    /// the constraint's direction.
+    #[test]
+    fn z1_chart_matches_reference_projection() {
+        for f in [
+            Vector3::new(0.2, -0.1, 4.0),
+            Vector3::new(-1.3, 0.9, 2.5),
+            Vector3::new(0.0, 0.0, 1.0),
+        ] {
+            let (x, y, z) = (f[0], f[1], f[2]);
+            // Reference: (Matrix<2,3>() << 1/z, 0, -x/(z*z), 0, 1/z, -y/(z*z))
+            let want = Matrix2x3::new(1.0 / z, 0.0, -x / (z * z), 0.0, 1.0 / z, -y / (z * z));
+            let got = dpi_z1(&f);
+            assert!((got - want).norm() < 1e-15, "dpi mismatch at {f:?}");
+            // Both charts annihilate the ray direction f (the feature-depth direction is
+            // what the nullspace projection later removes).
+            let n = f.norm();
+            let bhat = f / n;
+            let (e1, e2) = tangent_basis(&bhat);
+            let mut js2 = Matrix2x3::zeros();
+            js2.row_mut(0).copy_from(&(e1.transpose() / n));
+            js2.row_mut(1).copy_from(&(e2.transpose() / n));
+            assert!((got * f).norm() < 1e-12, "Z1 must annihilate f");
+            assert!((js2 * f).norm() < 1e-12, "S2 must annihilate f");
+            // S2 = W * Z1 for some invertible 2x2 W  =>  same row space.
+            let w = js2 * got.transpose() * (got * got.transpose()).try_inverse().unwrap();
+            assert!(
+                (js2 - w * got).norm() < 1e-12,
+                "S2 must be a left preconditioner of Z1 at {f:?}"
+            );
+        }
+    }
+
 
     /// The nullspace projection annihilates the feature direction: `Nᵀ h_f = 0`.
     #[test]

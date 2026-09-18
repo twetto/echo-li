@@ -244,6 +244,19 @@ pub struct MSCEqFFilter {
     pub cov: DMatrix<f64>,
     /// IMU/bias process noise + discretization order.
     pub noise: ProcessNoise,
+    /// Rectified stereo baseline (m), recorded for provenance/front-end use. The
+    /// metric-scale channel itself is driven per-observation by `MscTrackObs::
+    /// stereo_range` (EqVIO's log-inverse-range measurement), so the filter math no
+    /// longer reads this field; it documents the front-end baseline. `None` = mono.
+    pub stereo_baseline: Option<f64>,
+    /// DIAGNOSTIC-ONLY sink: one row per ACCEPTED `landmark_stream_update`, capturing
+    /// how much that single landmark's update moved the NAV state, versus its anchor
+    /// baseline — the distinguishing test for "does the current-estimate
+    /// relinearization leak into nav over long baselines?". Columns:
+    /// `[baseline_m, range_m, yaw_inc, vel_along_vhat_inc, att_inc_norm,
+    ///   vel_inc_norm, pos_inc_norm, chi2_d, rows]`. Never read by the filter math;
+    /// drained by the Python binding. Left empty unless populated.
+    pub lm_upd_diag: Vec<[f64; 9]>,
 }
 
 impl MSCEqFFilter {
@@ -251,6 +264,7 @@ impl MSCEqFFilter {
     pub fn dim(&self) -> usize {
         self.landmark_base() + LM_DOF * self.x.landmarks.len()
     }
+
 
     /// Covariance index of the clone at position `i` (0 = oldest).
     pub fn clone_idx(&self, i: usize) -> usize {
@@ -330,6 +344,8 @@ impl MSCEqFFilter {
             x: StateGroup::identity(),
             cov,
             noise,
+            stereo_baseline: None,
+            lm_upd_diag: Vec::new(),
         }
     }
 
@@ -500,7 +516,8 @@ impl MSCEqFFilter {
         let s_inv_adj = xi.s.adjoint().try_inverse().expect("S adjoint invertible");
         let lambda_s = s_inv_adj * att_pos;
 
-        // lambda_b = ad_se3(b) * lambda_T[0:6].
+        // lambda_b = ad_se3(b) * lambda_T[0:6].  Under a direct-product bias the bias
+        // factor is abelian, so its lift term vanishes (static bias chart).
         let lambda_b = SE3::adjoint_algebra(&xi.b) * lambda_t.fixed_rows::<6>(0).into_owned();
 
         Lift {
@@ -617,8 +634,11 @@ impl MSCEqFFilter {
         // B[D, 0:6] = AdD[0:9, 0:6].
         b.view_mut((di, 0), (9, 6))
             .copy_from(&ad_d.view((0, 0), (9, 6)));
-        // B[delta, 0:6] = ad_se3(b0) * AdD[0:6, 0:6].
-        let ad_d_66 = ad_d.view((0, 0), (6, 6)).into_owned();
+        // B[delta, 0:6] = ad_se3(b0) * AdD[0:6, 0:6]. AdD[0:6,0:6] == Ad_{B(D)=SE3(R,v)};
+        // under `sdb_novel` the bias-noise input uses the velocity-zeroed form too, so the
+        // ablation is complete across both covariance Jacobians (the nav block above keeps
+        // the true AdD).
+        let ad_d_66 = ad_d.fixed_view::<6, 6>(0, 0).into_owned();
         b.view_mut((di + 9, 0), (6, 6))
             .copy_from(&(adb0 * &ad_d_66));
         // B[delta, 6:12] = -AdD[0:6, 0:6].
@@ -863,6 +883,13 @@ fn se23_algebra_adjoint_msceqf(v: &SVector<f64, 9>) -> SMatrix<f64, 9, 9> {
 pub struct MscTrackObs {
     pub clone: usize,
     pub uvn: Vector2<f64>,
+    /// Optional metric stereo RANGE measurement at this observation, as the
+    /// log-inverse-range pair `(ell_obs, r_ell)` where `ell_obs = -ln(range_metric)`
+    /// and `r_ell = Var(range)/range²` (range variance propagated through `ell`).
+    /// This is the EqVIO stereo channel (`perform_vision_update_with_stereo`): a
+    /// direct 1-D metric-range innovation on the landmark, NOT a right-camera
+    /// bearing. `None` = mono (no metric constraint at this obs).
+    pub stereo_range: Option<(f64, f64)>,
 }
 
 /// A single feature track observed by several clones. The ANCHOR frame is the
@@ -1153,12 +1180,21 @@ impl MSCEqFFilter {
     /// Curvature (second-order) correction on the update rows is deferred, matching
     /// both OpenVINS' delayed-init and EqVIO's landmark path. Returns the new
     /// landmark's position, or `None` if the track is degenerate or χ²-rejected.
+    ///
+    /// `range_prior = Some((range, r_ell))` births the depth TIGHT and METRIC: the
+    /// mono bearing (direction of `f_a`) is kept, but the anchor-frame RANGE is set
+    /// from the measured stereo range and its inverse-depth variance is fixed to the
+    /// exogenous `r_ell` (decoupled from the under-scaled clones). Per the covariance
+    /// derivation, a loose mono depth absorbs any streamed range before it can move
+    /// the baseline; pinning depth at birth forces the persistent BEARING track to
+    /// carry the metric to the trajectory scale. `None` = mono birth (legacy).
     pub fn birth_landmark(
         &mut self,
         track: &MscTrack,
         cam: &dyn CameraModel,
         pixel_std: f64,
         chi2_mult: f64,
+        range_prior: Option<(f64, f64)>,
     ) -> Option<usize> {
         let nclones = self.x.clones.len();
         if nclones < 2 {
@@ -1187,14 +1223,33 @@ impl MSCEqFFilter {
         let nobs = obs.len();
 
         // 1. Triangulate → world point → anchor(obs[0])-frame reference f_a.
+        //    Birth is MONO: the metric SCALE is injected by the log-inverse-range
+        //    STREAM channel (EqVIO `perform_vision_update_with_stereo`), NOT by mixing
+        //    the true stereo baseline into a triangulation whose clone motion carries
+        //    the filter's (possibly under-scaled) scale. Mixing metric-baseline rays
+        //    with scale-inconsistent clone rays biased the birth range and pushed the
+        //    scale the WRONG way on the worst-under-scale trajectory (t1); measured.
         let x_f = msckf::triangulate(&mscobs, cam)?;
         let anchor = mscobs[0].pose.clone();
         let f_a: Vector3<f64> = anchor.inverse().act(&x_f);
         if f_a[2] <= 1e-6 {
             return None;
         }
+        // TIGHT-METRIC-DEPTH birth: keep the mono bearing but rescale the anchor-frame
+        // point so ‖f_a‖ equals the measured stereo range. `metric` carries the tight
+        // inverse-depth prior applied to the birth covariance below.
+        let (f_a, x_f, metric) = match range_prior {
+            Some((range, r_ell))
+                if range.is_finite() && range > 1e-6 && r_ell.is_finite() && r_ell > 0.0 =>
+            {
+                let f_a_m = f_a * (range / f_a.norm());
+                let x_f_m = anchor.act(&f_a_m);
+                (f_a_m, x_f_m, Some((range, r_ell)))
+            }
+            _ => (f_a, x_f, None),
+        };
 
-        // 2. LEFT-chart feature Jacobians, mapped into the inverse-depth chart at
+        // 2. LEFT bearing feature Jacobians, mapped into the inverse-depth chart at
         //    q0 = f_a (q̂ = identity at birth).
         let (h_f, h_x, res) = msckf::feature_jacobians_anchored_left(&x_f, &mscobs, cam)?;
         // Chart Jacobian in the LIFT's tangent direction (q̂ = identity at birth, so
@@ -1240,7 +1295,7 @@ impl MSCEqFFilter {
             m_mat[(k, k)] += sigma2;
         }
         let h_linv = h_finit.try_inverse()?; // 3×3, chart ← pixel
-        let p_ll_d = &h_linv * &m_mat * h_linv.transpose(); // new landmark chart block
+        let mut p_ll_d = &h_linv * &m_mat * h_linv.transpose(); // new landmark chart block
 
         // Cross-cov to the OLD full state: scatter hx_init's 6-blocks into the native
         // clone columns, then cross_old = −(Σ H_Rᵀ) H_L⁻ᵀ (dim×3, OLD ordering).
@@ -1252,15 +1307,35 @@ impl MSCEqFFilter {
                 .copy_from(&hx_init.view((0, 6 * a), (3, 6)));
         }
         let m_a = &self.cov * h_r_full.transpose(); // dim×3
-        let cross_old = -(m_a * h_linv.transpose()); // dim×3
+        let mut cross_old = -(m_a * h_linv.transpose()); // dim×3
 
         if !p_ll_d.iter().all(|v| v.is_finite()) || !cross_old.iter().all(|v| v.is_finite()) {
             return None;
         }
 
+        // Tight-metric-depth prior: overwrite the inverse-depth (chart coord 2) block.
+        // ρ0 = 1/range, and δρ = -δR/R² ⇒ Var(δρ) = ρ0²·r_ell (r_ell = Var(R)/R²). The
+        // metric depth is EXOGENOUS: decouple it from the mono bearing block (2×2) and
+        // from the old state, so the range constraint is not re-derived from — and thus
+        // not re-diluted by — the under-scaled clone geometry.
+        if let Some((range, r_ell)) = metric {
+            let rho0 = 1.0 / range;
+            p_ll_d[(0, 2)] = 0.0;
+            p_ll_d[(2, 0)] = 0.0;
+            p_ll_d[(1, 2)] = 0.0;
+            p_ll_d[(2, 1)] = 0.0;
+            p_ll_d[(2, 2)] = rho0 * rho0 * r_ell;
+            for r in 0..cross_old.nrows() {
+                cross_old[(r, 2)] = 0.0;
+            }
+        }
+
         // 6. Mean nudge: chart innovation δ_l = H_L⁻¹ res_init → SOT3 factor.
         let mut q = SOT3::identity();
-        let delta_l = &h_linv * &res_init; // 3-vec, invdepth chart tangent
+        let mut delta_l = &h_linv * &res_init; // 3-vec, invdepth chart tangent
+        if metric.is_some() {
+            delta_l[2] = 0.0; // depth is fixed by the metric range; nudge bearing only
+        }
         if delta_l.iter().all(|v| v.is_finite()) && delta_l.norm() > 0.0 {
             let dl = Vector3::new(delta_l[0], delta_l[1], delta_l[2]);
             q = sot3_left_increment_invdepth(&q, &f_a, &dl);
@@ -1466,6 +1541,7 @@ impl MSCEqFFilter {
         pixel_std: f64,
         chi2_mult: f64,
     ) -> usize {
+        let _ = cam; // bearing residual needs no projection model
         let sigma2 = pixel_std * pixel_std;
         let nclones = self.x.clones.len();
         let mut accepted = 0;
@@ -1503,42 +1579,101 @@ impl MSCEqFFilter {
                 .fixed_view_mut::<3, 3>(0, 3)
                 .copy_from(&(-Matrix3::identity()));
 
+            // Stereo METRIC-RANGE channel (EqVIO `perform_vision_update_with_stereo`):
+            // each obs carrying `stereo_range = (ell_obs, r_ell)` adds ONE 1-D
+            // log-inverse-range row `ell = -ln‖q‖` (q = point in the observing camera
+            // frame, so ‖q‖ is the radial range that the metric stereo depth also
+            // measures). This injects absolute scale directly, unlike a right-camera
+            // bearing whose disparity SNR collapses at aerial depth. Each range row is
+            // gated on its own χ²(1) innovation (a depth-edge outlier drops the range
+            // row but KEEPS the bearing rows for that obs).
             let m = obs.len();
-            let rows = 2 * m;
+            let n_range = obs.iter().filter(|o| o.stereo_range.is_some()).count();
+            let rows_max = 2 * m + n_range;
             let dim = self.dim();
-            let mut h = DMatrix::<f64>::zeros(rows, dim);
-            let mut res = DVector::<f64>::zeros(rows);
+            let mut h = DMatrix::<f64>::zeros(rows_max, dim);
+            let mut res = DVector::<f64>::zeros(rows_max);
+            let mut r_diag = DVector::<f64>::zeros(rows_max);
             let lcol = self.landmark_idx(upd.j);
             let acol = self.clone_idx(anchor_pos);
             let mut ok = true;
-            for (i, o) in obs.iter().enumerate() {
+            let mut ri = 0usize;
+            for o in obs.iter() {
                 let clone_pose = &self.x.clones[o.clone].pose;
                 let q = clone_pose.inverse().act(&g); // point in clone-k camera frame
                 if q[2] <= 1e-6 {
                     ok = false;
                     break;
                 }
-                let jpi = cam.projection_jacobian(&q); // 2×3
                 let rt_k = clone_pose.rotation.inverse().as_matrix(); // R_kᵀ
+                let kcol = self.clone_idx(o.clone);
+
+                // LEFT bearing residual on S² (Jπ = Bᵀ/|q|, r = Bᵀ(b_meas − b̂)).
+                let b_meas = msckf::bearing_of_uv(&o.uvn);
+                let (r, jpi) = match msckf::bearing_meas(&q, &b_meas) {
+                    Some(v) => v,
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                };
                 let dz_dg = jpi * rt_k; // 2×3
                 let h_l = dz_dg * dg_deps; // 2×3 landmark chart
                 let clone_col = dz_dg * a_mat; // 2×6 observing clone
-                let r = o.uvn - cam.project(&q); // residual
-                let ri = 2 * i;
                 for a in 0..2 {
                     res[ri + a] = r[a];
+                    r_diag[ri + a] = sigma2;
                     for c in 0..3 {
                         h[(ri + a, lcol + c)] = h_l[(a, c)];
                     }
-                    let kcol = self.clone_idx(o.clone);
                     for c in 0..6 {
-                        h[(ri + a, kcol + c)] = clone_col[(a, c)];
-                        // Anchor col = −clone col; ACCUMULATE (multiple obs share it).
+                        h[(ri + a, kcol + c)] += clone_col[(a, c)];
+                        // Anchor col = −clone col; ACCUMULATE (obs share it).
                         h[(ri + a, acol + c)] -= clone_col[(a, c)];
                     }
                 }
+                ri += 2;
+
+                // Log-inverse-range row (1×3 into g): ∂ell/∂q = −qᵀ/‖q‖².
+                if let Some((ell_obs, r_ell)) = o.stereo_range {
+                    let rn2 = q.norm_squared();
+                    let d_ell_dq = (-q.transpose()) / rn2; // 1×3, ∂ell/∂q
+                    let range_dz_dg = d_ell_dq * rt_k; // 1×3, ∂ell/∂g
+                    let range_h_l = range_dz_dg * dg_deps; // 1×3 landmark chart
+                    let range_clone = range_dz_dg * a_mat; // 1×6 observing clone
+                    let d_ell = ell_obs - (-(q.norm().ln())); // ell_obs − ell_pred
+                    // Per-row χ²(1) gate: S = h Σ hᵀ + r_ell over this single row.
+                    let mut hrow = DVector::<f64>::zeros(dim);
+                    for c in 0..3 {
+                        hrow[lcol + c] = range_h_l[c];
+                    }
+                    for c in 0..6 {
+                        hrow[kcol + c] += range_clone[c];
+                        hrow[acol + c] -= range_clone[c];
+                    }
+                    let s_ll = (hrow.transpose() * &self.cov * &hrow)[(0, 0)] + r_ell;
+                    let keep = r_ell > 0.0
+                        && s_ll > 0.0
+                        && d_ell.is_finite()
+                        && d_ell * d_ell <= chi2_mult * msckf::chi2_095(1) * s_ll;
+                    if keep {
+                        res[ri] = d_ell;
+                        r_diag[ri] = r_ell;
+                        h.row_mut(ri).copy_from(&hrow.transpose());
+                        ri += 1;
+                    }
+                }
+                if !ok {
+                    break;
+                }
             }
-            if !ok || !h.iter().all(|v| v.is_finite()) {
+            let rows = ri;
+            if !ok || rows == 0 {
+                continue;
+            }
+            let h = h.rows(0, rows).into_owned();
+            let res = res.rows(0, rows).into_owned();
+            if !h.iter().all(|v| v.is_finite()) {
                 continue;
             }
 
@@ -1546,7 +1681,7 @@ impl MSCEqFFilter {
             let g_mat = &self.cov * h.transpose(); // dim×rows
             let mut s = &h * &g_mat;
             for k in 0..rows {
-                s[(k, k)] += sigma2;
+                s[(k, k)] += r_diag[k];
             }
             let s_inv = match s.clone().try_inverse() {
                 Some(mm) => mm,
@@ -1562,12 +1697,45 @@ impl MSCEqFFilter {
             };
             let k_gain = chol.solve(&g_mat.transpose()).transpose(); // dim×rows
             let inn_vec = &k_gain * &res;
+            // DIAGNOSTIC: pre-update world velocity direction, for the along-v̂
+            // (scale-channel) projection of the nav correction this landmark injects.
+            let v_pre = self.phi().t.velocity;
             self.apply_left_increment(&inn_vec);
             let downdate = &k_gain * g_mat.transpose();
             self.cov -= downdate;
             let sym = (&self.cov + self.cov.transpose()) * 0.5;
             self.cov = sym;
             accepted += 1;
+            // DIAGNOSTIC (see `lm_upd_diag` doc): attribute this single landmark's
+            // nav-state correction to its anchor baseline. inn_vec tangent order is
+            // [att(0:3) vel(3:6) pos(6:9) ...] in the left/global frame; yaw is the
+            // world-z (NED down/gravity-axis) attitude component inn_vec[2].
+            {
+                let newest = obs.iter().map(|o| o.clone).max().unwrap_or(anchor_pos);
+                let cp = self.x.clones[newest].pose.act(&Vector3::zeros());
+                let ap = anchor_pose.act(&Vector3::zeros());
+                let baseline = (cp - ap).norm();
+                let att = Vector3::new(inn_vec[0], inn_vec[1], inn_vec[2]);
+                let vel = Vector3::new(inn_vec[3], inn_vec[4], inn_vec[5]);
+                let pos = Vector3::new(inn_vec[6], inn_vec[7], inn_vec[8]);
+                let vnorm = v_pre.norm();
+                let vel_along = if vnorm > 1e-6 {
+                    vel.dot(&(v_pre / vnorm))
+                } else {
+                    0.0
+                };
+                self.lm_upd_diag.push([
+                    baseline,
+                    lm.point().norm(),
+                    inn_vec[2],
+                    vel_along,
+                    att.norm(),
+                    vel.norm(),
+                    pos.norm(),
+                    d,
+                    rows as f64,
+                ]);
+            }
         }
 
         accepted
@@ -1628,23 +1796,42 @@ impl MSCEqFFilter {
         let phi_feat = h_f_new_inv * h_f_old; // 3×3, landmark ← old chart
         let phi_g = h_f_new_inv * h_g; // 3×6, landmark ← anchor pose
 
-        // Full-state Φ = I except the landmark's 3 rows (chart change).
+        // Full-state Φ = I except the landmark's 3 rows `L = li..li+3`, whose only
+        // nonzero column blocks are `phi_feat` (at li), `phi_g` (at old_col) and
+        // `−phi_g` (at new_col). Forming the dense dim×dim Φ and paying O(dim³) for
+        // `Φ P Φᵀ` is wasteful: since Φ acts as identity on every non-landmark row,
+        // the (O,O) block of `Φ P Φᵀ` (everything but L) is UNCHANGED, the L rows
+        // become `R·P` (R = the 3 landmark rows of Φ), and the L,L corner becomes
+        // `R·P·Rᵀ`. Rewriting just those 3 rows/cols is O(dim) and numerically
+        // identical to the dense triple product. (Reanchoring runs ~n_landmarks/
+        // clone-window every marginalization, so this is the filter's hot path.)
         let dim = self.dim();
         let li = self.landmark_idx(j);
         let old_col = self.clone_idx(old_anchor_pos);
         let new_col = self.clone_idx(new_anchor_pos);
-        let mut phi = DMatrix::<f64>::identity(dim, dim);
-        // Zero the landmark's identity diagonal, then place the change-of-variables.
-        phi.view_mut((li, li), (3, 3)).fill(0.0);
         let pf = DMatrix::from_column_slice(3, 3, phi_feat.as_slice());
-        phi.view_mut((li, li), (3, 3)).copy_from(&pf);
         let pg = DMatrix::from_column_slice(3, 6, phi_g.as_slice());
-        phi.view_mut((li, old_col), (3, 6)).copy_from(&pg);
-        phi.view_mut((li, new_col), (3, 6)).copy_from(&(-&pg));
 
-        self.cov = &phi * &self.cov * phi.transpose();
-        let sym = (&self.cov + self.cov.transpose()) * 0.5;
-        self.cov = sym;
+        // rc = R · P (3×dim): pull the affected row-blocks of P through the small left
+        // factors. R[a,k]·P[k,c] is nonzero only for k in the li / old_col / new_col
+        // blocks, so R·P = pf·P[L,:] + pg·P[old,:] − pg·P[new,:].
+        let cov_l = self.cov.rows(li, 3).into_owned();
+        let cov_ao = self.cov.rows(old_col, 6).into_owned();
+        let cov_an = self.cov.rows(new_col, 6).into_owned();
+        let rc = &pf * &cov_l + &pg * &cov_ao - &pg * &cov_an; // 3×dim
+
+        // cll = rc · Rᵀ (3×3): mirror the same block structure on the right.
+        let rc_l = rc.columns(li, 3).into_owned();
+        let rc_ao = rc.columns(old_col, 6).into_owned();
+        let rc_an = rc.columns(new_col, 6).into_owned();
+        let cll = &rc_l * pf.transpose() + &rc_ao * pg.transpose() - &rc_an * pg.transpose();
+
+        // Write back the L rows, the L columns (= rcᵀ by symmetry) and the corner.
+        // (O,O) is untouched; symmetrize only the tiny 3×3 corner (float hygiene).
+        self.cov.view_mut((li, 0), (3, dim)).copy_from(&rc);
+        self.cov.view_mut((0, li), (dim, 3)).copy_from(&rc.transpose());
+        let cll_sym = (&cll + cll.transpose()) * 0.5;
+        self.cov.view_mut((li, li), (3, 3)).copy_from(&cll_sym);
 
         // Reset the landmark to the new anchor (chart center = current point).
         self.x.landmarks[j].q = SOT3::identity();
@@ -2034,6 +2221,7 @@ mod tests {
                 MscTrackObs {
                     clone: i,
                     uvn: cam.project(&q),
+                    stereo_range: None,
                 }
             })
             .collect();
@@ -2102,7 +2290,7 @@ mod tests {
         let cam = norm_cam();
         let dim_before = f.dim();
         let j = f
-            .birth_landmark(&track, &cam, 1e-3, 1.0)
+            .birth_landmark(&track, &cam, 1e-3, 1.0, None)
             .expect("exact window-spanning track must birth a landmark");
         assert_eq!(j, 0);
         assert_eq!(f.n_landmarks(), 1);
@@ -2153,7 +2341,7 @@ mod tests {
         // update-row χ² gate must reject the birth and leave the state unaugmented.
         track.obs[1].uvn += Vector2::new(0.5, -0.4);
         let dim_before = f.dim();
-        let out = f.birth_landmark(&track, &cam, 1e-3, 1.0);
+        let out = f.birth_landmark(&track, &cam, 1e-3, 1.0, None);
         assert!(out.is_none(), "inconsistent track must be χ²-rejected");
         assert_eq!(f.n_landmarks(), 0);
         assert_eq!(f.dim(), dim_before);
@@ -2168,7 +2356,7 @@ mod tests {
         let (mut f, track, x_f) = scene_filter();
         let cam = norm_cam();
         let j = f
-            .birth_landmark(&track, &cam, 1e-3, 1.0)
+            .birth_landmark(&track, &cam, 1e-3, 1.0, None)
             .expect("exact track births a landmark");
 
         // Nudge the landmark mean through its own chart so point() is wrong.
@@ -2231,7 +2419,7 @@ mod tests {
         // mean and covariance untouched.
         let (mut f, mut track, _x_f) = scene_filter();
         let cam = norm_cam();
-        let j = f.birth_landmark(&track, &cam, 1e-3, 1.0).expect("birth");
+        let j = f.birth_landmark(&track, &cam, 1e-3, 1.0, None).expect("birth");
         let pt_before = f.x.landmarks[j].point();
         let tr_before = f.cov.trace();
 
@@ -2260,7 +2448,7 @@ mod tests {
         // the estimate toward truth; a flipped sign pushes it away.
         let (mut f, track, x_f) = scene_filter();
         let cam = norm_cam();
-        let j = f.birth_landmark(&track, &cam, 1e-3, 1.0).expect("birth");
+        let j = f.birth_landmark(&track, &cam, 1e-3, 1.0, None).expect("birth");
         assert_eq!(f.x.landmarks[j].anchor, f.x.clones[0].stamp);
 
         let origin = f.x.landmarks[j].origin;
@@ -2308,7 +2496,7 @@ mod tests {
     fn landmark_stream_update_ignores_anchor_only_and_rejects_outlier() {
         let (mut f, mut track, _x_f) = scene_filter();
         let cam = norm_cam();
-        let j = f.birth_landmark(&track, &cam, 1e-3, 1.0).expect("birth");
+        let j = f.birth_landmark(&track, &cam, 1e-3, 1.0, None).expect("birth");
         let pt_before = f.x.landmarks[j].point();
         let tr_before = f.cov.trace();
 
@@ -2356,7 +2544,7 @@ mod tests {
         // still pulls the estimate toward truth.
         let (mut f, track, x_f) = scene_filter();
         let cam = norm_cam();
-        let j = f.birth_landmark(&track, &cam, 1e-3, 1.0).expect("birth");
+        let j = f.birth_landmark(&track, &cam, 1e-3, 1.0, None).expect("birth");
         assert_eq!(
             f.x.landmarks[j].anchor, f.x.clones[0].stamp,
             "born on clone 0"
@@ -2434,13 +2622,65 @@ mod tests {
     }
 
     #[test]
+    fn reanchor_blockwise_equals_dense_phi_p_phi() {
+        // The reanchor covariance update is the O(dim) blockwise form of `Φ P Φᵀ`
+        // with Φ = I except the landmark's 3 rows. Pin it to the dense triple product
+        // computed independently here, so the optimization can never silently drift
+        // from the equivariant change-of-variables it replaces.
+        let (mut f, track, _x_f) = scene_filter();
+        let cam = norm_cam();
+        let j = f.birth_landmark(&track, &cam, 1e-3, 1.0, None).expect("birth");
+        let (old_pos, new_pos) = (0usize, 2usize);
+
+        // Reconstruct Φ exactly as reanchor_landmark builds its blocks.
+        let lm = f.x.landmarks[j].clone();
+        let pose_old = f.x.clones[old_pos].pose.clone();
+        let pose_new = f.x.clones[new_pos].pose.clone();
+        let g = pose_old.act(&lm.point());
+        let origin_new = pose_new.inverse().act(&g);
+        let h_f_old = pose_old.rotation.as_matrix() * landmark_chart_jacobian(&lm.q, &lm.origin);
+        let h_f_new =
+            pose_new.rotation.as_matrix() * landmark_chart_jacobian(&SOT3::identity(), &origin_new);
+        let h_f_new_inv = h_f_new.try_inverse().expect("h_f_new invertible");
+        let mut h_g = SMatrix::<f64, 3, 6>::zeros();
+        h_g.fixed_view_mut::<3, 3>(0, 0).copy_from(&(-skew(&g)));
+        h_g.fixed_view_mut::<3, 3>(0, 3)
+            .copy_from(&Matrix3::identity());
+        let phi_feat = h_f_new_inv * h_f_old;
+        let phi_g = h_f_new_inv * h_g;
+
+        let dim = f.dim();
+        let li = f.landmark_idx(j);
+        let old_col = f.clone_idx(old_pos);
+        let new_col = f.clone_idx(new_pos);
+        let mut phi = DMatrix::<f64>::identity(dim, dim);
+        phi.view_mut((li, li), (3, 3)).fill(0.0);
+        phi.view_mut((li, li), (3, 3))
+            .copy_from(&DMatrix::from_column_slice(3, 3, phi_feat.as_slice()));
+        let pg = DMatrix::from_column_slice(3, 6, phi_g.as_slice());
+        phi.view_mut((li, old_col), (3, 6)).copy_from(&pg);
+        phi.view_mut((li, new_col), (3, 6)).copy_from(&(-&pg));
+
+        let cov_before = f.cov.clone();
+        let dense = &phi * &cov_before * phi.transpose();
+        let dense = (&dense + dense.transpose()) * 0.5;
+
+        assert!(f.reanchor_landmark(j, new_pos), "reanchor applied");
+        assert!(
+            (&f.cov - &dense).amax() < 1e-10,
+            "blockwise reanchor must match dense ΦPΦᵀ (max diff {:.3e})",
+            (&f.cov - &dense).amax()
+        );
+    }
+
+    #[test]
     fn propagation_leaves_landmark_block_static() {
         // A born landmark lives in the propagation "tail" (Φ=I, no injection), so
         // its diagonal block must be frozen across a propagation step, and the cov
         // must stay symmetric/finite with the state dim unchanged.
         let (mut f, track, _x_f) = scene_filter();
         let cam = norm_cam();
-        f.birth_landmark(&track, &cam, 1e-3, 1.0).expect("births");
+        f.birth_landmark(&track, &cam, 1e-3, 1.0, None).expect("births");
         let li = f.landmark_idx(0);
         let lm_diag_before = f.cov.view((li, li), (LM_DOF, LM_DOF)).into_owned();
         let dim_before = f.dim();
