@@ -2,7 +2,7 @@
 
 Rust rewrite / experiment branch for ECHO-LI, including EqVIO, Rudolf-V tracking integration, sparse out-of-state depth filtering, and patch depth mapping.
 
-[demo video](https://youtu.be/YI_hrvH2_Yk?si=P5oRSkYA16Hb3IMG)`
+[demo video](https://youtu.be/YI_hrvH2_Yk?si=P5oRSkYA16Hb3IMG)
 
 ## Common Commands
 
