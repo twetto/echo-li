@@ -1,12 +1,13 @@
 RudolfV:
   equaliseImageHistogram: true
   # CLAHE gives better local contrast in dark / low-light VOXL2 scenes.
-  # Matched to OpenVINS: cv::createCLAHE(10.0, cv::Size(8,8)).
-  # OpenVINS 8×8 grid on 1280×800 → ~160px tiles; 128px is the closest
-  # square-tile equivalent (10×7 grid, slightly finer).
+  # RudolfVConfig keys are camelCase. The snake_case clahe_tile_size: 128 /
+  # clahe_clip_limit: 10.0 (OpenVINS-style) used before were ignored, so the
+  # frontend ran with the defaults below. On the 手持0908 mocap bags
+  # (2026-09-14) 128 / 10.0 was no better, so the effective values are kept.
   histeq: clahe
-  clahe_tile_size: 128
-  clahe_clip_limit: 10.0
+  claheTileSize: 256
+  claheClipLimit: 4.0
   featureDist: 16.0
   featureSearchThreshold: 0.8
   # Lower threshold to pull more features from dark/noisy H.265 frames.
@@ -16,18 +17,25 @@ RudolfV:
   lbpPolicy: SoftPenalty
   enableRansac: true
 
+# eqf values marked "tuned" were fitted on 2026-09-14 against mocap on the
+# 手持0908 handheld bags with tools/mocap_eval/sweep.py. The fit used 第一筆
+# and 第二筆; 第三筆 was held out. Objective: ATE + body-frame velocity RMSE.
+# Held-out result: ATE 1.01 -> 0.57 m, scale 0.65 -> 0.86, v_body 0.189 ->
+# 0.176 m/s. Previous values are kept in comments.
 eqf:
-  maxFeatures: 40
+  maxFeatures: 21  # tuned (was 40)
   initialValue:
     # sceneDepth: 3.0
-    sceneDepth: 20.0
+    # sceneDepth: 20.0
+    sceneDepth: 5.0
   initialVariance:
     attitude: 0.13565029126052572
     biasAcc: 1.5813333765300104
     biasGyr: 97162.79515771076
     cameraAttitude: 0.0010228558965517584
     cameraPosition: 0.023501400846134893
-    point: 129.90415638150924
+    # point: 129.90415638150924
+    point: 17.0  # tuned (was 5.0)
     position: 0.1
     velocity: 8.974852995731e-08
   measurementNoise:
@@ -35,12 +43,13 @@ eqf:
     # (matches OpenVINS sigma_px=4.0).  Now decoupled from the outlier gate.
     feature: 4.0
     # Outlier gate in pixels (was multiplied by sigma_bearing; now absolute).
-    # 10px ≈ the old 5.0 * 2.0 default.
-    featureOutlierAbs: 10.0
+    # Tuned (was 10px, ≈ the old 5.0 * 2.0 default). This is the largest single
+    # gain: rejecting >3.3px innovations fixes most of the scale error.
+    featureOutlierAbs: 3.3
     featureOutlierProb: 0.03229809583062128
     featureRetention: 0.18594708334486176
   processVariance:
-    attitude: 6.025875320811407e-05
+    attitude: 1.6e-05  # tuned (was 6.025875320811407e-05)
     biasAcc: 0.0
     biasGyr: 0.0
     # Frozen — with inflated bias random walk the extrinsics should not drift;
@@ -48,8 +57,8 @@ eqf:
     # triangulation geometry, collapsing landmark depths toward the camera.
     cameraAttitude: 0.0
     cameraPosition: 0.0
-    point: 0.00029845436136043135
-    position: 9.981466095928483e-06
+    point: 7.2e-05     # tuned (was 0.00029845436136043135)
+    position: 2.5e-04  # tuned (was 9.981466095928483e-06)
     velocity: 0.025317333863551263
   settings:
     coordinateChoice: Normal
@@ -65,15 +74,14 @@ eqf:
     # ICM42688P — Allan variance baseline × empirical multipliers.
     # Baseline (2026-09-06, 2.13h static bag):
     #   gyr_N=1.663e-4  gyr_RRW=2.399e-5  acc_N=4.622e-4  acc_RRW=6.442e-5
-    # Multipliers: gyr 2×, gyrBias 3×, acc 5×, accBias 20×
-    # NOT principled — chosen to land near previously-working values.
     # Allan variance = static bench floor; real deployment adds vibration,
-    # temperature drift, timing jitter.  Properly: prop-on Allan, or tune
-    # against innovation whiteness, or grid-sweep vs MOCAP ground truth.
-    acc: 2.31095e-03      # 4.622e-4 × 5   [m/s²/√Hz]
-    accBias: 1.28842e-03  # 6.442e-5 × 20  [m/s³/√Hz]
-    gyr: 3.32660e-04      # 1.663e-4 × 2   [rad/s/√Hz]
-    gyrBias: 7.19700e-05  # 2.399e-5 × 3   [rad/s²/√Hz]
+    # temperature drift, timing jitter.
+    # Tuned against mocap (handheld walking), replacing the old hand-picked
+    # multipliers gyr 2×, gyrBias 3×, acc 5×, accBias 20×:
+    acc: 4.2e-03      # 4.622e-4 × 9   [m/s²/√Hz]   (was 2.31095e-03)
+    accBias: 4.1e-03  # 6.442e-5 × 64  [m/s³/√Hz]   (was 1.28842e-03)
+    gyr: 1.7e-04      # 1.663e-4 × 1   [rad/s/√Hz]  (was 3.32660e-04)
+    gyrBias: 1.2e-04  # 2.399e-5 × 5   [rad/s²/√Hz] (was 7.19700e-05)
 
 SparseVog:
   parametrization: bearing_invdepth_additive3d
