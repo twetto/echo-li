@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
-"""Put decoded bag images and recorded IMU on one test timeline."""
+"""Put decoded bag images and recorded IMU on one test timeline.
+
+image_stamp_mode:
+  source        keep the decoder's stamp, which is the camera header stamp.
+  imu_anchored  restamp each image as latest IMU stamp + wall time since that
+                IMU sample. This is for bags whose camera and IMU clocks
+                differ. It adds the decoder's latency and jitter to every
+                frame, and it turns duplicate frames (e.g. from a leftover
+                decoder) into distinct observations.
+  auto          (default) decide on the first image: 'source' when the camera
+                stamp is within 1 s of the latest IMU stamp, else
+                'imu_anchored'.
+"""
 
 import time
 
@@ -36,6 +48,12 @@ class BagTimeRelay(Node):
         self.declare_parameter('output_imu_topic', '/echo_li_test/imu')
         self.declare_parameter('output_image_topic', '/echo_li_test/image')
         self.declare_parameter('odometry_topic', '/echo_li/odometry')
+        self.declare_parameter('image_stamp_mode', 'auto')
+        self.image_stamp_mode = self.get_parameter('image_stamp_mode').value
+        if self.image_stamp_mode not in ('auto', 'source', 'imu_anchored'):
+            raise ValueError(
+                "image_stamp_mode must be auto, source or imu_anchored, "
+                f"got {self.image_stamp_mode!r}")
 
         sensor_qos = QoSProfile(
             history=QoSHistoryPolicy.KEEP_LAST,
@@ -81,8 +99,15 @@ class BagTimeRelay(Node):
         if self.latest_imu_ns is None:
             self.image_without_imu += 1
             return
-        elapsed_ns = time.monotonic_ns() - self.latest_imu_wall_ns
-        set_stamp_ns(msg.header.stamp, self.latest_imu_ns + elapsed_ns)
+        if self.image_stamp_mode == 'auto':
+            gap_s = (stamp_ns(msg.header.stamp) - self.latest_imu_ns) / NSEC_PER_SEC
+            self.image_stamp_mode = 'source' if abs(gap_s) < 1.0 else 'imu_anchored'
+            self.get_logger().info(
+                f'image_stamp_mode=auto -> {self.image_stamp_mode} '
+                f'(camera stamp - latest IMU stamp = {gap_s:+.3f}s)')
+        if self.image_stamp_mode == 'imu_anchored':
+            elapsed_ns = time.monotonic_ns() - self.latest_imu_wall_ns
+            set_stamp_ns(msg.header.stamp, self.latest_imu_ns + elapsed_ns)
         self.image_count += 1
         self.image_pub.publish(msg)
 
