@@ -31,7 +31,7 @@ use echo_lie::base::LieGroup;
 use echo_lie::{SE3, SE23, SO3, SOT3, SemiDirectBias};
 use nalgebra::{DMatrix, DVector, Matrix3, SMatrix, SVector, Vector2, Vector3, Vector4, Vector6};
 
-use crate::coordinate_suite::invdepth::conv_ind2euc;
+use crate::coordinate_suite::invdepth::{conv_euc2ind, conv_ind2euc};
 use crate::mathematical::camera::CameraModel;
 use crate::mathematical::msckf;
 
@@ -1386,6 +1386,85 @@ impl MSCEqFFilter {
         Some(j)
     }
 
+    /// Civera-style UNDELAYED inverse-depth landmark birth (Civera, Davison & Montiel,
+    /// "Inverse Depth Parametrization for Monocular SLAM", T-RO 2008).
+    ///
+    /// [`Self::birth_landmark`] triangulates, so it needs parallax: it demands two
+    /// observations and rejects (or, worse, silently accepts a wild depth) when the
+    /// baseline is short. At motion onset that is exactly the regime — a few frames at
+    /// ~0.2 m/s — so triangulated birth either starves the filter of in-state landmarks
+    /// or poisons it with an over-confident depth.
+    ///
+    /// Civera's insight is that the *direction* is well known from one bearing while the
+    /// *depth* is not, and that although an unknown depth has unbounded Euclidean radial
+    /// variance, its inverse ρ = 1/d has a perfectly finite one: ρ ∈ [0, 2ρ₀] at 1σ with
+    /// σ_ρ = ρ₀ spans "infinitely far" to "half the prior depth". Because the landmark
+    /// chart here already IS (bearing, ρ) — `conv_euc2ind` row 2 is −ρ₀²y₀ᵀ — this is a
+    /// birth rule, not a new parametrization.
+    ///
+    /// The covariance is therefore built DIRECTLY in the chart. Building a Euclidean
+    /// block and mapping it through `conv_euc2ind` would defeat the purpose: the radial
+    /// entry that the inverse-depth chart keeps finite is the one that is unbounded in
+    /// Euclidean space. Only the transverse (bearing) part is mapped, using the suite's
+    /// own Jacobian so the stereographic scale factor is whatever the rest of the filter
+    /// uses rather than a hand-derived constant.
+    ///
+    /// Anchored representation ⇒ no cross-covariance at birth: the landmark is stored
+    /// relative to its anchor clone, and a fresh bearing from that same clone carries no
+    /// information about the rest of the state. (The triangulated path DOES correlate,
+    /// because its depth is inferred from clone-to-clone motion.)
+    pub fn birth_landmark_civera(
+        &mut self,
+        track: &MscTrack,
+        pixel_std: f64,
+        depth_prior: f64,
+        inv_depth_rel_std: f64,
+    ) -> Option<usize> {
+        if self.x.clones.is_empty() || !(depth_prior > 1e-6) || !(inv_depth_rel_std > 0.0) {
+            return None;
+        }
+        // Anchor on the OLDEST observation, matching `birth_landmark`'s convention.
+        let o = track.obs.iter().min_by_key(|o| o.clone)?;
+        if o.clone >= self.x.clones.len() {
+            return None;
+        }
+
+        // Direction is measured; depth is the prior.
+        let bearing = msckf::bearing_of_uv(&o.uvn);
+        let f_a = bearing * depth_prior;
+        let rho0 = 1.0 / depth_prior;
+
+        // Bearing block: transverse Euclidean uncertainty (d₀·σ_pix)² pushed through the
+        // suite's Euclidean→inv-depth Jacobian. ρ₀·d₀ = 1, so this reduces to the
+        // angular std up to the chart's own stereographic factor.
+        let c = conv_euc2ind(&f_a);
+        let y0 = bearing;
+        let sig_t = depth_prior * pixel_std;
+        let p_euc_t =
+            (sig_t * sig_t) * (Matrix3::identity() - y0 * y0.transpose());
+        let p_mapped = c * p_euc_t * c.transpose();
+
+        let mut p_ll = SMatrix::<f64, LM_DOF, LM_DOF>::zeros();
+        p_ll[(0, 0)] = p_mapped[(0, 0)];
+        p_ll[(0, 1)] = p_mapped[(0, 1)];
+        p_ll[(1, 0)] = p_mapped[(1, 0)];
+        p_ll[(1, 1)] = p_mapped[(1, 1)];
+        // σ_ρ = rel·ρ₀. rel = 1 is Civera's "covers infinity to half the prior depth".
+        let sig_rho = inv_depth_rel_std * rho0;
+        p_ll[(2, 2)] = sig_rho * sig_rho;
+
+        if !p_ll.iter().all(|v| v.is_finite()) {
+            return None;
+        }
+
+        let lm = Landmark {
+            q: SOT3::identity(),
+            anchor: self.x.clones[o.clone].stamp,
+            origin: f_a,
+        };
+        Some(self.insert_landmark(lm, &p_ll, None))
+    }
+
     /// In-state (SLAM) landmark measurement update — the equivariant analog of
     /// OpenVINS `UpdaterSLAM::update`. Unlike the structureless [`Self::msc_update`],
     /// the landmark is a state, so its feature column is KEPT (no nullspace
@@ -2282,6 +2361,72 @@ mod tests {
         // Rejected update leaves the state untouched.
         let dd = f.x.sdb.inverse().compose(&sdb_before);
         assert!(SemiDirectBias::log(&dd).norm() < 1e-12);
+    }
+
+    #[test]
+    fn civera_birth_needs_no_parallax_and_depth_band_is_multiplicative() {
+        let (mut f, track, _x_f) = scene_filter();
+        let cam = norm_cam();
+        let d0 = 10.0;
+
+        // ONE observation — no parallax anywhere in the input.
+        let single = MscTrack {
+            obs: vec![track.obs[0].clone()],
+            ..track.clone()
+        };
+        assert!(
+            f.birth_landmark(&single, &cam, 1e-3, 1.0, None).is_none(),
+            "triangulated birth must refuse a single observation"
+        );
+
+        let dim_before = f.dim();
+        let j = f
+            .birth_landmark_civera(&single, 1e-3, d0, 1.0)
+            .expect("Civera birth must succeed from one bearing");
+        assert_eq!(f.dim(), dim_before + LM_DOF);
+
+        // Direction is the measured bearing; depth is the prior.
+        let pt = f.x.landmarks[j].point();
+        assert!((pt.norm() - d0).abs() < 1e-9, "depth must be the prior");
+        let b = msckf::bearing_of_uv(&single.obs[0].uvn);
+        assert!(
+            (pt / pt.norm() - b).norm() < 1e-9,
+            "bearing must be preserved exactly"
+        );
+
+        // The depth band is MULTIPLICATIVE, not linear in ρ. `sot3_left_increment_invdepth`
+        // pushes the chart increment through `SOT3::exp`, whose scale term is `u[3].exp()`,
+        // and the increment works out to w[3] = δ/ρ₀. So a 1σ step with σ_ρ = rel·ρ₀ moves
+        // depth by a FACTOR of e^rel — the band is [d₀·e^−rel, d₀·e^+rel], which never
+        // reaches zero inverse depth. Measure it through the filter's own increment rather
+        // than asserting the textbook linear-ρ identity, which does NOT hold in this chart.
+        let li = f.landmark_idx(j);
+        let rho0 = 1.0 / d0;
+        let sig_rho = f.cov[(li + 2, li + 2)].sqrt();
+        assert!((sig_rho - rho0).abs() < 1e-12, "σ_ρ {sig_rho} must equal ρ₀ {rho0}");
+
+        let lm = &f.x.landmarks[j];
+        for rel in [0.5_f64, 1.0, 3.0] {
+            let step = Vector3::new(0.0, 0.0, rel * rho0);
+            let q_plus = sot3_left_increment_invdepth(&lm.q, &lm.origin, &step);
+            let d_plus = q_plus.act(&lm.origin).norm();
+            assert!(
+                ((d_plus / d0).ln().abs() - rel).abs() < 1e-6,
+                "1σ step of rel={rel} must move depth by a factor e^{rel}, got {}",
+                d_plus / d0
+            );
+        }
+
+        // Bearing block finite and positive; anchored birth is UNcorrelated.
+        assert!(f.cov[(li, li)] > 0.0 && f.cov[(li + 1, li + 1)] > 0.0);
+        for r in 0..li {
+            for c in 0..LM_DOF {
+                assert!(
+                    f.cov[(r, li + c)].abs() < 1e-15,
+                    "anchored single-bearing birth must not correlate with the old state"
+                );
+            }
+        }
     }
 
     #[test]

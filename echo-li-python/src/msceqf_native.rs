@@ -328,6 +328,44 @@ impl PyMSCEqFNativeFilter {
         }
     }
 
+    /// Civera-style UNDELAYED inverse-depth birth: one bearing, a depth PRIOR, and an
+    /// inverse-depth std of `inv_depth_rel_std * (1/depth_prior)`. Needs no parallax, so
+    /// it works at motion onset where the triangulated [`Self::birth_landmark`] either
+    /// refuses (<2 obs) or returns an over-confident depth from a near-zero baseline.
+    /// `inv_depth_rel_std = 1.0` is Civera's default band: infinity out to half the
+    /// prior depth at 1σ.
+    #[pyo3(signature = (track_id, obs, pixel_std, depth_prior, inv_depth_rel_std=1.0))]
+    fn birth_landmark_civera(
+        &mut self,
+        track_id: u64,
+        obs: Vec<(u64, f64, f64)>,
+        pixel_std: f64,
+        depth_prior: f64,
+        inv_depth_rel_std: f64,
+    ) -> bool {
+        if self.landmark_ids.contains(&track_id) {
+            return false;
+        }
+        let obs = self.obs_on_live_clones(&obs);
+        if obs.is_empty() {
+            return false;
+        }
+        let track = MscTrack { obs };
+        match self.filter.birth_landmark_civera(
+            &track,
+            pixel_std,
+            depth_prior,
+            inv_depth_rel_std,
+        ) {
+            Some(j) => {
+                debug_assert_eq!(j, self.landmark_ids.len(), "birth appends at tail");
+                self.landmark_ids.push(track_id);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// EKF update of in-state landmarks. `updates` maps `track_id ->
     /// [(clone_id, u_n, v_n)]`. Each landmark is updated jointly with its anchor
     /// clone (no nullspace projection — the feature is a state). Observations on
