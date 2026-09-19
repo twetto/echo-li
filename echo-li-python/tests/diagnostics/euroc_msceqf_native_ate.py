@@ -112,6 +112,38 @@ def main():
                          "(zero baseline => unconditioned triangulation). The reference "
                          "C++ has a zero-velocity updater; our Rust has none, so we start "
                          "from motion onset instead of pretending to handle rest.")
+    ap.add_argument("--init", choices=("gt", "gravity"), default="gt",
+                    help="gt: seed R0/p0/v0 from ground truth (benchmarking/debugging). "
+                         "gravity: gravity-align the mean accel of the --init-imu "
+                         "samples ending at t0, p0=0, v0=0 -- no ground truth at all.")
+    ap.add_argument("--civera-depth", type=float, default=0.0,
+                    help="if >0, birth in-state landmarks by Civera undelayed "
+                         "inverse-depth init with this depth PRIOR (m) instead of "
+                         "triangulating. Needs no parallax, so it works at motion onset. "
+                         "Pick it as the scene's rough scale (EuRoC rooms ~2-4 m).")
+    ap.add_argument("--diag-csv", default="",
+                    help="per-FRAME update ledger: attempted vs accepted updates, "
+                         "in-state landmark depth distribution, and state-vs-GT error. "
+                         "This is the 'when does it go bad, and what differs' probe -- "
+                         "aggregate end-of-run ATE cannot localise a divergence.")
+    ap.add_argument("--civera-frames", type=int, default=0,
+                    help="apply Civera+immediate promotion ONLY for the first N frames "
+                         "(the initialization phase), then revert to the normal "
+                         "window-spanning triangulated promotion. 0 = whole run. The "
+                         "init phase is where triangulation has no parallax to work "
+                         "with; after it, the standard path has earned its baseline.")
+    ap.add_argument("--civera-rho-rel", type=float, default=1.0,
+                    help="sigma_rho / rho0. 1.0 = Civera's band (infinity .. d0/2 at 1sigma)")
+    ap.add_argument("--init-r0-gt", action="store_true", help="ablation: GT attitude")
+    ap.add_argument("--init-p0-gt", action="store_true", help="ablation: GT position")
+    ap.add_argument("--init-v0-gt", action="store_true", help="ablation: GT velocity")
+    ap.add_argument("--init-std-gt", action="store_true", help="ablation: GT-init d_std")
+    ap.add_argument("--init-imu", type=int, default=200,
+                    help="accel samples averaged for the align (EuRoC IMU is ~200 Hz)")
+    ap.add_argument("--init-vel-std", type=float, default=10.0,
+                    help="initial velocity std for --init gravity")
+    ap.add_argument("--init-att-std", type=float, default=0.2,
+                    help="initial attitude std (rad) for --init gravity")
     ap.add_argument("--num-clones", type=int, default=11)
     ap.add_argument("--stereo", type=int, default=0,
                     help="metric range channel from cam1 via Stereo.from_euroc(), which "
@@ -184,12 +216,62 @@ def main():
         return p, R_wb(q), v
 
     t0 = imgs[0][0]
-    p0, R0, v0 = gt_at(t0)
     b0 = np.zeros(6)
     # EuRoC world frame is gravity-aligned with z UP => gravity acceleration is -z.
     grav = np.array([0.0, 0.0, -9.81])
     S0 = T_BS.copy()                      # cam0 -> body, exactly what the filter wants
     d_std = np.array([1e-2, 1e-2, 1e-2, 1e-1, 1e-1, 1e-1, 1e-4, 1e-4, 1e-4])
+
+    if args.init == "gt":
+        p0, R0, v0 = gt_at(t0)
+    else:
+        # Gravity-align, as echo_li_core::initialization::estimate_initial_pose does.
+        # Accel reads specific force f = R^T (a - g_vec), so at rest f_world = -g_vec
+        # and the align target is -grav/|grav| (= +z here, z-up).
+        #
+        # The samples are taken from the window ENDING at t0, not from the start of the
+        # recording. EuRoC begins at rest but the filter starts at motion onset (no
+        # ZUPT), and the vehicle is rotated by then -- aligning off the first samples
+        # would hand the filter a stale attitude from tens of seconds earlier. Ending
+        # at t0 keeps the align consistent with the state it initializes, and those
+        # samples are still at rest whenever start_speed onset is the first motion.
+        j1 = int(np.searchsorted(its, t0))
+        j0 = max(0, j1 - max(1, args.init_imu))
+        f_body = iacc[j0:j1].mean(axis=0)
+        a_hat = f_body / np.linalg.norm(f_body)
+        b_hat = -grav / np.linalg.norm(grav)
+        v = np.cross(a_hat, b_hat); c = float(a_hat @ b_hat)
+        if c < -0.999999:
+            ax = np.array([1., 0., 0.]) if abs(a_hat[0]) < 0.9 else np.array([0., 1., 0.])
+            v = np.cross(a_hat, ax); v /= np.linalg.norm(v)
+            Kx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+            R0 = np.eye(3) + 2.0 * Kx @ Kx
+        else:
+            Kx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+            R0 = np.eye(3) + Kx + Kx @ Kx / (1.0 + c)
+        p0 = np.zeros(3); v0 = np.zeros(3)
+        d_std[0:3] = args.init_att_std
+        d_std[3:6] = args.init_vel_std
+        _p, Rg, vg = gt_at(t0)
+        # Ablation: put back one GT component at a time to find which one of
+        # {R0, p0, v0, d_std} is responsible for updates never being accepted.
+        if args.init_r0_gt:
+            R0 = Rg.copy()
+        if args.init_p0_gt:
+            p0 = _p.copy()
+        if args.init_v0_gt:
+            v0 = vg.copy()
+        if args.init_std_gt:
+            d_std[0:3] = 1e-2; d_std[3:6] = 1e-1
+        # Yaw-invariant (observable) error: R^T u is unchanged by a yaw about u, so this
+        # isolates the tilt the align is actually responsible for from the free gauge.
+        u = b_hat
+        tilt = np.degrees(np.arccos(np.clip((R0.T @ u) @ (Rg.T @ u), -1.0, 1.0)))
+        tot = np.degrees(np.arccos(np.clip((np.trace(R0.T @ Rg) - 1.0) / 2.0, -1.0, 1.0)))
+        print(f"init=gravity: {j1-j0} accel samples ending at t0, |f|={np.linalg.norm(f_body):.3f} "
+              f"m/s^2 (|f|-g = {np.linalg.norm(f_body)-9.81:+.3f})")
+        print(f"  TILT err={tilt:.2f} deg (observable)   total={tot:.1f} deg (incl. free yaw)"
+              f"   |v_gt(t0)|={np.linalg.norm(vg):.2f} m/s asserted as 0")
     delta_std = np.full(6, args.delta_std)
     e_std = np.full(6, 1e-4)
 
@@ -231,7 +313,9 @@ def main():
         est_p.append(p.copy()); est_R.append(Rm.copy()); est_v.append(vv.copy())
         gt_p.append(gp.copy()); gt_R.append(gR.copy()); gt_v.append(gv.copy())
 
+    diag = [] if args.diag_csv else None
     for k, (tk, path) in enumerate(imgs):
+        n_acc_k = 0; n_slam_acc = 0; n_supd_try = 0; n_promoted_k = 0
         # --- propagate IMU up to this image time, with REAL dt (EuRoC is ~200 Hz) ---
         while imu_i < len(its) and its[imu_i] <= tk:
             dt = its[imu_i] - its[imu_i - 1] if imu_i > 0 else 0.005
@@ -273,7 +357,10 @@ def main():
 
         # (0) PROMOTE window-spanning tracks about to be marginalized (mirrors the
         #     MidAir harness: birth from the buffered obs, then re-anchor to `k`).
-        if args.max_slam > 0 and (marg is not None or args.slam_immediate) \
+        in_init = args.civera_frames <= 0 or k < args.civera_frames
+        use_civera = args.civera_depth > 0.0 and in_init
+        immediate = args.slam_immediate and in_init
+        if args.max_slam > 0 and (marg is not None or immediate) \
                 and len(slam) < args.max_slam:
             # NOTE: requiring the track to touch the MARGINALIZED clone (the MidAir
             # harness's rule) implicitly forces ~num_clones observations, because tracks
@@ -282,7 +369,7 @@ def main():
             # the marginalization requirement entirely.
             cand = [t for t, o in buf.items()
                     if t in cur and len(o) >= slam_min_len
-                    and (args.slam_immediate or any(fk == marg for (fk, *_) in o))]
+                    and (immediate or any(fk == marg for (fk, *_) in o))]
             cand.sort(key=lambda t: len(buf[t]), reverse=True)
             for tid in cand[: args.max_slam - len(slam)]:
                 rp = None
@@ -290,9 +377,16 @@ def main():
                     rr, vv = pri[tid]
                     if np.isfinite(rr) and 0.0 < rr < 400.0 and np.isfinite(vv) and vv > 0.0:
                         rp = (float(rr), float(vv) / (float(rr) * float(rr)))
-                if filt.birth_landmark(tid, buf[tid], pixel_std, slam_chi2, rp):
+                if use_civera:
+                    # Undelayed inverse-depth birth: no parallax needed, so promotion
+                    # is not gated on the track having earned a baseline.
+                    born = filt.birth_landmark_civera(
+                        tid, buf[tid], pixel_std, args.civera_depth, args.civera_rho_rel)
+                else:
+                    born = filt.birth_landmark(tid, buf[tid], pixel_std, slam_chi2, rp)
+                if born:
                     filt.reanchor_landmark(tid, k)
-                    slam.add(tid); buf.pop(tid, None); n_promoted += 1
+                    slam.add(tid); buf.pop(tid, None); n_promoted += 1; n_promoted_k += 1
 
         # (1) per-frame stream update for live landmarks; drop on track loss.
         if slam:
@@ -311,9 +405,11 @@ def main():
                             srange[tid] = [(k, -float(np.log(rr)),
                                             float(vv) / (float(rr) * float(rr)))]
                             n_stream_range += 1
+            n_supd_try = len(supd)
             if supd:
-                n_slam_upd += filt.landmark_stream_update(
+                n_slam_acc = filt.landmark_stream_update(
                     supd, pixel_std, slam_chi2, srange or None)
+                n_slam_upd += n_slam_acc
 
         ready, done = {}, []
         for tid, obs in buf.items():
@@ -325,11 +421,27 @@ def main():
                     ready[tid] = obs
                 done.append(tid)
         if ready:
-            n_upd += filt.msc_update(ready, pixel_std, args.chi2_mult, bool(args.curvature))
+            n_acc_k = filt.msc_update(ready, pixel_std, args.chi2_mult, bool(args.curvature))
+            n_upd += n_acc_k
         for tid in done:
             buf.pop(tid, None)
         while filt.n_clones() > args.num_clones:
             filt.marginalize_oldest()
+        if diag is not None:
+            ep, eR, ev = filt.nav_body_pose()
+            gp, gR, gv = gt_at(tk)
+            dep = [d for d in (filt.landmark_range_anchor(t) for t in slam)
+                   if d is not None and np.isfinite(d)]
+            dep = np.array(dep) if dep else np.array([np.nan])
+            # Gauge-free error channels: speed magnitude and attitude TILT need no
+            # alignment, so they are comparable frame-by-frame without Umeyama.
+            u_g = np.array([0.0, 0.0, 1.0])
+            tilt = np.degrees(np.arccos(np.clip((eR.T @ u_g) @ (gR.T @ u_g), -1, 1)))
+            diag.append([k, tk - t0, len(ready), n_acc_k, n_supd_try, n_slam_acc,
+                         len(slam), n_promoted_k,
+                         np.nanmedian(dep), np.nanmin(dep), np.nanmax(dep),
+                         np.linalg.norm(ev), np.linalg.norm(gv), tilt,
+                         float(np.trace(filt.nav_vel_cov())) if hasattr(filt, "nav_vel_cov") else np.nan])
         snap(tk)
         if k % 400 == 0:
             print(f"  frame {k}/{nimg}  feats {len(feats)}  updates {n_upd}")
@@ -348,6 +460,12 @@ def main():
     print(f"ATE RMSE (SE3)   = {rmse:8.4f} m    [EqVIO-path baseline V1_01 ~0.12 m]")
     print(f"ATE %            = {100*rmse/max(plen,1e-9):7.3f} %")
     print(f"ATE median/mean/max = {np.median(err):.4f} / {err.mean():.4f} / {err.max():.4f} m")
+    if diag:
+        hdr = ("k,t,msc_try,msc_acc,slam_try,slam_acc,n_slam,promoted,"
+               "dep_med,dep_min,dep_max,est_speed,gt_speed,tilt_deg,vel_cov_tr")
+        np.savetxt(args.diag_csv, np.array(diag, dtype=float), delimiter=",",
+                   header=hdr, comments="")
+        print(f"per-frame ledger -> {args.diag_csv}")
     if args.dump:
         np.savez(args.dump, est=est_p, gt=gt_p, est_R=np.array(est_R),
                  gt_R=np.array(gt_R), est_v=np.array(est_v), gt_v=np.array(gt_v))

@@ -228,6 +228,33 @@ def main():
     ap.add_argument("--gyr-rw", type=float, default=1.0e-4)
     ap.add_argument("--delta-std", type=float, default=1.0e-2,
                     help="init std of the IMU bias block; tiny value ~ freeze bias")
+    ap.add_argument("--civera-depth", type=float, default=0.0,
+                    help="if >0, birth in-state landmarks by Civera undelayed "
+                         "inverse-depth init with this depth PRIOR (m). MidAir scenes "
+                         "are 10-100 m, vs EuRoC rooms' ~3 m.")
+    ap.add_argument("--civera-rho-rel", type=float, default=1.0)
+    ap.add_argument("--civera-frames", type=int, default=0,
+                    help="Civera+immediate promotion for the first N frames only; 0=all")
+    ap.add_argument("--slam-immediate", action="store_true",
+                    help="promote without waiting for the track to reach the "
+                         "marginalized clone (mirrors the EuRoC harness)")
+    ap.add_argument("--init", choices=("gt", "gravity"), default="gt",
+                    help="gt: seed R0/p0/v0 from ground truth (benchmarking and "
+                         "debugging path -- direct speed injection). gravity: seed "
+                         "attitude by gravity-aligning the mean of the first "
+                         "--init-imu accel samples, p0=0, v0=0 -- i.e. what the "
+                         "EqVIO CLI does, with no ground truth anywhere.")
+    ap.add_argument("--init-imu", type=int, default=100,
+                    help="accel samples averaged for the gravity align (100 = 1 s)")
+    ap.add_argument("--init-vel-std", type=float, default=10.0,
+                    help="initial velocity std for --init gravity. NOT a tuning knob: "
+                         "v0=0 is asserted while the vehicle is doing 7-10 m/s, so "
+                         "this is the honest 1-sigma of that ignorance. The gt-init "
+                         "default of 0.1 would make it a 100-sigma error.")
+    ap.add_argument("--init-att-std", type=float, default=0.2,
+                    help="initial attitude std for --init gravity (rad). In-flight "
+                         "accel is specific force, not gravity, so the align is good "
+                         "to ~10-15 deg, not the 0.57 deg the gt-init default claims.")
     ap.add_argument("--dump", default="")
     ap.add_argument("--tracks", default=str(TRACKS))
     ap.add_argument("--tracks-t0", type=float, default=0.0)
@@ -308,18 +335,54 @@ def main():
         print("front-end: MSCEqF own KLT dump (replayed; t2-only; mono only)")
         by_frame = load_tracks_stereo(nimg, args.tracks, args.tracks_t0)
 
-    # --- GT-seeded given-origin init (frame 0) ---
-    R0 = Rwb[0]; p0 = pos[0].copy(); v0 = vel[0].copy(); b0 = np.zeros(6)
     S0 = np.array([[0., 0., 1., 0.],
                    [1., 0., 0., 0.],
                    [0., 1., 0., 0.],
                    [0., 0., 0., 1.]])          # T_imu_cam (cam->body)
     grav = np.array([0., 0., 9.81])
+    b0 = np.zeros(6)
     # Index 2 is rotation about body-z ~ YAW on a level start. Global yaw is
     # UNOBSERVABLE, so whatever the update writes into it is never contradicted by any
     # measurement; the reference pins it (defines the world frame by the initial yaw)
     # while we historically left 1e-2 rad of freedom there.
     d_std = np.array([1e-2, 1e-2, 1e-2, 1e-1, 1e-1, 1e-1, 1e-4, 1e-4, 1e-4])
+
+    if args.init == "gt":
+        R0 = Rwb[0]; p0 = pos[0].copy(); v0 = vel[0].copy()
+    else:
+        # Gravity-align, mirroring echo_li_core::initialization::estimate_initial_pose.
+        # The accelerometer reads specific force f = R^T (a - g_vec), so at rest
+        # f_world = -g_vec; the align target is therefore -grav/|grav|, which is
+        # correct for NED (MidAir, grav = +z) and z-up (EuRoC, grav = -z) alike.
+        #
+        # MidAir never starts at rest (|v0| is 7-10 m/s), so the mean accel is NOT
+        # gravity and this lands ~10-15 deg off -- that error is the point of the test,
+        # not a defect in it. Yaw is unobservable from gravity, so from_vectors' minimal
+        # rotation leaves the world frame yawed by an arbitrary amount; that is a pure
+        # gauge freedom and align_umeyama absorbs it, as it does p0.
+        f_body = acc[:max(1, args.init_imu)].mean(axis=0)
+        a_hat = f_body / np.linalg.norm(f_body)
+        b_hat = -grav / np.linalg.norm(grav)
+        v = np.cross(a_hat, b_hat); c = float(a_hat @ b_hat)
+        if c < -0.999999:                       # antiparallel: any perpendicular axis
+            ax = np.array([1., 0., 0.]) if abs(a_hat[0]) < 0.9 else np.array([0., 1., 0.])
+            v = np.cross(a_hat, ax); v /= np.linalg.norm(v)
+            Kx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+            R0 = np.eye(3) + 2.0 * Kx @ Kx        # 180 deg about v
+        else:
+            Kx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+            R0 = np.eye(3) + Kx + Kx @ Kx / (1.0 + c)
+        p0 = np.zeros(3); v0 = np.zeros(3)
+        d_std[0:3] = args.init_att_std
+        d_std[3:6] = args.init_vel_std
+        tilt = np.degrees(np.arccos(np.clip(
+            (R0 @ a_hat) @ b_hat, -1.0, 1.0)))
+        att_err = np.degrees(np.arccos(np.clip(
+            (np.trace(R0.T @ Rwb[0]) - 1.0) / 2.0, -1.0, 1.0)))
+        print(f"init=gravity: {args.init_imu} accel samples, |f|={np.linalg.norm(f_body):.3f} "
+              f"m/s^2, align residual={tilt:.2e} deg")
+        print(f"  vs GT frame 0: total attitude error={att_err:.1f} deg (incl. free yaw), "
+              f"velocity error={np.linalg.norm(vel[0]):.2f} m/s asserted as 0")
     delta_std = np.full(6, args.delta_std)
     e_std = np.full(6, 1e-4)
 
@@ -390,10 +453,13 @@ def main():
         marg = filt.clone_ids()[0] if filt.n_clones() > args.num_clones else None
 
         # (0) PROMOTE long window-spanning tracks about to be marginalized.
-        if args.max_slam > 0 and marg is not None and len(slam) < args.max_slam:
+        in_init = args.civera_frames <= 0 or k < args.civera_frames
+        use_civera = args.civera_depth > 0.0 and in_init
+        immediate = args.slam_immediate and in_init
+        if args.max_slam > 0 and (marg is not None or immediate) and len(slam) < args.max_slam:
             cand = [tid for tid, obs in buf.items()
                     if tid in cur and len(obs) >= slam_min_len
-                    and any(fk == marg for (fk, *_ ) in obs)]
+                    and (immediate or any(fk == marg for (fk, *_ ) in obs))]
             cand.sort(key=lambda t: len(buf[t]), reverse=True)
             for tid in cand[: args.max_slam - len(slam)]:
                 obs = [(fk, un, vn) for (fk, un, vn, rng, rvar) in buf[tid]]
@@ -409,7 +475,11 @@ def main():
                             rp = (float(rng), _rv)
                             n_stereo_obs += 1
                             break
-                ok = filt.birth_landmark(tid, obs, pixel_std, slam_chi2, rp)
+                if use_civera:
+                    ok = filt.birth_landmark_civera(
+                        tid, obs, pixel_std, args.civera_depth, args.civera_rho_rel)
+                else:
+                    ok = filt.birth_landmark(tid, obs, pixel_std, slam_chi2, rp)
                 if ok:
                     filt.reanchor_landmark(tid, k)
                     slam.add(tid)
