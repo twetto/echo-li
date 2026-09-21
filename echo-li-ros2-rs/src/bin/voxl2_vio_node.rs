@@ -142,8 +142,9 @@ fn require_str(node: &r2r::Node, name: &str) -> String {
 
 fn load_params(node: &r2r::Node) -> NodeParams {
     let config_path = get_str(node, "echo_config_path", "config/eqvio_voxl2.yaml");
-    // No offset unless a calibration measures one: the VOXL2's own Kalibr
-    // timeshift is +4.3 ms, not the -26.4 ms this used to assume.
+    // No offset unless the rig's calibration measures one. A guessed value is
+    // an angular error during every turn, which the filter pays for as
+    // translation.
     let offset_sec = get_f64(node, "camera_time_offset_sec", 0.0);
 
     let intrinsics = require_f64_array::<4>(node, "intrinsics");
@@ -237,9 +238,15 @@ fn decimate<'a>(points: impl Iterator<Item = &'a [f64; 3]>, max: usize) -> Vec<[
 
 // ── Reference trajectory tracker ────────────────────────────────────────────
 
+/// How much reference history to retain. Bounded by time, not sample count:
+/// mocap and external VIO arrive at different rates, so a shared count cap would
+/// cover very different spans. Only the part overlapping the estimate is ever
+/// used — `estimated_positions` itself holds about ten minutes at image rate.
+const REF_TRACK_WINDOW_NS: i64 = 600 * NSEC_PER_SEC;
+
 struct ReferenceTrack {
-    stamps_ns: Vec<i64>,
-    positions: Vec<[f64; 3]>,
+    stamps_ns: VecDeque<i64>,
+    positions: VecDeque<[f64; 3]>,
     offsets_ns: VecDeque<i64>,
     last_stamp_ns: Option<i64>,
     last_pose: Option<([f64; 3], [f64; 4])>,
@@ -248,8 +255,8 @@ struct ReferenceTrack {
 impl ReferenceTrack {
     fn new() -> Self {
         Self {
-            stamps_ns: Vec::new(),
-            positions: Vec::new(),
+            stamps_ns: VecDeque::new(),
+            positions: VecDeque::new(),
             offsets_ns: VecDeque::with_capacity(2000),
             last_stamp_ns: None,
             last_pose: None,
@@ -280,8 +287,15 @@ impl ReferenceTrack {
             }
             self.offsets_ns.push_back(stamp_ns - imu_ns);
         }
-        self.stamps_ns.push(stamp_ns);
-        self.positions.push(position);
+        while let Some(&oldest) = self.stamps_ns.front() {
+            if stamp_ns - oldest <= REF_TRACK_WINDOW_NS {
+                break;
+            }
+            self.stamps_ns.pop_front();
+            self.positions.pop_front();
+        }
+        self.stamps_ns.push_back(stamp_ns);
+        self.positions.push_back(position);
     }
 
     fn offset_ns(&self) -> Option<i64> {
@@ -299,11 +313,13 @@ impl ReferenceTrack {
         if n < 2 {
             return None;
         }
-        let t: Vec<f64> = self.stamps_ns[..n]
+        let t: Vec<f64> = self
+            .stamps_ns
             .iter()
+            .take(n)
             .map(|&s| (s - offset) as f64 / NSEC_PER_SEC as f64)
             .collect();
-        Some((t, self.positions[..n].to_vec()))
+        Some((t, self.positions.iter().take(n).copied().collect()))
     }
 }
 
@@ -350,7 +366,6 @@ struct VioNode {
     images_processed: u64,
     dropped_imu: u64,
     dropped_images: u64,
-    bad_images: u64,
     patch_depth_frame_count: u64,
 
     // Timing stats
@@ -578,7 +593,6 @@ impl VioNode {
             images_processed: 0,
             dropped_imu: 0,
             dropped_images: 0,
-            bad_images: 0,
             patch_depth_frame_count: 0,
             imu_times_us: VecDeque::with_capacity(300),
             gray_times_ms: VecDeque::with_capacity(300),
@@ -760,7 +774,6 @@ impl VioNode {
         let gray = match self.to_gray(msg) {
             Ok(g) => g,
             Err(e) => {
-                self.bad_images += 1;
                 log::error!("{e}");
                 return;
             }
@@ -829,7 +842,7 @@ impl VioNode {
         );
 
         let n_lm = state.camera_landmarks.len();
-        push_capped_usize(&mut self.landmark_counts, n_lm, 300);
+        push_capped(&mut self.landmark_counts, n_lm, 300);
         let (global_landmarks, _, _) = landmarks_to_global(&state);
 
         // Camera pose: T_wc = T_wb @ T_bc
@@ -950,8 +963,8 @@ impl VioNode {
             }
         }
 
-        push_capped_usize(&mut self.seed_counts, priors.len(), 300);
-        push_capped_usize(&mut self.sparse_seed_counts, sparse_world.len(), 300);
+        push_capped(&mut self.seed_counts, priors.len(), 300);
+        push_capped(&mut self.sparse_seed_counts, sparse_world.len(), 300);
         self.sparse_census = census;
         self.sparse_range_var = range_var;
         Self::publish_landmarks(
@@ -1066,16 +1079,28 @@ impl VioNode {
         if self.image_scale >= 1.0 {
             return Ok(full);
         }
+        // Area-average, not point-sample. Rudolf-V's pyramid applies a proper
+        // blur+decimate, but only for the levels above level 0 — level 0 is a
+        // verbatim copy of whatever it is handed, and KLT tracks against it. So
+        // a point-sampled input aliases the gradients the tracker keys on and
+        // every pyramid level above inherits that.
         let ow = self.width;
         let oh = self.height;
-        let inv = 1.0 / self.image_scale;
         let mut out = Vec::with_capacity(ow * oh);
         for oy in 0..oh {
-            let sy = ((oy as f64 + 0.5) * inv) as usize;
-            let row = sy.min(h - 1) * w;
+            let y0 = oy * h / oh;
+            let y1 = (((oy + 1) * h / oh).max(y0 + 1)).min(h);
             for ox in 0..ow {
-                let sx = ((ox as f64 + 0.5) * inv) as usize;
-                out.push(full[row + sx.min(w - 1)]);
+                let x0 = ox * w / ow;
+                let x1 = (((ox + 1) * w / ow).max(x0 + 1)).min(w);
+                let mut sum = 0u32;
+                for sy in y0..y1 {
+                    let row = sy * w;
+                    for sx in x0..x1 {
+                        sum += full[row + sx] as u32;
+                    }
+                }
+                out.push((sum / (((y1 - y0) * (x1 - x0)) as u32)) as u8);
             }
         }
         Ok(out)
@@ -1434,12 +1459,12 @@ impl VioNode {
         let frontend_ms = median_deque(&self.frontend_times_ms).unwrap_or(0.0);
         let vision_ms = median_deque(&self.vision_times_ms).unwrap_or(0.0);
         let total_ms = median_deque(&self.total_times_ms).unwrap_or(0.0);
-        let tracks = median_deque_u64(&self.track_counts).unwrap_or(0);
+        let tracks = median_ord(&self.track_counts).unwrap_or(0);
 
         let mut mapping_part = String::new();
         if let Some(pd_ms) = median_deque(&self.patch_depth_times_ms) {
-            let seeds_med = median_deque_usize(&self.seed_counts).unwrap_or(0);
-            let sparse_med = median_deque_usize(&self.sparse_seed_counts).unwrap_or(0);
+            let seeds_med = median_ord(&self.seed_counts).unwrap_or(0);
+            let sparse_med = median_ord(&self.sparse_seed_counts).unwrap_or(0);
             let c = self.sparse_census;
             mapping_part.push_str(&format!(
                 "; sparse[pending={} pool={} short_track={} low_inlier={} high_var={} usable={}]",
@@ -1500,7 +1525,7 @@ impl VioNode {
             self.image_queue.len(),
             self.dropped_imu,
             self.dropped_images,
-            median_deque_usize(&self.landmark_counts).unwrap_or(0),
+            median_ord(&self.landmark_counts).unwrap_or(0),
         );
     }
 }
@@ -1508,13 +1533,6 @@ impl VioNode {
 // ── Utility ─────────────────────────────────────────────────────────────────
 
 fn push_capped<T>(deque: &mut VecDeque<T>, val: T, max: usize) {
-    if deque.len() >= max {
-        deque.pop_front();
-    }
-    deque.push_back(val);
-}
-
-fn push_capped_usize(deque: &mut VecDeque<usize>, val: usize, max: usize) {
     if deque.len() >= max {
         deque.pop_front();
     }
@@ -1530,23 +1548,17 @@ fn median_deque(d: &VecDeque<f64>) -> Option<f64> {
     Some(v[v.len() / 2])
 }
 
-fn median_deque_u64(d: &VecDeque<u64>) -> Option<u64> {
+/// Median for the integer counters. `median_deque` stays separate because f64
+/// has no total order.
+fn median_ord<T: Ord + Copy>(d: &VecDeque<T>) -> Option<T> {
     if d.is_empty() {
         return None;
     }
-    let mut v: Vec<u64> = d.iter().copied().collect();
+    let mut v: Vec<T> = d.iter().copied().collect();
     v.sort_unstable();
     Some(v[v.len() / 2])
 }
 
-fn median_deque_usize(d: &VecDeque<usize>) -> Option<usize> {
-    if d.is_empty() {
-        return None;
-    }
-    let mut v: Vec<usize> = d.iter().copied().collect();
-    v.sort_unstable();
-    Some(v[v.len() / 2])
-}
 
 // ── Main ────────────────────────────────────────────────────────────────────
 

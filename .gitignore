@@ -45,3 +45,6 @@ rudolf-v-local/
 bench_pi.txt
 mpv-shot*.jpg
 *.bak
+
+# aarch64 cross-build tree (CARGO_TARGET_DIR=target-orin)
+target-orin/
