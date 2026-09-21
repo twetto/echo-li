@@ -119,13 +119,13 @@ PatchDepth:
   patch_stride: 4
   gn_eta_convergence_tol: 0.001
   n_pyramid_levels: 3
-  seed_radius_px: 128
+  seed_radius_px: 80
   min_baseline_ratio: 0.005
   max_baseline_ratio: 0.3
   max_depth: 12.0
   # min_structure_eigen: 1.0
   min_structure_eigen: 0.0
-  vis_min_depth: 0.3
+  vis_min_depth: 0.2
   vis_max_depth: 8.0
 
 DISDepth:
