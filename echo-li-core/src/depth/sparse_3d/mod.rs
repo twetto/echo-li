@@ -568,6 +568,65 @@ impl Sparse3DFilter {
         self.features.len()
     }
 
+    /// Median range (m) and median range-variance over live pool features, so
+    /// `conv_variance_threshold` can be judged against what the filter actually
+    /// achieves rather than against a guess.
+    /// `[r_p10, r_p50, r_p90, var_p10, var_p50, var_p90, frac_short]` where
+    /// `frac_short` is the fraction of the pool sitting below 0.5 m — births far
+    /// below scene depth carry a huge `var_rho = init_depth_var / r^4`, so their
+    /// reported range variance explodes as the range estimate later corrects.
+    pub fn range_var_percentiles(&self) -> [f64; 7] {
+        let mut ranges: Vec<f64> = Vec::with_capacity(self.features.len());
+        let mut vars: Vec<f64> = Vec::with_capacity(self.features.len());
+        for feat in &self.features {
+            let r = feat.position.norm();
+            if r > 0.0 && r.is_finite() {
+                ranges.push(r);
+                vars.push(feat.range_variance_for_chart(self.chart));
+            }
+        }
+        if ranges.is_empty() {
+            return [-1.0; 7];
+        }
+        ranges.sort_by(|a, b| a.total_cmp(b));
+        vars.sort_by(|a, b| a.total_cmp(b));
+        let pick = |v: &Vec<f64>, q: f64| v[(((v.len() - 1) as f64) * q).round() as usize];
+        let short = ranges.iter().filter(|r| **r < 0.5).count() as f64 / ranges.len() as f64;
+        [
+            pick(&ranges, 0.1),
+            pick(&ranges, 0.5),
+            pick(&ranges, 0.9),
+            pick(&vars, 0.1),
+            pick(&vars, 0.5),
+            pick(&vars, 0.9),
+            short,
+        ]
+    }
+
+    /// Why `query_range` yields what it does, as live counts:
+    /// `[pending, in_pool, short_track, low_inlier, high_var, usable]`.
+    /// The last four partition `in_pool` in the same order the gates are applied,
+    /// so whichever is largest is the one actually capping seed supply.
+    pub fn gate_census(&self) -> [usize; 6] {
+        let mut c = [0usize; 6];
+        c[0] = self.pending.len();
+        c[1] = self.features.len();
+        for feat in &self.features {
+            if feat.position.norm() <= 0.0 || feat.track_length < self.settings.min_track_length {
+                c[2] += 1;
+            } else if feat.inlier_ratio() < self.settings.conv_inlier_ratio {
+                c[3] += 1;
+            } else if feat.range_variance_for_chart(self.chart)
+                > self.settings.conv_variance_threshold
+            {
+                c[4] += 1;
+            } else {
+                c[5] += 1;
+            }
+        }
+        c
+    }
+
     pub fn chart(&self) -> Sparse3DChart {
         self.chart
     }
@@ -677,6 +736,19 @@ fn measurement_variance_px2(settings: &SparseVogSettings, feat: &FeatureState3D)
 /// as the SOT(3) path. No log-depth, no re-charting -> no sequential-linearisation
 /// overconfidence: a multiplicative (log-depth) chart re-introduces it and
 /// biases the converged range, so the additive inverse-depth chart is used.
+/// Keep inverse depth inside the configured depth range.
+///
+/// Birth already gates `range_anchor` to `[min_depth, max_depth]`, but the
+/// additive charts then update `rho` with no constraint, so it is free to walk
+/// to zero (range -> infinity) or negative. That is not merely a bad estimate:
+/// the reported range variance is `r^4 * var_rho`, so a drifting rho inflates it
+/// by the fourth power and the feature can never pass `conv_variance_threshold`.
+fn clamp_rho(settings: &SparseVogSettings, rho: f64) -> f64 {
+    let lo = 1.0 / settings.max_depth.max(1e-6);
+    let hi = 1.0 / settings.min_depth.max(1e-6);
+    rho.clamp(lo, hi)
+}
+
 fn invdepth_additive_update_3d(
     k: &Matrix3<f64>,
     settings: &SparseVogSettings,
@@ -810,6 +882,7 @@ fn invdepth_additive_update_3d(
 
     // Additive state update (abelian / flat): s <- s + gamma. No re-charting.
     feat.inv_s += gamma;
+    feat.inv_s[2] = clamp_rho(settings, feat.inv_s[2]);
     feat.inv_p = 0.5 * (p_new + p_new.transpose());
     feat.track_length += 1;
     update_beta(settings, feat, w1, w2);
@@ -964,6 +1037,7 @@ fn bearing_invdepth_additive_update_3d(
     }
 
     feat.inv_s += gamma;
+    feat.inv_s[2] = clamp_rho(settings, feat.inv_s[2]);
     feat.inv_p = 0.5 * (p_new + p_new.transpose());
     feat.track_length += 1;
     update_beta(settings, feat, w1, w2);
@@ -1134,7 +1208,7 @@ fn bearing_bias_update_3d(
 
     feat.inv_s[0] += gamma[0];
     feat.inv_s[1] += gamma[1];
-    feat.inv_s[2] += gamma[2];
+    feat.inv_s[2] = clamp_rho(settings, feat.inv_s[2] + gamma[2]);
     feat.bias[0] += gamma[3];
     feat.bias[1] += gamma[4];
     let inv_p = p_new.fixed_view::<3, 3>(0, 0).into_owned();
