@@ -11,6 +11,42 @@ pub fn to_stamp(ns: i64) -> r2r::builtin_interfaces::msg::Time {
     }
 }
 
+/// Build an unordered XYZI `PointCloud2` from packed little-endian f32 quads.
+/// `data` must hold exactly `n` points of x, y, z, intensity.
+pub fn xyzi_cloud(
+    stamp: r2r::builtin_interfaces::msg::Time,
+    frame_id: &str,
+    data: Vec<u8>,
+    n: u32,
+) -> r2r::sensor_msgs::msg::PointCloud2 {
+    const POINT_STEP: u32 = 16;
+    let field = |name: &str, offset: u32| r2r::sensor_msgs::msg::PointField {
+        name: name.into(),
+        offset,
+        datatype: 7, // FLOAT32
+        count: 1,
+    };
+    r2r::sensor_msgs::msg::PointCloud2 {
+        header: r2r::std_msgs::msg::Header {
+            stamp,
+            frame_id: frame_id.to_string(),
+        },
+        height: 1,
+        width: n,
+        fields: vec![
+            field("x", 0),
+            field("y", 4),
+            field("z", 8),
+            field("intensity", 12),
+        ],
+        is_bigendian: false,
+        point_step: POINT_STEP,
+        row_step: POINT_STEP * n,
+        data,
+        is_dense: true,
+    }
+}
+
 pub fn quat_to_se3(position: &[f64; 3], quaternion: &[f64; 4]) -> nalgebra::Matrix4<f64> {
     let [x, y, z, w] = *quaternion;
     let mut m = nalgebra::Matrix4::identity();

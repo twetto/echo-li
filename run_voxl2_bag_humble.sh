@@ -7,6 +7,7 @@ BAG_PATH="/home/twetto/Downloads/voxl_imu_camera_test_raw_imu_track_encoded_2"
 INTERNAL_ID=""
 RATE=1.0
 DECODER=auto
+OCCUPANCY=true
 IMAGE_STAMP_MODE="auto"
 ECHO_CONFIG="$SCRIPT_DIR/echo-li-ros2/config/eqvio_voxl2.yaml"
 GT_TRAJECTORY=""
@@ -56,6 +57,8 @@ Options:
                          the mocap track onto the estimate by heading and
                          origin and republishes it on /echo_li/mocap_path.
   --vio-topic TOPIC      External VIO Odometry topic to overlay.
+  --no-occupancy         Disable the local occupancy grid (it is on by default
+                         and published as /echo_li/occupancy).
   --no-rviz              Don't launch rviz2.
   --rviz-config PATH     rviz2 config (default: echo_li_voxl2.rviz).
   --rviz-view VIEW       Startup 3D view: follow (default, chases imu_link) or
@@ -102,6 +105,7 @@ while [[ $# -gt 0 ]]; do
         --gt) need_value "$@"; GT_TRAJECTORY="$2"; shift 2 ;;
         --mocap-topic) need_value "$@"; MOCAP_TOPIC="$2"; shift 2 ;;
         --vio-topic) need_value "$@"; VIO_TOPIC="$2"; shift 2 ;;
+        --no-occupancy) OCCUPANCY=false; shift ;;
         --no-rviz) USE_RVIZ=0; shift ;;
         --rviz-config) need_value "$@"; RVIZ_CFG="$2"; shift 2 ;;
         --rviz-view) need_value "$@"; RVIZ_VIEW="$2"; shift 2 ;;
@@ -354,7 +358,7 @@ setsid env RUST_LOG="${RUST_LOG:-info}" "$VIO_BIN" --ros-args \
     -p "imu_topic:=${IMU_TOPIC}" \
     -p "image_topic:=${IMAGE_TOPIC}" \
     -p "patch_depth_enabled:=true" \
-    -p "occupancy_enabled:=false" \
+    -p "occupancy_enabled:=${OCCUPANCY}" \
     -p "trajectory_output:=${LOG_DIR}/trajectory.tum" \
     "${EXTRA_ROS_ARGS[@]}" \
     >"$LOG_DIR/echo_li.log" 2>&1 &

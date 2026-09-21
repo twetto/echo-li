@@ -17,7 +17,7 @@ use echo_li_core::mathematical::imu_velocity::IMUVelocity;
 use echo_li_core::mathematical::vio_state::{VIOSensorState, VIOState};
 use echo_li_core::mathematical::vision_measurement::VisionMeasurement;
 use echo_li_core::{VIOFilter, landmarks_to_global};
-use echo_li_ros2::{NSEC_PER_SEC, best_effort_qos, quat_to_se3, stamp_ns, to_stamp};
+use echo_li_ros2::{NSEC_PER_SEC, best_effort_qos, quat_to_se3, stamp_ns, to_stamp, xyzi_cloud};
 use echo_lie::SE3;
 use futures::StreamExt;
 use nalgebra::{Matrix3, Matrix4, Vector2, Vector3, Vector6};
@@ -328,6 +328,7 @@ struct VioNode {
     depth_pub: Option<r2r::Publisher<r2r::sensor_msgs::msg::Image>>,
     depth_status_pub: Option<r2r::Publisher<r2r::sensor_msgs::msg::Image>>,
     sparse_landmark_pub: r2r::Publisher<r2r::sensor_msgs::msg::PointCloud2>,
+    occupancy_pub: Option<r2r::Publisher<r2r::sensor_msgs::msg::PointCloud2>>,
     occupancy_map: Option<LocalOccupancyMap>,
     mapping_stride: usize,
 
@@ -399,6 +400,7 @@ impl VioNode {
         depth_pub: Option<r2r::Publisher<r2r::sensor_msgs::msg::Image>>,
         depth_status_pub: Option<r2r::Publisher<r2r::sensor_msgs::msg::Image>>,
         sparse_landmark_pub: r2r::Publisher<r2r::sensor_msgs::msg::PointCloud2>,
+        occupancy_pub: Option<r2r::Publisher<r2r::sensor_msgs::msg::PointCloud2>>,
     ) -> Self {
         let s = params.image_scale;
         let [fx, fy, cx, cy] = [
@@ -558,6 +560,7 @@ impl VioNode {
             depth_pub,
             depth_status_pub,
             sparse_landmark_pub,
+            occupancy_pub,
             occupancy_map,
             mapping_stride: params.mapping_stride,
             imu_queue: VecDeque::new(),
@@ -1216,47 +1219,46 @@ impl VioNode {
             let depth = (dx * dx + dy * dy + dz * dz).sqrt() as f32;
             data.extend_from_slice(&depth.to_le_bytes());
         }
-        let fields = vec![
-            r2r::sensor_msgs::msg::PointField {
-                name: "x".into(),
-                offset: 0,
-                datatype: 7,
-                count: 1,
-            },
-            r2r::sensor_msgs::msg::PointField {
-                name: "y".into(),
-                offset: 4,
-                datatype: 7,
-                count: 1,
-            },
-            r2r::sensor_msgs::msg::PointField {
-                name: "z".into(),
-                offset: 8,
-                datatype: 7,
-                count: 1,
-            },
-            r2r::sensor_msgs::msg::PointField {
-                name: "intensity".into(),
-                offset: 12,
-                datatype: 7,
-                count: 1,
-            },
-        ];
-        let msg = r2r::sensor_msgs::msg::PointCloud2 {
-            header: r2r::std_msgs::msg::Header {
-                stamp,
-                frame_id: frame_id.to_string(),
-            },
-            height: 1,
-            width: n,
-            fields,
-            is_bigendian: false,
-            point_step,
-            row_step: point_step * n,
-            data,
-            is_dense: true,
+        let _ = pub_.publish(&xyzi_cloud(stamp, frame_id, data, n));
+    }
+
+    /// Publish the occupied voxels of the local occupancy grid as a point cloud,
+    /// intensity carrying log-odds. Rides the path timer rather than the image
+    /// path: the grid is ~500k voxels and occupancy changes far more slowly than
+    /// frames arrive. Render it in rviz2 with Style=Boxes and Size = resolution.
+    fn publish_occupancy(&self, pub_: &r2r::Publisher<r2r::sensor_msgs::msg::PointCloud2>) {
+        let (Some(occ), Some(&last_stamp)) = (&self.occupancy_map, self.estimated_stamps.back())
+        else {
+            return;
         };
-        let _ = pub_.publish(&msg);
+        let snap = occ.snapshot();
+        let occupied = occ.settings().occupied_threshold;
+        let res = snap.resolution;
+        let mut data: Vec<u8> = Vec::new();
+        let mut n: u32 = 0;
+        for z in 0..snap.depth {
+            for y in 0..snap.height {
+                for x in 0..snap.width {
+                    let log_odds = snap.log_odds[(z * snap.height + y) * snap.width + x];
+                    if log_odds < occupied {
+                        continue;
+                    }
+                    let wx = snap.origin_x + (x as f64 + 0.5) * res;
+                    let wy = snap.origin_y + (y as f64 + 0.5) * res;
+                    let wz = snap.origin_z + (z as f64 + 0.5) * res;
+                    data.extend_from_slice(&(wx as f32).to_le_bytes());
+                    data.extend_from_slice(&(wy as f32).to_le_bytes());
+                    data.extend_from_slice(&(wz as f32).to_le_bytes());
+                    data.extend_from_slice(&log_odds.to_le_bytes());
+                    n += 1;
+                }
+            }
+        }
+        if n == 0 {
+            return;
+        }
+        let stamp = to_stamp((last_stamp * NSEC_PER_SEC as f64).round() as i64);
+        let _ = pub_.publish(&xyzi_cloud(stamp, &self.odom_frame, data, n));
     }
 
     /// Fit a reference track onto the estimated trajectory: pair the two by
@@ -1618,6 +1620,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "/echo_li/sparse3d_landmarks",
         r2r::QosProfile::default(),
     )?;
+    let occupancy_pub = if params.occupancy_enabled {
+        Some(node.create_publisher::<r2r::sensor_msgs::msg::PointCloud2>(
+            "/echo_li/occupancy",
+            r2r::QosProfile::default(),
+        )?)
+    } else {
+        None
+    };
     // Dense depth is only worth a topic when the mapper is actually running.
     let (depth_pub, depth_status_pub) = if params.patch_depth_enabled {
         (
@@ -1687,7 +1697,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     );
 
-    let mut state = VioNode::new(&params, depth_pub, depth_status_pub, sparse_landmark_pub);
+    let mut state = VioNode::new(
+        &params,
+        depth_pub,
+        depth_status_pub,
+        sparse_landmark_pub,
+        occupancy_pub,
+    );
     let traj_output = params.trajectory_output.clone();
 
     // Spin the underlying rcl node in a background thread
@@ -1722,6 +1738,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             _ = path_timer.tick() => {
                 state.publish_paths(&path_pub, mocap_path_pub.as_ref());
+                if let Some(occ_pub) = &state.occupancy_pub {
+                    state.publish_occupancy(occ_pub);
+                }
             }
             _ = stats_timer.tick() => {
                 state.report_statistics();
