@@ -6,6 +6,14 @@
 #   t_bs is Kalibr's T_ic (cam0 -> imu0); its rotation differs from the ideal
 #   axis permutation by 1.6 deg, and the camera sits 1.5 cm above the IMU.
 #   camera_time_offset_sec is Kalibr's timeshift, t_imu = t_cam + shift.
+#
+# Which unit this is: fx 467.2 sits 1 % from the ID 1 factory intrinsics and
+# 10 % from ID 2, so the calibration bag was shot with an ID 1-class board. The
+# RC V1.8 bundle's README (CCLoLab/rc-v15-orin, 2026-09-21) says the board that
+# flies at the site is ID 2. If that holds, these intrinsics and this mount
+# geometry belong to a different unit than the 0914 flight bags, and the site
+# drone needs its own Kalibr run. Replaying the flights could not separate the
+# three intrinsics sets: run-to-run spread is +-0.07 m, larger than the gap.
 echo_li_voxl2:
   ros__parameters:
     image_width: 1280
