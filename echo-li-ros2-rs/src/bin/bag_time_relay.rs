@@ -78,7 +78,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let sensor_qos = best_effort_qos(2000);
-    let image_qos = best_effort_qos(5);
+    // A 1280x800 mono image is 1 MB, which the middleware splits into hundreds
+    // of loopback UDP datagrams. Best effort loses the whole frame to a single
+    // missing fragment and never asks for it again: a third of the frames went
+    // that way, on this relay and on an rclpy one alike. Reliable recovers them.
+    let image_qos = r2r::QosProfile {
+        depth: 30,
+        reliability: r2r::qos::ReliabilityPolicy::Reliable,
+        ..r2r::QosProfile::sensor_data()
+    };
 
     let imu_pub = node.create_publisher::<Imu>(&output_imu, sensor_qos.clone())?;
     let image_pub = node.create_publisher::<Image>(&output_image, image_qos.clone())?;

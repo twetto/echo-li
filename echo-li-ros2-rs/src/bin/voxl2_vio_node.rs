@@ -7,7 +7,8 @@ use echo_li_core::config::VIOConfig;
 use echo_li_core::core_types::CameraIntrinsics;
 use echo_li_core::depth::occupancy::LocalOccupancyMap;
 use echo_li_core::depth::patch_depth::{
-    FrameProducts, PatchDepthMapper, PatchDepthSeedCoordinates, SparseDepthPrior,
+    FrameProducts, PatchDepthMapper, PatchDepthOutput, PatchDepthSeedCoordinates, PatchStatus,
+    SparseDepthPrior,
 };
 use echo_li_core::depth::sparse_3d::{Sparse3DChart, Sparse3DFilter};
 use echo_li_core::initialization::estimate_initial_pose;
@@ -59,12 +60,9 @@ struct NodeParams {
     trajectory_output: String,
     mocap_topic: String,
     vio_topic: String,
-    #[cfg(feature = "rerun")]
-    rerun_enabled: bool,
-    #[cfg(feature = "rerun")]
-    rerun_url: String,
-    #[cfg(feature = "rerun")]
-    rerun_world_stride: usize,
+    path_topic: String,
+    mocap_path_topic: String,
+    path_period_sec: f64,
 }
 
 // ── Parameter helpers ────────────────────────────────────────────────────────
@@ -112,43 +110,45 @@ fn get_f64_vec(node: &r2r::Node, name: &str) -> Option<Vec<f64>> {
     }
 }
 
+// Anything describing the physical rig is required rather than defaulted: a
+// built-in value would silently run the filter on some other rig's geometry.
+fn missing(name: &str) -> ! {
+    panic!("parameter '{name}' is missing; pass the rig's calibration with --params-file")
+}
+
+fn require_f64_array<const N: usize>(node: &r2r::Node, name: &str) -> [f64; N] {
+    let v = get_f64_vec(node, name).unwrap_or_else(|| missing(name));
+    let len = v.len();
+    v.try_into()
+        .unwrap_or_else(|_| panic!("parameter '{name}' needs {N} values, got {len}"))
+}
+
+fn require_i64(node: &r2r::Node, name: &str) -> i64 {
+    let params = node.params.lock().unwrap();
+    match params.get(name).map(|p| &p.value) {
+        Some(r2r::ParameterValue::Integer(v)) => *v,
+        Some(r2r::ParameterValue::Double(v)) => *v as i64,
+        _ => missing(name),
+    }
+}
+
+fn require_str(node: &r2r::Node, name: &str) -> String {
+    let params = node.params.lock().unwrap();
+    match params.get(name).map(|p| &p.value) {
+        Some(r2r::ParameterValue::String(s)) => s.clone(),
+        _ => missing(name),
+    }
+}
+
 fn load_params(node: &r2r::Node) -> NodeParams {
     let config_path = get_str(node, "echo_config_path", "config/eqvio_voxl2.yaml");
-    let offset_sec = get_f64(node, "camera_time_offset_sec", -0.0264);
+    // No offset unless a calibration measures one: the VOXL2's own Kalibr
+    // timeshift is +4.3 ms, not the -26.4 ms this used to assume.
+    let offset_sec = get_f64(node, "camera_time_offset_sec", 0.0);
 
-    let [fx, fy, cx, cy] = if let Some(v) = get_f64_vec(node, "intrinsics") {
-        assert!(v.len() == 4, "intrinsics must have 4 elements");
-        [v[0], v[1], v[2], v[3]]
-    } else {
-        [
-            get_f64(node, "fx", 462.459_008_454_092_61),
-            get_f64(node, "fy", 462.540_269_670_589_45),
-            get_f64(node, "cx", 670.414_298_091_828),
-            get_f64(node, "cy", 398.445_515_810_873_47),
-        ]
-    };
-
-    let [k1, k2, k3, k4] = if let Some(v) = get_f64_vec(node, "distortion_coefficients") {
-        assert!(v.len() == 4, "distortion_coefficients must have 4 elements");
-        [v[0], v[1], v[2], v[3]]
-    } else {
-        [
-            get_f64(node, "k1", 0.067_992_633_732_965_42),
-            get_f64(node, "k2", 0.002_231_546_482_175_450_2),
-            get_f64(node, "k3", 0.004_627_575_172_719_192),
-            get_f64(node, "k4", -0.003_319_341_100_961_203_3),
-        ]
-    };
-
-    let t_bs = if let Some(v) = get_f64_vec(node, "t_bs") {
-        assert!(v.len() == 16, "t_bs must have 16 elements");
-        Matrix4::from_row_slice(&v)
-    } else {
-        let t_bs_default: [f64; 16] = [
-            0.0, 0.0, 1.0, 0.037, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0006, 0.0, 0.0, 0.0, 1.0,
-        ];
-        Matrix4::from_row_slice(&t_bs_default)
-    };
+    let intrinsics = require_f64_array::<4>(node, "intrinsics");
+    let distortion = require_f64_array::<4>(node, "distortion_coefficients");
+    let t_bs = Matrix4::from_row_slice(&require_f64_array::<16>(node, "t_bs"));
 
     NodeParams {
         config_path,
@@ -159,16 +159,18 @@ fn load_params(node: &r2r::Node) -> NodeParams {
         body_frame: get_str(node, "body_frame_id", "imu_link"),
         publish_tf: get_bool(node, "publish_tf", true),
         camera_offset_ns: (offset_sec * NSEC_PER_SEC as f64).round() as i64,
-        width: get_i64(node, "image_width", 1280) as usize,
-        height: get_i64(node, "image_height", 800) as usize,
-        intrinsics: [fx, fy, cx, cy],
-        distortion: [k1, k2, k3, k4],
-        camera_model: get_str(node, "camera_model", "equidistant"),
+        width: require_i64(node, "image_width") as usize,
+        height: require_i64(node, "image_height") as usize,
+        intrinsics,
+        distortion,
+        camera_model: require_str(node, "camera_model"),
         t_bs,
         n_init: get_i64(node, "initialization_imu_samples", 100) as usize,
         imu_qos_depth: get_i64(node, "imu_qos_depth", 2000) as usize,
-        image_qos_depth: get_i64(node, "image_qos_depth", 5) as usize,
-        image_qos_reliable: get_str(node, "image_qos_reliability", "best_effort") == "reliable",
+        image_qos_depth: get_i64(node, "image_qos_depth", 30) as usize,
+        // Reliable by default: see the note in bag_time_relay.rs. Whole images
+        // are lost to single dropped UDP fragments otherwise.
+        image_qos_reliable: get_str(node, "image_qos_reliability", "reliable") == "reliable",
         max_imu_queue: get_i64(node, "max_imu_queue", 5000) as usize,
         max_image_queue: get_i64(node, "max_image_queue", 4) as usize,
         stats_period_sec: get_f64(node, "statistics_period_sec", 5.0),
@@ -179,13 +181,58 @@ fn load_params(node: &r2r::Node) -> NodeParams {
         mapping_stride: (get_i64(node, "mapping_stride", 1) as usize).max(1),
         mocap_topic: get_str(node, "mocap_topic", ""),
         vio_topic: get_str(node, "vio_topic", ""),
-        #[cfg(feature = "rerun")]
-        rerun_enabled: get_bool(node, "rerun_enabled", false),
-        #[cfg(feature = "rerun")]
-        rerun_url: get_str(node, "rerun_url", ""),
-        #[cfg(feature = "rerun")]
-        rerun_world_stride: (get_i64(node, "rerun_world_stride", 3) as usize).max(1),
+        path_topic: get_str(node, "path_topic", "/echo_li/path"),
+        mocap_path_topic: get_str(node, "mocap_path_topic", "/echo_li/mocap_path"),
+        path_period_sec: get_f64(node, "path_period_sec", 0.5).max(0.05),
     }
+}
+
+// ── Trajectory plotting ─────────────────────────────────────────────────────
+
+/// Longest gap that still counts as the same instant when pairing a reference
+/// pose with an estimated one.
+const PATH_MATCH_DT: f64 = 0.02;
+/// Below this many pairs, or this much horizontal travel (m), the heading fit
+/// is noise.
+const PATH_MIN_PAIRS: usize = 50;
+const PATH_MIN_SPREAD: f64 = 0.3;
+/// Poses per published path. Mocap runs at a few hundred hertz, and rviz2 does
+/// not need every sample to draw the line.
+const PATH_MAX_POINTS: usize = 4000;
+
+/// Yaw and translation putting a reference track into the VIO's odom frame.
+/// Both are gravity-aligned, so heading and origin are all that differ.
+#[derive(Clone, Copy)]
+struct PlanarAlignment {
+    yaw: f64,
+    t: [f64; 3],
+    rmse: f64,
+    pairs: usize,
+}
+
+impl PlanarAlignment {
+    fn apply(&self, p: &[f64; 3]) -> [f64; 3] {
+        let (s, c) = self.yaw.sin_cos();
+        [
+            c * p[0] - s * p[1] + self.t[0],
+            s * p[0] + c * p[1] + self.t[1],
+            p[2] + self.t[2],
+        ]
+    }
+}
+
+fn decimate<'a>(points: impl Iterator<Item = &'a [f64; 3]>, max: usize) -> Vec<[f64; 3]> {
+    let all: Vec<[f64; 3]> = points.copied().collect();
+    if all.len() <= max {
+        return all;
+    }
+    let stride = (all.len() + max - 1) / max;
+    let mut out: Vec<[f64; 3]> = all.iter().step_by(stride).copied().collect();
+    match (out.last(), all.last()) {
+        (Some(last), Some(end)) if last != end => out.push(*end),
+        _ => {}
+    }
+    out
 }
 
 // ── Reference trajectory tracker ────────────────────────────────────────────
@@ -278,6 +325,9 @@ struct VioNode {
     // Dense mapping
     depth_mapper: Option<PatchDepthMapper>,
     depth_seed_coords: PatchDepthSeedCoordinates,
+    depth_pub: Option<r2r::Publisher<r2r::sensor_msgs::msg::Image>>,
+    depth_status_pub: Option<r2r::Publisher<r2r::sensor_msgs::msg::Image>>,
+    sparse_landmark_pub: r2r::Publisher<r2r::sensor_msgs::msg::PointCloud2>,
     occupancy_map: Option<LocalOccupancyMap>,
     mapping_stride: usize,
 
@@ -310,8 +360,13 @@ struct VioNode {
     total_times_ms: VecDeque<f64>,
     track_counts: VecDeque<u64>,
     patch_depth_times_ms: VecDeque<f64>,
+    depth_valid_pct: VecDeque<f64>,
+    depth_seedonly_pct: VecDeque<f64>,
     occupancy_times_ms: VecDeque<f64>,
     seed_counts: VecDeque<usize>,
+    sparse_seed_counts: VecDeque<usize>,
+    sparse_census: [usize; 6],
+    sparse_range_var: [f64; 7],
     landmark_counts: VecDeque<usize>,
 
     // Reference trajectories
@@ -320,6 +375,7 @@ struct VioNode {
     estimated_stamps: VecDeque<f64>,
     estimated_positions: VecDeque<[f64; 3]>,
     estimated_quaternions: VecDeque<[f64; 4]>,
+    mocap_fit: Option<PlanarAlignment>,
 
     // Image parameters
     input_width: usize,
@@ -338,7 +394,12 @@ struct VioNode {
 }
 
 impl VioNode {
-    fn new(params: &NodeParams) -> Self {
+    fn new(
+        params: &NodeParams,
+        depth_pub: Option<r2r::Publisher<r2r::sensor_msgs::msg::Image>>,
+        depth_status_pub: Option<r2r::Publisher<r2r::sensor_msgs::msg::Image>>,
+        sparse_landmark_pub: r2r::Publisher<r2r::sensor_msgs::msg::PointCloud2>,
+    ) -> Self {
         let s = params.image_scale;
         let [fx, fy, cx, cy] = [
             params.intrinsics[0] * s,
@@ -494,6 +555,9 @@ impl VioNode {
             sparse_3d,
             depth_mapper,
             depth_seed_coords,
+            depth_pub,
+            depth_status_pub,
+            sparse_landmark_pub,
             occupancy_map,
             mapping_stride: params.mapping_stride,
             imu_queue: VecDeque::new(),
@@ -520,14 +584,20 @@ impl VioNode {
             total_times_ms: VecDeque::with_capacity(300),
             track_counts: VecDeque::with_capacity(300),
             patch_depth_times_ms: VecDeque::with_capacity(300),
+            depth_valid_pct: VecDeque::with_capacity(300),
+            depth_seedonly_pct: VecDeque::with_capacity(300),
             occupancy_times_ms: VecDeque::with_capacity(300),
             seed_counts: VecDeque::with_capacity(300),
+            sparse_seed_counts: VecDeque::with_capacity(300),
+            sparse_census: [0; 6],
+            sparse_range_var: [-1.0; 7],
             landmark_counts: VecDeque::with_capacity(300),
             mocap_track: ReferenceTrack::new(),
             vio_track: ReferenceTrack::new(),
             estimated_stamps: VecDeque::with_capacity(20000),
             estimated_positions: VecDeque::with_capacity(20000),
             estimated_quaternions: VecDeque::with_capacity(20000),
+            mocap_fit: None,
             input_width: params.width,
             input_height: params.height,
             width: w,
@@ -815,13 +885,31 @@ impl VioNode {
         let mut priors = Vec::new();
         let mut sparse3d_fids = std::collections::HashSet::new();
 
+        let mut sparse_world: HashMap<u64, Vector3<f64>> = HashMap::new();
+        let mut census = [0usize; 6];
+        let mut range_var = [-1.0f64; 7];
+
         if let Some(ref sparse) = self.sparse_3d {
+            census = sparse.gate_census();
+            range_var = sparse.range_var_percentiles();
             for feat in features {
                 let (rng, rng_var) = sparse.query_range(feat.id);
                 if rng < 0.0 {
                     continue;
                 }
                 sparse3d_fids.insert(feat.id);
+                if let Some(state) = sparse.feature(feat.id) {
+                    // position is cached in the current camera frame.
+                    let p = state.position;
+                    sparse_world.insert(
+                        feat.id,
+                        Vector3::new(
+                            t_wc[(0, 0)] * p[0] + t_wc[(0, 1)] * p[1] + t_wc[(0, 2)] * p[2] + t_wc[(0, 3)],
+                            t_wc[(1, 0)] * p[0] + t_wc[(1, 1)] * p[1] + t_wc[(1, 2)] * p[2] + t_wc[(1, 3)],
+                            t_wc[(2, 0)] * p[0] + t_wc[(2, 1)] * p[1] + t_wc[(2, 2)] * p[2] + t_wc[(2, 3)],
+                        ),
+                    );
+                }
                 let eta = rng.ln();
                 let eta_var = if rng > 0.01 {
                     rng_var / (rng * rng)
@@ -860,6 +948,16 @@ impl VioNode {
         }
 
         push_capped_usize(&mut self.seed_counts, priors.len(), 300);
+        push_capped_usize(&mut self.sparse_seed_counts, sparse_world.len(), 300);
+        self.sparse_census = census;
+        self.sparse_range_var = range_var;
+        Self::publish_landmarks(
+            stamp_ns,
+            &self.odom_frame,
+            &sparse_world,
+            &cam_pos,
+            &self.sparse_landmark_pub,
+        );
         self.patch_depth_frame_count += 1;
 
         let pd_start = Instant::now();
@@ -881,6 +979,10 @@ impl VioNode {
             pd_start.elapsed().as_secs_f64() * 1000.0,
             300,
         );
+
+        if let Some(output) = &depth_result {
+            self.publish_depth_maps(stamp_ns, output);
+        }
 
         if let (Some(output), Some(occ)) = (&depth_result, &mut self.occupancy_map) {
             let occ_start = Instant::now();
@@ -1020,6 +1122,76 @@ impl VioNode {
         }
     }
 
+    /// Publish the dense map so its coverage is inspectable from ROS: a 32FC1
+    /// range image, NaN where the mapper produced nothing, alongside a mono8
+    /// status image. The status image is what separates "never had texture to
+    /// work with" from "solved and then rejected" when the map comes out sparse.
+    fn publish_depth_maps(&mut self, stamp_ns: i64, output: &PatchDepthOutput) {
+        let (w, h) = (output.eta.width, output.eta.height);
+        let pixels = (w * h) as f64;
+
+        let mut range = Vec::with_capacity(w * h * 4);
+        let mut valid = 0usize;
+        for &eta in &output.eta.data {
+            let metres = if eta.is_finite() {
+                valid += 1;
+                eta.exp()
+            } else {
+                f32::NAN
+            };
+            range.extend_from_slice(&metres.to_le_bytes());
+        }
+
+        let mut status = Vec::with_capacity(w * h);
+        let mut seed_only = 0usize;
+        for s in &output.status.data {
+            status.push(match s {
+                PatchStatus::Unknown => 0u8,
+                PatchStatus::SeedOnly => {
+                    seed_only += 1;
+                    85
+                }
+                PatchStatus::Rejected => 170,
+                PatchStatus::PhotoRefined => 255,
+            });
+        }
+
+        push_capped(&mut self.depth_valid_pct, 100.0 * valid as f64 / pixels, 300);
+        push_capped(
+            &mut self.depth_seedonly_pct,
+            100.0 * seed_only as f64 / pixels,
+            300,
+        );
+
+        let stamp = to_stamp(stamp_ns);
+        let header = r2r::std_msgs::msg::Header {
+            stamp,
+            frame_id: self.body_frame.clone(),
+        };
+        if let Some(p) = &self.depth_pub {
+            let _ = p.publish(&r2r::sensor_msgs::msg::Image {
+                header: header.clone(),
+                height: h as u32,
+                width: w as u32,
+                encoding: "32FC1".into(),
+                is_bigendian: 0,
+                step: (w * 4) as u32,
+                data: range,
+            });
+        }
+        if let Some(p) = &self.depth_status_pub {
+            let _ = p.publish(&r2r::sensor_msgs::msg::Image {
+                header,
+                height: h as u32,
+                width: w as u32,
+                encoding: "mono8".into(),
+                is_bigendian: 0,
+                step: w as u32,
+                data: status,
+            });
+        }
+    }
+
     fn publish_landmarks(
         stamp_ns: i64,
         frame_id: &str,
@@ -1087,6 +1259,130 @@ impl VioNode {
         let _ = pub_.publish(&msg);
     }
 
+    /// Fit a reference track onto the estimated trajectory: pair the two by
+    /// time (the track's own clock offset is already known), then solve for the
+    /// heading and origin that put the reference into the odom frame.
+    fn fit_planar(&self, track: &ReferenceTrack) -> Option<PlanarAlignment> {
+        let (ref_t, ref_p) = track.snapshot()?;
+        let mut j = 0usize;
+        let mut pairs: Vec<([f64; 3], [f64; 3])> = Vec::new();
+        for i in 0..self.estimated_stamps.len() {
+            let t = self.estimated_stamps[i];
+            while j + 1 < ref_t.len() && (ref_t[j + 1] - t).abs() <= (ref_t[j] - t).abs() {
+                j += 1;
+            }
+            if (ref_t[j] - t).abs() <= PATH_MATCH_DT {
+                pairs.push((ref_p[j], self.estimated_positions[i]));
+            }
+        }
+        let n = pairs.len();
+        if n < PATH_MIN_PAIRS {
+            return None;
+        }
+        let (mut mr, mut me) = ([0.0f64; 3], [0.0f64; 3]);
+        for (r, e) in &pairs {
+            for k in 0..3 {
+                mr[k] += r[k];
+                me[k] += e[k];
+            }
+        }
+        for k in 0..3 {
+            mr[k] /= n as f64;
+            me[k] /= n as f64;
+        }
+        let (mut sxx, mut sxy, mut spread) = (0.0f64, 0.0f64, 0.0f64);
+        for (r, e) in &pairs {
+            let (rx, ry) = (r[0] - mr[0], r[1] - mr[1]);
+            let (ex, ey) = (e[0] - me[0], e[1] - me[1]);
+            sxx += rx * ex + ry * ey;
+            sxy += rx * ey - ry * ex;
+            spread = spread.max((rx * rx + ry * ry).sqrt());
+        }
+        if spread < PATH_MIN_SPREAD {
+            return None;
+        }
+        let yaw = sxy.atan2(sxx);
+        let (sin_y, cos_y) = yaw.sin_cos();
+        let fit = PlanarAlignment {
+            yaw,
+            t: [
+                me[0] - (cos_y * mr[0] - sin_y * mr[1]),
+                me[1] - (sin_y * mr[0] + cos_y * mr[1]),
+                me[2] - mr[2],
+            ],
+            rmse: 0.0,
+            pairs: n,
+        };
+        let mut sq = 0.0;
+        for (r, e) in &pairs {
+            let a = fit.apply(r);
+            sq += (a[0] - e[0]).powi(2) + (a[1] - e[1]).powi(2) + (a[2] - e[2]).powi(2);
+        }
+        Some(PlanarAlignment {
+            rmse: (sq / n as f64).sqrt(),
+            ..fit
+        })
+    }
+
+    fn make_path(
+        &self,
+        stamp: &r2r::builtin_interfaces::msg::Time,
+        points: &[[f64; 3]],
+    ) -> r2r::nav_msgs::msg::Path {
+        let mut path = r2r::nav_msgs::msg::Path::default();
+        path.header.stamp = stamp.clone();
+        path.header.frame_id = self.odom_frame.clone();
+        path.poses = points
+            .iter()
+            .map(|p| {
+                let mut ps = r2r::geometry_msgs::msg::PoseStamped::default();
+                ps.header.stamp = stamp.clone();
+                ps.header.frame_id = self.odom_frame.clone();
+                ps.pose.position.x = p[0];
+                ps.pose.position.y = p[1];
+                ps.pose.position.z = p[2];
+                ps.pose.orientation.w = 1.0;
+                ps
+            })
+            .collect();
+        path
+    }
+
+    /// Draw the estimated trajectory, and the mocap one beside it once enough
+    /// of both overlap to fit the heading.
+    fn publish_paths(
+        &mut self,
+        path_pub: &r2r::Publisher<r2r::nav_msgs::msg::Path>,
+        mocap_path_pub: Option<&r2r::Publisher<r2r::nav_msgs::msg::Path>>,
+    ) {
+        let Some(&last_stamp) = self.estimated_stamps.back() else {
+            return;
+        };
+        let stamp = to_stamp((last_stamp * NSEC_PER_SEC as f64).round() as i64);
+        let estimate = decimate(self.estimated_positions.iter(), PATH_MAX_POINTS);
+        let _ = path_pub.publish(&self.make_path(&stamp, &estimate));
+
+        let Some(mocap_path_pub) = mocap_path_pub else {
+            return;
+        };
+        let Some(fit) = self.fit_planar(&self.mocap_track) else {
+            return;
+        };
+        if self.mocap_fit.is_none() {
+            log::info!(
+                "Mocap fitted to the estimate: yaw={:+.1}deg over {} pairs",
+                fit.yaw.to_degrees(),
+                fit.pairs
+            );
+        }
+        self.mocap_fit = Some(fit);
+        let points: Vec<[f64; 3]> = decimate(self.mocap_track.positions.iter(), PATH_MAX_POINTS)
+            .iter()
+            .map(|p| fit.apply(p))
+            .collect();
+        let _ = mocap_path_pub.publish(&self.make_path(&stamp, &points));
+    }
+
     fn save_trajectory(&self, path: &str) {
         use std::io::Write;
         let Ok(mut f) = std::fs::File::create(path) else {
@@ -1141,8 +1437,22 @@ impl VioNode {
         let mut mapping_part = String::new();
         if let Some(pd_ms) = median_deque(&self.patch_depth_times_ms) {
             let seeds_med = median_deque_usize(&self.seed_counts).unwrap_or(0);
+            let sparse_med = median_deque_usize(&self.sparse_seed_counts).unwrap_or(0);
+            let c = self.sparse_census;
             mapping_part.push_str(&format!(
-                "; seeds_med={seeds_med} patch_depth_med={pd_ms:.1}ms"
+                "; sparse[pending={} pool={} short_track={} low_inlier={} high_var={} usable={}]",
+                c[0], c[1], c[2], c[3], c[4], c[5]
+            ));
+            let rv = self.sparse_range_var;
+            mapping_part.push_str(&format!(
+                " range(p10/50/90)={:.2}/{:.2}/{:.2}m var(p10/50/90)={:.2}/{:.2}/{:.2} short<0.5m={:.0}%",
+                rv[0], rv[1], rv[2], rv[3], rv[4], rv[5], 100.0 * rv[6]
+            ));
+            let valid = median_deque(&self.depth_valid_pct).unwrap_or(0.0);
+            let seed_only = median_deque(&self.depth_seedonly_pct).unwrap_or(0.0);
+            mapping_part.push_str(&format!(
+                "; seeds_med={seeds_med} sparse_seeds_med={sparse_med} patch_depth_med={pd_ms:.1}ms \
+                 depth_valid={valid:.1}% depth_seedonly={seed_only:.1}%"
             ));
         }
         if let Some(occ_ms) = median_deque(&self.occupancy_times_ms) {
@@ -1163,6 +1473,14 @@ impl VioNode {
                     track.stamps_ns.len()
                 ));
             }
+        }
+        if let Some(fit) = self.mocap_fit {
+            mapping_part.push_str(&format!(
+                "; mocap_fit yaw={:+.1}deg rmse={:.3}m pairs={}",
+                fit.yaw.to_degrees(),
+                fit.rmse,
+                fit.pairs
+            ));
         }
         log::info!(
             "input: imu={:.1}Hz image={:.1}Hz; \
@@ -1230,6 +1548,31 @@ fn median_deque_usize(d: &VecDeque<usize>) -> Option<usize> {
 
 // ── Main ────────────────────────────────────────────────────────────────────
 
+/// Drain a subscription into an unbounded channel. r2r gives each subscription
+/// a 10-message channel and its spin thread drops whatever does not fit
+/// (try_send, logged at debug only). The main loop blocks for tens of
+/// milliseconds per image, so at 1 kHz roughly 40 % of the IMU samples were
+/// being lost before the node ever saw them, which diverged the filter; mocap
+/// at a few hundred hertz has the same problem. A pump task keeps every
+/// subscription drained while the loop is busy.
+fn spawn_pump<S, T>(sub: Option<S>) -> tokio::sync::mpsc::UnboundedReceiver<T>
+where
+    S: futures::Stream<Item = T> + Unpin + Send + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    if let Some(mut sub) = sub {
+        tokio::spawn(async move {
+            while let Some(msg) = sub.next().await {
+                if tx.send(msg).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    rx
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
@@ -1268,13 +1611,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "/echo_li/landmarks",
         r2r::QosProfile::default(),
     )?;
+    // Separate from /echo_li/landmarks (EqF SLAM points) so the two seed sources
+    // can be told apart: this one carries the Sparse3D features that actually
+    // passed the convergence gate and therefore seed the patch mapper.
+    let sparse_landmark_pub = node.create_publisher::<r2r::sensor_msgs::msg::PointCloud2>(
+        "/echo_li/sparse3d_landmarks",
+        r2r::QosProfile::default(),
+    )?;
+    // Dense depth is only worth a topic when the mapper is actually running.
+    let (depth_pub, depth_status_pub) = if params.patch_depth_enabled {
+        (
+            Some(node.create_publisher::<r2r::sensor_msgs::msg::Image>(
+                "/echo_li/depth",
+                r2r::QosProfile::default(),
+            )?),
+            Some(node.create_publisher::<r2r::sensor_msgs::msg::Image>(
+                "/echo_li/depth_status",
+                r2r::QosProfile::default(),
+            )?),
+        )
+    } else {
+        (None, None)
+    };
+    let path_pub = node
+        .create_publisher::<r2r::nav_msgs::msg::Path>(&params.path_topic, r2r::QosProfile::default())?;
+    let mocap_path_pub = if params.mocap_topic.is_empty() {
+        None
+    } else {
+        Some(node.create_publisher::<r2r::nav_msgs::msg::Path>(
+            &params.mocap_path_topic,
+            r2r::QosProfile::default(),
+        )?)
+    };
 
     // Subscribers
-    let mut imu_sub = node.subscribe::<r2r::sensor_msgs::msg::Imu>(&params.imu_topic, imu_qos)?;
+    let imu_sub = node.subscribe::<r2r::sensor_msgs::msg::Imu>(&params.imu_topic, imu_qos)?;
     let mut image_sub =
         node.subscribe::<r2r::sensor_msgs::msg::Image>(&params.image_topic, image_qos)?;
 
-    let mut mocap_sub = if !params.mocap_topic.is_empty() {
+    let mocap_sub = if !params.mocap_topic.is_empty() {
         log::info!("Mocap: subscribing to {}", params.mocap_topic);
         Some(node.subscribe::<r2r::geometry_msgs::msg::PoseStamped>(
             &params.mocap_topic,
@@ -1283,7 +1658,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
-    let mut vio_sub = if !params.vio_topic.is_empty() {
+    let vio_sub = if !params.vio_topic.is_empty() {
         log::info!("VIO ref: subscribing to {}", params.vio_topic);
         Some(node.subscribe::<r2r::nav_msgs::msg::Odometry>(&params.vio_topic, ref_qos)?)
     } else {
@@ -1292,6 +1667,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let stats_dur = std::time::Duration::from_secs_f64(params.stats_period_sec);
     let mut stats_timer = node.create_wall_timer(stats_dur)?;
+    let mut path_timer =
+        node.create_wall_timer(std::time::Duration::from_secs_f64(params.path_period_sec))?;
 
     log::info!(
         "ECHO-LI ready: imu={}, image={}, camera={}x{} (scale={}) {}, \
@@ -1310,7 +1687,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     );
 
-    let mut state = VioNode::new(&params);
+    let mut state = VioNode::new(&params, depth_pub, depth_status_pub, sparse_landmark_pub);
     let traj_output = params.trajectory_output.clone();
 
     // Spin the underlying rcl node in a background thread
@@ -1320,12 +1697,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    let mut imu_rx = spawn_pump(Some(imu_sub));
+    let mut mocap_rx = spawn_pump(mocap_sub);
+    let mut vio_rx = spawn_pump(vio_sub);
+
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
     loop {
         tokio::select! {
-            Some(msg) = imu_sub.next() => {
+            Some(msg) = imu_rx.recv() => {
                 state.on_imu(&msg);
                 state.drain_queues(&odom_pub, tf_pub.as_ref(), &landmark_pub);
             }
@@ -1333,25 +1714,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 state.on_image(msg);
                 state.drain_queues(&odom_pub, tf_pub.as_ref(), &landmark_pub);
             }
-            msg = async {
-                match mocap_sub.as_mut() {
-                    Some(s) => s.next().await,
-                    None => futures::future::pending().await,
-                }
-            } => {
-                if let Some(msg) = msg {
-                    state.on_mocap(&msg);
-                }
+            Some(msg) = mocap_rx.recv() => {
+                state.on_mocap(&msg);
             }
-            msg = async {
-                match vio_sub.as_mut() {
-                    Some(s) => s.next().await,
-                    None => futures::future::pending().await,
-                }
-            } => {
-                if let Some(msg) = msg {
-                    state.on_vio(&msg);
-                }
+            Some(msg) = vio_rx.recv() => {
+                state.on_vio(&msg);
+            }
+            _ = path_timer.tick() => {
+                state.publish_paths(&path_pub, mocap_path_pub.as_ref());
             }
             _ = stats_timer.tick() => {
                 state.report_statistics();

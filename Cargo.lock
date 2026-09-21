@@ -2805,7 +2805,6 @@ dependencies = [
  "log",
  "nalgebra",
  "r2r",
- "rerun",
  "rudolf-v",
  "serde",
  "serde_yaml",
