@@ -12,7 +12,7 @@ RudolfV:
   featureSearchThreshold: 0.8
   # Lower threshold to pull more features from dark/noisy H.265 frames.
   fastThreshold: 40
-  maxFeatures: 300
+  maxFeatures: 21
   maxLevel: 3
   lbpPolicy: SoftPenalty
   enableRansac: true
@@ -25,9 +25,10 @@ RudolfV:
 eqf:
   maxFeatures: 21  # tuned (was 40)
   initialValue:
-    # sceneDepth: 3.0
-    # sceneDepth: 20.0
-    sceneDepth: 5.0
+    # rho0 = 1/0.7 = 1.43 1/m, with var(rho) 0.5 below: +-2 sigma spans rho in [0, 2.85],
+    # i.e. depth from 0.35 m out to INFINITY. Set from the closest thing the camera can
+    # see, not from the typical scene distance (Civera 2008).
+    sceneDepth: 0.7
   initialVariance:
     attitude: 0.13565029126052572
     biasAcc: 1.5813333765300104
@@ -36,6 +37,7 @@ eqf:
     cameraPosition: 0.023501400846134893
     # point: 129.90415638150924
     point: 17.0  # tuned (was 5.0)
+    pointDepth: 0.5  # var(rho) for the birth covariance's depth coordinate
     position: 0.1
     velocity: 8.974852995731e-08
   measurementNoise:
@@ -45,7 +47,9 @@ eqf:
     # Outlier gate in pixels (was multiplied by sigma_bearing; now absolute).
     # Tuned (was 10px, ≈ the old 5.0 * 2.0 default). This is the largest single
     # gain: rejecting >3.3px innovations fixes most of the scale error.
-    featureOutlierAbs: 3.3
+    # myrig: 6.6, because this camera's focal length is 907 px vs the voxl2's 462 --
+    # the same angular innovation is twice the pixels. Measured: 62.3 -> 9.5 cm rmse.
+    featureOutlierAbs: 6.6
     featureOutlierProb: 0.03229809583062128
     featureRetention: 0.18594708334486176
   processVariance:
@@ -61,7 +65,15 @@ eqf:
     position: 2.5e-04  # tuned (was 9.981466095928483e-06)
     velocity: 0.025317333863551263
   settings:
-    coordinateChoice: Normal
+    # Civera inverse-depth init. In this chart the depth coordinate is rho = 1/range, so
+    # a wrong initial depth barely moves the reprojection and parallax can still correct it.
+    # Measured tolerance to a wrong prior (sceneDepth swept 0.5 -> 20 m on a 0.5 m scene):
+    #   InvDepth   9.6 / 5.4 / 10.5 / 10.4 /  8.8 / 13.5 cm
+    #   Normal     7.1 / 6.0 / 54   / 565  / 1210 / 2878 cm
+    #   Euclidean  4.6 / 4.8 / 152  / 804  / fail / fail
+    # So the prior may be 40x wrong and still cost ~13 cm. That is what makes one config
+    # work on scenes at any distance, instead of retuning sceneDepth per bag.
+    coordinateChoice: InvDepth
     fastRiccati: false
     useDiscreteInnovationLift: false
     useDiscreteVelocityLift: false
@@ -96,12 +108,10 @@ SparseVog:
   ab_min: 1.0
   ab_max: 200.0
   min_inlier_ratio: 0.5
-  # mahalanobis_reset_chi2: 0.2
-  mahalanobis_reset_chi2: 5.99
+  mahalanobis_reset_chi2: 0.2
   bias_walk_var: 0.0
   process_depth_var: 0.01
-  # pose_range_scale: 1.0
-  pose_range_scale: 0.0
+  pose_range_scale: 1.0
   pose_range_coherent: 0.0
   min_parallax: 0.0001
   min_cos_sim: 0.95
@@ -118,8 +128,8 @@ PatchDepth:
   patch_size: 8
   patch_stride: 4
   gn_eta_convergence_tol: 0.001
-  n_pyramid_levels: 3
-  seed_radius_px: 128
+  n_pyramid_levels: 1
+  seed_radius_px: 64
   min_baseline_ratio: 0.005
   max_baseline_ratio: 0.3
   max_depth: 12.0

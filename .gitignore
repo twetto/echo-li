@@ -35,3 +35,13 @@ artifacts/
 # maturin/pip build artifacts dropped into the source package
 *.pyd
 *.pdb
+
+# ROS 2 Humble build tree (CARGO_TARGET_DIR=target-humble)
+target-humble/
+# run_voxl2_bag_humble.sh scratch logs
+log/
+# local working copy of the Rudolf-V repo (a git dependency, not part of this one)
+rudolf-v-local/
+bench_pi.txt
+mpv-shot*.jpg
+*.bak
