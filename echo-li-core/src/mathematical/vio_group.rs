@@ -1,9 +1,9 @@
-use echo_lie::{base::LieGroup, SE23, SE3, SO3, SOT3};
+use echo_lie::{SE3, SE23, SO3, SOT3, base::LieGroup};
 use nalgebra::{Vector3, Vector4, Vector6};
 
-use crate::mathematical::bias_group_ops::BiasGroupOps;
-use crate::mathematical::vio_state::{Landmark, VIOSensorState, VIOState, GRAVITY_CONSTANT};
 use crate::ImuBiasGroup;
+use crate::mathematical::bias_group_ops::BiasGroupOps;
+use crate::mathematical::vio_state::{GRAVITY_CONSTANT, Landmark, VIOSensorState, VIOState};
 
 /// Symmetry group element for EqVIO.
 #[derive(Debug, Clone)]

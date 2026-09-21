@@ -121,15 +121,12 @@ impl PyLocalOccupancyMap {
             .collect();
 
         let output = PatchDepthOutput {
-            eta: DepthMap::from_vec(w, h, eta_data).map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(e.to_string())
-            })?,
-            eta_var: DepthMap::from_vec(w, h, eta_var_data).map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(e.to_string())
-            })?,
-            status: DepthMap::from_vec(w, h, status_data).map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(e.to_string())
-            })?,
+            eta: DepthMap::from_vec(w, h, eta_data)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?,
+            eta_var: DepthMap::from_vec(w, h, eta_var_data)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?,
+            status: DepthMap::from_vec(w, h, status_data)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?,
         };
 
         let pose = array_to_matrix4(&t_wc);
@@ -214,11 +211,8 @@ impl PyLocalOccupancyMap {
     /// Full 3D log-odds grid as (depth, height, width) float32 array.
     fn log_odds_grid<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray3<f32>> {
         let snap = self.inner.snapshot();
-        let arr = Array3::from_shape_vec(
-            (snap.depth, snap.height, snap.width),
-            snap.log_odds,
-        )
-        .expect("occupancy grid shape is valid");
+        let arr = Array3::from_shape_vec((snap.depth, snap.height, snap.width), snap.log_odds)
+            .expect("occupancy grid shape is valid");
         PyArray3::from_owned_array(py, arr)
     }
 

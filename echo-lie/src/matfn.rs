@@ -55,12 +55,18 @@ pub fn expm(a: &DMatrix<f64>) -> DMatrix<f64> {
     // U = A(b₁I + b₃A² + b₅A⁴ + b₇A⁶ + A⁶(b₉A² + b₁₁A⁴ + b₁₃A⁶))
     let inner_u = &a2 * PADE13_B[9] + &a4 * PADE13_B[11] + &a6 * PADE13_B[13];
     let u = &a_scaled
-        * (&id * PADE13_B[1] + &a2 * PADE13_B[3] + &a4 * PADE13_B[5] + &a6 * PADE13_B[7]
+        * (&id * PADE13_B[1]
+            + &a2 * PADE13_B[3]
+            + &a4 * PADE13_B[5]
+            + &a6 * PADE13_B[7]
             + &a6 * inner_u);
 
     // V = b₀I + b₂A² + b₄A⁴ + b₆A⁶ + A⁶(b₈A² + b₁₀A⁴ + b₁₂A⁶)
     let inner_v = &a2 * PADE13_B[8] + &a4 * PADE13_B[10] + &a6 * PADE13_B[12];
-    let v = &id * PADE13_B[0] + &a2 * PADE13_B[2] + &a4 * PADE13_B[4] + &a6 * PADE13_B[6]
+    let v = &id * PADE13_B[0]
+        + &a2 * PADE13_B[2]
+        + &a4 * PADE13_B[4]
+        + &a6 * PADE13_B[6]
         + &a6 * inner_v;
 
     // r₁₃ = (V - U)⁻¹(V + U)

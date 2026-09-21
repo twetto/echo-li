@@ -1,6 +1,6 @@
-use nalgebra::{DMatrix, DVector, Matrix3, SMatrix, Vector3, SVector, U9};
+use nalgebra::{DMatrix, DVector, Matrix3, SMatrix, SVector, U9, Vector3};
 
-use crate::base::{skew, vex, LieGroup};
+use crate::base::{LieGroup, skew, vex};
 use crate::se3::SE3;
 use crate::so3::SO3;
 
@@ -304,14 +304,12 @@ impl SEn3 {
         let theta = omega.norm();
 
         let coeff = if theta.abs() > 1e-8 {
-            1.0 / (theta * theta)
-                * (1.0 - (theta * theta.sin()) / (2.0 * (1.0 - theta.cos())))
+            1.0 / (theta * theta) * (1.0 - (theta * theta.sin()) / (2.0 * (1.0 - theta.cos())))
         } else {
             1.0 / 12.0
         };
 
-        let v_inv =
-            Matrix3::identity() - 0.5 * omega_skew + coeff * omega_skew * omega_skew;
+        let v_inv = Matrix3::identity() - 0.5 * omega_skew + coeff * omega_skew * omega_skew;
 
         let cdim = 3 + 3 * self.n;
         let mut u = DVector::zeros(cdim);
@@ -372,11 +370,7 @@ impl SEn3 {
 
     pub fn inverse(&self) -> SEn3 {
         let r_inv = self.rotation.inverse();
-        let translations = self
-            .translations
-            .iter()
-            .map(|xi| r_inv.act(&-xi))
-            .collect();
+        let translations = self.translations.iter().map(|xi| r_inv.act(&-xi)).collect();
         SEn3 {
             n: self.n,
             rotation: r_inv,
@@ -459,11 +453,7 @@ mod tests {
         for _ in 0..100 {
             let p = SEn3::random(2);
             let id = p.compose(&p.inverse());
-            assert_abs_diff_eq!(
-                id.as_matrix(),
-                DMatrix::identity(5, 5),
-                epsilon = 1e-10
-            );
+            assert_abs_diff_eq!(id.as_matrix(), DMatrix::identity(5, 5), epsilon = 1e-10);
         }
     }
 

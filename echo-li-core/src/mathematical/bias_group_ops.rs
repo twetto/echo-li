@@ -1,8 +1,8 @@
 use echo_lie::SE3;
 use nalgebra::{SMatrix, Vector6};
 
-use crate::mathematical::vio_group::{VIOAlgebra, VIOGroup};
 use crate::ImuBiasGroup;
+use crate::mathematical::vio_group::{VIOAlgebra, VIOGroup};
 
 #[derive(Debug, Clone, Copy)]
 pub struct BiasGroupOps {

@@ -1,6 +1,6 @@
-use nalgebra::{Matrix3, Matrix4, Vector3, Vector4, U4};
+use nalgebra::{Matrix3, Matrix4, U4, Vector3, Vector4};
 
-use crate::base::{skew, LieGroup};
+use crate::base::{LieGroup, skew};
 use crate::so3::SO3;
 
 /// SOT(3) — SO(3) × R⁺ (rotation with isotropic scale).

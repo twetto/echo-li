@@ -336,8 +336,7 @@ impl PyFrontend {
         }
         let data = image.as_slice()?;
         let rudolf_img = RudolfImage::from_vec(self.width, self.height, data.to_vec());
-        let (features, stats) =
-            py.allow_threads(|| self.inner.process(&rudolf_img));
+        let (features, stats) = py.allow_threads(|| self.inner.process(&rudolf_img));
 
         let feat_list = pyo3::types::PyList::empty(py);
         for f in features {

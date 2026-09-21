@@ -1,5 +1,5 @@
-use nalgebra::{Matrix3, Vector3, Dim, DefaultAllocator};
 use nalgebra::allocator::Allocator;
+use nalgebra::{DefaultAllocator, Dim, Matrix3, Vector3};
 
 /// Convert 3-vector to 3x3 skew-symmetric matrix.
 #[inline]
@@ -21,41 +21,40 @@ pub fn vex(m: &Matrix3<f64>) -> Vector3<f64> {
 ///
 /// This trait provides a unified interface for groups used in VIO,
 /// allowing the filter to be generic over the state representation.
-pub trait LieGroup: Sized + Clone + std::fmt::Debug 
-where 
-    DefaultAllocator: Allocator<Self::D> + Allocator<Self::D, Self::D>
+pub trait LieGroup: Sized + Clone + std::fmt::Debug
+where
+    DefaultAllocator: Allocator<Self::D> + Allocator<Self::D, Self::D>,
 {
     /// Dimension of the Lie Algebra (tangent space).
     type D: Dim;
-    
+
     /// The associated Lie Algebra type.
     type Tangent;
-    
+
     /// The type for the Adjoint matrix.
     type Adjoint;
 
     /// Identity element of the group.
     fn identity() -> Self;
-    
+
     /// Group inverse.
     fn inverse(&self) -> Self;
-    
+
     /// Group composition: self * other.
     fn compose(&self, other: &Self) -> Self;
-    
+
     /// Exponential map: Lie Algebra → Lie Group.
     fn exp(v: &Self::Tangent) -> Self;
-    
+
     /// Logarithm map: Lie Group → Lie Algebra.
     fn log(&self) -> Self::Tangent;
-    
+
     /// Adjoint representation Ad_X: Tangent → Tangent.
     fn adjoint(&self) -> Self::Adjoint;
-    
+
     /// Group action on a 3D Euclidean point: X * p.
     fn act(&self, p: &Vector3<f64>) -> Vector3<f64>;
 }
-
 
 #[cfg(test)]
 mod tests {

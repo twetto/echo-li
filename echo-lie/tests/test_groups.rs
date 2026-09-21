@@ -28,7 +28,12 @@ mod so3_tests {
     #[test]
     fn exp_log() {
         for _ in 0..N_TRIALS {
-            let v = 0.5 * Vector3::new(rand::random::<f64>() - 0.5, rand::random::<f64>() - 0.5, rand::random::<f64>() - 0.5);
+            let v = 0.5
+                * Vector3::new(
+                    rand::random::<f64>() - 0.5,
+                    rand::random::<f64>() - 0.5,
+                    rand::random::<f64>() - 0.5,
+                );
             let x = SO3::exp(&v);
             let v2 = x.log();
             assert_abs_diff_eq!(x.as_matrix(), SO3::exp(&v2).as_matrix(), epsilon = 1e-10);
@@ -62,8 +67,16 @@ mod so3_tests {
         for _ in 0..N_TRIALS {
             let x = SO3::random();
             let xi = x.inverse();
-            assert_abs_diff_eq!(x.compose(&xi).as_matrix(), Matrix3::identity(), epsilon = 1e-10);
-            assert_abs_diff_eq!(xi.compose(&x).as_matrix(), Matrix3::identity(), epsilon = 1e-10);
+            assert_abs_diff_eq!(
+                x.compose(&xi).as_matrix(),
+                Matrix3::identity(),
+                epsilon = 1e-10
+            );
+            assert_abs_diff_eq!(
+                xi.compose(&x).as_matrix(),
+                Matrix3::identity(),
+                epsilon = 1e-10
+            );
         }
     }
 
@@ -128,12 +141,14 @@ mod so3_tests {
                 rand::random::<f64>() - 0.5,
                 rand::random::<f64>() - 0.5,
                 rand::random::<f64>() - 0.5,
-            ).normalize();
+            )
+            .normalize();
             let w: Vector3<f64> = Vector3::new(
                 rand::random::<f64>() - 0.5,
                 rand::random::<f64>() - 0.5,
                 rand::random::<f64>() - 0.5,
-            ).normalize();
+            )
+            .normalize();
             let r = SO3::from_vectors(&v, &w);
             assert_abs_diff_eq!(w, r.act(&v), epsilon = 1e-10);
         }
@@ -150,8 +165,12 @@ mod se3_tests {
     fn wedge_vee() {
         for _ in 0..N_TRIALS {
             let v = Vector6::new(
-                rand::random(), rand::random(), rand::random(),
-                rand::random(), rand::random(), rand::random(),
+                rand::random(),
+                rand::random(),
+                rand::random(),
+                rand::random(),
+                rand::random(),
+                rand::random(),
             );
             let m = SE3::wedge(&v);
             let v2 = SE3::vee(&m);
@@ -163,8 +182,12 @@ mod se3_tests {
     fn exp_log() {
         for _ in 0..N_TRIALS {
             let mut v = Vector6::new(
-                rand::random::<f64>() - 0.5, rand::random::<f64>() - 0.5, rand::random::<f64>() - 0.5,
-                rand::random::<f64>() - 0.5, rand::random::<f64>() - 0.5, rand::random::<f64>() - 0.5,
+                rand::random::<f64>() - 0.5,
+                rand::random::<f64>() - 0.5,
+                rand::random::<f64>() - 0.5,
+                rand::random::<f64>() - 0.5,
+                rand::random::<f64>() - 0.5,
+                rand::random::<f64>() - 0.5,
             );
             v.fixed_rows_mut::<3>(0).scale_mut(0.5);
             let x = SE3::exp(&v);
@@ -201,8 +224,16 @@ mod se3_tests {
     fn inverse() {
         for _ in 0..N_TRIALS {
             let x = SE3::random();
-            assert_abs_diff_eq!(x.compose(&x.inverse()).as_matrix(), Matrix4::identity(), epsilon = 1e-10);
-            assert_abs_diff_eq!(x.inverse().compose(&x).as_matrix(), Matrix4::identity(), epsilon = 1e-10);
+            assert_abs_diff_eq!(
+                x.compose(&x.inverse()).as_matrix(),
+                Matrix4::identity(),
+                epsilon = 1e-10
+            );
+            assert_abs_diff_eq!(
+                x.inverse().compose(&x).as_matrix(),
+                Matrix4::identity(),
+                epsilon = 1e-10
+            );
         }
     }
 
@@ -224,8 +255,12 @@ mod se3_tests {
         for _ in 0..N_TRIALS {
             let x = SE3::random();
             let u = Vector6::new(
-                rand::random(), rand::random(), rand::random(),
-                rand::random(), rand::random(), rand::random(),
+                rand::random(),
+                rand::random(),
+                rand::random(),
+                rand::random(),
+                rand::random(),
+                rand::random(),
             );
             let ad_xu1 = SE3::wedge(&(x.adjoint() * u));
             let ad_xu2 = x.as_matrix() * SE3::wedge(&u) * x.inverse().as_matrix();
@@ -237,12 +272,20 @@ mod se3_tests {
     fn algebra_adjoint() {
         for _ in 0..N_TRIALS {
             let v = Vector6::new(
-                rand::random(), rand::random(), rand::random(),
-                rand::random(), rand::random(), rand::random(),
+                rand::random(),
+                rand::random(),
+                rand::random(),
+                rand::random(),
+                rand::random(),
+                rand::random(),
             );
             let u = Vector6::new(
-                rand::random(), rand::random(), rand::random(),
-                rand::random(), rand::random(), rand::random(),
+                rand::random(),
+                rand::random(),
+                rand::random(),
+                rand::random(),
+                rand::random(),
+                rand::random(),
             );
             let ad_vu1 = SE3::wedge(&(SE3::adjoint_algebra(&v) * u));
             let ad_vu2 = SE3::wedge(&v) * SE3::wedge(&u) - SE3::wedge(&u) * SE3::wedge(&v);
@@ -254,8 +297,12 @@ mod se3_tests {
     fn left_jacobian() {
         for _ in 0..N_TRIALS {
             let u = Vector6::new(
-                rand::random(), rand::random(), rand::random(),
-                rand::random(), rand::random(), rand::random(),
+                rand::random(),
+                rand::random(),
+                rand::random(),
+                rand::random(),
+                rand::random(),
+                rand::random(),
             );
             let jl = SE3::left_jacobian(&u);
             let a = SE3::exp(&u).adjoint();
@@ -274,7 +321,12 @@ mod sot3_tests {
     #[test]
     fn wedge_vee() {
         for _ in 0..N_TRIALS {
-            let v = Vector4::new(rand::random(), rand::random(), rand::random(), rand::random());
+            let v = Vector4::new(
+                rand::random(),
+                rand::random(),
+                rand::random(),
+                rand::random(),
+            );
             let m = SOT3::wedge(&v);
             let v2 = SOT3::vee(&m);
             assert_abs_diff_eq!(v, v2, epsilon = 1e-15);
@@ -285,8 +337,10 @@ mod sot3_tests {
     fn exp_log() {
         for _ in 0..N_TRIALS {
             let mut v = Vector4::new(
-                rand::random::<f64>() - 0.5, rand::random::<f64>() - 0.5,
-                rand::random::<f64>() - 0.5, rand::random::<f64>() - 0.5,
+                rand::random::<f64>() - 0.5,
+                rand::random::<f64>() - 0.5,
+                rand::random::<f64>() - 0.5,
+                rand::random::<f64>() - 0.5,
             );
             v[0] *= 0.5;
             v[1] *= 0.5;
@@ -325,7 +379,11 @@ mod sot3_tests {
     fn inverse() {
         for _ in 0..N_TRIALS {
             let x = SOT3::random();
-            assert_abs_diff_eq!(x.compose(&x.inverse()).as_matrix(), Matrix4::identity(), epsilon = 1e-10);
+            assert_abs_diff_eq!(
+                x.compose(&x.inverse()).as_matrix(),
+                Matrix4::identity(),
+                epsilon = 1e-10
+            );
         }
     }
 
@@ -333,7 +391,12 @@ mod sot3_tests {
     fn group_adjoint() {
         for _ in 0..N_TRIALS {
             let x = SOT3::random();
-            let u = Vector4::new(rand::random(), rand::random(), rand::random(), rand::random());
+            let u = Vector4::new(
+                rand::random(),
+                rand::random(),
+                rand::random(),
+                rand::random(),
+            );
             let ad_xu1 = SOT3::wedge(&(x.adjoint() * u));
             let ad_xu2 = x.as_matrix() * SOT3::wedge(&u) * x.inverse().as_matrix();
             assert_abs_diff_eq!(ad_xu1, ad_xu2, epsilon = 1e-10);
@@ -343,8 +406,18 @@ mod sot3_tests {
     #[test]
     fn algebra_adjoint() {
         for _ in 0..N_TRIALS {
-            let v = Vector4::new(rand::random(), rand::random(), rand::random(), rand::random());
-            let u = Vector4::new(rand::random(), rand::random(), rand::random(), rand::random());
+            let v = Vector4::new(
+                rand::random(),
+                rand::random(),
+                rand::random(),
+                rand::random(),
+            );
+            let u = Vector4::new(
+                rand::random(),
+                rand::random(),
+                rand::random(),
+                rand::random(),
+            );
             let ad_vu1 = SOT3::wedge(&(SOT3::adjoint_algebra(&v) * u));
             let ad_vu2 = SOT3::wedge(&v) * SOT3::wedge(&u) - SOT3::wedge(&u) * SOT3::wedge(&v);
             assert_abs_diff_eq!(ad_vu1, ad_vu2, epsilon = 1e-10);
@@ -384,7 +457,11 @@ mod sen3_tests {
             let u = rand_algebra();
             let x = SEn3::exp(N, &u);
             let u2 = x.log();
-            assert_abs_diff_eq!(x.as_matrix(), SEn3::exp(N, &u2).as_matrix(), epsilon = 1e-10);
+            assert_abs_diff_eq!(
+                x.as_matrix(),
+                SEn3::exp(N, &u2).as_matrix(),
+                epsilon = 1e-10
+            );
         }
     }
 
@@ -430,8 +507,7 @@ mod sen3_tests {
             let x = SEn3::random(N);
             let u = DVector::from_fn(9, |_, _| rand::random::<f64>());
             let ad_xu1 = SEn3::wedge(N, &(x.adjoint() * &u));
-            let ad_xu2 =
-                x.as_matrix() * SEn3::wedge(N, &u) * x.inverse().as_matrix();
+            let ad_xu2 = x.as_matrix() * SEn3::wedge(N, &u) * x.inverse().as_matrix();
             assert_abs_diff_eq!(ad_xu1, ad_xu2, epsilon = 1e-10);
         }
     }
@@ -475,7 +551,11 @@ mod semi_direct_bias_tests {
     }
 
     fn assert_group_eq(a: &SemiDirectBias, b: &SemiDirectBias, eps: f64) {
-        assert_abs_diff_eq!(a.d.rotation.as_matrix(), b.d.rotation.as_matrix(), epsilon = eps);
+        assert_abs_diff_eq!(
+            a.d.rotation.as_matrix(),
+            b.d.rotation.as_matrix(),
+            epsilon = eps
+        );
         assert_abs_diff_eq!(a.d.position, b.d.position, epsilon = eps);
         assert_abs_diff_eq!(a.d.velocity, b.d.velocity, epsilon = eps);
         assert_abs_diff_eq!(a.delta, b.delta, epsilon = eps);
@@ -534,10 +614,18 @@ mod semi_direct_bias_tests {
             let z = x.compose(&y);
             let d_product = x.d.compose(&y.d);
 
-            assert_abs_diff_eq!(z.d.rotation.as_matrix(), d_product.rotation.as_matrix(), epsilon = 1e-10);
+            assert_abs_diff_eq!(
+                z.d.rotation.as_matrix(),
+                d_product.rotation.as_matrix(),
+                epsilon = 1e-10
+            );
             assert_abs_diff_eq!(z.d.position, d_product.position, epsilon = 1e-10);
             assert_abs_diff_eq!(z.d.velocity, d_product.velocity, epsilon = 1e-10);
-            assert_abs_diff_eq!(z.delta, x.delta + x.b().adjoint() * y.delta, epsilon = 1e-10);
+            assert_abs_diff_eq!(
+                z.delta,
+                x.delta + x.b().adjoint() * y.delta,
+                epsilon = 1e-10
+            );
         }
     }
 

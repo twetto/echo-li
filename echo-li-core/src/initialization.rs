@@ -1,12 +1,9 @@
-use nalgebra::Vector3;
-use echo_lie::{SO3, SE3};
 use crate::mathematical::IMUVelocity;
+use echo_lie::{SE3, SO3};
+use nalgebra::Vector3;
 
 /// Estimate initial pose from stationary IMU accelerometer readings.
-pub fn estimate_initial_pose(
-    imu_readings: &[IMUVelocity],
-    n_samples: usize,
-) -> SE3 {
+pub fn estimate_initial_pose(imu_readings: &[IMUVelocity], n_samples: usize) -> SE3 {
     if imu_readings.len() < 5 {
         return SE3::identity();
     }
@@ -48,7 +45,7 @@ pub fn check_stationary(
     // Compute gyro stats
     let mut gyro_sum = Vector3::zeros();
     let mut gyro_sq_sum = 0.0;
-    
+
     // Compute acc norm stats
     let mut acc_norm_sum = 0.0;
     let mut acc_norm_sq_sum = 0.0;
@@ -64,7 +61,7 @@ pub fn check_stationary(
     }
 
     let nf = n as f64;
-    
+
     // Std dev of gyro components (approximate with average of squares)
     let gyro_mean_sq = gyro_sq_sum / nf;
     let gyro_vec_mean = gyro_sum / nf;

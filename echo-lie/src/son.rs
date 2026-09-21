@@ -32,10 +32,7 @@ impl SOn {
         let svd = m.clone().svd(true, true);
         let u = svd.u.unwrap();
         let vt = svd.v_t.unwrap();
-        Self {
-            n,
-            matrix: u * vt,
-        }
+        Self { n, matrix: u * vt }
     }
 
     pub fn random(n: usize) -> Self {
@@ -146,10 +143,7 @@ impl SOn {
         for i in 0..cdim {
             let mut ei = nalgebra::DVector::zeros(cdim);
             ei[i] = 1.0;
-            let col = Self::vee(
-                self.n,
-                &(&self.matrix * Self::wedge(self.n, &ei) * &rt),
-            );
+            let col = Self::vee(self.n, &(&self.matrix * Self::wedge(self.n, &ei) * &rt));
             ad.set_column(i, &col);
         }
         ad

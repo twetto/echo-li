@@ -1,7 +1,9 @@
-use nalgebra::{Matrix3, Matrix4, Vector3};
-use crate::depth::flowdep_kernels::{depth_densification, bilinear_splatting, bilinear_splatting_ab, vogiatzis_update};
+use crate::depth::flowdep_kernels::{
+    bilinear_splatting, bilinear_splatting_ab, depth_densification, vogiatzis_update,
+};
 use crate::depth::keyframe_pool::KeyframePool;
 use crate::depth::sparse_gb::SparseVogSettings;
+use nalgebra::{Matrix3, Matrix4, Vector3};
 
 pub trait OpticalFlowBackend {
     /// Compute dense optical flow between two grayscale frames.
@@ -20,11 +22,11 @@ pub struct FlowDepFilter {
     b_state: Option<Vec<f32>>,
 
     keyframe_pool: KeyframePool,
-    
+
     prev_gray: Option<Vec<u8>>,
     prev_t_wc: Option<Matrix4<f64>>,
     prev_stamp: f64,
-    
+
     width: usize,
     height: usize,
 }
@@ -32,7 +34,7 @@ pub struct FlowDepFilter {
 impl FlowDepFilter {
     pub fn new(k: Matrix3<f64>, settings: SparseVogSettings, width: usize, height: usize) -> Self {
         let sigma_norm = settings.sigma_pixel / k[(0, 0)];
-        
+
         Self {
             k,
             settings,
@@ -61,7 +63,13 @@ impl FlowDepFilter {
             self.prev_gray = Some(curr_gray.to_vec());
             self.prev_t_wc = Some(*t_wc_curr);
             self.prev_stamp = stamp;
-            self.keyframe_pool.add_keyframe(curr_gray.to_vec(), self.width, self.height, *t_wc_curr, stamp);
+            self.keyframe_pool.add_keyframe(
+                curr_gray.to_vec(),
+                self.width,
+                self.height,
+                *t_wc_curr,
+                stamp,
+            );
             return false;
         }
 
@@ -72,7 +80,7 @@ impl FlowDepFilter {
 
         if let Some(best_kf) = self.keyframe_pool.select_best(t_wc_curr) {
             flow = flow_backend.compute(&best_kf.gray, curr_gray, self.height, self.width);
-            
+
             let t_cw_curr = t_wc_curr.try_inverse().unwrap_or_else(Matrix4::identity);
             let t_curr_kf = t_cw_curr * best_kf.t_wc;
             r_curr_ref = t_curr_kf.fixed_view::<3, 3>(0, 0).into_owned();
@@ -89,14 +97,26 @@ impl FlowDepFilter {
             t_curr_ref = t_curr_prev.fixed_view::<3, 1>(0, 3).into_owned();
         }
 
-        self.keyframe_pool.add_keyframe(curr_gray.to_vec(), self.width, self.height, *t_wc_curr, stamp);
+        self.keyframe_pool.add_keyframe(
+            curr_gray.to_vec(),
+            self.width,
+            self.height,
+            *t_wc_curr,
+            stamp,
+        );
 
         let (observed_invdepth, geom_drive_map) = depth_densification(
-            &self.k, &r_curr_ref, &t_curr_ref, &flow, self.height, self.width
+            &self.k,
+            &r_curr_ref,
+            &t_curr_ref,
+            &flow,
+            self.height,
+            self.width,
         );
 
         let dt = (stamp - self.prev_stamp).max(0.0);
-        let (predicted_invdepth, predicted_var, predicted_a, predicted_b) = self.predict(t_wc_curr, dt);
+        let (predicted_invdepth, predicted_var, predicted_a, predicted_b) =
+            self.predict(t_wc_curr, dt);
 
         if predicted_invdepth.is_none() {
             self.init_all_states(&observed_invdepth, &geom_drive_map);
@@ -118,7 +138,7 @@ impl FlowDepFilter {
                 self.settings.min_inlier_ratio as f32,
                 self.settings.mahalanobis_reset_chi2 as f32,
                 self.height,
-                self.width
+                self.width,
             );
             self.invdepth_state = Some(updated_invdepth);
             self.invdepth_var = Some(updated_var);
@@ -133,7 +153,16 @@ impl FlowDepFilter {
         true
     }
 
-    fn predict(&self, t_wc_curr: &Matrix4<f64>, _dt: f64) -> (Option<Vec<f32>>, Option<Vec<f32>>, Option<Vec<f32>>, Option<Vec<f32>>) {
+    fn predict(
+        &self,
+        t_wc_curr: &Matrix4<f64>,
+        _dt: f64,
+    ) -> (
+        Option<Vec<f32>>,
+        Option<Vec<f32>>,
+        Option<Vec<f32>>,
+        Option<Vec<f32>>,
+    ) {
         if self.invdepth_state.is_none() {
             return (None, None, None, None);
         }
@@ -165,27 +194,28 @@ impl FlowDepFilter {
                 let idx = v * self.width + u;
                 let rho = invdepth_state[idx] as f64;
                 let var = invdepth_var[idx] as f64;
-                
-                if rho > 0.0 && var < 3.0 { // propagate_crit_var = 3.0
+
+                if rho > 0.0 && var < 3.0 {
+                    // propagate_crit_var = 3.0
                     let x_norm = (u as f64 - cx) / fx;
                     let y_norm = (v as f64 - cy) / fy;
                     let z = 1.0 / rho;
-                    
+
                     let p_prev = Vector3::new(x_norm * z, y_norm * z, z);
                     let p_curr = r * p_prev + t;
                     let z_new = p_curr[2];
-                    
+
                     if z_new > 0.1 {
                         let inv_z_new = 1.0 / z_new;
                         u_proj.push(((p_curr[0] * inv_z_new) * fx + cx) as f32);
                         v_proj.push(((p_curr[1] * inv_z_new) * fy + cy) as f32);
                         inv_z_proj.push(inv_z_new as f32);
-                        
+
                         let g = r[(2, 0)] * x_norm + r[(2, 1)] * y_norm + r[(2, 2)];
                         let j = g * (z / z_new).powi(2);
                         let proc_noise = self.settings.process_depth_var;
                         propagated_var.push(((j * j * var) + proc_noise) as f32);
-                        
+
                         a_vals.push(a_state[idx]);
                         b_vals.push(b_state[idx]);
                     }
@@ -194,11 +224,15 @@ impl FlowDepFilter {
         }
 
         let (pred_inv, pred_var, w_accum) = bilinear_splatting(
-            &u_proj, &v_proj, &inv_z_proj, &propagated_var, self.height, self.width
+            &u_proj,
+            &v_proj,
+            &inv_z_proj,
+            &propagated_var,
+            self.height,
+            self.width,
         );
-        let (pred_a_accum, pred_b_accum, _) = bilinear_splatting_ab(
-            &u_proj, &v_proj, &a_vals, &b_vals, self.height, self.width
-        );
+        let (pred_a_accum, pred_b_accum, _) =
+            bilinear_splatting_ab(&u_proj, &v_proj, &a_vals, &b_vals, self.height, self.width);
 
         let mut final_inv = vec![-1.0f32; self.height * self.width];
         let mut final_var = vec![self.settings.init_invdepth_var as f32; self.height * self.width];
@@ -215,7 +249,12 @@ impl FlowDepFilter {
             }
         }
 
-        (Some(final_inv), Some(final_var), Some(final_a), Some(final_b))
+        (
+            Some(final_inv),
+            Some(final_var),
+            Some(final_a),
+            Some(final_b),
+        )
     }
 
     fn init_all_states(&mut self, inv_depth_map: &[f32], geom_drive: &[f32]) {

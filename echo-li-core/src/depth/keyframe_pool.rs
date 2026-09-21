@@ -23,7 +23,14 @@ impl KeyframePool {
         }
     }
 
-    pub fn add_keyframe(&mut self, gray: Vec<u8>, width: usize, height: usize, t_wc: Matrix4<f64>, stamp: f64) {
+    pub fn add_keyframe(
+        &mut self,
+        gray: Vec<u8>,
+        width: usize,
+        height: usize,
+        t_wc: Matrix4<f64>,
+        stamp: f64,
+    ) {
         if self.pool.len() >= self.max_keyframes {
             self.pool.remove(0); // drop oldest
         }
@@ -38,8 +45,10 @@ impl KeyframePool {
     }
 
     pub fn select_best(&self, t_wc_curr: &Matrix4<f64>) -> Option<&Keyframe> {
-        if self.pool.is_empty() { return None; }
-        
+        if self.pool.is_empty() {
+            return None;
+        }
+
         let t_cw_curr = t_wc_curr.try_inverse().unwrap_or_else(Matrix4::identity);
         let mut best_kf = None;
         let mut best_baseline = 0.0;
