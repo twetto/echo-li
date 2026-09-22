@@ -8,6 +8,7 @@ INTERNAL_ID=""
 RATE=1.0
 DECODER=auto
 OCCUPANCY=true
+PATCH_DEPTH=true
 IMAGE_STAMP_MODE="auto"
 ECHO_CONFIG="$SCRIPT_DIR/echo-li-ros2/config/eqvio_voxl2.yaml"
 GT_TRAJECTORY=""
@@ -59,6 +60,10 @@ Options:
   --vio-topic TOPIC      External VIO Odometry topic to overlay.
   --no-occupancy         Disable the local occupancy grid (it is on by default
                          and published as /echo_li/occupancy).
+  --no-patch-depth       Disable dense patch depth, and occupancy with it (it is
+                         fed from patch depth, so it would sit empty otherwise).
+                         Pose output is unaffected; this is the dominant per-frame
+                         cost, so drop it when only odometry is wanted.
   --no-rviz              Don't launch rviz2.
   --rviz-config PATH     rviz2 config (default: echo_li_voxl2.rviz).
   --rviz-view VIEW       Startup 3D view: follow (default, chases imu_link) or
@@ -106,6 +111,7 @@ while [[ $# -gt 0 ]]; do
         --mocap-topic) need_value "$@"; MOCAP_TOPIC="$2"; shift 2 ;;
         --vio-topic) need_value "$@"; VIO_TOPIC="$2"; shift 2 ;;
         --no-occupancy) OCCUPANCY=false; shift ;;
+        --no-patch-depth) PATCH_DEPTH=false; OCCUPANCY=false; shift ;;
         --no-rviz) USE_RVIZ=0; shift ;;
         --rviz-config) need_value "$@"; RVIZ_CFG="$2"; shift 2 ;;
         --rviz-view) need_value "$@"; RVIZ_VIEW="$2"; shift 2 ;;
@@ -195,8 +201,13 @@ done
 # Stop leftovers from a previous run on this ROS domain.
 STALE_PIDS=()
 for pid in $(pgrep -f 'voxl2_vio_node|bag_time_relay|h265_decoder_node|ros2 bag play' || true); do
-    domain="$(tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null |
-        sed -n 's/^ROS_DOMAIN_ID=//p')"
+    # pgrep -f matches any command line containing those names, including this
+    # script and whatever shell invoked it, so skip ourselves. And environ is
+    # unreadable for processes we don't own: that must not abort the run, hence
+    # the subshell that swallows the redirect failure.
+    [[ "$pid" == "$$" || "$pid" == "$PPID" ]] && continue
+    domain="$( (tr '\0' '\n' <"/proc/$pid/environ") 2>/dev/null |
+        sed -n 's/^ROS_DOMAIN_ID=//p' || true)"
     if [[ "${domain:-42}" == "$ROS_DOMAIN_ID" ]]; then
         STALE_PIDS+=("$pid")
     fi
@@ -357,7 +368,7 @@ setsid env RUST_LOG="${RUST_LOG:-info}" "$VIO_BIN" --ros-args \
     -p "echo_config_path:=${ECHO_CONFIG}" \
     -p "imu_topic:=${IMU_TOPIC}" \
     -p "image_topic:=${IMAGE_TOPIC}" \
-    -p "patch_depth_enabled:=true" \
+    -p "patch_depth_enabled:=${PATCH_DEPTH}" \
     -p "occupancy_enabled:=${OCCUPANCY}" \
     -p "trajectory_output:=${LOG_DIR}/trajectory.tum" \
     "${EXTRA_ROS_ARGS[@]}" \

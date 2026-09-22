@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use camera_geometry::CameraProjection;
@@ -920,9 +921,18 @@ impl VioNode {
                     sparse_world.insert(
                         feat.id,
                         Vector3::new(
-                            t_wc[(0, 0)] * p[0] + t_wc[(0, 1)] * p[1] + t_wc[(0, 2)] * p[2] + t_wc[(0, 3)],
-                            t_wc[(1, 0)] * p[0] + t_wc[(1, 1)] * p[1] + t_wc[(1, 2)] * p[2] + t_wc[(1, 3)],
-                            t_wc[(2, 0)] * p[0] + t_wc[(2, 1)] * p[1] + t_wc[(2, 2)] * p[2] + t_wc[(2, 3)],
+                            t_wc[(0, 0)] * p[0]
+                                + t_wc[(0, 1)] * p[1]
+                                + t_wc[(0, 2)] * p[2]
+                                + t_wc[(0, 3)],
+                            t_wc[(1, 0)] * p[0]
+                                + t_wc[(1, 1)] * p[1]
+                                + t_wc[(1, 2)] * p[2]
+                                + t_wc[(1, 3)],
+                            t_wc[(2, 0)] * p[0]
+                                + t_wc[(2, 1)] * p[1]
+                                + t_wc[(2, 2)] * p[2]
+                                + t_wc[(2, 3)],
                         ),
                     );
                 }
@@ -1184,7 +1194,11 @@ impl VioNode {
             });
         }
 
-        push_capped(&mut self.depth_valid_pct, 100.0 * valid as f64 / pixels, 300);
+        push_capped(
+            &mut self.depth_valid_pct,
+            100.0 * valid as f64 / pixels,
+            300,
+        );
         push_capped(
             &mut self.depth_seedonly_pct,
             100.0 * seed_only as f64 / pixels,
@@ -1559,7 +1573,6 @@ fn median_ord<T: Ord + Copy>(d: &VecDeque<T>) -> Option<T> {
     Some(v[v.len() / 2])
 }
 
-
 // ── Main ────────────────────────────────────────────────────────────────────
 
 /// Drain a subscription into an unbounded channel. r2r gives each subscription
@@ -1655,8 +1668,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         (None, None)
     };
-    let path_pub = node
-        .create_publisher::<r2r::nav_msgs::msg::Path>(&params.path_topic, r2r::QosProfile::default())?;
+    let path_pub = node.create_publisher::<r2r::nav_msgs::msg::Path>(
+        &params.path_topic,
+        r2r::QosProfile::default(),
+    )?;
     let mocap_path_pub = if params.mocap_topic.is_empty() {
         None
     } else {
@@ -1718,9 +1733,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let traj_output = params.trajectory_output.clone();
 
-    // Spin the underlying rcl node in a background thread
+    // Spin the underlying rcl node in a background thread.
+    //
+    // This must be able to stop. `spawn_blocking` tasks cannot be cancelled, so
+    // an endless loop here leaves the runtime's Drop waiting for it forever: the
+    // select below exits cleanly on SIGINT, `main` returns, and then shutdown
+    // hangs with the spin thread still burning a core. From outside that looks
+    // exactly like a node ignoring Ctrl-C, and only SIGKILL ends it.
+    let spinning = Arc::new(AtomicBool::new(true));
+    let spin_flag = Arc::clone(&spinning);
     let _spin = tokio::task::spawn_blocking(move || {
-        loop {
+        while spin_flag.load(Ordering::Relaxed) {
             node.spin_once(std::time::Duration::from_millis(1));
         }
     });
@@ -1761,6 +1784,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ = sigterm.recv() => { break; }
         }
     }
+
+    // Release the spin thread before the runtime is dropped, or its Drop blocks.
+    spinning.store(false, Ordering::Relaxed);
 
     state.report_statistics();
     if !traj_output.is_empty() {
