@@ -549,7 +549,7 @@ if [[ -n "$WORLD_FRAME" ]]; then
 fi
 
 if [[ -z "$RVIZ_CFG" ]]; then
-    RVIZ_CFG="$SCRIPT_DIR/echo-li-ros2-rs/config/echo_li_voxl2.rviz"
+    RVIZ_CFG="$SCRIPT_DIR/echo-li-ros2/config/echo_li_voxl2.rviz"
 fi
 case "$RVIZ_VIEW" in
     follow|world) ;;

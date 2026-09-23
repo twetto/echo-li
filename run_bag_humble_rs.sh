@@ -4,7 +4,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 BAG_PATH=""
-CALIBRATION="$SCRIPT_DIR/echo-li-ros2-rs/config/myrig_calib.yaml"
+CALIBRATION="$SCRIPT_DIR/echo-li-ros2/config/myrig_calib.yaml"
 ECHO_CONFIG="$SCRIPT_DIR/echo-li-ros2/config/eqvio_myrig.yaml"
 RATE=1.0
 DEPTH_BACKEND="dis"
@@ -287,7 +287,7 @@ if ! ros2 node list 2>/dev/null | grep -qx '/echo_li_voxl2'; then
 fi
 
 # Launch rviz2 with the ECHO-LI config.
-RVIZ_CFG="$SCRIPT_DIR/echo-li-ros2-rs/config/echo_li.rviz"
+RVIZ_CFG="$SCRIPT_DIR/echo-li-ros2/config/echo_li.rviz"
 if [[ -f "$RVIZ_CFG" ]] && command -v rviz2 >/dev/null 2>&1; then
     setsid env QT_QPA_PLATFORM=xcb rviz2 -d "$RVIZ_CFG" \
         >"$LOG_DIR/rviz2.log" 2>&1 &
@@ -309,7 +309,7 @@ YAML
 echo "Playing $BAG_PATH at ${RATE}x. Press Ctrl-C to stop."
 echo "  Odometry: /echo_li/odometry (frame: echo_li_odom)"
 echo "  Landmarks: /echo_li/landmarks"
-echo "  rviz2 -d $SCRIPT_DIR/echo-li-ros2-rs/config/echo_li.rviz"
+echo "  rviz2 -d $SCRIPT_DIR/echo-li-ros2/config/echo_li.rviz"
 set +e
 ros2 bag play "$BAG_PATH" --rate "$RATE" \
     --qos-profile-overrides-path "$BAG_QOS" \
