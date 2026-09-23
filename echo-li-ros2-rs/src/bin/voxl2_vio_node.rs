@@ -393,6 +393,9 @@ struct VioNode {
     estimated_positions: VecDeque<[f64; 3]>,
     estimated_quaternions: VecDeque<[f64; 4]>,
     mocap_fit: Option<PlanarAlignment>,
+    /// Frame the mocap poses arrive in. The fit is broadcast as odom -> this,
+    /// so anything else published in that frame lands where the mocap path is.
+    mocap_frame_id: String,
 
     // Image parameters
     input_width: usize,
@@ -616,6 +619,7 @@ impl VioNode {
             estimated_positions: VecDeque::with_capacity(20000),
             estimated_quaternions: VecDeque::with_capacity(20000),
             mocap_fit: None,
+            mocap_frame_id: String::new(),
             input_width: params.width,
             input_height: params.height,
             width: w,
@@ -1395,6 +1399,7 @@ impl VioNode {
         &mut self,
         path_pub: &r2r::Publisher<r2r::nav_msgs::msg::Path>,
         mocap_path_pub: Option<&r2r::Publisher<r2r::nav_msgs::msg::Path>>,
+        tf_pub: Option<&r2r::Publisher<r2r::tf2_msgs::msg::TFMessage>>,
     ) {
         let Some(&last_stamp) = self.estimated_stamps.back() else {
             return;
@@ -1411,12 +1416,38 @@ impl VioNode {
         };
         if self.mocap_fit.is_none() {
             log::info!(
-                "Mocap fitted to the estimate: yaw={:+.1}deg over {} pairs",
+                "Mocap fitted to the estimate: yaw={:+.1}deg over {} pairs; \
+                 broadcasting TF {} -> {}",
                 fit.yaw.to_degrees(),
-                fit.pairs
+                fit.pairs,
+                self.odom_frame,
+                self.mocap_frame_id
             );
         }
         self.mocap_fit = Some(fit);
+        // The same fit as TF, so obstacle markers or other bodies published in
+        // the mocap frame render where the mocap path is drawn. Refreshed with
+        // the path, since the fit keeps improving as the tracks grow.
+        if self.publish_tf
+            && !self.mocap_frame_id.is_empty()
+            && self.mocap_frame_id != self.odom_frame
+        {
+            if let Some(tf_pub) = tf_pub {
+                let (half_sin, half_cos) = (fit.yaw / 2.0).sin_cos();
+                let mut tf = r2r::geometry_msgs::msg::TransformStamped::default();
+                tf.header.stamp = stamp.clone();
+                tf.header.frame_id = self.odom_frame.clone();
+                tf.child_frame_id = self.mocap_frame_id.clone();
+                tf.transform.translation.x = fit.t[0];
+                tf.transform.translation.y = fit.t[1];
+                tf.transform.translation.z = fit.t[2];
+                tf.transform.rotation.z = half_sin;
+                tf.transform.rotation.w = half_cos;
+                let _ = tf_pub.publish(&r2r::tf2_msgs::msg::TFMessage {
+                    transforms: vec![tf],
+                });
+            }
+        }
         let points: Vec<[f64; 3]> = decimate(self.mocap_track.positions.iter(), PATH_MAX_POINTS)
             .iter()
             .map(|p| fit.apply(p))
@@ -1445,6 +1476,9 @@ impl VioNode {
     }
 
     fn on_mocap(&mut self, msg: &r2r::geometry_msgs::msg::PoseStamped) {
+        if self.mocap_frame_id.is_empty() && !msg.header.frame_id.is_empty() {
+            self.mocap_frame_id = msg.header.frame_id.clone();
+        }
         let p = &msg.pose.position;
         let o = &msg.pose.orientation;
         self.mocap_track.add(
@@ -1772,7 +1806,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 state.on_vio(&msg);
             }
             _ = path_timer.tick() => {
-                state.publish_paths(&path_pub, mocap_path_pub.as_ref());
+                state.publish_paths(&path_pub, mocap_path_pub.as_ref(), tf_pub.as_ref());
                 if let Some(occ_pub) = &state.occupancy_pub {
                     state.publish_occupancy(occ_pub);
                 }
