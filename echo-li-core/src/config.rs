@@ -801,6 +801,7 @@ impl VIOConfig {
             .map(|v| v.eq_ignore_ascii_case("faster"))
             .unwrap_or(false);
         settings.initial_scene_depth = self.eqf.initial_value.scene_depth;
+        settings.use_median_depth = self.eqf.settings.use_median_depth;
 
         settings
     }

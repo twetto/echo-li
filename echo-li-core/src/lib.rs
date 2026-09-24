@@ -102,6 +102,13 @@ pub struct VIOFilterSettings {
 
     // initialValue
     pub initial_scene_depth: f64,
+    /// Seed new landmarks at the MEDIAN depth of the currently tracked ones
+    /// instead of the fixed `initial_scene_depth`. Wires up the `useMedianDepth`
+    /// config key, which was parsed but never read. Off by default: it makes the
+    /// prior scene-adaptive, but couples every new landmark to the current state,
+    /// which is suspected of causing trajectory wobble across sudden scene
+    /// changes. Experimental -- see the corridor scale work of 2026-09-24.
+    pub use_median_depth: bool,
 
     // processVariance
     pub process_attitude: f64,
@@ -154,6 +161,7 @@ impl Default for VIOFilterSettings {
             initial_camera_attitude_variance: 0.0010228558965517584,
             initial_camera_position_variance: 0.023501400846134893,
             initial_scene_depth: 5.0,
+            use_median_depth: false,
             process_attitude: 6.025875320811407e-05,
             process_position: 9.981466095928483e-06,
             process_velocity: 0.025317333863551263,
@@ -452,10 +460,19 @@ impl VIOFilter {
             }
             let uv = measurement.cam_coordinates.get(&id).unwrap();
             let bearing = cam.undistort(&Vector2::new(uv[0] as f64, uv[1] as f64));
-            let fallback_range = if bearing[2] > 1e-9 {
-                self.settings.initial_scene_depth / bearing[2]
+            // `p` is in the camera frame, so p[2] is depth, directly comparable
+            // to initial_scene_depth (which is a depth, hence the /bearing[2]
+            // below turning it into a range along the bearing).
+            let fallback_depth = if self.settings.use_median_depth {
+                median_landmark_depth(&self.eqf.state_estimate())
+                    .unwrap_or(self.settings.initial_scene_depth)
             } else {
                 self.settings.initial_scene_depth
+            };
+            let fallback_range = if bearing[2] > 1e-9 {
+                fallback_depth / bearing[2]
+            } else {
+                fallback_depth
             };
             let prior = depth_priors
                 .get(&id)
@@ -836,6 +853,26 @@ pub fn landmarks_to_global(state: &VIOState) -> (HashMap<u64, Vector3<f64>>, Vec
     }
 
     (global_landmarks, p_cam_world, r_world_cam)
+}
+
+/// Median depth (camera-frame z) of the currently tracked landmarks.
+///
+/// Returns None below MIN_LANDMARKS so a nearly empty state cannot set the
+/// prior from one or two points -- exactly the moment after a sudden scene
+/// change, when most tracks have just been lost.
+fn median_landmark_depth(state: &VIOState) -> Option<f64> {
+    const MIN_LANDMARKS: usize = 5;
+    let mut d: Vec<f64> = state
+        .camera_landmarks
+        .iter()
+        .map(|lm| lm.p[2])
+        .filter(|z| z.is_finite() && *z > 1e-3)
+        .collect();
+    if d.len() < MIN_LANDMARKS {
+        return None;
+    }
+    d.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    Some(d[d.len() / 2])
 }
 
 #[cfg(test)]
