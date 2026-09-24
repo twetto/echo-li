@@ -11,8 +11,8 @@ members = [
 
 [workspace.dependencies]
 echo-lie = { path = "echo-lie" }
-rudolf-v = { git = "https://github.com/twetto/Rudolf-V.git", rev = "0f955da" }
-camera-geometry = { git = "https://github.com/twetto/Rudolf-V.git", rev = "0f955da" }
+rudolf-v = { git = "https://github.com/twetto/Rudolf-V.git", rev = "c352ce1" }
+camera-geometry = { git = "https://github.com/twetto/Rudolf-V.git", rev = "c352ce1" }
 nalgebra = "0.33"
 approx = "0.5"
 rand = "0.9"
