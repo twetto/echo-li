@@ -29,6 +29,7 @@ use rudolf_v::fast::Feature;
 use rudolf_v::frontend::{Frontend, FrontendConfig, LbpPolicy};
 use rudolf_v::histeq::HistEqMethod;
 use rudolf_v::image::Image as RudolfImage;
+use rudolf_v::klt::LkMethod;
 
 // ── Parameters ──────────────────────────────────────────────────────────────
 
@@ -58,6 +59,7 @@ struct NodeParams {
     occupancy_enabled: bool,
     mapping_stride: usize,
     image_scale: f64,
+    klt_method: String,
     trajectory_output: String,
     mocap_topic: String,
     vio_topic: String,
@@ -179,6 +181,11 @@ fn load_params(node: &r2r::Node) -> NodeParams {
         patch_depth_enabled: get_bool(node, "patch_depth_enabled", true),
         occupancy_enabled: get_bool(node, "occupancy_enabled", true),
         image_scale: get_f64(node, "image_scale", 1.0).clamp(0.25, 1.0),
+        // forward_additive is the FrontendConfig default and is the only KLT
+        // variant with no SIMD on any architecture -- it is scalar bilinear
+        // loops. inverse_compositional reaches extract_template_gradients and
+        // ic_iterate_patch, both of which have NEON kernels on aarch64.
+        klt_method: get_str(node, "klt_method", "forward_additive"),
         trajectory_output: get_str(node, "trajectory_output", ""),
         mapping_stride: (get_i64(node, "mapping_stride", 1) as usize).max(1),
         mocap_topic: get_str(node, "mocap_topic", ""),
@@ -373,6 +380,14 @@ struct VioNode {
     imu_times_us: VecDeque<f64>,
     gray_times_ms: VecDeque<f64>,
     frontend_times_ms: VecDeque<f64>,
+    // Frontend sub-stages, straight from rudolf_v FrameStats.timing. The
+    // frontend was a single 5.7 ms number with no way to tell pyramid from
+    // KLT from detect; these split it.
+    fe_histeq_ms: VecDeque<f64>,
+    fe_pyramid_ms: VecDeque<f64>,
+    fe_klt_ms: VecDeque<f64>,
+    fe_ransac_ms: VecDeque<f64>,
+    fe_detect_ms: VecDeque<f64>,
     vision_times_ms: VecDeque<f64>,
     total_times_ms: VecDeque<f64>,
     track_counts: VecDeque<u64>,
@@ -465,6 +480,15 @@ impl VioNode {
         }
         frontend_cfg.pyramid_levels = rv.max_level;
         frontend_cfg.cell_size = rv.feature_dist as usize;
+        frontend_cfg.klt_method = match params.klt_method.as_str() {
+            "inverse_compositional" | "ic" => LkMethod::InverseCompositional,
+            "inverse_compositional_fixed" | "ic_fixed" => LkMethod::InverseCompositionalFixed,
+            "forward_additive" | "fa" => LkMethod::ForwardAdditive,
+            other => panic!(
+                "unknown klt_method {other:?}; expected forward_additive, \
+                 inverse_compositional or inverse_compositional_fixed"
+            ),
+        };
         frontend_cfg.klt_residual_enabled = rv.klt_residual;
         frontend_cfg.enable_internal_ransac = rv.enable_ransac;
         frontend_cfg.epipolar_gate_threshold = rv.epipolar_gate_threshold;
@@ -601,6 +625,11 @@ impl VioNode {
             imu_times_us: VecDeque::with_capacity(300),
             gray_times_ms: VecDeque::with_capacity(300),
             frontend_times_ms: VecDeque::with_capacity(300),
+            fe_histeq_ms: VecDeque::with_capacity(300),
+            fe_pyramid_ms: VecDeque::with_capacity(300),
+            fe_klt_ms: VecDeque::with_capacity(300),
+            fe_ransac_ms: VecDeque::with_capacity(300),
+            fe_detect_ms: VecDeque::with_capacity(300),
             vision_times_ms: VecDeque::with_capacity(300),
             total_times_ms: VecDeque::with_capacity(300),
             track_counts: VecDeque::with_capacity(300),
@@ -809,6 +838,14 @@ impl VioNode {
         self.images_processed += 1;
         push_capped(&mut self.gray_times_ms, gray_ms, 300);
         push_capped(&mut self.frontend_times_ms, frontend_ms, 300);
+        {
+            let t = &frame_stats.timing;
+            push_capped(&mut self.fe_histeq_ms, t.histeq * 1000.0, 300);
+            push_capped(&mut self.fe_pyramid_ms, t.pyramid * 1000.0, 300);
+            push_capped(&mut self.fe_klt_ms, t.klt * 1000.0, 300);
+            push_capped(&mut self.fe_ransac_ms, t.ransac * 1000.0, 300);
+            push_capped(&mut self.fe_detect_ms, t.detect * 1000.0, 300);
+        }
         push_capped(&mut self.vision_times_ms, vision_ms, 300);
         push_capped(
             &mut self.total_times_ms,
@@ -1506,6 +1543,11 @@ impl VioNode {
         let gray_ms = median_deque(&self.gray_times_ms).unwrap_or(0.0);
         let frontend_ms = median_deque(&self.frontend_times_ms).unwrap_or(0.0);
         let vision_ms = median_deque(&self.vision_times_ms).unwrap_or(0.0);
+        let fe_histeq = median_deque(&self.fe_histeq_ms).unwrap_or(0.0);
+        let fe_pyr = median_deque(&self.fe_pyramid_ms).unwrap_or(0.0);
+        let fe_klt = median_deque(&self.fe_klt_ms).unwrap_or(0.0);
+        let fe_ransac = median_deque(&self.fe_ransac_ms).unwrap_or(0.0);
+        let fe_detect = median_deque(&self.fe_detect_ms).unwrap_or(0.0);
         let total_ms = median_deque(&self.total_times_ms).unwrap_or(0.0);
         let tracks = median_ord(&self.track_counts).unwrap_or(0);
 
@@ -1563,6 +1605,8 @@ impl VioNode {
              queues: imu={} image={}; \
              dropped: imu={} image={}; \
              imu_med={imu_us:.0}us gray_med={gray_ms:.1}ms frontend_med={frontend_ms:.1}ms \
+             fe[histeq={fe_histeq:.2} pyr={fe_pyr:.2} klt={fe_klt:.2} \
+             ransac={fe_ransac:.2} detect={fe_detect:.2}]ms \
              vision_med={vision_ms:.1}ms total_med={total_ms:.1}ms \
              tracks_med={tracks} lm_med={}{mapping_part}",
             self.imu_received as f64 / elapsed,
@@ -1743,7 +1787,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     log::info!(
         "ECHO-LI ready: imu={}, image={}, camera={}x{} (scale={}) {}, \
-         camera_time_offset={:+.6}s, image_qos={}",
+         camera_time_offset={:+.6}s, image_qos={}, klt={}",
         params.imu_topic,
         params.image_topic,
         (params.width as f64 * params.image_scale).round() as usize,
@@ -1756,6 +1800,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             "best_effort"
         },
+        params.klt_method,
     );
 
     let mut state = VioNode::new(
