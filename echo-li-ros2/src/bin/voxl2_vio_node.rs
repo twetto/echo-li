@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::mem::ManuallyDrop;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -26,9 +27,36 @@ use rudolf_v::camera::{
     CameraIntrinsics as RudolfCameraIntrinsics, DistortionModel as RudolfDistortionModel,
 };
 use rudolf_v::fast::Feature;
-use rudolf_v::frontend::{Frontend, FrontendConfig, LbpPolicy};
+use rudolf_v::frontend::{FrameStats, Frontend, FrontendConfig, LbpPolicy};
+use rudolf_v::gpu::device::GpuDevice;
+use rudolf_v::gpu::frontend::{GpuFrontend, GpuFrontendConfig};
 use rudolf_v::histeq::HistEqMethod;
 use rudolf_v::image::Image as RudolfImage;
+
+// ── Frontend backend ────────────────────────────────────────────────────────
+
+/// The CPU frontend, or the wgpu one with the Vulkan device it runs on.
+///
+/// The GPU state is never destroyed: on the Orin (L4T R36.4 / driver 540.4)
+/// `vkDestroyDevice` segfaults in the driver's `[vkps] Update` thread, after
+/// everything has already been written out. There is one frontend per
+/// process, so leaking it at exit costs nothing. RADV tears down cleanly.
+enum FrontendBackend {
+    Cpu(Frontend),
+    Gpu {
+        frontend: ManuallyDrop<GpuFrontend>,
+        device: ManuallyDrop<GpuDevice>,
+    },
+}
+
+impl FrontendBackend {
+    fn process(&mut self, image: &RudolfImage<u8>) -> (&[Feature], FrameStats) {
+        match self {
+            FrontendBackend::Cpu(frontend) => frontend.process(image),
+            FrontendBackend::Gpu { device, frontend } => frontend.process(device, image),
+        }
+    }
+}
 
 // ── Parameters ──────────────────────────────────────────────────────────────
 
@@ -58,6 +86,8 @@ struct NodeParams {
     occupancy_enabled: bool,
     mapping_stride: usize,
     image_scale: f64,
+    frontend_backend: String,
+    image_transport: String,
     trajectory_output: String,
     mocap_topic: String,
     vio_topic: String,
@@ -179,6 +209,11 @@ fn load_params(node: &r2r::Node) -> NodeParams {
         patch_depth_enabled: get_bool(node, "patch_depth_enabled", true),
         occupancy_enabled: get_bool(node, "occupancy_enabled", true),
         image_scale: get_f64(node, "image_scale", 1.0).clamp(0.25, 1.0),
+        frontend_backend: get_str(node, "frontend_backend", "cpu"),
+        // "raw": sensor_msgs/Image on image_topic. "compressed":
+        // sensor_msgs/CompressedImage (JPEG/PNG), decoded in-process — no
+        // image_transport republisher, which costs most of a core.
+        image_transport: get_str(node, "image_transport", "raw"),
         trajectory_output: get_str(node, "trajectory_output", ""),
         mapping_stride: (get_i64(node, "mapping_stride", 1) as usize).max(1),
         mocap_topic: get_str(node, "mocap_topic", ""),
@@ -330,7 +365,7 @@ struct VioNode {
     // VIO pipeline
     filter: VIOFilter,
     camera: Arc<dyn CameraModel>,
-    frontend: Frontend,
+    frontend: FrontendBackend,
     t_bc: Matrix4<f64>,
     initialized: bool,
     n_init: usize,
@@ -371,6 +406,7 @@ struct VioNode {
 
     // Timing stats
     imu_times_us: VecDeque<f64>,
+    decode_times_ms: VecDeque<f64>,
     gray_times_ms: VecDeque<f64>,
     frontend_times_ms: VecDeque<f64>,
     vision_times_ms: VecDeque<f64>,
@@ -490,7 +526,50 @@ impl VioNode {
             _ => HistEqMethod::None,
         };
         frontend_cfg.camera = Some(cam_intrinsics);
-        let frontend = Frontend::new(frontend_cfg, w, h);
+        let frontend = match params.frontend_backend.as_str() {
+            "cpu" => FrontendBackend::Cpu(Frontend::new(frontend_cfg, w, h)),
+            "gpu" => {
+                // The GPU frontend has FAST + IC-KLT only; refuse config it
+                // would silently ignore.
+                if let Some(detector) = rv.detector.as_deref() {
+                    if detector != "fast" {
+                        panic!("frontend_backend=gpu supports only detector=fast, got {detector}");
+                    }
+                }
+                if rv.epipolar_gate_threshold > 0.0 {
+                    panic!("frontend_backend=gpu has no pose-prior epipolar gate");
+                }
+                if rv.klt_residual {
+                    panic!("frontend_backend=gpu has no KLT residual pass");
+                }
+                let device = GpuDevice::new().unwrap_or_else(|e| {
+                    panic!("frontend_backend=gpu: no usable Vulkan device: {e}")
+                });
+                log::info!("GPU frontend on {}", device.adapter_info);
+                let mut cpu_cfg = frontend_cfg;
+                let gpu_cfg = GpuFrontendConfig {
+                    max_features: cpu_cfg.max_features,
+                    fast_threshold: cpu_cfg.fast_threshold,
+                    pyramid_levels: cpu_cfg.pyramid_levels,
+                    cell_size: cpu_cfg.cell_size,
+                    lbp_policy: cpu_cfg.lbp_policy,
+                    histeq: cpu_cfg.histeq,
+                    // GPU RANSAC runs iff intrinsics are given.
+                    camera: if rv.enable_ransac {
+                        cpu_cfg.camera.take()
+                    } else {
+                        None
+                    },
+                    ..GpuFrontendConfig::default()
+                };
+                let frontend = GpuFrontend::new(&device, gpu_cfg, w, h);
+                FrontendBackend::Gpu {
+                    frontend: ManuallyDrop::new(frontend),
+                    device: ManuallyDrop::new(device),
+                }
+            }
+            other => panic!("frontend_backend must be \"cpu\" or \"gpu\", got {other:?}"),
+        };
 
         // VIO filter
         let filter_settings = vio_config.to_filter_settings();
@@ -599,6 +678,7 @@ impl VioNode {
             dropped_images: 0,
             patch_depth_frame_count: 0,
             imu_times_us: VecDeque::with_capacity(300),
+            decode_times_ms: VecDeque::with_capacity(300),
             gray_times_ms: VecDeque::with_capacity(300),
             frontend_times_ms: VecDeque::with_capacity(300),
             vision_times_ms: VecDeque::with_capacity(300),
@@ -659,6 +739,38 @@ impl VioNode {
             self.imu_queue.pop_front();
             self.dropped_imu += 1;
         }
+    }
+
+    /// Decode a JPEG/PNG CompressedImage in-process and hand it to `on_image`
+    /// as rgb8, so the grey conversion is the same one the republish path got.
+    fn on_compressed_image(&mut self, msg: r2r::sensor_msgs::msg::CompressedImage) {
+        let started = Instant::now();
+        let rgb = match image::load_from_memory(&msg.data) {
+            Ok(img) => img.into_rgb8(),
+            Err(e) => {
+                log::error!(
+                    "cannot decode compressed image (format {:?}, {} bytes): {e}",
+                    msg.format,
+                    msg.data.len()
+                );
+                return;
+            }
+        };
+        push_capped(
+            &mut self.decode_times_ms,
+            started.elapsed().as_secs_f64() * 1000.0,
+            300,
+        );
+        let (width, height) = rgb.dimensions();
+        self.on_image(r2r::sensor_msgs::msg::Image {
+            header: msg.header,
+            height,
+            width,
+            encoding: "rgb8".to_string(),
+            is_bigendian: 0,
+            step: width * 3,
+            data: rgb.into_raw(),
+        });
     }
 
     fn on_image(&mut self, msg: r2r::sensor_msgs::msg::Image) {
@@ -1510,6 +1622,9 @@ impl VioNode {
         let tracks = median_ord(&self.track_counts).unwrap_or(0);
 
         let mut mapping_part = String::new();
+        if let Some(decode_ms) = median_deque(&self.decode_times_ms) {
+            mapping_part.push_str(&format!("; decode_med={decode_ms:.1}ms"));
+        }
         if let Some(pd_ms) = median_deque(&self.patch_depth_times_ms) {
             let seeds_med = median_ord(&self.seed_counts).unwrap_or(0);
             let sparse_med = median_ord(&self.sparse_seed_counts).unwrap_or(0);
@@ -1636,7 +1751,13 @@ where
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::init();
+    // wgpu_core logs its per-frame fence wait at INFO ("waiting for submission
+    // index N"); keep wgpu below WARN unless RUST_LOG names it explicitly.
+    let mut log_filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
+    if !log_filter.contains("wgpu") {
+        log_filter.push_str(",wgpu_core=warn,wgpu_hal=warn");
+    }
+    env_logger::Builder::new().parse_filters(&log_filter).init();
     let ctx = r2r::Context::create()?;
     let mut node = r2r::Node::create(ctx, "echo_li_voxl2", "")?;
 
@@ -1717,8 +1838,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Subscribers
     let imu_sub = node.subscribe::<r2r::sensor_msgs::msg::Imu>(&params.imu_topic, imu_qos)?;
-    let mut image_sub =
-        node.subscribe::<r2r::sensor_msgs::msg::Image>(&params.image_topic, image_qos)?;
+    let compressed = match params.image_transport.as_str() {
+        "raw" => false,
+        "compressed" => true,
+        other => panic!("image_transport must be \"raw\" or \"compressed\", got {other:?}"),
+    };
+    let mut image_sub = if compressed {
+        None
+    } else {
+        Some(
+            node.subscribe::<r2r::sensor_msgs::msg::Image>(&params.image_topic, image_qos.clone())?,
+        )
+    };
+    let mut cimage_sub =
+        if compressed {
+            Some(node.subscribe::<r2r::sensor_msgs::msg::CompressedImage>(
+                &params.image_topic,
+                image_qos,
+            )?)
+        } else {
+            None
+        };
 
     let mocap_sub = if !params.mocap_topic.is_empty() {
         log::info!("Mocap: subscribing to {}", params.mocap_topic);
@@ -1742,14 +1882,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         node.create_wall_timer(std::time::Duration::from_secs_f64(params.path_period_sec))?;
 
     log::info!(
-        "ECHO-LI ready: imu={}, image={}, camera={}x{} (scale={}) {}, \
+        "ECHO-LI ready: imu={}, image={} ({}), camera={}x{} (scale={}) {}, frontend={}, \
          camera_time_offset={:+.6}s, image_qos={}",
         params.imu_topic,
         params.image_topic,
+        params.image_transport,
         (params.width as f64 * params.image_scale).round() as usize,
         (params.height as f64 * params.image_scale).round() as usize,
         params.image_scale,
         params.camera_model,
+        params.frontend_backend,
         params.camera_offset_ns as f64 / NSEC_PER_SEC as f64,
         if params.image_qos_reliable {
             "reliable"
@@ -1776,7 +1918,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // exactly like a node ignoring Ctrl-C, and only SIGKILL ends it.
     let spinning = Arc::new(AtomicBool::new(true));
     let spin_flag = Arc::clone(&spinning);
-    let _spin = tokio::task::spawn_blocking(move || {
+    let spin = tokio::task::spawn_blocking(move || {
         while spin_flag.load(Ordering::Relaxed) {
             node.spin_once(std::time::Duration::from_millis(1));
         }
@@ -1795,9 +1937,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 state.on_imu(&msg);
                 state.drain_queues(&odom_pub, tf_pub.as_ref(), &landmark_pub);
             }
-            Some(msg) = image_sub.next() => {
-                state.on_image(msg);
-                state.drain_queues(&odom_pub, tf_pub.as_ref(), &landmark_pub);
+            msg = async {
+                match image_sub.as_mut() {
+                    Some(s) => s.next().await,
+                    None => futures::future::pending().await,
+                }
+            } => {
+                if let Some(msg) = msg {
+                    state.on_image(msg);
+                    state.drain_queues(&odom_pub, tf_pub.as_ref(), &landmark_pub);
+                }
+            }
+            msg = async {
+                match cimage_sub.as_mut() {
+                    Some(s) => s.next().await,
+                    None => futures::future::pending().await,
+                }
+            } => {
+                if let Some(msg) = msg {
+                    state.on_compressed_image(msg);
+                    state.drain_queues(&odom_pub, tf_pub.as_ref(), &landmark_pub);
+                }
             }
             Some(msg) = mocap_rx.recv() => {
                 state.on_mocap(&msg);
@@ -1825,6 +1985,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     state.report_statistics();
     if !traj_output.is_empty() {
         state.save_trajectory(&traj_output);
+    }
+
+    if matches!(state.frontend, FrontendBackend::Gpu { .. }) {
+        // Leave without libc's exit handlers. On the Orin (driver 540.4) the
+        // NVIDIA Vulkan driver's static destructors segfault its own
+        // `[vkps] Update` thread while FastDDS's ~DomainParticipantFactory is
+        // still running, turning every clean stop into a core dump. Nothing is
+        // lost: the trajectory is written, the node is finalised by the spin
+        // thread below, and the GPU state is deliberately never destroyed.
+        drop(state);
+        let _ = spin.await;
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        let _ = std::io::stderr().flush();
+        unsafe { libc::_exit(0) }
     }
 
     Ok(())

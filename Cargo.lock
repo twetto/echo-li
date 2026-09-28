@@ -1325,7 +1325,7 @@ dependencies = [
 [[package]]
 name = "camera-geometry"
 version = "0.1.0"
-source = "git+https://github.com/twetto/Rudolf-V.git?rev=0f955da#0f955daa9364bcf8a4c887331bfb08b7b2f5421e"
+source = "git+https://github.com/twetto/Rudolf-V.git?rev=cd88dce#cd88dce167b8cd9c7ceed0df53c8b2e23c2ca4cf"
 dependencies = [
  "nalgebra",
 ]
@@ -2802,6 +2802,8 @@ dependencies = [
  "echo-lie",
  "env_logger",
  "futures",
+ "image",
+ "libc",
  "log",
  "nalgebra",
  "r2r",
@@ -9641,7 +9643,7 @@ checksum = "6c20b6793b5c2fa6553b250154b78d6d0db37e72700ae35fad9387a46f487c97"
 [[package]]
 name = "rudolf-v"
 version = "0.1.0"
-source = "git+https://github.com/twetto/Rudolf-V.git?rev=0f955da#0f955daa9364bcf8a4c887331bfb08b7b2f5421e"
+source = "git+https://github.com/twetto/Rudolf-V.git?rev=cd88dce#cd88dce167b8cd9c7ceed0df53c8b2e23c2ca4cf"
 dependencies = [
  "bytemuck",
  "camera-geometry",

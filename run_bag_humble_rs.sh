@@ -16,6 +16,9 @@ GT_TRAJECTORY=""
 MOCAP_TOPIC=""
 VIO_TOPIC=""
 KILL_STALE=0
+FRONTEND_BACKEND="cpu"
+IMAGE_TRANSPORT="raw"
+NO_RVIZ=0
 
 usage() {
     cat <<'EOF'
@@ -40,6 +43,11 @@ Options:
   --mocap-topic TOPIC         Mocap PoseStamped topic to overlay.
   --vio-topic TOPIC           External VIO Odometry topic to overlay.
   --kill-stale                Stop leftover processes on the same ROS domain.
+  --frontend cpu|gpu          Feature-tracking backend (default: cpu).
+  --image-transport raw|compressed
+                              raw: decompress with image_transport republish;
+                              compressed: the node decodes JPEG itself (default: raw).
+  --no-rviz                   Do not launch rviz2.
   -h, --help                  Show this help.
 EOF
 }
@@ -118,6 +126,20 @@ while [[ $# -gt 0 ]]; do
             KILL_STALE=1
             shift
             ;;
+        --frontend)
+            need_value "$@"
+            FRONTEND_BACKEND="$2"
+            shift 2
+            ;;
+        --image-transport)
+            need_value "$@"
+            IMAGE_TRANSPORT="$2"
+            shift 2
+            ;;
+        --no-rviz)
+            NO_RVIZ=1
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
@@ -149,7 +171,7 @@ if [[ ! -r /opt/ros/humble/setup.bash ]]; then
     exit 1
 fi
 
-VIO_BIN="$SCRIPT_DIR/target-humble/release/voxl2_vio_node"
+VIO_BIN="${VIO_BIN:-$SCRIPT_DIR/target-humble/release/voxl2_vio_node}"
 if [[ ! -x "$VIO_BIN" ]]; then
     echo "Rust VIO binary not found: $VIO_BIN" >&2
     echo "Build it with:" >&2
@@ -164,14 +186,21 @@ source /opt/ros/humble/setup.bash
 set -u
 
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-42}"
-export ROS_LOCALHOST_ONLY=0
+# Not localhost-only by default: on the Orin, ROS_LOCALHOST_ONLY=1 left the
+# node and the bag player unable to discover each other (0 Hz for the whole
+# run), and on the laptop it did not even stop LAN traffic getting in. Two
+# machines replaying on the same domain feed each other's frames, so give
+# each machine its own ROS_DOMAIN_ID instead.
+export ROS_LOCALHOST_ONLY="${ROS_LOCALHOST_ONLY:-0}"
 export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"
 
 # Kill stale processes from a previous run on the same ROS domain.
 STALE_PIDS=()
 for pid in $(pgrep -f 'voxl2_vio_node|republish|ros2 bag play' || true); do
-    domain="$(tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null |
-        sed -n 's/^ROS_DOMAIN_ID=//p')"
+    # Unreadable environ (another user's, or a host process seen from the
+    # container) is not ours to kill: skip it rather than abort under set -e.
+    domain="$({ tr '\0' '\n' <"/proc/$pid/environ"; } 2>/dev/null |
+        sed -n 's/^ROS_DOMAIN_ID=//p')" || domain=""
     if [[ "$domain" == "$ROS_DOMAIN_ID" ]]; then
         STALE_PIDS+=("$pid")
     fi
@@ -226,22 +255,27 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# Decompress CompressedImage → raw Image.
-IMAGE_RAW_TOPIC="/echo_li/image"
-echo "Starting image_transport republish: ${IMAGE_COMPRESSED_TOPIC} → ${IMAGE_RAW_TOPIC}"
-setsid ros2 run image_transport republish compressed raw \
-    --ros-args \
-    --remap "in/compressed:=${IMAGE_COMPRESSED_TOPIC}" \
-    --remap "out:=${IMAGE_RAW_TOPIC}" \
-    >"$LOG_DIR/republish.log" 2>&1 &
-REPUB_PID=$!
-PIDS+=("$REPUB_PID")
-sleep 2
+if [[ "$IMAGE_TRANSPORT" == "compressed" ]]; then
+    # The node subscribes to the CompressedImage topic and decodes it itself.
+    IMAGE_RAW_TOPIC="$IMAGE_COMPRESSED_TOPIC"
+else
+    # Decompress CompressedImage → raw Image.
+    IMAGE_RAW_TOPIC="/echo_li/image"
+    echo "Starting image_transport republish: ${IMAGE_COMPRESSED_TOPIC} → ${IMAGE_RAW_TOPIC}"
+    setsid ros2 run image_transport republish compressed raw \
+        --ros-args \
+        --remap "in/compressed:=${IMAGE_COMPRESSED_TOPIC}" \
+        --remap "out:=${IMAGE_RAW_TOPIC}" \
+        >"$LOG_DIR/republish.log" 2>&1 &
+    REPUB_PID=$!
+    PIDS+=("$REPUB_PID")
+    sleep 2
 
-if ! kill -0 "$REPUB_PID" >/dev/null 2>&1; then
-    echo "image_transport republish exited during startup:" >&2
-    tail -40 "$LOG_DIR/republish.log" >&2 || true
-    exit 1
+    if ! kill -0 "$REPUB_PID" >/dev/null 2>&1; then
+        echo "image_transport republish exited during startup:" >&2
+        tail -40 "$LOG_DIR/republish.log" >&2 || true
+        exit 1
+    fi
 fi
 
 # Start the Rust VIO node.
@@ -253,7 +287,7 @@ fi
 if [[ -n "$VIO_TOPIC" ]]; then
     EXTRA_ROS_ARGS+=(-p "vio_topic:=${VIO_TOPIC}")
 fi
-setsid env RUST_LOG="${RUST_LOG:-info}" "$VIO_BIN" --ros-args \
+setsid env RUST_LOG="${RUST_LOG:-info,wgpu_core=warn,wgpu_hal=warn}" "$VIO_BIN" --ros-args \
     --params-file "$CALIBRATION" \
     -p "echo_config_path:=${ECHO_CONFIG}" \
     -p "imu_topic:=${IMU_TOPIC}" \
@@ -263,6 +297,8 @@ setsid env RUST_LOG="${RUST_LOG:-info}" "$VIO_BIN" --ros-args \
     -p "patch_depth_enabled:=false" \
     -p "occupancy_enabled:=false" \
     -p "image_scale:=${IMAGE_SCALE}" \
+    -p "frontend_backend:=${FRONTEND_BACKEND}" \
+    -p "image_transport:=${IMAGE_TRANSPORT}" \
     -p "trajectory_output:=${LOG_DIR}/trajectory.tum" \
     "${EXTRA_ROS_ARGS[@]}" \
     >"$LOG_DIR/echo_li.log" 2>&1 &
@@ -288,7 +324,7 @@ fi
 
 # Launch rviz2 with the ECHO-LI config.
 RVIZ_CFG="$SCRIPT_DIR/echo-li-ros2/config/echo_li.rviz"
-if [[ -f "$RVIZ_CFG" ]] && command -v rviz2 >/dev/null 2>&1; then
+if [[ "$NO_RVIZ" -eq 0 && -f "$RVIZ_CFG" ]] && command -v rviz2 >/dev/null 2>&1; then
     setsid env QT_QPA_PLATFORM=xcb rviz2 -d "$RVIZ_CFG" \
         >"$LOG_DIR/rviz2.log" 2>&1 &
     RVIZ_PID=$!
