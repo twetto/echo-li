@@ -7,6 +7,7 @@ mod patch_depth;
 mod sparse_3d;
 mod stereo;
 mod vio_filter;
+mod height_gate;
 
 #[pymodule]
 fn _echo_li(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -19,6 +20,7 @@ fn _echo_li(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<sparse_3d::PySparse3DFilter>()?;
     m.add_class::<patch_depth::PyPatchDepthMapper>()?;
     m.add_class::<occupancy::PyLocalOccupancyMap>()?;
+    m.add_class::<height_gate::PyFlightHeightGate>()?;
     m.add_class::<stereo::PyStereo>()?;
     Ok(())
 }

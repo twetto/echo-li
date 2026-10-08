@@ -1,5 +1,6 @@
 pub mod flowdep;
 pub mod flowdep_kernels;
+pub mod height_gate;
 pub mod keyframe_pool;
 pub mod occupancy;
 pub mod patch_depth;

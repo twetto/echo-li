@@ -689,6 +689,10 @@ pub struct VIOConfig {
     pub patch_depth: Option<PatchDepthConfig>,
     #[serde(rename = "LocalOccupancy", default)]
     pub local_occupancy: Option<LocalOccupancyConfig>,
+    /// Occupancy integration only while the vehicle holds its programmed
+    /// flight height (see depth::height_gate).
+    #[serde(rename = "FlightHeightGate", default)]
+    pub flight_height_gate: Option<crate::depth::height_gate::FlightHeightGateSettings>,
     #[serde(rename = "Stereo", default)]
     pub stereo: Option<StereoConfig>,
     #[serde(rename = "Rerun", default)]
