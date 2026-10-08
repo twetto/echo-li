@@ -280,9 +280,22 @@ impl LocalOccupancyMap {
                 }
 
                 let range = (eta as f64).exp();
-                if range < self.settings.min_range || range > self.settings.max_range {
+                if range < self.settings.min_range {
                     continue;
                 }
+                // Beyond `max_range` the endpoint is not trusted, but the space
+                // the ray crossed to get there still is: carve free up to the
+                // cutoff and mark no hit, as a lidar max-range return is handled.
+                // Discarding the whole ray instead (what this did before) threw
+                // away the free-space evidence that erases spurious near cells,
+                // so *lowering* max_range made the map dirtier inside the range
+                // it kept -- about 110 free cells per 11 m ray at 0.1 m, against
+                // the 2.4 misses it takes to cancel one hit.
+                let (range, mark_endpoint) = if range > self.settings.max_range {
+                    (self.settings.max_range, false)
+                } else {
+                    (range, true)
+                };
 
                 let uv = Vector2::new((x as f64 + 0.5) * sx - 0.5, (y as f64 + 0.5) * sy - 0.5);
                 let bearing_c = bearing_for_pixel(camera, intrinsics, coordinates, &uv);
@@ -296,10 +309,16 @@ impl LocalOccupancyMap {
                 stats.rays_integrated += 1;
                 match self.settings.update_mode {
                     OccupancyUpdateMode::FixedIncrement => {
-                        self.integrate_ray(cam_origin, endpoint, &mut stats);
+                        self.integrate_ray(cam_origin, endpoint, mark_endpoint, &mut stats);
                     }
                     OccupancyUpdateMode::UncertaintyAware => {
-                        self.integrate_ray_sigma(cam_origin, endpoint, rel_std, &mut stats);
+                        self.integrate_ray_sigma(
+                            cam_origin,
+                            endpoint,
+                            rel_std,
+                            mark_endpoint,
+                            &mut stats,
+                        );
                     }
                 }
             }
@@ -355,10 +374,14 @@ impl LocalOccupancyMap {
     /// Carves free space for every in-bounds voxel up to the boundary, and marks
     /// the endpoint occupied only if it is itself in bounds (clip-and-carve: an
     /// off-grid endpoint still contributes its near free space).
+    /// `mark_endpoint == false` carves the free space along the ray without
+    /// marking the far cell occupied: the endpoint is a range cutoff, not a
+    /// surface.
     fn integrate_ray(
         &mut self,
         origin: Vector3<f64>,
         endpoint: Vector3<f64>,
+        mark_endpoint: bool,
         stats: &mut OccupancyUpdateStats,
     ) {
         let res = self.settings.resolution;
@@ -404,7 +427,7 @@ impl LocalOccupancyMap {
         let mut entered = false;
         loop {
             if cell == end {
-                if endpoint_in_bounds {
+                if endpoint_in_bounds && mark_endpoint {
                     self.add_log_odds(cell[0], cell[1], cell[2], self.settings.log_odds_hit);
                     stats.occupied_updates += 1;
                 }
@@ -449,11 +472,14 @@ impl LocalOccupancyMap {
     /// confidence weight (1 for a depth at the σ floor, shrinking as the band
     /// widens). The traversal is extended to `range + band_k·σ_m` so the far
     /// half of the occupied bump is written.
+    /// `mark_endpoint == false` writes no occupied bump: the ray is carved free
+    /// up to the cutoff and stops there (see `integrate_ray`).
     fn integrate_ray_sigma(
         &mut self,
         origin: Vector3<f64>,
         endpoint: Vector3<f64>,
         rel_std: f64,
+        mark_endpoint: bool,
         stats: &mut OccupancyUpdateStats,
     ) {
         let res = self.settings.resolution;
@@ -468,8 +494,13 @@ impl LocalOccupancyMap {
         let half_band = self.settings.band_k * sigma_m;
         let w = (sigma_floor / sigma_m).clamp(self.settings.min_confidence_weight, 1.0);
         // Traverse up to the far edge of the occupied band so both sides of the
-        // Gaussian bump are written; beyond it the ray is occluded.
-        let far = origin + unit * (range + half_band);
+        // Gaussian bump are written; beyond it the ray is occluded. With no
+        // endpoint to mark there is no bump, so stop at the cutoff itself.
+        let far = if mark_endpoint {
+            origin + unit * (range + half_band)
+        } else {
+            endpoint
+        };
 
         let to_voxel = |p: &Vector3<f64>| {
             [
@@ -516,7 +547,18 @@ impl LocalOccupancyMap {
                 );
                 let d = (center - origin).dot(&unit);
                 let z = d - range;
-                if z <= half_band {
+                if !mark_endpoint {
+                    // Free space only, up to the cutoff.
+                    if z <= 0.0 {
+                        self.add_log_odds(
+                            cell[0],
+                            cell[1],
+                            cell[2],
+                            (self.settings.log_odds_miss as f64 * w) as f32,
+                        );
+                        stats.free_updates += 1;
+                    }
+                } else if z <= half_band {
                     let delta = if z < -half_band {
                         self.settings.log_odds_miss as f64 * w
                     } else {
@@ -651,6 +693,65 @@ mod tests {
         assert_eq!(stats.rays_integrated, 1);
         assert_eq!(map.cell_state(5, 5, 1), Some(OccupancyCell::Free));
         assert_eq!(map.cell_state(5, 8, 1), Some(OccupancyCell::Occupied));
+    }
+
+    #[test]
+    fn beyond_max_range_carves_free_up_to_the_cutoff_without_a_hit() {
+        // A reading past max_range is not trusted as a surface, but the space it
+        // crossed still is. Discarding the ray outright (the old behaviour) threw
+        // the free-space evidence away, so lowering max_range left MORE clutter
+        // inside the range that was kept.
+        let settings = LocalOccupancySettings {
+            enabled: true,
+            resolution: 1.0,
+            width_cells: 21,
+            height_cells: 21,
+            sample_stride: 1,
+            log_odds_hit: 1.0,
+            log_odds_miss: -1.0,
+            occupied_threshold: 0.5,
+            free_threshold: -0.5,
+            max_range: 4.0, // the 8 m reading is past the cutoff
+            ..Default::default()
+        };
+        let mut map = LocalOccupancyMap::new(settings).unwrap();
+        let camera = PinholeModel {
+            fx: 1.0,
+            fy: 1.0,
+            cx: 0.0,
+            cy: 0.0,
+        };
+        let pose = y_forward_pose();
+        let intrinsics = CameraIntrinsics::new(1.0, 1.0, 0.0, 0.0);
+
+        let stats = map.update_from_patch_depth(
+            &single_depth_output(8.0),
+            &camera,
+            intrinsics,
+            PatchDepthSeedCoordinates::UndistortedPinhole,
+            1,
+            1,
+            &pose,
+        );
+
+        assert_eq!(stats.rays_integrated, 1, "the ray must still be traced");
+        assert_eq!(
+            stats.occupied_updates, 0,
+            "a reading beyond max_range must not mark an obstacle"
+        );
+        assert!(
+            stats.free_updates > 0,
+            "it must still carve the free space it crossed"
+        );
+        // Free up to the cutoff; nothing marked occupied at or past it.
+        assert_eq!(map.cell_state(10, 11, 1), Some(OccupancyCell::Free));
+        for y in 13..21 {
+            assert_ne!(
+                map.cell_state(10, y, 1),
+                Some(OccupancyCell::Occupied),
+                "cell at y={y} is past the cutoff and must not be occupied"
+            );
+        }
     }
 
     #[test]
