@@ -48,3 +48,6 @@ mpv-shot*.jpg
 
 # aarch64 cross-build tree (CARGO_TARGET_DIR=target-orin)
 target-orin/
+
+# maturin/PyO3 build tree for the Python 3.10 wheel (CARGO_TARGET_DIR=target-py310)
+target-py310/
