@@ -1,0 +1,22 @@
+# Mocap rigid body ("drone_01") relative to the IMU frame that the Kalibr
+# extrinsics (voxl2_kalibr_20260907.yaml, t_bs = cam -> imu, IMU x-forward
+# z-down) are expressed in. Used by the offline harness (--marker) to place the
+# camera from the mocap pose; the live pipeline does not use it.
+#
+# body_flip: the rigid body is x-forward, z-up (FLU); roll it 180 deg about x.
+# yaw/pitch/roll: residual marker-to-IMU rotation, applied in the marker frame
+#   before the flip as Rz(yaw) Ry(pitch) Rx(roll). Fitted 2026-09-29 from 43
+#   hand-picked pillar corners on 8 frames of flight 0928_164709 with the lever
+#   arm fixed (tau_calib_points.py --fit z --lever ... --huber-px 40):
+#   reprojection residual 2.1 px median, 3.9 px p90, 4.7 px max.
+# lever_body_m: IMU origin relative to the rigid-body centre, FRD metres.
+#   Measured on the drone: the camera lens is 0.25 m ahead of and 0.035 m
+#   below the rigid-body centre; minus the cam->imu translation in t_bs
+#   (x 0.0383, z -0.0148) that gives the IMU at (0.2117, 0.0006, 0.0498).
+mocap_marker:
+  rigid_body: drone_01
+  body_flip: true
+  yaw_deg: 4.393
+  pitch_deg: 0.830
+  roll_deg: -0.473
+  lever_body_m: [0.2117, 0.0006, 0.0498]

@@ -10,15 +10,22 @@ DECODER=auto
 OCCUPANCY=true
 PATCH_DEPTH=true
 IMAGE_STAMP_MODE="auto"
-ECHO_CONFIG="$SCRIPT_DIR/echo-li-ros2/config/eqvio_voxl2.yaml"
+# Demo mapper (decision 2026-09-29): the legacy patch mapper at 300 features.
+# eqvio_voxl2.yaml is the 2026-09-28 mapper (one-patch seeds, verified
+# photo-only, parallax keyframes); eqvio_voxl2_c2f.yaml the coarse-to-fine one.
+ECHO_CONFIG="$SCRIPT_DIR/echo-li-ros2/config/eqvio_voxl2_legacy.yaml"
 GT_TRAJECTORY=""
 MOCAP_TOPIC=""
 VIO_TOPIC=""
+# sensor_msgs/Range for the occupancy flight-height gate (FlightHeightGate in
+# the EqVIO config): auto = the bag's */rangefinder/rangefinder topic if any.
+RANGEFINDER_TOPIC="auto"
 USE_RVIZ=1
 KILL_STALE=0
 WORLD_FRAME=""
 RVIZ_CFG=""
 RVIZ_VIEW="follow"
+PIN_PILLARS=0
 KEEP_RVIZ=1
 NODE_PARAMS=()
 CALIBRATION_OVERRIDE=""
@@ -34,7 +41,7 @@ IMAGE_TOPIC="/echo_li_test/image"
 # 2026-09-22 from this lab's mocap_to_mavros bridge: map = (x, -z, y) of the
 # VRPN world, i.e. +90 deg about x with zero offset (0.3 mm rms residual).
 BOXES="auto"
-BOX_SIZE="0.40 0.90 0.50"
+BOX_SIZE="0.40 1.05 0.50"
 BOX_HEIGHT_AXIS=1
 BOX_ANCHOR="top"
 BOX_FRAME="world"
@@ -64,7 +71,9 @@ Options:
                          (default: /echo_li_test/imu, the relay's output;
                          /voxl/raw_imu takes it straight from the bag).
   --image-topic TOPIC    Same for images (default: /echo_li_test/image).
-  --echo-config PATH     EqVIO config YAML (default: eqvio_voxl2).
+  --echo-config PATH     EqVIO config YAML (default: eqvio_voxl2_legacy, the
+                         demo mapper; eqvio_voxl2.yaml is the 2026-09-28
+                         mapper, eqvio_voxl2_c2f.yaml the coarse-to-fine one).
   --gt PATH              Ground-truth trajectory (TUM) for ATE eval.
   --mocap-topic TOPIC    Mocap PoseStamped topic to plot next to the estimate
                          (default: the bag's */vision_pose/pose, else its
@@ -72,14 +81,18 @@ Options:
                          the mocap track onto the estimate by heading and
                          origin and republishes it on /echo_li/mocap_path.
   --vio-topic TOPIC      External VIO Odometry topic to overlay.
+  --rangefinder-topic T  sensor_msgs/Range for the occupancy height gate
+                         (default auto: the bag's */rangefinder/rangefinder;
+                         none = VIO height only).
   --boxes LIST           Mocap rigid bodies to draw as solid boxes in rviz2,
                          comma-separated VRPN names (default: auto, every
                          /vrpn_mocap/*/pose in the bag except the body named in
-                         the mocap topic; "none" to skip). Drawn on
+                         the mocap topic, or all of /mocap_obstacles/poses when
+                         the bag carries that PoseArray; "none" to skip). Drawn on
                          /box_markers/markers in the VRPN frame, which is tied
                          to echo_li_odom through the node's mocap fit.
   --box-size "X Y Z"     Box extents in metres along the VRPN body axes
-                         (default: 0.40 0.90 0.50). This VRPN stream is Y-up,
+                         (default: 0.40 1.05 0.50, the three-box pillars). This VRPN stream is Y-up,
                          so the middle value is the height.
   --box-anchor WHERE     Where the VRPN pose sits on the box: top (default),
                          centre or bottom.
@@ -104,6 +117,10 @@ Options:
                          frame (map): the node broadcasts echo_li_odom -> that
                          from its fit, and the two would form a TF cycle.
   --world-rpy "R P Y"    Rotation for that TF, radians (default: 0 0 0).
+  --pin-pillars          Make the pillars' (mocap) frame the rviz2 fixed frame:
+                         the pillars stay put and the VIO map, path and body
+                         move by the node's planar mocap fit, instead of the
+                         pillars shifting whenever the fit updates.
   --close-rviz           Close rviz2 when the run ends. By default it is left
                          open with the last pose pinned, and the next run on
                          this domain reuses it.
@@ -140,6 +157,7 @@ while [[ $# -gt 0 ]]; do
         --gt) need_value "$@"; GT_TRAJECTORY="$2"; shift 2 ;;
         --mocap-topic) need_value "$@"; MOCAP_TOPIC="$2"; shift 2 ;;
         --vio-topic) need_value "$@"; VIO_TOPIC="$2"; shift 2 ;;
+        --rangefinder-topic) need_value "$@"; RANGEFINDER_TOPIC="$2"; shift 2 ;;
         --boxes) need_value "$@"; BOXES="$2"; shift 2 ;;
         --box-size) need_value "$@"; BOX_SIZE="$2"; shift 2 ;;
         --box-anchor) need_value "$@"; BOX_ANCHOR="$2"; shift 2 ;;
@@ -149,6 +167,7 @@ while [[ $# -gt 0 ]]; do
         --no-rviz) USE_RVIZ=0; shift ;;
         --rviz-config) need_value "$@"; RVIZ_CFG="$2"; shift 2 ;;
         --rviz-view) need_value "$@"; RVIZ_VIEW="$2"; shift 2 ;;
+        --pin-pillars) PIN_PILLARS=1; shift ;;
         --world-frame) need_value "$@"; WORLD_FRAME="$2"; shift 2 ;;
         --world-rpy) need_value "$@"; WORLD_RPY="$2"; shift 2 ;;
         --calibration) need_value "$@"; CALIBRATION_OVERRIDE="$2"; shift 2 ;;
@@ -275,10 +294,12 @@ if [[ ${#STALE_PIDS[@]} -gt 0 ]]; then
 fi
 
 # The TF helpers an earlier run left for its rviz2 would fight this run's.
-for pid in $(pgrep -f 'echo_li_world_tf|echo_li_box_frame_tf|echo_li_final_pose|echo_li_view_watch' \
+for pid in $(pgrep -f 'echo_li_world_tf|echo_li_box_frame_tf|echo_li_final_pose|pin_pose_tf|echo_li_view_watch' \
     2>/dev/null || true); do
-    domain="$(tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null |
-        sed -n 's/^ROS_DOMAIN_ID=//p')"
+    # A process that vanished or belongs to another user must not abort the run.
+    [[ -r "/proc/$pid/environ" ]] || continue
+    domain="$( { tr '\0' '\n' <"/proc/$pid/environ"; } 2>/dev/null |
+        sed -n 's/^ROS_DOMAIN_ID=//p' || true)"
     if [[ "${domain:-42}" == "$ROS_DOMAIN_ID" ]]; then
         kill "$pid" 2>/dev/null || true
     fi
@@ -336,11 +357,13 @@ keep_or_stop_viewer() {
     if [[ -n "$last" ]]; then
         read -r _ pose <<<"$last"
         read -r PX PY PZ QX QY QZ QW <<<"$pose"
-        setsid ros2 run tf2_ros static_transform_publisher \
+        # A slow dynamic transform, not a static one: rviz2 keeps a frame
+        # static for the life of the window once it has seen it that way, and
+        # the next replay's live imu_link would then flicker against it.
+        setsid python3 "$SCRIPT_DIR/tools/pin_pose_tf.py" \
             --frame-id echo_li_odom --child-frame-id "$BODY_FRAME" \
             --x "$PX" --y "$PY" --z "$PZ" \
             --qx "$QX" --qy "$QY" --qz "$QZ" --qw "$QW" \
-            --ros-args -r __node:=echo_li_final_pose \
             >"$LOG_DIR/final_pose_tf.log" 2>&1 &
         VIEW_PIDS+=("$!")
     fi
@@ -400,10 +423,15 @@ elif [[ -z "$MOCAP_TOPIC" && -f "$BAG_PATH/metadata.yaml" ]]; then
     fi
 fi
 
-# Boxes: every VRPN body in the bag that isn't the one being flown.
+# Boxes: every VRPN body in the bag that isn't the one being flown, or the
+# mocap bridge's PoseArray of all obstacles (/mocap_obstacles/poses, ENU
+# `map` frame, names on /mocap_obstacles/names) when the bag carries that.
 BOX_BODIES=()
+BOX_MODE="vrpn"
 if [[ "$BOXES" == "auto" ]]; then
-    if [[ -f "$BAG_PATH/metadata.yaml" ]]; then
+    if [[ -f "$BAG_PATH/metadata.yaml" ]] && grep -q '/mocap_obstacles/poses' "$BAG_PATH/metadata.yaml" 2>/dev/null; then
+        BOX_MODE="posearray"
+    elif [[ -f "$BAG_PATH/metadata.yaml" ]]; then
         while read -r body; do
             [[ -z "$body" ]] && continue
             # The mocap topic names the tracked vehicle either directly
@@ -422,16 +450,31 @@ fi
 BOX_LIST=""
 if [[ ${#BOX_BODIES[@]} -gt 0 ]]; then
     BOX_LIST="$(IFS=,; echo "${BOX_BODIES[*]}")"
+elif [[ "$BOX_MODE" == "posearray" ]]; then
+    BOX_LIST="posearray"
 fi
 
 echo "Starting ECHO-LI (Rust) on ROS domain ${ROS_DOMAIN_ID}..."
 echo "  Calibration: $(basename "$CALIBRATION")"
+echo "  EqVIO config: $(basename "$ECHO_CONFIG")"
 EXTRA_ROS_ARGS=()
 if [[ -n "$MOCAP_TOPIC" ]]; then
     EXTRA_ROS_ARGS+=(-p "mocap_topic:=${MOCAP_TOPIC}")
 fi
 if [[ -n "$VIO_TOPIC" ]]; then
     EXTRA_ROS_ARGS+=(-p "vio_topic:=${VIO_TOPIC}")
+fi
+if [[ "$RANGEFINDER_TOPIC" == "auto" ]]; then
+    RANGEFINDER_TOPIC=""
+    if [[ -f "$BAG_PATH/metadata.yaml" ]]; then
+        RANGEFINDER_TOPIC="$(grep -oE '/[A-Za-z0-9_/]*rangefinder/rangefinder' "$BAG_PATH/metadata.yaml" | head -1 || true)"
+    fi
+elif [[ "$RANGEFINDER_TOPIC" == "none" ]]; then
+    RANGEFINDER_TOPIC=""
+fi
+if [[ -n "$RANGEFINDER_TOPIC" ]]; then
+    echo "  Rangefinder (occupancy height gate): ${RANGEFINDER_TOPIC}"
+    EXTRA_ROS_ARGS+=(-p "rangefinder_topic:=${RANGEFINDER_TOPIC}")
 fi
 for param in ${NODE_PARAMS[@]+"${NODE_PARAMS[@]}"}; do
     EXTRA_ROS_ARGS+=(-p "$param")
@@ -504,26 +547,47 @@ if ! kill -0 "$RELAY_PID" >/dev/null 2>&1; then
 fi
 
 if [[ -n "$BOX_LIST" ]]; then
-    echo "Boxes: ${BOX_LIST} as ${BX} x ${BY} x ${BZ} m, anchor ${BOX_ANCHOR} (--boxes none to skip)"
-    setsid python3 "$SCRIPT_DIR/tools/box_markers.py" --ros-args \
-        -p "bodies:=[${BOX_LIST}]" \
-        -p "size:=[${BX}, ${BY}, ${BZ}]" \
-        -p "height_axis:=${BOX_HEIGHT_AXIS}" \
-        -p "anchor:=${BOX_ANCHOR}" \
-        >"$LOG_DIR/box_markers.log" 2>&1 &
+    if [[ "$BOX_MODE" == "posearray" ]]; then
+        # ENU: the VRPN (x, height, lateral) size becomes (x, lateral, height)
+        echo "Boxes: /mocap_obstacles/poses (all tracked obstacles, ENU) as ${BX} x ${BZ} x ${BY} m, anchor ${BOX_ANCHOR} (--boxes none to skip)"
+        setsid python3 "$SCRIPT_DIR/tools/box_markers.py" --ros-args \
+            -p "pose_array_topic:=/mocap_obstacles/poses" \
+            -p "names_topic:=/mocap_obstacles/names" \
+            -p "size:=[${BX}, ${BZ}, ${BY}]" \
+            -p "height_axis:=2" \
+            -p "anchor:=${BOX_ANCHOR}" \
+            >"$LOG_DIR/box_markers.log" 2>&1 &
+        BOX_FRAME="map"
+    else
+        echo "Boxes: ${BOX_LIST} as ${BX} x ${BY} x ${BZ} m, anchor ${BOX_ANCHOR} (--boxes none to skip)"
+        setsid python3 "$SCRIPT_DIR/tools/box_markers.py" --ros-args \
+            -p "bodies:=[${BOX_LIST}]" \
+            -p "size:=[${BX}, ${BY}, ${BZ}]" \
+            -p "height_axis:=${BOX_HEIGHT_AXIS}" \
+            -p "anchor:=${BOX_ANCHOR}" \
+            >"$LOG_DIR/box_markers.log" 2>&1 &
+    fi
     BOX_PID=$!
     PIDS+=("$BOX_PID")
+    # The node fits the mocap track and broadcasts echo_li_odom -> <fitted
+    # frame>: `world` (Y-up) when it fits a VRPN topic, `map` (ENU) when it
+    # fits vision_pose. Bridge to the markers' frame only when they differ.
+    FITTED_FRAME="map"
+    [[ "$MOCAP_TOPIC" == /vrpn_mocap/* ]] && FITTED_FRAME="world"
     if [[ -z "$MOCAP_TOPIC" ]]; then
         echo "  No mocap track is being fitted, so nothing ties ${BOX_FRAME} to echo_li_odom:" >&2
         echo "  the boxes will not line up with the map." >&2
-    elif [[ "$MOCAP_TOPIC" == /vrpn_mocap/* ]]; then
-        # Fitted straight from VRPN, so the boxes already share the fitted frame.
-        echo "  Boxes share the fitted VRPN frame; no axis bridge needed."
+    elif [[ "$FITTED_FRAME" == "$BOX_FRAME" ]]; then
+        echo "  Boxes share the fitted ${BOX_FRAME} frame; no axis bridge needed."
     else
-        read -r BR BP BYAW <<<"$BOX_FRAME_RPY"
-        echo "  Static TF: ${BOX_PARENT_FRAME} -> ${BOX_FRAME} (rpy ${BR:-0} ${BP:-0} ${BYAW:-0} rad)"
+        if [[ "$FITTED_FRAME" == "map" ]]; then
+            read -r BR BP BYAW <<<"$BOX_FRAME_RPY"          # map -> world: Y-up to Z-up
+        else
+            BR="-1.5707963"; BP=0; BYAW=0                    # world -> map: the inverse
+        fi
+        echo "  Static TF: ${FITTED_FRAME} -> ${BOX_FRAME} (rpy ${BR:-0} ${BP:-0} ${BYAW:-0} rad)"
         setsid ros2 run tf2_ros static_transform_publisher \
-            --frame-id "$BOX_PARENT_FRAME" --child-frame-id "$BOX_FRAME" \
+            --frame-id "$FITTED_FRAME" --child-frame-id "$BOX_FRAME" \
             --x 0 --y 0 --z 0 --roll "${BR:-0}" --pitch "${BP:-0}" --yaw "${BYAW:-0}" \
             --ros-args -r __node:=echo_li_box_frame_tf \
             >"$LOG_DIR/box_frame_tf.log" 2>&1 &
@@ -576,8 +640,17 @@ PY
 fi
 if [[ "$USE_RVIZ" -eq 1 && -f "$RVIZ_CFG" ]] && command -v rviz2 >/dev/null 2>&1; then
     RVIZ_ARGS=(-d "$RVIZ_CFG")
-    if [[ -n "$WORLD_FRAME" ]]; then
+    PIN_OK=0
+    [[ "$PIN_PILLARS" -eq 1 && -n "${BOX_LIST:-}" && -n "$MOCAP_TOPIC" ]] && PIN_OK=1
+    if [[ "$PIN_OK" -eq 1 ]]; then
+        [[ -n "$WORLD_FRAME" ]] && echo "--pin-pillars overrides --world-frame ${WORLD_FRAME} as the fixed frame" >&2
+        echo "  rviz2 fixed frame: ${BOX_FRAME} (pillars pinned; the VIO moves by the mocap fit)"
+        RVIZ_ARGS+=(-f "$BOX_FRAME")
+    elif [[ -n "$WORLD_FRAME" ]]; then
         RVIZ_ARGS+=(-f "$WORLD_FRAME")
+    fi
+    if [[ "$PIN_PILLARS" -eq 1 && "$PIN_OK" -eq 0 ]]; then
+        echo "--pin-pillars: no mocap boxes or no fitted mocap track in this run; keeping the echo_li_odom fixed frame" >&2
     fi
     for pid in $(pgrep -x rviz2 2>/dev/null || true); do
         domain="$(tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null |

@@ -118,58 +118,28 @@ PatchDepth:
   patch_size: 8
   patch_stride: 4
   gn_eta_convergence_tol: 0.001
-  n_pyramid_levels: 3
-  # A landmark seeds only the patches within one patch of it (32 full-res px
-  # = 8 px at scale 0.25; the solver caps the reach at patch_size anyway).
-  # The old 128 px reach painted "seed blobs": one landmark's depth over a
-  # 256 px neighbourhood, image or no image.
-  seed_radius_px: 32
-  # ... and the solver caps the reach at this many patch sizes regardless.
-  seed_reach_max_patches: 1.0
-  # Gradient gate: mean squared derivative of the current patch along its
-  # epipolar direction (gray^2/px^2). Below it a patch fails quietly.
-  # Sweep on flight 0928 (2026-09-28): 16 -> 4 doubles photo-only coverage
-  # and brings the pillar cells back to the legacy count (36 -> 45 union,
-  # 0 -> 8 final) at 3 % gross photo-only errors; 1 adds little but noise.
-  min_structure_eigen: 4.0
-  # Patches with gradient but no landmark within reach are solved from the
-  # image alone (status PhotoOnly): a candidate search from the range where
-  # the parallax drops below one pixel inwards, one candidate every
-  # search_step_px of disparity, then Gauss-Newton.
-  photo_only: true
-  photo_search: true
-  photo_search_parent_hypotheses: true
-  search_step_px: 1.5
-  max_search_candidates: 40
-  search_max_disp_px: 40
-  # Reject when the runner-up basin is within 30 % of the best (repetitive
-  # texture) or the refined residual is not clearly below the typical
-  # candidate cost (flat cost curve).
-  photo_distinct_min_ratio: 1.3
-  photo_contrast_max_ratio: 0.8
-  # A photo-only patch is reported only when the previous frame's photo-only
-  # estimate at the same bearing agrees within 20 % of range: one-frame
-  # outliers never reach the map, real surfaces arrive one frame late.
-  photo_temporal_tol: 0.2
-  # Two-baseline verification: the image-only depth must be reproduced within
-  # 15 % of range by an independent solve against a second keyframe whose
-  # baseline differs by at least 35 %. Wrong basins move with the baseline;
-  # surfaces do not.
-  photo_verify_tol: 0.15
-  # Reference frame per patch: of the pool keyframes inside the parallax
-  # window (working-scale pixels at the scene depth), the one with the most
-  # baseline perpendicular to the patch's bearing; a second, 35 % different
-  # one verifies photo-only depths. A deep pool keeps sideways baselines
-  # around through a forward leg, where patches near the focus of expansion
-  # would otherwise have no parallax at all.
-  keyframe_pool_size: 24
-  min_parallax_px: 6
-  max_parallax_px: 32
-  keyframe_spacing_px: 3
-  fallback_scene_depth: 3.0
+  # Two levels: the 80x50 level only contributes wrong minima under real seeding
+  # (2026-09-26 sweep: false air 272 -> 240 at equal pillars).
+  n_pyramid_levels: 2
+  # Coarse-to-fine seeding (C) and photometric-confidence densify (D).
+  # Measured 2026-09-24 on flight 172844 against the mocap box pillars with
+  # the node's seeding (Sparse3D + EqF): pillar cells 348 -> 366, in-air
+  # false cells 218 -> 272, mapper +30 %. (The 36 -> 124 figure quoted
+  # earlier that day was with EqF-only seeding.)
+  # Record: ECHO-LI-notes docs/patch-depth/coarse_to_fine_measured.md.
+  coarse_to_fine: true
+  photo_confidence_weighting: true
+  # Weaker parent prior; with 2 levels this is the best C2F point measured
+  # (370 pillar / 230 false in-air cells vs legacy 348 / 218, +23 % time).
+  c2f_var_inflation: 8.0
+  seed_radius_px: 128
+  # keep the 32 px working-scale reach under the 2026-09-28 binary (default cap is one patch)
+  seed_reach_max_patches: 4.0
   min_baseline_ratio: 0.005
   max_baseline_ratio: 0.3
   max_depth: 12.0
+  # min_structure_eigen: 1.0
+  min_structure_eigen: 0.0
   vis_min_depth: 0.2
   vis_max_depth: 8.0
 
@@ -193,23 +163,14 @@ LocalOccupancy:
   max_range: 12.0
   max_eta_std: 0.5
   update_mode: fixed
+  # Fraction of the depth image (per axis, centred) that feeds the grid. The
+  # central half looked cleaner live on 2026-09-24, but with the node's
+  # seeding the harness says it costs: 352 vs 366 pillar cells, 369 vs 272
+  # false in-air cells, a third less reach. Full frame for the numbers; set
+  # 0.5 to get the cleaner-looking live view back.
+  center_fraction: 1.0
   min_obstacle_height: -1.0
   max_obstacle_height: 1.0
-
-FlightHeightGate:
-  # Depth reaches the occupancy map only while the vehicle holds its
-  # programmed flight height: take-off and landing sweep the floor at close
-  # range and carve out the map. Band flight_height_m +- tolerance_m on the
-  # rangefinder (node param rangefinder_topic) while its readings are fresh,
-  # on the VIO height (odom z above the take-off point) otherwise.
-  enabled: true
-  flight_height_m: 1.0     # the court missions' takeoff / waypoint relative altitude
-  tolerance_m: 0.3         # the VIO reads ~10 % low at 1 m; 0.2 fragments the early hover
-  vio_ground_z: 0.0        # the filter initialises on the ground
-  use_vio: true
-  use_range: true
-  range_timeout_s: 1.0     # the flight controller's rangefinder arrives at 2 Hz
-  range_overrides_vio: true  # a fresh rangefinder reading decides alone; the VIO height drifts ~0.3 m
 
 main:
   writeState: false
