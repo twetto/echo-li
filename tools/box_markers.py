@@ -22,6 +22,16 @@ Two things a hand-written marker usually gets wrong:
 * **Up axis.** `size` is given along the body's own axes and `height_axis` says
   which of them is vertical. A VRPN stream is often Y-up, in which case the
   height is the second component and `height_axis:=1`.
+* **Upright.** With `upright: true` (the default) `height_axis` is also read as
+  the vertical axis of the frame the poses arrive in, and the box is anchored
+  and drawn standing on that axis: pushed straight down in the world, yaw taken
+  from the pose, roll and pitch discarded. Without it a flipped tracking
+  solution turns the box upside down -- a mocap solver returns a rigid body's
+  orientation flipped often enough (a near-symmetric marker cluster fits more
+  than one way) that pillars were seen growing upwards out of their top face.
+  An obstacle standing on the floor is never actually upside down, so the flip
+  belongs to the tracking, not to the world. Set `upright: false` for an
+  obstacle that really is tilted.
 
 Markers are stamped zero ("latest transform"), because the VRPN clock and the
 estimator's clock are generally not the same clock -- see `_header`.
@@ -33,13 +43,15 @@ launcher adds the static axis change between the fitted mocap frame and the
 VRPN one. Without that chain the boxes and the map are two clouds in unrelated
 coordinates, and any visual agreement is a coincidence.
 """
+import math
 import sys
 
 import rclpy
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseArray, PoseStamped, Quaternion
+from std_msgs.msg import String
 from visualization_msgs.msg import Marker, MarkerArray
 
 # Best-effort matches a best-effort publisher and still matches a reliable one,
@@ -62,6 +74,33 @@ def rotate(q, v):
     return [v[i] + q.w * t[i] + cross[i] for i in range(3)]
 
 
+def axis_vector(i, length=1.0):
+    v = [0.0, 0.0, 0.0]
+    v[i] = length
+    return v
+
+
+def yaw_about(up, q):
+    """The yaw part of `q` about frame axis `up`, as a quaternion.
+
+    Keeps the box's up axis vertical and takes only its heading from the pose,
+    so a flipped or tilted tracking solution cannot stand the box on its side.
+    A 180-degree flip survives as a 180-degree yaw, which a rectangular box is
+    symmetric under, so the drawn volume is unchanged.
+    """
+    p, r = (up + 1) % 3, (up + 2) % 3         # (p, r, up) is a right-handed cycle
+    v = rotate(q, axis_vector(p))
+    if math.hypot(v[p], v[r]) < 1e-6:         # that axis came out vertical
+        w = rotate(q, axis_vector(r))
+        theta = math.atan2(w[r], w[p]) - math.pi / 2
+    else:
+        theta = math.atan2(v[r], v[p])
+    out = Quaternion()
+    setattr(out, "xyz"[up], math.sin(theta / 2.0))
+    out.w = math.cos(theta / 2.0)
+    return out
+
+
 class BoxMarkers(Node):
     def __init__(self):
         super().__init__("box_markers")
@@ -69,16 +108,23 @@ class BoxMarkers(Node):
         self.bodies = [b for b in self.bodies if b]
         self.template = self.declare_parameter(
             "topic_template", "/vrpn_mocap/{}/pose").value
+        # Alternative source: one PoseArray with every body (e.g. the mocap
+        # bridge's /mocap_obstacles/poses, ENU) plus a String topic with the
+        # comma-separated names in the same order. `bodies` is then optional
+        # (names come from the topic) and filters when given.
+        self.pose_array_topic = self.declare_parameter("pose_array_topic", "").value
+        self.names_topic = self.declare_parameter("names_topic", "/mocap_obstacles/names").value
         self.size = list(self.declare_parameter("size", [0.0]).value)
         self.height_axis = int(self.declare_parameter("height_axis", 2).value)
         self.anchor = self.declare_parameter("anchor", "top").value
+        self.upright = bool(self.declare_parameter("upright", True).value)
         self.alpha = float(self.declare_parameter("alpha", 0.55).value)
         self.frame_override = self.declare_parameter("frame_id", "").value
         self.label = bool(self.declare_parameter("label", True).value)
         rate = float(self.declare_parameter("publish_rate", 10.0).value)
 
         problems = []
-        if not self.bodies:
+        if not self.bodies and not self.pose_array_topic:
             problems.append("parameter 'bodies' is empty: name the rigid bodies to draw")
         if len(self.size) != 3 or any(s <= 0 for s in self.size):
             problems.append("parameter 'size' must be three positive extents in metres")
@@ -92,7 +138,12 @@ class BoxMarkers(Node):
             raise SystemExit(2)
 
         self.latest = {}
-        for name in self.bodies:
+        self.array_names = []
+        if self.pose_array_topic:
+            self.create_subscription(String, self.names_topic, self.on_names, BEST_EFFORT)
+            self.create_subscription(PoseArray, self.pose_array_topic, self.on_array, BEST_EFFORT)
+            self.get_logger().info(f"PoseArray {self.pose_array_topic}, names from {self.names_topic}")
+        for name in self.bodies if not self.pose_array_topic else []:
             topic = self.template.format(name)
             self.create_subscription(
                 PoseStamped, topic,
@@ -103,13 +154,29 @@ class BoxMarkers(Node):
         self.create_timer(1.0 / rate, self.tick)
         self.get_logger().info(
             f"size {self.size} m, height axis {'xyz'[self.height_axis]}, "
-            f"anchor {self.anchor}; publishing ~/markers at {rate:g} Hz")
+            f"anchor {self.anchor}, {'upright' if self.upright else 'free'}; "
+            f"publishing ~/markers at {rate:g} Hz")
+
+    def on_names(self, msg):
+        self.array_names = [n.strip() for n in msg.data.split(",") if n.strip()]
+
+    def on_array(self, msg):
+        names = self.array_names or [f"box{i + 1}" for i in range(len(msg.poses))]
+        for i, pose in enumerate(msg.poses):
+            name = names[i] if i < len(names) else f"box{i + 1}"
+            if self.bodies and name not in self.bodies:
+                continue
+            ps = PoseStamped()
+            ps.header = msg.header
+            ps.pose = pose
+            self.latest[name] = ps
 
     def tick(self):
         if not self.latest:
             return
         arr = MarkerArray()
-        for i, name in enumerate(self.bodies):
+        order = self.bodies if self.bodies else sorted(self.latest)
+        for i, name in enumerate(order):
             msg = self.latest.get(name)
             if msg is None:
                 continue
@@ -124,9 +191,10 @@ class BoxMarkers(Node):
         if self.anchor in ("centre", "center"):
             return [p.x, p.y, p.z]
         half = self.size[self.height_axis] / 2.0
-        local = [0.0, 0.0, 0.0]
-        local[self.height_axis] = -half if self.anchor == "top" else half
-        d = rotate(msg.pose.orientation, local)
+        off = axis_vector(self.height_axis, -half if self.anchor == "top" else half)
+        # Straight down the frame's vertical axis when upright, so the box hangs
+        # below its top face whatever orientation the mocap reports for it.
+        d = off if self.upright else rotate(msg.pose.orientation, off)
         return [p.x + d[0], p.y + d[1], p.z + d[2]]
 
     def _header(self, marker, msg):
@@ -143,7 +211,8 @@ class BoxMarkers(Node):
         self._header(m, msg)
         m.ns, m.id, m.type, m.action = "mocap_boxes", i, Marker.CUBE, Marker.ADD
         m.pose.position.x, m.pose.position.y, m.pose.position.z = self._anchored(msg)
-        m.pose.orientation = msg.pose.orientation
+        m.pose.orientation = (yaw_about(self.height_axis, msg.pose.orientation)
+                              if self.upright else msg.pose.orientation)
         m.scale.x, m.scale.y, m.scale.z = self.size
         r, g, b = PALETTE[i % len(PALETTE)]
         m.color.r, m.color.g, m.color.b, m.color.a = r, g, b, self.alpha
@@ -155,13 +224,13 @@ class BoxMarkers(Node):
         m.ns, m.id = "mocap_box_labels", i
         m.type, m.action = Marker.TEXT_VIEW_FACING, Marker.ADD
         # Float the label clear of the top surface, along the body's up axis.
-        lift = [0.0, 0.0, 0.0]
-        lift[self.height_axis] = 0.15
+        lift = 0.15
         if self.anchor in ("centre", "center"):
-            lift[self.height_axis] += self.size[self.height_axis] / 2.0
+            lift += self.size[self.height_axis] / 2.0
         elif self.anchor == "bottom":
-            lift[self.height_axis] += self.size[self.height_axis]
-        d = rotate(msg.pose.orientation, lift)
+            lift += self.size[self.height_axis]
+        lift = axis_vector(self.height_axis, lift)
+        d = lift if self.upright else rotate(msg.pose.orientation, lift)
         p = msg.pose.position
         m.pose.position.x, m.pose.position.y, m.pose.position.z = \
             p.x + d[0], p.y + d[1], p.z + d[2]
