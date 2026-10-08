@@ -6,6 +6,7 @@ use std::time::Instant;
 use camera_geometry::CameraProjection;
 use echo_li_core::config::VIOConfig;
 use echo_li_core::core_types::CameraIntrinsics;
+use echo_li_core::depth::height_gate::{FlightHeightGate, GateDecision};
 use echo_li_core::depth::occupancy::LocalOccupancyMap;
 use echo_li_core::depth::patch_depth::{
     FrameProducts, PatchDepthMapper, PatchDepthOutput, PatchDepthSeedCoordinates, PatchStatus,
@@ -18,7 +19,10 @@ use echo_li_core::mathematical::imu_velocity::IMUVelocity;
 use echo_li_core::mathematical::vio_state::{VIOSensorState, VIOState};
 use echo_li_core::mathematical::vision_measurement::VisionMeasurement;
 use echo_li_core::{VIOFilter, landmarks_to_global};
-use echo_li_ros2::{NSEC_PER_SEC, best_effort_qos, quat_to_se3, stamp_ns, to_stamp, xyzi_cloud};
+use echo_li_ros2::{
+    NSEC_PER_SEC, best_effort_qos, quat_to_se3, ramp_rgb, stamp_ns, to_stamp, xyzi_cloud,
+    xyzirgb_cloud,
+};
 use echo_lie::SE3;
 use futures::StreamExt;
 use nalgebra::{Matrix3, Matrix4, Vector2, Vector3, Vector6};
@@ -61,9 +65,24 @@ struct NodeParams {
     trajectory_output: String,
     mocap_topic: String,
     vio_topic: String,
+    /// sensor_msgs/Range for the occupancy flight-height gate ("" = none).
+    rangefinder_topic: String,
     path_topic: String,
     mocap_path_topic: String,
     path_period_sec: f64,
+    /// How often the occupied-cell cloud goes out to rviz. One publish scans
+    /// the whole grid (about a millisecond at 512k cells), so 10 Hz is cheap.
+    occupancy_publish_period_sec: f64,
+    /// Height range (odom z, metres) mapped onto the cloud's blue-to-red
+    /// colour ramp; cells outside are clamped to the end colours.
+    occupancy_color_z_min: f64,
+    occupancy_color_z_max: f64,
+    /// How often the exposed-face mesh goes out (default: with the cloud).
+    /// Greedy merging keeps it small, and unchanged maps are not re-sent.
+    occupancy_mesh_period_sec: f64,
+    /// Cells with fewer occupied 6-neighbours than this are left out of the
+    /// mesh (display only; the map and the cloud keep them). 0 draws all.
+    occupancy_mesh_min_neighbors: usize,
 }
 
 // ── Parameter helpers ────────────────────────────────────────────────────────
@@ -183,9 +202,15 @@ fn load_params(node: &r2r::Node) -> NodeParams {
         mapping_stride: (get_i64(node, "mapping_stride", 1) as usize).max(1),
         mocap_topic: get_str(node, "mocap_topic", ""),
         vio_topic: get_str(node, "vio_topic", ""),
+        rangefinder_topic: get_str(node, "rangefinder_topic", ""),
         path_topic: get_str(node, "path_topic", "/echo_li/path"),
         mocap_path_topic: get_str(node, "mocap_path_topic", "/echo_li/mocap_path"),
         path_period_sec: get_f64(node, "path_period_sec", 0.5).max(0.05),
+        occupancy_publish_period_sec: get_f64(node, "occupancy_publish_period_sec", 0.1).max(0.02),
+        occupancy_color_z_min: get_f64(node, "occupancy_color_z_min", -0.3),
+        occupancy_color_z_max: get_f64(node, "occupancy_color_z_max", 1.2),
+        occupancy_mesh_period_sec: get_f64(node, "occupancy_mesh_period_sec", 0.1).max(0.05),
+        occupancy_mesh_min_neighbors: get_i64(node, "occupancy_mesh_min_neighbors", 0).clamp(0, 6) as usize,
     }
 }
 
@@ -213,6 +238,17 @@ struct PlanarAlignment {
 }
 
 impl PlanarAlignment {
+    /// Whether adopting `self` in place of `other` would visibly move what is
+    /// drawn in the mocap frame.
+    fn differs_from(&self, other: &Self, max_shift_m: f64, max_yaw_rad: f64) -> bool {
+        let dyaw = (self.yaw - other.yaw).sin().atan2((self.yaw - other.yaw).cos()).abs();
+        let shift = ((self.t[0] - other.t[0]).powi(2)
+            + (self.t[1] - other.t[1]).powi(2)
+            + (self.t[2] - other.t[2]).powi(2))
+        .sqrt();
+        shift > max_shift_m || dyaw > max_yaw_rad
+    }
+
     fn apply(&self, p: &[f64; 3]) -> [f64; 3] {
         let (s, c) = self.yaw.sin_cos();
         [
@@ -346,7 +382,18 @@ struct VioNode {
     depth_status_pub: Option<r2r::Publisher<r2r::sensor_msgs::msg::Image>>,
     sparse_landmark_pub: r2r::Publisher<r2r::sensor_msgs::msg::PointCloud2>,
     occupancy_pub: Option<r2r::Publisher<r2r::sensor_msgs::msg::PointCloud2>>,
+    occupancy_mesh_pub: Option<r2r::Publisher<r2r::visualization_msgs::msg::MarkerArray>>,
+    /// Publish the mesh on every n-th occupancy tick, and the tick counter.
+    occupancy_mesh_every: u32,
+    occupancy_tick: std::cell::Cell<u32>,
+    occupancy_mesh_hash: std::cell::Cell<u64>,
+    occupancy_mesh_min_neighbors: usize,
     occupancy_map: Option<LocalOccupancyMap>,
+    /// Occupancy integration only at the programmed flight height.
+    height_gate: Option<FlightHeightGate>,
+    occupancy_gated_frames: u64,
+    height_gate_last: Option<GateDecision>,
+    occupancy_color_z: (f64, f64),
     mapping_stride: usize,
 
     // Message queues
@@ -393,6 +440,8 @@ struct VioNode {
     estimated_positions: VecDeque<[f64; 3]>,
     estimated_quaternions: VecDeque<[f64; 4]>,
     mocap_fit: Option<PlanarAlignment>,
+    /// The fit currently broadcast and drawn; lags `mocap_fit` by hysteresis.
+    mocap_fit_shown: Option<PlanarAlignment>,
     /// Frame the mocap poses arrive in. The fit is broadcast as odom -> this,
     /// so anything else published in that frame lands where the mocap path is.
     mocap_frame_id: String,
@@ -420,6 +469,7 @@ impl VioNode {
         depth_status_pub: Option<r2r::Publisher<r2r::sensor_msgs::msg::Image>>,
         sparse_landmark_pub: r2r::Publisher<r2r::sensor_msgs::msg::PointCloud2>,
         occupancy_pub: Option<r2r::Publisher<r2r::sensor_msgs::msg::PointCloud2>>,
+        occupancy_mesh_pub: Option<r2r::Publisher<r2r::visualization_msgs::msg::MarkerArray>>,
     ) -> Self {
         let s = params.image_scale;
         let [fx, fy, cx, cy] = [
@@ -534,6 +584,7 @@ impl VioNode {
         let mut depth_mapper = None;
         let mut depth_seed_coords = PatchDepthSeedCoordinates::RawDistorted;
         let mut occupancy_map = None;
+        let mut height_gate = None;
         if params.patch_depth_enabled {
             let intrinsics = CameraIntrinsics { fx, fy, cx, cy };
             let pd_settings = vio_config
@@ -558,6 +609,26 @@ impl VioNode {
                             }
                             Err(e) => log::error!("Failed to create LocalOccupancyMap: {e}"),
                         }
+                        if let Some(gs) = vio_config.flight_height_gate.clone().filter(|g| g.enabled) {
+                            match FlightHeightGate::new(gs) {
+                                Ok(g) => {
+                                    let (lo, hi) = g.band();
+                                    log::info!(
+                                        "Occupancy flight-height gate: {lo:.2}-{hi:.2} m (VIO{}{})",
+                                        if g.settings().use_range { " + rangefinder" } else { "" },
+                                        if g.settings().use_range && params.rangefinder_topic.is_empty() {
+                                            ", but no rangefinder_topic set"
+                                        } else {
+                                            ""
+                                        }
+                                    );
+                                    height_gate = Some(g);
+                                }
+                                // A gate asked for but mis-configured must not
+                                // silently map take-off and landing.
+                                Err(e) => panic!("FlightHeightGate: {e}"),
+                            }
+                        }
                     }
                     depth_mapper = Some(mapper);
                 }
@@ -580,7 +651,15 @@ impl VioNode {
             depth_status_pub,
             sparse_landmark_pub,
             occupancy_pub,
+            occupancy_mesh_pub,
+            occupancy_mesh_every: ((params.occupancy_mesh_period_sec / params.occupancy_publish_period_sec).round() as u32).max(1),
+            occupancy_tick: std::cell::Cell::new(0),
+            occupancy_mesh_hash: std::cell::Cell::new(0),
+            occupancy_mesh_min_neighbors: params.occupancy_mesh_min_neighbors,
             occupancy_map,
+            height_gate,
+            occupancy_gated_frames: 0,
+            height_gate_last: None,
             mapping_stride: params.mapping_stride,
             imu_queue: VecDeque::new(),
             image_queue: VecDeque::new(),
@@ -619,6 +698,7 @@ impl VioNode {
             estimated_positions: VecDeque::with_capacity(20000),
             estimated_quaternions: VecDeque::with_capacity(20000),
             mocap_fit: None,
+            mocap_fit_shown: None,
             mocap_frame_id: String::new(),
             input_width: params.width,
             input_height: params.height,
@@ -627,6 +707,7 @@ impl VioNode {
             image_scale: s,
             intrinsics: CameraIntrinsics { fx, fy, cx, cy },
             odom_frame: params.odom_frame.clone(),
+            occupancy_color_z: (params.occupancy_color_z_min, params.occupancy_color_z_max),
             body_frame: params.body_frame.clone(),
             publish_tf: params.publish_tf,
             started_at: Instant::now(),
@@ -867,13 +948,19 @@ impl VioNode {
                 .iter()
                 .map(|f| (f.id, Vector2::new(f.x, f.y)))
                 .collect();
-            let (p_vv, p_ww) = self
-                .filter
-                .sparse_camera_pose_covariances()
-                .map(|(v, w)| (Some(v), Some(w)))
-                .unwrap_or((None, None));
+            // Sparse3D's prediction step models per-frame motion uncertainty
+            // (dt^2 * sigma_v^2 along the bearing), so it wants the body-velocity
+            // covariance in the camera frame, not the absolute pose covariance:
+            // that block's position part is gauge-unobservable and grows with
+            // drift, and feeding it halved the usable seeds (measured
+            // 2026-09-26 on flight 172844: 20 vs 47 seeds per frame, final map
+            // 188 vs 325 pillar cells).
+            let p_vv = self.filter.velocity_covariance().map(|sigma_v| {
+                let r_cb = self.t_bc.fixed_view::<3, 3>(0, 0).transpose();
+                r_cb * sigma_v * r_cb.transpose()
+            });
             let measurement = VisionMeasurement::new(stamp, feature_uvs);
-            sparse.update(&measurement, &t_wc, p_vv.as_ref(), p_ww.as_ref());
+            sparse.update(&measurement, &t_wc, p_vv.as_ref(), None);
         }
 
         // Dense mapping: patch depth → occupancy
@@ -1014,7 +1101,29 @@ impl VioNode {
             self.publish_depth_maps(stamp_ns, output);
         }
 
-        if let (Some(output), Some(occ)) = (&depth_result, &mut self.occupancy_map) {
+        let gate_open = match self.height_gate.as_mut() {
+            None => true,
+            Some(gate) => {
+                let t_wb = t_wc * self.t_bc.try_inverse().unwrap_or_else(Matrix4::identity);
+                let was_open = gate.last_open();
+                let d = gate.evaluate(self.started_at.elapsed().as_secs_f64(), t_wb[(2, 3)]);
+                if was_open != Some(d.open) {
+                    let (lo, hi) = gate.band();
+                    log::info!(
+                        "occupancy gate {}: VIO height {} m, rangefinder {} m (band {lo:.2}-{hi:.2} m)",
+                        if d.open { "OPEN" } else { "CLOSED" },
+                        d.vio_height.map_or("-".to_string(), |h| format!("{h:.2}")),
+                        d.range_height.map_or("-".to_string(), |h| format!("{h:.2}")),
+                    );
+                }
+                self.height_gate_last = Some(d);
+                d.open
+            }
+        };
+        if !gate_open && depth_result.is_some() && self.occupancy_map.is_some() {
+            self.occupancy_gated_frames += 1;
+        }
+        if let (true, Some(output), Some(occ)) = (gate_open, &depth_result, &mut self.occupancy_map) {
             let occ_start = Instant::now();
             occ.update_from_patch_depth(
                 output,
@@ -1194,6 +1303,7 @@ impl VioNode {
                     85
                 }
                 PatchStatus::Rejected => 170,
+                PatchStatus::PhotoOnly => 220,
                 PatchStatus::PhotoRefined => 255,
             });
         }
@@ -1265,10 +1375,12 @@ impl VioNode {
         let _ = pub_.publish(&xyzi_cloud(stamp, frame_id, data, n));
     }
 
-    /// Publish the occupied voxels of the local occupancy grid as a point cloud,
-    /// intensity carrying log-odds. Rides the path timer rather than the image
-    /// path: the grid is ~500k voxels and occupancy changes far more slowly than
-    /// frames arrive. Render it in rviz2 with Style=Boxes and Size = resolution.
+    /// Publish the occupied voxels of the local occupancy grid as a point cloud:
+    /// intensity carries the log-odds, `rgb` a blue-to-red ramp over the cell's
+    /// height (`occupancy_color_z_min..max`). Has its own timer
+    /// (occupancy_publish_period_sec) rather than the image path: the grid is
+    /// ~500k voxels and occupancy changes far more slowly than frames arrive.
+    /// Render it in rviz2 with Style=Boxes, Size = resolution, colour RGB8.
     fn publish_occupancy(&self, pub_: &r2r::Publisher<r2r::sensor_msgs::msg::PointCloud2>) {
         let (Some(occ), Some(&last_stamp)) = (&self.occupancy_map, self.estimated_stamps.back())
         else {
@@ -1277,6 +1389,8 @@ impl VioNode {
         let snap = occ.snapshot();
         let occupied = occ.settings().occupied_threshold;
         let res = snap.resolution;
+        let (z_lo, z_hi) = self.occupancy_color_z;
+        let z_span = (z_hi - z_lo).max(1e-6);
         let mut data: Vec<u8> = Vec::new();
         let mut n: u32 = 0;
         for z in 0..snap.depth {
@@ -1293,6 +1407,8 @@ impl VioNode {
                     data.extend_from_slice(&(wy as f32).to_le_bytes());
                     data.extend_from_slice(&(wz as f32).to_le_bytes());
                     data.extend_from_slice(&log_odds.to_le_bytes());
+                    let rgb = ramp_rgb(((wz - z_lo) / z_span) as f32);
+                    data.extend_from_slice(&f32::from_bits(rgb).to_le_bytes());
                     n += 1;
                 }
             }
@@ -1301,7 +1417,204 @@ impl VioNode {
             return;
         }
         let stamp = to_stamp((last_stamp * NSEC_PER_SEC as f64).round() as i64);
-        let _ = pub_.publish(&xyzi_cloud(stamp, &self.odom_frame, data, n));
+        let _ = pub_.publish(&xyzirgb_cloud(stamp, &self.odom_frame, data, n));
+    }
+
+    /// The occupied cells as one TRIANGLE_LIST marker of their exposed faces,
+    /// greedily merged: on every slice of the grid, runs of exposed faces with
+    /// the same colour (the same height layer) become one rectangle, so a
+    /// pillar's flank is a handful of strips and its top one quad instead of
+    /// hundreds of cell faces. Faces shared by two occupied cells are never
+    /// drawn, so adjacent cells render as one seamless surface. Skipped when
+    /// the occupied set has not changed since the last publish.
+    fn publish_occupancy_mesh(&self, pub_: &r2r::Publisher<r2r::visualization_msgs::msg::MarkerArray>) {
+        let (Some(occ), Some(&last_stamp)) = (&self.occupancy_map, self.estimated_stamps.back())
+        else {
+            return;
+        };
+        let snap = occ.snapshot();
+        let occupied = occ.settings().occupied_threshold;
+        let res = snap.resolution;
+        let dims = [snap.width, snap.height, snap.depth];
+        let origin = [snap.origin_x, snap.origin_y, snap.origin_z];
+        let mut solid: Vec<bool> = snap.log_odds.iter().map(|&lo| lo >= occupied).collect();
+        if self.occupancy_mesh_min_neighbors > 0 {
+            let raw = solid.clone();
+            let (w, h, d) = (dims[0], dims[1], dims[2]);
+            let at = |x: isize, y: isize, z: isize| {
+                x >= 0 && y >= 0 && z >= 0 && (x as usize) < w && (y as usize) < h && (z as usize) < d
+                    && raw[(z as usize * h + y as usize) * w + x as usize]
+            };
+            for z in 0..d {
+                for y in 0..h {
+                    for x in 0..w {
+                        let i = (z * h + y) * w + x;
+                        if !raw[i] {
+                            continue;
+                        }
+                        let (xi, yi, zi) = (x as isize, y as isize, z as isize);
+                        let n = [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)]
+                            .iter()
+                            .filter(|(dx, dy, dz)| at(xi + dx, yi + dy, zi + dz))
+                            .count();
+                        solid[i] = n >= self.occupancy_mesh_min_neighbors;
+                    }
+                }
+            }
+        }
+        // FNV-1a over the occupied set; identical maps are not re-sent.
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for (i, &b) in solid.iter().enumerate() {
+            if b {
+                hash ^= i as u64;
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+        }
+        if hash == self.occupancy_mesh_hash.get() {
+            return;
+        }
+        self.occupancy_mesh_hash.set(hash);
+        let idx = |c: [usize; 3]| (c[2] * dims[1] + c[1]) * dims[0] + c[0];
+        let (z_lo, z_hi) = self.occupancy_color_z;
+        let z_span = (z_hi - z_lo).max(1e-6);
+        // one marker per height layer: the marker's single colour replaces
+        // per-vertex colours (16 bytes a vertex less on the wire)
+        let mut layers: Vec<Vec<r2r::geometry_msgs::msg::Point>> = vec![Vec::new(); dims[2]];
+        let layer_color = |k: usize| {
+            let zc = origin[2] + (k as f64 + 0.5) * res;
+            let rgb = ramp_rgb(((zc - z_lo) / z_span) as f32);
+            r2r::std_msgs::msg::ColorRGBA {
+                r: ((rgb >> 16) & 0xff) as f32 / 255.0,
+                g: ((rgb >> 8) & 0xff) as f32 / 255.0,
+                b: (rgb & 0xff) as f32 / 255.0,
+                a: 1.0,
+            }
+        };
+        for a in 0..3usize {
+            let (b, c) = ((a + 1) % 3, (a + 2) % 3);
+            let (nb, nc) = (dims[b], dims[c]);
+            // cell coordinates from (slice, u, v)
+            let cell = |s_: usize, u: usize, v: usize| {
+                let mut co = [0usize; 3];
+                co[a] = s_;
+                co[b] = u;
+                co[c] = v;
+                co
+            };
+            for positive in [true, false] {
+                let mut key = vec![usize::MAX; nb * nc]; // colour key (z index) of exposed faces, MAX = none
+                for s_ in 0..dims[a] {
+                    for e in key.iter_mut() {
+                        *e = usize::MAX;
+                    }
+                    let mut any = false;
+                    for v in 0..nc {
+                        for u in 0..nb {
+                            let co = cell(s_, u, v);
+                            if !solid[idx(co)] {
+                                continue;
+                            }
+                            let exposed = if positive {
+                                co[a] + 1 >= dims[a] || !solid[idx({ let mut n = co; n[a] += 1; n })]
+                            } else {
+                                co[a] == 0 || !solid[idx({ let mut n = co; n[a] -= 1; n })]
+                            };
+                            if exposed {
+                                key[v * nb + u] = co[2];
+                                any = true;
+                            }
+                        }
+                    }
+                    if !any {
+                        continue;
+                    }
+                    // greedy rectangles of equal key
+                    for v0 in 0..nc {
+                        let mut u0 = 0;
+                        while u0 < nb {
+                            let k = key[v0 * nb + u0];
+                            if k == usize::MAX {
+                                u0 += 1;
+                                continue;
+                            }
+                            let mut u1 = u0 + 1;
+                            while u1 < nb && key[v0 * nb + u1] == k {
+                                u1 += 1;
+                            }
+                            let mut v1 = v0 + 1;
+                            while v1 < nc && (u0..u1).all(|u| key[v1 * nb + u] == k) {
+                                v1 += 1;
+                            }
+                            for v in v0..v1 {
+                                for u in u0..u1 {
+                                    key[v * nb + u] = usize::MAX;
+                                }
+                            }
+                            // the quad on the face plane, in world coordinates
+                            let plane = origin[a] + (s_ + usize::from(positive)) as f64 * res;
+                            let mut corner = |u: usize, v: usize| {
+                                let mut w = [0.0f64; 3];
+                                w[a] = plane;
+                                w[b] = origin[b] + u as f64 * res;
+                                w[c] = origin[c] + v as f64 * res;
+                                r2r::geometry_msgs::msg::Point {
+                                    x: w[0],
+                                    y: w[1],
+                                    z: w[2],
+                                }
+                            };
+                            let quad = [corner(u0, v0), corner(u1, v0), corner(u1, v1), corner(u0, v1)];
+                            // (a, b, c) is cyclic, so e_b x e_c = +e_a: this order faces +a
+                            let order: [usize; 6] = if positive { [0, 1, 2, 0, 2, 3] } else { [0, 3, 2, 0, 2, 1] };
+                            for &i in &order {
+                                layers[k].push(quad[i].clone());
+                            }
+                            u0 = u1;
+                        }
+                    }
+                }
+            }
+        }
+        let stamp = to_stamp((last_stamp * NSEC_PER_SEC as f64).round() as i64);
+        let header = || r2r::std_msgs::msg::Header {
+            stamp: stamp.clone(),
+            frame_id: self.odom_frame.clone(),
+        };
+        let mut markers = Vec::with_capacity(dims[2] + 1);
+        markers.push(r2r::visualization_msgs::msg::Marker {
+            header: header(),
+            ns: "occupancy".into(),
+            action: 3, // DELETEALL: layers that emptied since the last publish vanish
+            ..Default::default()
+        });
+        for (k, points) in layers.into_iter().enumerate() {
+            if points.is_empty() {
+                continue;
+            }
+            markers.push(r2r::visualization_msgs::msg::Marker {
+                header: header(),
+                ns: "occupancy".into(),
+                id: k as i32,
+                type_: 11, // TRIANGLE_LIST
+                action: 0, // ADD
+                pose: r2r::geometry_msgs::msg::Pose {
+                    orientation: r2r::geometry_msgs::msg::Quaternion {
+                        w: 1.0,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                scale: r2r::geometry_msgs::msg::Vector3 {
+                    x: 1.0,
+                    y: 1.0,
+                    z: 1.0,
+                },
+                color: layer_color(k),
+                points,
+                ..Default::default()
+            });
+        }
+        let _ = pub_.publish(&r2r::visualization_msgs::msg::MarkerArray { markers });
     }
 
     /// Fit a reference track onto the estimated trajectory: pair the two by
@@ -1425,22 +1738,32 @@ impl VioNode {
             );
         }
         self.mocap_fit = Some(fit);
+        // The fit keeps improving as the tracks grow, but a fresh least-squares
+        // answer every tick moves by about a centimetre, and with it every
+        // frame axes, path and box drawn in the mocap frame. Adopt a new fit
+        // for display only when it differs materially from the shown one.
+        let shown = match self.mocap_fit_shown {
+            Some(prev) if !fit.differs_from(&prev, 0.03, 1.0f64.to_radians()) => prev,
+            _ => {
+                self.mocap_fit_shown = Some(fit);
+                fit
+            }
+        };
         // The same fit as TF, so obstacle markers or other bodies published in
-        // the mocap frame render where the mocap path is drawn. Refreshed with
-        // the path, since the fit keeps improving as the tracks grow.
+        // the mocap frame render where the mocap path is drawn.
         if self.publish_tf
             && !self.mocap_frame_id.is_empty()
             && self.mocap_frame_id != self.odom_frame
         {
             if let Some(tf_pub) = tf_pub {
-                let (half_sin, half_cos) = (fit.yaw / 2.0).sin_cos();
+                let (half_sin, half_cos) = (shown.yaw / 2.0).sin_cos();
                 let mut tf = r2r::geometry_msgs::msg::TransformStamped::default();
                 tf.header.stamp = stamp.clone();
                 tf.header.frame_id = self.odom_frame.clone();
                 tf.child_frame_id = self.mocap_frame_id.clone();
-                tf.transform.translation.x = fit.t[0];
-                tf.transform.translation.y = fit.t[1];
-                tf.transform.translation.z = fit.t[2];
+                tf.transform.translation.x = shown.t[0];
+                tf.transform.translation.y = shown.t[1];
+                tf.transform.translation.z = shown.t[2];
                 tf.transform.rotation.z = half_sin;
                 tf.transform.rotation.w = half_cos;
                 let _ = tf_pub.publish(&r2r::tf2_msgs::msg::TFMessage {
@@ -1450,7 +1773,7 @@ impl VioNode {
         }
         let points: Vec<[f64; 3]> = decimate(self.mocap_track.positions.iter(), PATH_MAX_POINTS)
             .iter()
-            .map(|p| fit.apply(p))
+            .map(|p| shown.apply(p))
             .collect();
         let _ = mocap_path_pub.publish(&self.make_path(&stamp, &points));
     }
@@ -1487,6 +1810,18 @@ impl VioNode {
             [o.x, o.y, o.z, o.w],
             self.latest_imu_ns,
         );
+    }
+
+    fn on_range(&mut self, msg: &r2r::sensor_msgs::msg::Range) {
+        let r = msg.range as f64;
+        let (lo, hi) = (msg.min_range as f64, msg.max_range as f64);
+        // Readings outside the sensor's own valid interval carry no height.
+        if !r.is_finite() || r < lo || (hi > lo && r > hi) {
+            return;
+        }
+        if let Some(gate) = self.height_gate.as_mut() {
+            gate.update_range(self.started_at.elapsed().as_secs_f64(), r);
+        }
     }
 
     fn on_vio(&mut self, msg: &r2r::nav_msgs::msg::Odometry) {
@@ -1539,6 +1874,16 @@ impl VioNode {
             } else {
                 mapping_part.push_str(&format!(" occupancy_med={occ_ms:.1}ms"));
             }
+        }
+        if let (Some(gate), Some(d)) = (&self.height_gate, &self.height_gate_last) {
+            let (lo, hi) = gate.band();
+            mapping_part.push_str(&format!(
+                " gate={} (vio={} range={} band {lo:.2}-{hi:.2}) gated_frames={}",
+                if d.open { "open" } else { "CLOSED" },
+                d.vio_height.map_or("-".to_string(), |h| format!("{h:.2}")),
+                d.range_height.map_or("-".to_string(), |h| format!("{h:.2}")),
+                self.occupancy_gated_frames
+            ));
         }
         for (name, track) in [("mocap", &self.mocap_track), ("vio", &self.vio_track)] {
             if let Some(offset) = track.offset_ns() {
@@ -1679,10 +2024,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "/echo_li/sparse3d_landmarks",
         r2r::QosProfile::default(),
     )?;
+    // A visualisation stream: best effort, latest cloud only. Reliable QoS made
+    // publish() block the main loop whenever rviz2 fell behind at 10 Hz, and
+    // the image queue overflowed in bursts (measured 2026-09-24: 7-14 extra
+    // dropped frames per flight, mocap fit 0.49 m -> 0.91 m). The rviz config
+    // subscribes best effort to match.
     let occupancy_pub = if params.occupancy_enabled {
         Some(node.create_publisher::<r2r::sensor_msgs::msg::PointCloud2>(
             "/echo_li/occupancy",
-            r2r::QosProfile::default(),
+            best_effort_qos(1),
+        )?)
+    } else {
+        None
+    };
+    // The same cells as one mesh of their exposed faces: adjacent voxels
+    // render as a single solid without the seams box-style point clouds show.
+    let occupancy_mesh_pub = if params.occupancy_enabled {
+        Some(node.create_publisher::<r2r::visualization_msgs::msg::MarkerArray>(
+            "/echo_li/occupancy_mesh",
+            best_effort_qos(1),
         )?)
     } else {
         None
@@ -1729,6 +2089,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+    let range_sub = if !params.rangefinder_topic.is_empty() {
+        log::info!("Rangefinder: subscribing to {}", params.rangefinder_topic);
+        Some(node.subscribe::<r2r::sensor_msgs::msg::Range>(&params.rangefinder_topic, ref_qos.clone())?)
+    } else {
+        None
+    };
     let vio_sub = if !params.vio_topic.is_empty() {
         log::info!("VIO ref: subscribing to {}", params.vio_topic);
         Some(node.subscribe::<r2r::nav_msgs::msg::Odometry>(&params.vio_topic, ref_qos)?)
@@ -1740,6 +2106,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut stats_timer = node.create_wall_timer(stats_dur)?;
     let mut path_timer =
         node.create_wall_timer(std::time::Duration::from_secs_f64(params.path_period_sec))?;
+    let mut occupancy_timer = node.create_wall_timer(std::time::Duration::from_secs_f64(
+        params.occupancy_publish_period_sec,
+    ))?;
 
     log::info!(
         "ECHO-LI ready: imu={}, image={}, camera={}x{} (scale={}) {}, \
@@ -1764,6 +2133,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         depth_status_pub,
         sparse_landmark_pub,
         occupancy_pub,
+        occupancy_mesh_pub,
     );
     let traj_output = params.trajectory_output.clone();
 
@@ -1785,6 +2155,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut imu_rx = spawn_pump(Some(imu_sub));
     let mut mocap_rx = spawn_pump(mocap_sub);
     let mut vio_rx = spawn_pump(vio_sub);
+    let mut range_rx = spawn_pump(range_sub);
 
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -1805,10 +2176,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(msg) = vio_rx.recv() => {
                 state.on_vio(&msg);
             }
+            Some(msg) = range_rx.recv() => {
+                state.on_range(&msg);
+            }
             _ = path_timer.tick() => {
                 state.publish_paths(&path_pub, mocap_path_pub.as_ref(), tf_pub.as_ref());
+            }
+            _ = occupancy_timer.tick() => {
                 if let Some(occ_pub) = &state.occupancy_pub {
                     state.publish_occupancy(occ_pub);
+                }
+                let tick = state.occupancy_tick.get().wrapping_add(1);
+                state.occupancy_tick.set(tick);
+                if tick % state.occupancy_mesh_every == 0 {
+                    if let Some(mesh_pub) = &state.occupancy_mesh_pub {
+                        state.publish_occupancy_mesh(mesh_pub);
+                    }
                 }
             }
             _ = stats_timer.tick() => {

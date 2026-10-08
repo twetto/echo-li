@@ -47,6 +47,58 @@ pub fn xyzi_cloud(
     }
 }
 
+/// XYZ + intensity + packed RGB (PCL layout: `rgb` is a FLOAT32 whose bits are
+/// 0x00RRGGBB), 20 bytes per point. rviz2 colours it with the RGB8 transformer.
+pub fn xyzirgb_cloud(
+    stamp: r2r::builtin_interfaces::msg::Time,
+    frame_id: &str,
+    data: Vec<u8>,
+    n: u32,
+) -> r2r::sensor_msgs::msg::PointCloud2 {
+    const POINT_STEP: u32 = 20;
+    let field = |name: &str, offset: u32| r2r::sensor_msgs::msg::PointField {
+        name: name.into(),
+        offset,
+        datatype: 7, // FLOAT32
+        count: 1,
+    };
+    r2r::sensor_msgs::msg::PointCloud2 {
+        header: r2r::std_msgs::msg::Header {
+            stamp,
+            frame_id: frame_id.to_string(),
+        },
+        height: 1,
+        width: n,
+        fields: vec![
+            field("x", 0),
+            field("y", 4),
+            field("z", 8),
+            field("intensity", 12),
+            field("rgb", 16),
+        ],
+        is_bigendian: false,
+        point_step: POINT_STEP,
+        row_step: POINT_STEP * n,
+        data,
+        is_dense: true,
+    }
+}
+
+/// Blue -> green -> yellow -> red for `t` in [0, 1], packed as 0x00RRGGBB.
+pub fn ramp_rgb(t: f32) -> u32 {
+    let t = if t.is_finite() { t.clamp(0.0, 1.0) } else { 0.0 };
+    let (r, g, b) = if t < 1.0 / 3.0 {
+        let u = t * 3.0;
+        (0.0, u, 1.0 - u)
+    } else if t < 2.0 / 3.0 {
+        ((t - 1.0 / 3.0) * 3.0, 1.0, 0.0)
+    } else {
+        (1.0, 1.0 - (t - 2.0 / 3.0) * 3.0, 0.0)
+    };
+    let c = |v: f32| (v * 255.0).round().clamp(0.0, 255.0) as u32;
+    (c(r) << 16) | (c(g) << 8) | c(b)
+}
+
 pub fn quat_to_se3(position: &[f64; 3], quaternion: &[f64; 4]) -> nalgebra::Matrix4<f64> {
     let [x, y, z, w] = *quaternion;
     let mut m = nalgebra::Matrix4::identity();

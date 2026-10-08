@@ -161,7 +161,7 @@ Visualization Manager:
     Use Fixed Frame: true
     Use rainbow: true
     Value: true
-  - Alpha: 0.6
+  - Alpha: 1
     Autocompute Intensity Bounds: false
     Autocompute Value Bounds:
       Max Value: 10
@@ -171,9 +171,9 @@ Visualization Manager:
     Channel Name: intensity
     Class: rviz_default_plugins/PointCloud2
     Color: 255; 255; 255
-    Color Transformer: Intensity
+    Color Transformer: RGB8
     Decay Time: 0
-    Enabled: true
+    Enabled: false
     Invert Rainbow: false
     Max Color: 255; 255; 255
     Max Intensity: 4.0
@@ -190,10 +190,23 @@ Visualization Manager:
       Durability Policy: Volatile
       Filter size: 10
       History Policy: Keep Last
-      Reliability Policy: Reliable
+      Reliability Policy: Best Effort
       Value: /echo_li/occupancy
     Use Fixed Frame: true
     Use rainbow: true
+    Value: true
+  - Class: rviz_default_plugins/MarkerArray
+    Enabled: true
+    Name: Occupancy mesh
+    Namespaces:
+      occupancy: true
+    Topic:
+      Depth: 5
+      Durability Policy: Volatile
+      Filter size: 10
+      History Policy: Keep Last
+      Reliability Policy: Best Effort
+      Value: /echo_li/occupancy_mesh
     Value: true
   - Alpha: 1
     Autocompute Intensity Bounds: true
