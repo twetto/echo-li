@@ -666,6 +666,12 @@ pub struct LocalOccupancyConfig {
     #[serde(default)]
     pub max_eta_std: Option<f64>,
     #[serde(default)]
+    pub accept_seed_only: Option<bool>,
+    #[serde(default)]
+    pub accept_photo_only: Option<bool>,
+    #[serde(default)]
+    pub center_fraction: Option<f64>,
+    #[serde(default)]
     pub log_odds_hit: Option<f32>,
     #[serde(default)]
     pub log_odds_miss: Option<f32>,
@@ -716,6 +722,15 @@ impl LocalOccupancyConfig {
         }
         if let Some(v) = self.max_eta_std {
             settings.max_eta_std = v;
+        }
+        if let Some(v) = self.accept_seed_only {
+            settings.accept_seed_only = v;
+        }
+        if let Some(v) = self.accept_photo_only {
+            settings.accept_photo_only = v;
+        }
+        if let Some(v) = self.center_fraction {
+            settings.center_fraction = v;
         }
         if let Some(v) = self.log_odds_hit {
             settings.log_odds_hit = v;

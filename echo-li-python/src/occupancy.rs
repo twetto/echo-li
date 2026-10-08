@@ -116,6 +116,7 @@ impl PyLocalOccupancyMap {
                 1 => PatchStatus::SeedOnly,
                 2 => PatchStatus::PhotoRefined,
                 3 => PatchStatus::Rejected,
+                4 => PatchStatus::PhotoOnly,
                 _ => PatchStatus::Unknown,
             })
             .collect();

@@ -31,6 +31,20 @@ pub struct LocalOccupancySettings {
     pub min_range: f64,
     pub max_range: f64,
     pub max_eta_std: f64,
+    /// Integrate seed-only depth (a prior the image did not confirm) as a
+    /// surface. Off, the map is built from photometrically confirmed depth only
+    /// and seed-only pixels neither occupy nor carve.
+    pub accept_seed_only: bool,
+    /// Integrate pixels the image resolved without a landmark prior
+    /// (`PatchStatus::PhotoOnly`).
+    pub accept_photo_only: bool,
+    /// Fraction of the depth image, per axis and centred, whose rays feed the
+    /// grid; 1.0 = the whole image. A display/experiment knob: with the node's
+    /// real seeding (Sparse3D + EqF) the crop at 0.5 kept the pillar cells
+    /// (352 vs 366) but raised false in-air cells (369 vs 272) and cut reach
+    /// by a third on flight 172844, 2026-09-24. Earlier numbers that favoured
+    /// it were measured with EqF-only seeding.
+    pub center_fraction: f64,
     pub log_odds_hit: f32,
     pub log_odds_miss: f32,
     pub log_odds_min: f32,
@@ -70,6 +84,9 @@ impl Default for LocalOccupancySettings {
             min_range: 0.25,
             max_range: 12.0,
             max_eta_std: 0.50,
+            accept_seed_only: true,
+            accept_photo_only: true,
+            center_fraction: 1.0,
             log_odds_hit: 0.85,
             log_odds_miss: -0.35,
             log_odds_min: -4.0,
@@ -257,14 +274,28 @@ impl LocalOccupancyMap {
         let sx = image_width as f64 / output.eta.width as f64;
         let sy = image_height as f64 / output.eta.height as f64;
 
+        // Border rays are dropped before they count as considered; the
+        // sampling grid itself is unchanged so 1.0 is byte-identical to before.
+        let frac = self.settings.center_fraction.clamp(0.0, 1.0);
+        let margin_x = ((1.0 - frac) * 0.5 * output.eta.width as f64).round() as usize;
+        let margin_y = ((1.0 - frac) * 0.5 * output.eta.height as f64).round() as usize;
+        let x_end = output.eta.width.saturating_sub(margin_x);
+        let y_end = output.eta.height.saturating_sub(margin_y);
+
         for y in (0..output.eta.height).step_by(self.settings.sample_stride) {
             for x in (0..output.eta.width).step_by(self.settings.sample_stride) {
+                if x < margin_x || x >= x_end || y < margin_y || y >= y_end {
+                    continue;
+                }
                 stats.rays_considered += 1;
                 let idx = y * output.eta.width + x;
-                if !matches!(
-                    output.status.data[idx],
-                    PatchStatus::SeedOnly | PatchStatus::PhotoRefined
-                ) {
+                let usable = match output.status.data[idx] {
+                    PatchStatus::PhotoRefined => true,
+                    PatchStatus::PhotoOnly => self.settings.accept_photo_only,
+                    PatchStatus::SeedOnly => self.settings.accept_seed_only,
+                    _ => false,
+                };
+                if !usable {
                     continue;
                 }
                 let eta = output.eta.data[idx];
@@ -655,6 +686,100 @@ mod tests {
         pose[(2, 1)] = 1.0;
         pose[(2, 2)] = 0.0;
         pose
+    }
+
+    #[test]
+    fn center_fraction_drops_border_rays() {
+        // 4x4 depth image, one measurement in the corner and one in the
+        // middle; the central half keeps only the middle one.
+        let mut settings = LocalOccupancySettings {
+            enabled: true,
+            resolution: 1.0,
+            width_cells: 11,
+            height_cells: 11,
+            sample_stride: 1,
+            ..Default::default()
+        };
+        let camera = PinholeModel {
+            fx: 1.0,
+            fy: 1.0,
+            cx: 0.0,
+            cy: 0.0,
+        };
+        let intrinsics = CameraIntrinsics::new(1.0, 1.0, 0.0, 0.0);
+        let pose = y_forward_pose();
+        let mut output = PatchDepthOutput {
+            eta: DepthMap::new(4, 4, f32::NAN),
+            eta_var: DepthMap::new(4, 4, f32::NAN),
+            status: DepthMap::new(4, 4, PatchStatus::Unknown),
+        };
+        for idx in [0usize, 2 * 4 + 2] {
+            output.eta.data[idx] = 1.0f32.ln();
+            output.eta_var.data[idx] = 0.01;
+            output.status.data[idx] = PatchStatus::PhotoRefined;
+        }
+        let integrated = |settings: LocalOccupancySettings| {
+            let mut map = LocalOccupancyMap::new(settings).unwrap();
+            map.update_from_patch_depth(
+                &output,
+                &camera,
+                intrinsics,
+                PatchDepthSeedCoordinates::UndistortedPinhole,
+                4,
+                4,
+                &pose,
+            )
+            .rays_integrated
+        };
+        assert_eq!(integrated(settings.clone()), 2);
+        settings.center_fraction = 0.5;
+        assert_eq!(integrated(settings), 1);
+    }
+
+    #[test]
+    fn seed_only_depth_is_skipped_when_not_accepted() {
+        let base = LocalOccupancySettings {
+            enabled: true,
+            resolution: 1.0,
+            width_cells: 11,
+            height_cells: 11,
+            sample_stride: 1,
+            log_odds_hit: 1.0,
+            log_odds_miss: -1.0,
+            occupied_threshold: 0.5,
+            free_threshold: -0.5,
+            ..Default::default()
+        };
+        let camera = PinholeModel {
+            fx: 1.0,
+            fy: 1.0,
+            cx: 0.0,
+            cy: 0.0,
+        };
+        let intrinsics = CameraIntrinsics::new(1.0, 1.0, 0.0, 0.0);
+        let mut seed_only = single_depth_output(3.0);
+        seed_only.status = DepthMap::from_vec(1, 1, vec![PatchStatus::SeedOnly]).unwrap();
+        let integrated = |accept: bool| {
+            let mut map = LocalOccupancyMap::new(LocalOccupancySettings {
+                accept_seed_only: accept,
+                ..base.clone()
+            })
+            .unwrap();
+            map.update_from_patch_depth(
+                &seed_only,
+                &camera,
+                intrinsics,
+                PatchDepthSeedCoordinates::UndistortedPinhole,
+                1,
+                1,
+                &y_forward_pose(),
+            )
+            .rays_integrated
+        };
+        // Legacy behaviour: a seed-only pixel is a surface like any other.
+        assert_eq!(integrated(true), 1);
+        // Confirmed-only: the prior neither occupies nor carves.
+        assert_eq!(integrated(false), 0);
     }
 
     #[test]
