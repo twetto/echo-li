@@ -135,7 +135,9 @@ pub(super) fn nearby_seed_weights(
                 let du = seeds[idx].uv[0] - cu;
                 let dv = seeds[idx].uv[1] - cv;
                 let dist_sq = du * du + dv * dv;
-                if dist_sq > radius_sq {
+                // `>=`: a seed exactly on the boundary would get w_spatial = 0 and,
+                // alone, a 0/0 prior mean.
+                if dist_sq >= radius_sq {
                     continue;
                 }
                 let dist = dist_sq.sqrt();

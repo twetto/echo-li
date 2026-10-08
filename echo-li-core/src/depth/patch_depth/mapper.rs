@@ -44,26 +44,106 @@ impl PatchDepthMapper {
         }
 
         let depth_frame = self.depth_frame_products(frame)?;
-        let median_depth = median_seed_depth(seeds).unwrap_or(self.settings.max_depth);
-        let selected = self.select_keyframe(&depth_frame.frame.pose_t_wc, median_depth);
+        let median_depth = self.scene_depth(seeds);
+        let mut prev_photo = self.prev_photo.take();
+        let output = {
+            // Every pool keyframe inside the baseline window, largest first;
+            // the per-patch solver picks among them by perpendicular baseline.
+            let refs: Vec<RefCandidate> = self
+                .candidate_keyframes(&depth_frame.frame.pose_t_wc, median_depth)
+                .into_iter()
+                .map(|(kf, t_ref_curr)| {
+                    let unc = compute_warp_uncertainty(
+                        &self.intrinsics,
+                        &t_ref_curr,
+                        p_vv,
+                        p_ww,
+                        self.settings.pose_angular_velocity_var,
+                        dt,
+                        median_depth,
+                    );
+                    RefCandidate::new(kf, t_ref_curr, unc)
+                })
+                .collect();
+            if refs.is_empty() {
+                None
+            } else {
+                Some(self.solve(&depth_frame, &refs, seeds, median_depth, &mut prev_photo))
+            }
+        };
+        self.prev_photo = prev_photo;
         self.manage_keyframes(&depth_frame, median_depth);
-        let (ref_keyframe, t_ref_curr) = selected?;
-        let warp_uncertainty = compute_warp_uncertainty(
-            &self.intrinsics,
-            &t_ref_curr,
-            p_vv,
-            p_ww,
-            self.settings.pose_angular_velocity_var,
-            dt,
-            median_depth,
-        );
-        Some(self.solve(
-            &depth_frame,
-            &ref_keyframe,
-            &t_ref_curr,
-            seeds,
-            warp_uncertainty,
-        ))
+        let output = output?;
+        self.remember_median_range(&output);
+        if std::env::var_os("ECHO_LI_PATCH_DEBUG").is_some()
+            && depth_frame.frame.frame_id % 300 == 0
+        {
+            self.funnel.report_and_reset(depth_frame.frame.frame_id);
+        }
+        Some(output)
+    }
+
+    /// Scene depth for the keyframe gates: the seeds' median range, else the
+    /// previous output's, else `fallback_scene_depth` (`max_depth` when unset).
+    fn scene_depth(&self, seeds: &[SparseDepthPrior]) -> f64 {
+        median_seed_depth(seeds)
+            .or(self.last_median_range)
+            .unwrap_or(if self.settings.fallback_scene_depth > 0.0 {
+                self.settings.fallback_scene_depth
+            } else {
+                self.settings.max_depth
+            })
+    }
+
+    fn remember_median_range(&mut self, output: &PatchDepthOutput) {
+        let mut ranges: Vec<f32> = output
+            .eta
+            .data
+            .iter()
+            .step_by(7)
+            .copied()
+            .filter(|e| e.is_finite())
+            .collect();
+        if ranges.len() >= 16 {
+            let mid = ranges.len() / 2;
+            let (_, m, _) = ranges.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
+            self.last_median_range = Some((*m as f64).exp());
+        }
+    }
+
+    /// Baseline window for the reference choice. In parallax mode the window is
+    /// `[min_parallax_px, max_parallax_px]` of expected disparity at the scene
+    /// depth, `f * baseline / depth` in working-scale pixels; otherwise the
+    /// legacy baseline ratios.
+    fn baseline_window(&self, median_depth: f64) -> (f64, f64) {
+        let s = &self.settings;
+        if s.min_parallax_px > 0.0 || s.max_parallax_px > 0.0 {
+            let f = 0.5 * (self.intrinsics.fx + self.intrinsics.fy) * s.scale;
+            let per_px = median_depth / f.max(1e-9);
+            let max = if s.max_parallax_px > 0.0 {
+                s.max_parallax_px * per_px
+            } else {
+                f64::INFINITY
+            };
+            (s.min_parallax_px * per_px, max)
+        } else {
+            (
+                s.min_baseline_ratio * median_depth,
+                s.max_baseline_ratio * median_depth,
+            )
+        }
+    }
+
+    /// Spacing between stored keyframes: `keyframe_spacing_px` of parallax in
+    /// parallax mode, else the legacy minimum baseline.
+    fn keyframe_spacing(&self, median_depth: f64) -> f64 {
+        let s = &self.settings;
+        if s.keyframe_spacing_px > 0.0 {
+            let f = 0.5 * (self.intrinsics.fx + self.intrinsics.fy) * s.scale;
+            s.keyframe_spacing_px * median_depth / f.max(1e-9)
+        } else {
+            self.baseline_window(median_depth).0
+        }
     }
 
     pub(super) fn update_with_priors_tiled_bearing(
@@ -220,13 +300,15 @@ impl PatchDepthMapper {
         let median_depth = median_seed_depth(&seeds).unwrap_or(self.settings.max_depth);
         self.manage_keyframes(&depth_frame, median_depth);
 
-        Some(self.solve(
-            &depth_frame,
+        let mut prev_photo = self.prev_photo.take();
+        let refs = [RefCandidate::new(
             &ref_keyframe,
-            &t_c1_c0,
-            &seeds,
+            t_c1_c0,
             WarpUncertainty::scalar(0.0),
-        ))
+        )];
+        let output = self.solve(&depth_frame, &refs, &seeds, median_depth, &mut prev_photo);
+        self.prev_photo = prev_photo;
+        Some(output)
     }
 
     pub(super) fn update_with_stereo_ref_tiled_bearing(
@@ -486,8 +568,7 @@ impl PatchDepthMapper {
         t_wc: &Matrix4<f64>,
         median_depth: f64,
     ) -> Option<(DepthKeyframe, Matrix4<f64>)> {
-        let min_bl = self.settings.min_baseline_ratio * median_depth;
-        let max_bl = self.settings.max_baseline_ratio * median_depth;
+        let (min_bl, max_bl) = self.baseline_window(median_depth);
         let mut best: Option<(DepthKeyframe, Matrix4<f64>, f64)> = None;
 
         for keyframe in &self.keyframes {
@@ -509,13 +590,41 @@ impl PatchDepthMapper {
         best.map(|(kf, t, _)| (kf, t))
     }
 
+    /// Every pool keyframe whose baseline lies in the window, largest first.
+    /// The first entry is what `select_keyframe` would return.
+    pub(super) fn candidate_keyframes(
+        &self,
+        t_wc: &Matrix4<f64>,
+        median_depth: f64,
+    ) -> Vec<(&DepthKeyframe, Matrix4<f64>)> {
+        let (min_bl, max_bl) = self.baseline_window(median_depth);
+        let mut out: Vec<(&DepthKeyframe, Matrix4<f64>, f64)> = self
+            .keyframes
+            .iter()
+            .filter_map(|keyframe| {
+                let t_ref_curr = keyframe
+                    .frame
+                    .pose_t_wc
+                    .try_inverse()
+                    .unwrap_or_else(Matrix4::identity)
+                    * t_wc;
+                let baseline = t_ref_curr.fixed_view::<3, 1>(0, 3).norm();
+                (baseline >= min_bl && baseline <= max_bl)
+                    .then_some((keyframe, t_ref_curr, baseline))
+            })
+            .collect();
+        out.sort_by(|a, b| b.2.total_cmp(&a.2));
+        out.into_iter().map(|(kf, t, _)| (kf, t)).collect()
+    }
+
     pub(super) fn manage_keyframes(&mut self, depth_frame: &DepthFrameProducts, median_depth: f64) {
+        let pool = self.settings.keyframe_pool_size.max(2);
         if self.keyframes.len() < 2 {
             self.keyframes.push(self.make_keyframe(depth_frame));
             return;
         }
 
-        let min_bl = self.settings.min_baseline_ratio * median_depth;
+        let min_bl = self.keyframe_spacing(median_depth);
         let newest = &self.keyframes[self.keyframes.len() - 1];
         let t_new_curr = newest
             .frame
@@ -525,7 +634,9 @@ impl PatchDepthMapper {
             * depth_frame.frame.pose_t_wc;
         let baseline = t_new_curr.fixed_view::<3, 1>(0, 3).norm();
         if baseline >= min_bl {
-            self.keyframes.remove(0);
+            if self.keyframes.len() >= pool {
+                self.keyframes.remove(0);
+            }
             self.keyframes.push(self.make_keyframe(depth_frame));
         }
     }

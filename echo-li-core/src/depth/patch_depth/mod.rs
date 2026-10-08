@@ -33,7 +33,8 @@ use fuse::PatchGrid;
 #[cfg(not(feature = "parallel"))]
 use fuse::densify_pixels;
 #[cfg(feature = "parallel")]
-use fuse::{densify_pixels_parallel, patch_centers};
+use fuse::densify_pixels_parallel;
+use fuse::patch_centers;
 use image_ops::{
     bilerp_ptr, bilinear_patch_footprint, build_bilinear_valid_pyramid, build_pinhole_to_raw_lut,
     build_pyramid_from_u8, dyadic_scale_offset, empty_pyramid, gradients, mask_row_valid,
@@ -115,6 +116,102 @@ pub struct PatchDepthSettings {
     pub status_weight_seed: f64,
     pub tiled_tile_size: usize,
     pub tiled_tile_overlap: usize,
+    /// Solve the coarsest pyramid level first and initialise each finer level
+    /// from the level above, so a patch's prior comes from a photometrically
+    /// validated neighbour instead of a landmark far across the image. The
+    /// sparse seeds anchor the coarsest level only (see `c2f_seed_all_levels`),
+    /// with `seed_radius_px` measured there. Tiled-bearing path only.
+    pub coarse_to_fine: bool,
+    /// Reach of an inherited prior at each finer level, in that level's pixels.
+    pub c2f_prior_radius_px: f64,
+    /// Variance inflation applied to a parent estimate when it seeds a child.
+    pub c2f_var_inflation: f64,
+    /// Parents whose photometric confidence (the image's share of the posterior
+    /// information) falls below this do not propagate. Off by default: a strong
+    /// seed prior the image *agrees* with also has a small image share, and
+    /// gating on it discards exactly the well-anchored parents.
+    pub c2f_min_confidence: f64,
+    /// Offer the sparse seeds at every level rather than only the coarsest.
+    pub c2f_seed_all_levels: bool,
+    /// Let seed-only parents (no image evidence at their level) seed children.
+    /// On, the seeds' reach survives down the pyramid where the image had
+    /// nothing to say; off, only image-confirmed parents propagate.
+    pub c2f_propagate_seed_only: bool,
+    /// Densify by photometric information: weight a refined patch by the
+    /// image's own precision rather than the prior-dominated posterior, and let
+    /// seed-only patches fill only where no refined patch reaches. Without this a
+    /// patch that merely sat on a confident prior fuses as if the image had
+    /// confirmed it. Tiled-bearing path only.
+    pub photo_confidence_weighting: bool,
+    /// Before the Gauss-Newton refinement, evaluate `n_search_candidates`
+    /// photometric costs over +-`search_half_range` in eta around the prior and
+    /// start from the best. This is what lets a patch leave a wrong basin it
+    /// inherited (coarse-to-fine) or was seeded into. Per-patch-bearing and
+    /// tiled-bearing solvers; the pinhole solver always searched.
+    pub photo_search: bool,
+    /// Contrast test on the search: the refined residual must be at most this
+    /// fraction of the median candidate cost, or the image is judged
+    /// uninformative at this patch and it is reported as seed-only rather than
+    /// refined. A flat cost curve (textureless floor) has a ratio near 1.
+    /// 1.0 disables the test; needs `photo_search`.
+    pub photo_contrast_max_ratio: f64,
+    /// With `photo_search`, also try each nearby prior's own eta as a candidate
+    /// (PatchMatch-style propagation of hypotheses). At a depth edge the
+    /// weighted mean of a near and a far prior is a depth nothing is at, and a
+    /// +-`search_half_range` window around it may reach neither; the parents'
+    /// own values do.
+    pub photo_search_parent_hypotheses: bool,
+    /// Solve patches that have no landmark within reach from the image alone:
+    /// a candidate search from the range where the parallax drops below one
+    /// pixel inwards, then Gauss-Newton, reported as `PatchStatus::PhotoOnly`
+    /// with a photometric-only variance (no Sparse3D uncertainty behind it).
+    /// Per-patch-bearing solver only.
+    pub photo_only: bool,
+    /// Spacing of the search candidates in pixels of disparity (uniform in
+    /// inverse range). 0 keeps the legacy `n_search_candidates` uniform in eta.
+    pub search_step_px: f64,
+    /// Upper bound on the number of search candidates per patch.
+    pub max_search_candidates: usize,
+    /// Near end of the photo-only search: the disparity, in pixels, the search
+    /// reaches at most (the per-patch affine chart is only accurate near the
+    /// patch).
+    pub search_max_disp_px: f64,
+    /// A photo-only patch is kept only if the second-best local minimum of its
+    /// candidate cost curve is at least this factor above the best (repetitive
+    /// texture has several equal basins). 1.0 disables the test.
+    pub photo_distinct_min_ratio: f64,
+    /// Reference frames kept for the baseline/parallax choice (per-patch-bearing
+    /// and pinhole paths). Legacy: 2, i.e. always the frame just behind.
+    pub keyframe_pool_size: usize,
+    /// When > 0, the reference frame is chosen by expected parallax at the
+    /// scene depth, `f * baseline / depth` in working-scale pixels, within
+    /// [`min_parallax_px`, `max_parallax_px`], instead of by baseline ratio.
+    pub min_parallax_px: f64,
+    pub max_parallax_px: f64,
+    /// A new keyframe is stored once the newest one is this many pixels of
+    /// parallax behind the current frame (parallax mode only).
+    pub keyframe_spacing_px: f64,
+    /// Scene depth used for the parallax gates when neither seeds nor a
+    /// previous depth output are available.
+    pub fallback_scene_depth: f64,
+    /// Temporal consistency for photo-only patches: a patch is reported only
+    /// if the previous frame's photo-only estimate at the same bearing
+    /// (rotation-compensated) agrees within this much in eta; the fresh
+    /// estimate is remembered either way, so a real surface appears one
+    /// frame late and a one-frame outlier never. 0 disables the check.
+    pub photo_temporal_tol: f64,
+    /// Two-baseline verification of photo-only patches: the depth found
+    /// against the reference keyframe must be reproduced, within this much in
+    /// eta, by an independent solve against a second keyframe of clearly
+    /// different baseline. A repetitive texture or a sliding patch lands in a
+    /// different wrong basin for a different baseline; a surface does not.
+    /// 0 disables it; when enabled and no second keyframe qualifies, no
+    /// photo-only patch is reported.
+    pub photo_verify_tol: f64,
+    /// Cap on the seed reach in patches: `seed_radius_px * scale` is never
+    /// more than this many patch sizes. 1.0 = a landmark seeds only the
+    /// patches it lies within one patch of.
+    pub seed_reach_max_patches: f64,
 }
 
 impl Default for PatchDepthSettings {
@@ -150,6 +247,29 @@ impl Default for PatchDepthSettings {
             status_weight_seed: 0.6,
             tiled_tile_size: 96,
             tiled_tile_overlap: 16,
+            coarse_to_fine: false,
+            c2f_prior_radius_px: 8.0,
+            c2f_var_inflation: 4.0,
+            c2f_min_confidence: 0.0,
+            c2f_seed_all_levels: false,
+            c2f_propagate_seed_only: true,
+            photo_confidence_weighting: false,
+            photo_search: false,
+            photo_contrast_max_ratio: 1.0,
+            photo_search_parent_hypotheses: false,
+            photo_only: false,
+            search_step_px: 0.0,
+            max_search_candidates: 40,
+            search_max_disp_px: 40.0,
+            photo_distinct_min_ratio: 1.0,
+            keyframe_pool_size: 2,
+            min_parallax_px: 0.0,
+            max_parallax_px: 0.0,
+            keyframe_spacing_px: 0.0,
+            fallback_scene_depth: 0.0,
+            photo_temporal_tol: 0.0,
+            photo_verify_tol: 0.0,
+            seed_reach_max_patches: 1.0,
         }
     }
 }
@@ -161,6 +281,16 @@ pub enum PatchStatus {
     SeedOnly = 1,
     PhotoRefined = 2,
     Rejected = 3,
+    /// Refined by the image alone: no landmark within reach, so the variance
+    /// is photometric only and not backed by Sparse3D uncertainty.
+    PhotoOnly = 4,
+}
+
+impl PatchStatus {
+    /// Depth the image confirmed, with or without a landmark prior behind it.
+    pub fn is_photometric(self) -> bool {
+        matches!(self, PatchStatus::PhotoRefined | PatchStatus::PhotoOnly)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -229,6 +359,51 @@ impl RelativePose {
     }
 }
 
+/// One reference frame a patch may be solved against: the keyframe, its pose
+/// relative to the current frame and the warp uncertainty for that baseline.
+/// The per-patch-bearing solver picks, per patch, the candidate with the most
+/// baseline *perpendicular to the patch's bearing* (that is what moves the
+/// patch), so a patch near the focus of expansion of a forward leg can use an
+/// older keyframe from a sideways one.
+#[derive(Debug, Clone)]
+pub(super) struct RefCandidate<'a> {
+    pub(super) kf: &'a DepthKeyframe,
+    pub(super) t_ref_curr: Matrix4<f64>,
+    pub(super) rel: RelativePose,
+    pub(super) unc: WarpUncertainty,
+}
+
+impl<'a> RefCandidate<'a> {
+    pub(super) fn new(
+        kf: &'a DepthKeyframe,
+        t_ref_curr: Matrix4<f64>,
+        unc: WarpUncertainty,
+    ) -> Self {
+        Self {
+            kf,
+            t_ref_curr,
+            rel: RelativePose::from_matrix(&t_ref_curr),
+            unc,
+        }
+    }
+
+    /// The same candidate with the warp uncertainty at a coarser pixel scale.
+    fn at_pixel_scale(&self, s: f64) -> Self {
+        Self {
+            kf: self.kf,
+            t_ref_curr: self.t_ref_curr,
+            rel: self.rel.clone(),
+            unc: self.unc.at_pixel_scale(s),
+        }
+    }
+
+    /// Camera translation from the current frame to this reference, in the
+    /// current camera frame.
+    fn baseline_in_current(&self) -> Vector3<f64> {
+        -(self.rel.r.transpose() * self.rel.t)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct WarpUncertainty {
     pub(super) scalar_sq: f64,
@@ -242,6 +417,16 @@ impl WarpUncertainty {
             scalar_sq,
             translation_dt2: None,
             angular_dt2: None,
+        }
+    }
+
+    /// The same uncertainty in the pixels of a coarser pyramid level. The
+    /// pose-derived terms project through that level's own focal length, so
+    /// only the fixed pixel term rescales.
+    fn at_pixel_scale(&self, s: f64) -> Self {
+        Self {
+            scalar_sq: self.scalar_sq * s * s,
+            ..self.clone()
         }
     }
 
@@ -292,6 +477,13 @@ pub(super) struct PatchEstimate {
     pub(super) eta: f64,
     pub(super) status: PatchStatus,
     pub(super) inv_var_w: f64,
+    /// The image's share of the posterior information,
+    /// `hess_photo / (hess_photo + hess_prior)`: 1 on the legacy paths, 0 when
+    /// only a prior was available.
+    pub(super) confidence: f64,
+    /// Photometric precision alone (`hess_photo`), for information-weighted
+    /// densification and for seeding the next finer level.
+    pub(super) photo_precision: f64,
 }
 
 impl PatchEstimate {
@@ -300,6 +492,8 @@ impl PatchEstimate {
             eta: 0.0,
             status: PatchStatus::Unknown,
             inv_var_w: 0.0,
+            confidence: 0.0,
+            photo_precision: 0.0,
         }
     }
 
@@ -308,28 +502,88 @@ impl PatchEstimate {
             eta,
             status: PatchStatus::Rejected,
             inv_var_w: 0.0,
+            confidence: 0.0,
+            photo_precision: 0.0,
         }
     }
 
     fn photo_refined(eta: f64, eta_var: f64, settings: &PatchDepthSettings) -> Self {
+        let eta_var = eta_var.max(settings.var_floor);
         Self {
             eta,
             status: PatchStatus::PhotoRefined,
-            inv_var_w: settings.status_weight_photo / eta_var.max(settings.var_floor),
+            inv_var_w: settings.status_weight_photo / eta_var,
+            confidence: 1.0,
+            photo_precision: 1.0 / eta_var,
         }
     }
 
-    fn seed_only(eta: f64, eta_var: f64, settings: &PatchDepthSettings) -> Self {
+    /// A refined patch described by where its information came from. The
+    /// posterior variance is `1 / (hess_photo + hess_prior)` exactly as before;
+    /// the split is kept so densification and coarse-to-fine seeding can tell
+    /// an image-confirmed depth from one that merely sat on its prior.
+    pub(super) fn photo_refined_with_information(
+        eta: f64,
+        hess_photo: f64,
+        hess_prior: f64,
+        settings: &PatchDepthSettings,
+    ) -> Self {
+        let total = (hess_photo + hess_prior).max(1e-12);
+        let eta_var = (1.0 / total).max(settings.var_floor);
+        Self {
+            eta,
+            status: PatchStatus::PhotoRefined,
+            inv_var_w: settings.status_weight_photo / eta_var,
+            confidence: (hess_photo / total).clamp(0.0, 1.0),
+            photo_precision: hess_photo.max(0.0),
+        }
+    }
+
+    /// A patch the image resolved without any landmark prior: the variance is
+    /// the photometric one alone.
+    pub(super) fn photo_only(eta: f64, hess_photo: f64, settings: &PatchDepthSettings) -> Self {
+        let eta_var = (1.0 / hess_photo.max(1e-12)).max(settings.var_floor);
+        Self {
+            eta,
+            status: PatchStatus::PhotoOnly,
+            inv_var_w: settings.status_weight_photo / eta_var,
+            confidence: 1.0,
+            photo_precision: hess_photo.max(0.0),
+        }
+    }
+
+    pub(super) fn seed_only(eta: f64, eta_var: f64, settings: &PatchDepthSettings) -> Self {
         Self {
             eta,
             status: PatchStatus::SeedOnly,
             inv_var_w: settings.status_weight_seed / eta_var.max(settings.var_floor),
+            confidence: 0.0,
+            photo_precision: 0.0,
         }
     }
 
     #[inline(always)]
     pub(super) fn inv_var_weight_f32(self) -> Option<f32> {
         (self.inv_var_w > 0.0).then_some(self.inv_var_w as f32)
+    }
+
+    /// Fusion weight for densification. With `photo_confidence_weighting` a
+    /// refined patch counts by the image's own precision rather than a posterior
+    /// the prior may have tightened; seed-only patches keep their prior weight
+    /// and are fused separately, into pixels no refined patch reached.
+    #[inline(always)]
+    pub(super) fn densify_weight_f32(self, settings: &PatchDepthSettings) -> Option<f32> {
+        if !settings.photo_confidence_weighting {
+            return self.inv_var_weight_f32();
+        }
+        match self.status {
+            PatchStatus::PhotoRefined | PatchStatus::PhotoOnly => {
+                let w = settings.status_weight_photo * self.photo_precision;
+                (w > 0.0).then_some(w as f32)
+            }
+            PatchStatus::SeedOnly => self.inv_var_weight_f32(),
+            _ => None,
+        }
     }
 }
 
@@ -732,6 +986,90 @@ pub struct PatchDepthMapper {
     stereo_undistort_luts: Option<Vec<UndistortLut>>,
     stereo_valid_pyramid: Option<Arc<Vec<Image<f32>>>>,
     stereo_t_c1_c0: Option<Matrix4<f64>>,
+    /// Median range of the previous depth output: the scene depth for the
+    /// keyframe gates when a frame has no seeds.
+    last_median_range: Option<f64>,
+    /// The previous frame's photo-only estimates, for the temporal check.
+    prev_photo: Option<PrevPhoto>,
+    /// Where seedless patches drop out, for `ECHO_LI_PATCH_DEBUG` reports.
+    funnel: PhotoFunnel,
+}
+
+/// Counters over the seedless (photo-only) path, indexed by `Funnel`.
+#[derive(Debug, Default)]
+pub(super) struct PhotoFunnel {
+    counts: [std::sync::atomic::AtomicUsize; Funnel::COUNT],
+}
+
+#[derive(Debug, Clone, Copy)]
+#[repr(usize)]
+pub(super) enum Funnel {
+    Seedless = 0,
+    NoParallax,
+    NoGradient,
+    /// Fewer than three evaluable candidates (no parallax to speak of).
+    NoMinimum,
+    /// Best candidate at the far end: the surface is beyond one pixel of parallax.
+    MinAtFar,
+    /// Best candidate at the near end: nearer than `search_max_disp_px` allows.
+    MinAtNear,
+    NotDistinct,
+    RefineFailed,
+    NoVerifyRef,
+    VerifyFailed,
+    VerifyDisagree,
+    Temporal,
+    Reported,
+}
+
+impl Funnel {
+    const COUNT: usize = 13;
+    const NAMES: [&'static str; Self::COUNT] = [
+        "seedless",
+        "no_parallax",
+        "no_gradient",
+        "no_minimum",
+        "min_at_far",
+        "min_at_near",
+        "not_distinct",
+        "refine_failed",
+        "no_verify_ref",
+        "verify_failed",
+        "verify_disagree",
+        "temporal",
+        "reported",
+    ];
+}
+
+impl PhotoFunnel {
+    #[inline]
+    pub(super) fn hit(&self, stage: Funnel) {
+        self.counts[stage as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(super) fn report_and_reset(&self, frame_id: u64) {
+        let vals: Vec<usize> = self
+            .counts
+            .iter()
+            .map(|c| c.swap(0, std::sync::atomic::Ordering::Relaxed))
+            .collect();
+        let line: Vec<String> = Funnel::NAMES
+            .iter()
+            .zip(&vals)
+            .map(|(n, v)| format!("{n}={v}"))
+            .collect();
+        eprintln!("[patch-depth funnel] frame {frame_id}: {}", line.join(" "));
+    }
+}
+
+/// Photo-only patch estimates of one frame, indexed like its `PatchGrid`,
+/// with the camera rotation they were seen from.
+#[derive(Debug, Clone)]
+pub(super) struct PrevPhoto {
+    r_wc: Matrix3<f64>,
+    etas: Vec<f32>,
+    n_u: usize,
+    n_v: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -910,6 +1248,14 @@ impl PatchDepthMapper {
                 || settings.tiled_tile_overlap > settings.patch_size,
             "PatchDepth camera_mode=tiled_bearing requires tiled_tile_overlap > patch_size for overlap blending"
         );
+        anyhow::ensure!(
+            !settings.coarse_to_fine
+                || matches!(
+                    camera_mode,
+                    PatchDepthCameraMode::TiledBearing | PatchDepthCameraMode::PerPatchBearing
+                ),
+            "PatchDepth coarse_to_fine supports camera_mode per_patch_bearing or tiled_bearing"
+        );
 
         let bearing_lut = match camera_mode {
             PatchDepthCameraMode::RawDistorted | PatchDepthCameraMode::PerPatchBearing => {
@@ -993,6 +1339,9 @@ impl PatchDepthMapper {
             stereo_undistort_luts: None,
             stereo_valid_pyramid: None,
             stereo_t_c1_c0: None,
+            last_median_range: None,
+            prev_photo: None,
+            funnel: PhotoFunnel::default(),
         })
     }
 }

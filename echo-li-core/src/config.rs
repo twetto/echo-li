@@ -411,6 +411,52 @@ pub struct PatchDepthConfig {
     #[serde(default)]
     pub tiled_tile_overlap: Option<usize>,
     #[serde(default)]
+    pub coarse_to_fine: Option<bool>,
+    #[serde(default)]
+    pub c2f_prior_radius_px: Option<f64>,
+    #[serde(default)]
+    pub c2f_var_inflation: Option<f64>,
+    #[serde(default)]
+    pub c2f_min_confidence: Option<f64>,
+    #[serde(default)]
+    pub c2f_seed_all_levels: Option<bool>,
+    #[serde(default)]
+    pub c2f_propagate_seed_only: Option<bool>,
+    #[serde(default)]
+    pub photo_confidence_weighting: Option<bool>,
+    #[serde(default)]
+    pub photo_search: Option<bool>,
+    #[serde(default)]
+    pub photo_contrast_max_ratio: Option<f64>,
+    #[serde(default)]
+    pub photo_search_parent_hypotheses: Option<bool>,
+    #[serde(default)]
+    pub photo_only: Option<bool>,
+    #[serde(default)]
+    pub search_step_px: Option<f64>,
+    #[serde(default)]
+    pub max_search_candidates: Option<usize>,
+    #[serde(default)]
+    pub search_max_disp_px: Option<f64>,
+    #[serde(default)]
+    pub photo_distinct_min_ratio: Option<f64>,
+    #[serde(default)]
+    pub keyframe_pool_size: Option<usize>,
+    #[serde(default)]
+    pub min_parallax_px: Option<f64>,
+    #[serde(default)]
+    pub max_parallax_px: Option<f64>,
+    #[serde(default)]
+    pub keyframe_spacing_px: Option<f64>,
+    #[serde(default)]
+    pub fallback_scene_depth: Option<f64>,
+    #[serde(default)]
+    pub photo_temporal_tol: Option<f64>,
+    #[serde(default)]
+    pub photo_verify_tol: Option<f64>,
+    #[serde(default)]
+    pub seed_reach_max_patches: Option<f64>,
+    #[serde(default)]
     pub vis_min_depth: Option<f64>,
     #[serde(default)]
     pub vis_max_depth: Option<f64>,
@@ -527,6 +573,75 @@ impl PatchDepthConfig {
         }
         if let Some(v) = self.tiled_tile_overlap {
             settings.tiled_tile_overlap = v;
+        }
+        if let Some(v) = self.coarse_to_fine {
+            settings.coarse_to_fine = v;
+        }
+        if let Some(v) = self.c2f_prior_radius_px {
+            settings.c2f_prior_radius_px = v;
+        }
+        if let Some(v) = self.c2f_var_inflation {
+            settings.c2f_var_inflation = v;
+        }
+        if let Some(v) = self.c2f_min_confidence {
+            settings.c2f_min_confidence = v;
+        }
+        if let Some(v) = self.c2f_seed_all_levels {
+            settings.c2f_seed_all_levels = v;
+        }
+        if let Some(v) = self.c2f_propagate_seed_only {
+            settings.c2f_propagate_seed_only = v;
+        }
+        if let Some(v) = self.photo_confidence_weighting {
+            settings.photo_confidence_weighting = v;
+        }
+        if let Some(v) = self.photo_search {
+            settings.photo_search = v;
+        }
+        if let Some(v) = self.photo_contrast_max_ratio {
+            settings.photo_contrast_max_ratio = v;
+        }
+        if let Some(v) = self.photo_search_parent_hypotheses {
+            settings.photo_search_parent_hypotheses = v;
+        }
+        if let Some(v) = self.photo_only {
+            settings.photo_only = v;
+        }
+        if let Some(v) = self.search_step_px {
+            settings.search_step_px = v;
+        }
+        if let Some(v) = self.max_search_candidates {
+            settings.max_search_candidates = v;
+        }
+        if let Some(v) = self.search_max_disp_px {
+            settings.search_max_disp_px = v;
+        }
+        if let Some(v) = self.photo_distinct_min_ratio {
+            settings.photo_distinct_min_ratio = v;
+        }
+        if let Some(v) = self.keyframe_pool_size {
+            settings.keyframe_pool_size = v;
+        }
+        if let Some(v) = self.min_parallax_px {
+            settings.min_parallax_px = v;
+        }
+        if let Some(v) = self.max_parallax_px {
+            settings.max_parallax_px = v;
+        }
+        if let Some(v) = self.keyframe_spacing_px {
+            settings.keyframe_spacing_px = v;
+        }
+        if let Some(v) = self.fallback_scene_depth {
+            settings.fallback_scene_depth = v;
+        }
+        if let Some(v) = self.photo_temporal_tol {
+            settings.photo_temporal_tol = v;
+        }
+        if let Some(v) = self.photo_verify_tol {
+            settings.photo_verify_tol = v;
+        }
+        if let Some(v) = self.seed_reach_max_patches {
+            settings.seed_reach_max_patches = v;
         }
         settings
     }

@@ -341,6 +341,10 @@ impl PatchDepthMapper {
         (grad, hess, sum_abs_res, n_valid)
     }
 
+    /// `level == None` stacks every pyramid level into one cost, with `(cu, cv)`
+    /// in level-0 coordinates. `Some(l)` evaluates level `l` alone, with
+    /// `(cu, cv)` already in that level's coordinates: the coarse-to-fine path.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn patch_residual_jacobian_fast_translation_tiled(
         &self,
         cu: f64,
@@ -350,6 +354,7 @@ impl PatchDepthMapper {
         ref_keyframe: &TiledBearingKeyframe,
         rel_pose: &RelativePose,
         sigma_warp_sq: f64,
+        level: Option<usize>,
     ) -> (f64, f64, f64, usize) {
         let Some(layouts) = self.tiled_bearing_levels.as_ref() else {
             return (0.0, 0.0, 0.0, 0);
@@ -359,18 +364,25 @@ impl PatchDepthMapper {
         let mut sum_abs_res = 0.0;
         let mut n_valid = 0;
         let half = self.settings.patch_size / 2;
+        for (lvl, layout) in layouts.iter().enumerate() {
+            if level.is_some_and(|only| only != lvl) {
+                continue;
+            }
+            let scale = if level.is_some() {
+                1.0
+            } else {
+                1.0 / (1usize << lvl) as f64
+            };
 
-        for (level, layout) in layouts.iter().enumerate() {
-            let scale = 1.0 / (1usize << level) as f64;
             let cu_l = cu * scale;
             let cv_l = cv * scale;
             let Some(tile_idx) = layout.owning_tile_for_patch(cu_l, cv_l, half) else {
                 continue;
             };
-            let Some(curr_level) = depth_frame.levels.get(level) else {
+            let Some(curr_level) = depth_frame.levels.get(lvl) else {
                 continue;
             };
-            let Some(ref_level) = ref_keyframe.levels.get(level) else {
+            let Some(ref_level) = ref_keyframe.levels.get(lvl) else {
                 continue;
             };
             let Some(curr_tile) = curr_level.tiles.get(tile_idx) else {

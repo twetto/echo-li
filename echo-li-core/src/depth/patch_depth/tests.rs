@@ -278,6 +278,7 @@ fn tiled_bearing_fusion_accumulates_log_range() {
         local[1],
         estimate,
         None,
+        false,
     );
 
     // Fusion stays in log-range space: the accumulated mean is η itself (range is
@@ -1086,4 +1087,542 @@ fn per_patch_affine_simd_matches_scalar_leaf() {
     // gradient-dependent σ_eff² path.
     check(0.0);
     check(0.5);
+}
+
+#[test]
+fn coarse_to_fine_extends_coverage_past_the_seed_radius() {
+    let base = PatchDepthSettings {
+        camera_mode: PatchDepthCameraMode::TiledBearing,
+        warp_mode: PatchDepthWarpMode::FastTranslation,
+        patch_size: 4,
+        patch_stride: 2,
+        tiled_tile_size: 16,
+        tiled_tile_overlap: 12,
+        n_pyramid_levels: 2,
+        seed_radius_px: 3.0,
+        min_photo_curvature: 0.0,
+        max_photo_residual: 255.0,
+        ..PatchDepthSettings::default()
+    };
+    let seeds = vec![SparseDepthPrior {
+        uv: Vector2::new(16.0, 16.0),
+        eta: 0.693,
+        eta_var: 0.04,
+    }];
+    // Per configuration: finite depth pixels, and how the patches ended up.
+    let run = |label: &str, settings: PatchDepthSettings| -> usize {
+        let (camera, intr) = camera();
+        let mut mapper = PatchDepthMapper::new(camera, intr, 32, 32, settings).unwrap();
+        let img = textured_image();
+        assert!(
+            mapper
+                .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
+                .is_none()
+        );
+        let out = mapper
+            .update_with_priors(frame(1, 0.02, img), &seeds, None, 0.0)
+            .unwrap();
+        let count = |st: PatchStatus| out.status.data.iter().filter(|s| **s == st).count();
+        let finite = out.eta.data.iter().filter(|e| e.is_finite()).count();
+        eprintln!(
+            "{label}: finite={finite} refined_px={} seedonly_px={} rejected_px={} unknown_px={}",
+            count(PatchStatus::PhotoRefined),
+            count(PatchStatus::SeedOnly),
+            count(PatchStatus::Rejected),
+            count(PatchStatus::Unknown)
+        );
+        assert!(
+            count(PatchStatus::PhotoRefined) > 0,
+            "{label}: no patch was photometrically refined"
+        );
+        finite
+    };
+    let legacy = run("legacy r=3", base.clone());
+    let c2f = run(
+        "coarse-to-fine r=3",
+        PatchDepthSettings {
+            coarse_to_fine: true,
+            c2f_prior_radius_px: 6.0,
+            ..base
+        },
+    );
+    assert!(legacy > 0, "legacy produced no depth at all");
+    // The same 3 px seed radius reaches 6 px of level 0 from the coarse level,
+    // and the solution then carries the prior outward on its own.
+    assert!(
+        c2f > legacy,
+        "coarse-to-fine covered {c2f} px against {legacy} px for the legacy path"
+    );
+}
+
+#[test]
+fn photo_confidence_weighting_lets_refined_patches_own_their_pixels() {
+    let (camera, intr) = camera();
+    let settings = PatchDepthSettings {
+        camera_mode: PatchDepthCameraMode::TiledBearing,
+        warp_mode: PatchDepthWarpMode::FastTranslation,
+        patch_size: 4,
+        patch_stride: 2,
+        tiled_tile_size: 16,
+        tiled_tile_overlap: 12,
+        photo_confidence_weighting: true,
+        ..PatchDepthSettings::default()
+    };
+    let mapper = PatchDepthMapper::new(camera, intr, 32, 32, settings).unwrap();
+    let layout = mapper.tiled_bearing_levels.as_ref().unwrap();
+    let level = &layout[0];
+    let tile_idx = level.owning_tile_for_patch(28.0, 28.0, 2).unwrap();
+    let tile = &level.tiles[tile_idx];
+    let local = tile.global_to_local(Vector2::new(28.0, 28.0));
+
+    // A weakly image-constrained patch on a very confident prior: tight
+    // posterior, low confidence.
+    let refined =
+        PatchEstimate::photo_refined_with_information(0.2, 50.0, 5000.0, &mapper.settings);
+    assert!((refined.confidence - 50.0 / 5050.0).abs() < 1e-12);
+    assert!((refined.photo_precision - 50.0).abs() < 1e-12);
+    let seed = PatchEstimate::seed_only(1.5, 0.01, &mapper.settings);
+
+    let mut eta_acc = vec![0.0f32; 32 * 32];
+    let mut w_acc = vec![0.0f32; 32 * 32];
+    let mut status = vec![PatchStatus::Unknown; 32 * 32];
+    let idx = 28 * 32 + 28;
+    mapper.accumulate_tiled_patch(
+        &mut eta_acc,
+        &mut w_acc,
+        &mut status,
+        32,
+        32,
+        tile,
+        local[0],
+        local[1],
+        refined,
+        None,
+        false,
+    );
+    // The refined patch is weighted by its photometric information alone ...
+    assert!((w_acc[idx] - 50.0 * mapper.settings.status_weight_photo as f32).abs() < 1e-3);
+    // ... and a seed-only patch offered as fill leaves an already-refined pixel
+    // alone, although its prior precision (100) would have outvoted the image (50).
+    mapper.accumulate_tiled_patch(
+        &mut eta_acc,
+        &mut w_acc,
+        &mut status,
+        32,
+        32,
+        tile,
+        local[0],
+        local[1],
+        seed,
+        None,
+        true,
+    );
+    assert!((eta_acc[idx] / w_acc[idx] - refined.eta as f32).abs() < 1e-5);
+    assert_eq!(status[idx], PatchStatus::PhotoRefined);
+}
+
+#[test]
+fn per_patch_bearing_coarse_to_fine_extends_coverage_past_the_seed_radius() {
+    let base = PatchDepthSettings {
+        camera_mode: PatchDepthCameraMode::PerPatchBearing,
+        warp_mode: PatchDepthWarpMode::FastTranslation,
+        scale: 1.0,
+        patch_size: 4,
+        patch_stride: 2,
+        tiled_tile_size: 16,
+        n_pyramid_levels: 2,
+        seed_radius_px: 3.0,
+        min_photo_curvature: 0.0,
+        max_photo_residual: 255.0,
+        ..PatchDepthSettings::default()
+    };
+    let seeds = vec![SparseDepthPrior {
+        uv: Vector2::new(16.0, 16.0),
+        eta: 0.693,
+        eta_var: 0.04,
+    }];
+    let covered = |label: &str, settings: PatchDepthSettings| -> usize {
+        let (camera, intr) = camera();
+        let mut mapper = PatchDepthMapper::new(camera, intr, 32, 32, settings).unwrap();
+        let img = textured_image();
+        assert!(
+            mapper
+                .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
+                .is_none()
+        );
+        let out = mapper
+            .update_with_priors(frame(1, 0.02, img), &seeds, None, 0.0)
+            .unwrap();
+        assert!(
+            out.status.data.contains(&PatchStatus::PhotoRefined),
+            "{label}: no patch was photometrically refined"
+        );
+        out.eta.data.iter().filter(|e| e.is_finite()).count()
+    };
+    let legacy = covered("legacy r=3", base.clone());
+    let c2f = covered(
+        "coarse-to-fine r=3",
+        PatchDepthSettings {
+            coarse_to_fine: true,
+            c2f_prior_radius_px: 6.0,
+            ..base
+        },
+    );
+    assert!(legacy > 0, "legacy produced no depth at all");
+    assert!(
+        c2f > legacy,
+        "coarse-to-fine covered {c2f} px against {legacy} px for the legacy path"
+    );
+}
+
+#[test]
+fn coarse_to_fine_is_refused_on_stacked_pyramid_modes() {
+    let (camera, intr) = camera();
+    let settings = PatchDepthSettings {
+        camera_mode: PatchDepthCameraMode::UndistortedPinhole,
+        coarse_to_fine: true,
+        ..PatchDepthSettings::default()
+    };
+    assert!(PatchDepthMapper::new(camera, intr, 32, 32, settings).is_err());
+}
+
+/// Left half textured, right half near-flat (a 3-level ripple on a constant):
+/// the right half's cost curve is flat across depth, so it must not pass as
+/// photometrically refined once the contrast test is on.
+fn half_flat_image() -> Vec<u8> {
+    let mut data = vec![0u8; 32 * 32];
+    for y in 0..32 {
+        for x in 0..32 {
+            data[y * 32 + x] = if x < 16 {
+                ((x * 5 + y * 3) % 255) as u8
+            } else {
+                (100 + (x * 7 + y * 13) % 3) as u8
+            };
+        }
+    }
+    data
+}
+
+#[test]
+fn contrast_test_reports_flat_patches_as_seed_only() {
+    let seeds = vec![
+        SparseDepthPrior {
+            uv: Vector2::new(8.0, 16.0),
+            eta: 0.693,
+            eta_var: 0.04,
+        },
+        SparseDepthPrior {
+            uv: Vector2::new(24.0, 16.0),
+            eta: 0.693,
+            eta_var: 0.04,
+        },
+    ];
+    let run = |settings: PatchDepthSettings| {
+        let (camera, intr) = camera();
+        let mut mapper = PatchDepthMapper::new(camera, intr, 32, 32, settings).unwrap();
+        let img = half_flat_image();
+        assert!(
+            mapper
+                .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
+                .is_none()
+        );
+        let out = mapper
+            .update_with_priors(frame(1, 0.02, img), &seeds, None, 0.0)
+            .unwrap();
+        let refined_on = |lo: usize, hi: usize| {
+            (0..32)
+                .flat_map(|y| (lo..hi).map(move |x| y * 32 + x))
+                .filter(|&i| out.status.data[i] == PatchStatus::PhotoRefined)
+                .count()
+        };
+        (refined_on(0, 16), refined_on(16, 32))
+    };
+    let base = PatchDepthSettings {
+        camera_mode: PatchDepthCameraMode::PerPatchBearing,
+        warp_mode: PatchDepthWarpMode::FastTranslation,
+        scale: 1.0,
+        patch_size: 4,
+        patch_stride: 2,
+        tiled_tile_size: 16,
+        n_pyramid_levels: 1,
+        seed_radius_px: 8.0,
+        min_photo_curvature: 0.0,
+        max_photo_residual: 255.0,
+        ..PatchDepthSettings::default()
+    };
+    let (tex_off, flat_off) = run(base.clone());
+    let (tex_on, flat_on) = run(PatchDepthSettings {
+        photo_search: true,
+        photo_contrast_max_ratio: 0.8,
+        ..base
+    });
+    assert!(
+        tex_off > 0 && flat_off > 0,
+        "legacy refines both halves ({tex_off}, {flat_off})"
+    );
+    assert!(tex_on > 0, "textured half must survive the contrast test");
+    assert!(
+        flat_on < flat_off / 2,
+        "flat half should mostly fail the contrast test: {flat_on} vs {flat_off} without it"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Seed reach, photo-only solve, parallax keyframes (2026-09-28).
+// ---------------------------------------------------------------------------
+
+/// Smooth, non-periodic texture sampled at a fractional column shift: the view
+/// of a fronto-parallel plane from a camera translated along x.
+fn plane_texture(shift_px: f64) -> Vec<u8> {
+    let mut data = vec![0u8; 32 * 32];
+    for y in 0..32 {
+        for x in 0..32 {
+            let u = x as f64 + shift_px;
+            let v = y as f64;
+            let t = 128.0
+                + 40.0 * (2.0 * std::f64::consts::PI * u / 7.3).sin()
+                + 30.0 * (2.0 * std::f64::consts::PI * u / 3.1 + v / 2.0).sin()
+                + 25.0 * (2.0 * std::f64::consts::PI * v / 5.7).cos()
+                + 20.0 * (2.0 * std::f64::consts::PI * (u + v) / 11.0).sin();
+            data[y * 32 + x] = t.clamp(0.0, 255.0) as u8;
+        }
+    }
+    data
+}
+
+fn ppb_settings() -> PatchDepthSettings {
+    PatchDepthSettings {
+        camera_mode: PatchDepthCameraMode::PerPatchBearing,
+        warp_mode: PatchDepthWarpMode::FastTranslation,
+        scale: 1.0,
+        patch_size: 4,
+        patch_stride: 2,
+        tiled_tile_size: 16,
+        n_pyramid_levels: 1,
+        seed_radius_px: 8.0,
+        min_photo_curvature: 0.0,
+        max_photo_residual: 255.0,
+        ..PatchDepthSettings::default()
+    }
+}
+
+#[test]
+fn seed_reach_is_capped_at_one_patch() {
+    let (camera, intr) = camera();
+    let settings = PatchDepthSettings {
+        seed_radius_px: 100.0,
+        ..ppb_settings()
+    };
+    let mut mapper = PatchDepthMapper::new(camera, intr, 32, 32, settings).unwrap();
+    assert_eq!(mapper.seed_reach_px(), 4.0);
+    let seeds = vec![SparseDepthPrior {
+        uv: Vector2::new(16.0, 16.0),
+        eta: 0.693,
+        eta_var: 0.04,
+    }];
+    let img = textured_image();
+    assert!(
+        mapper
+            .update_with_priors(frame(0, 0.0, img.clone()), &seeds, None, 0.0)
+            .is_none()
+    );
+    let out = mapper
+        .update_with_priors(frame(1, 0.02, img), &seeds, None, 0.0)
+        .unwrap();
+    // Patch centres within 4 px of the seed paint pixels 12..20; nothing
+    // further out is seeded, and without photo_only nothing else is solved.
+    assert_ne!(out.status.data[16 * 32 + 15], PatchStatus::Unknown);
+    assert_eq!(out.status.data[16 * 32 + 8], PatchStatus::Unknown);
+    assert_eq!(out.status.data[4 * 32 + 4], PatchStatus::Unknown);
+}
+
+#[test]
+fn photo_only_solves_textured_patches_without_seeds() {
+    // Plane at Z = 2 m, camera translated by 0.2 m along x, f = 40 px:
+    // the current image is the reference shifted left by 4 px.
+    let (camera, intr) = camera();
+    let settings = PatchDepthSettings {
+        photo_only: true,
+        search_step_px: 1.0,
+        max_search_candidates: 200,
+        search_max_disp_px: 12.0,
+        min_structure_eigen: 1.0,
+        photo_distinct_min_ratio: 1.2,
+        photo_contrast_max_ratio: 0.8,
+        ..ppb_settings()
+    };
+    let mut mapper = PatchDepthMapper::new(camera, intr, 32, 32, settings).unwrap();
+    let z = 2.0;
+    let b = 0.2;
+    let shift = 40.0 * b / z;
+    assert!(
+        mapper
+            .update_with_priors(frame(0, 0.0, plane_texture(0.0)), &[], None, 0.0)
+            .is_none()
+    );
+    let out = mapper
+        .update_with_priors(frame(1, b, plane_texture(shift)), &[], None, 0.0)
+        .unwrap();
+    assert!(!out.status.data.contains(&PatchStatus::SeedOnly));
+    assert!(!out.status.data.contains(&PatchStatus::PhotoRefined));
+    let mut n_photo = 0;
+    let mut n_good = 0;
+    let mut n_pixels = 0;
+    for y in 6..26 {
+        for x in 6..22 {
+            n_pixels += 1;
+            let idx = y * 32 + x;
+            if out.status.data[idx] != PatchStatus::PhotoOnly {
+                continue;
+            }
+            n_photo += 1;
+            let bx = (x as f64 - 16.0) / 40.0;
+            let by = (y as f64 - 16.0) / 40.0;
+            let expected = (z * (bx * bx + by * by + 1.0).sqrt()).ln();
+            if (out.eta.data[idx] as f64 - expected).abs() < 0.1 {
+                n_good += 1;
+            }
+            assert!(out.eta_var.data[idx].is_finite() && out.eta_var.data[idx] > 0.0);
+        }
+    }
+    assert!(
+        n_photo * 10 >= n_pixels * 7,
+        "photo-only should cover most of the textured interior: {n_photo}/{n_pixels}"
+    );
+    assert!(
+        n_good * 10 >= n_photo * 9,
+        "photo-only depths should be within 10 % of the plane: {n_good}/{n_photo}"
+    );
+}
+
+#[test]
+fn photo_only_rejects_patches_without_epipolar_gradient() {
+    let (camera, intr) = camera();
+    let settings = PatchDepthSettings {
+        photo_only: true,
+        search_step_px: 1.0,
+        max_search_candidates: 200,
+        search_max_disp_px: 12.0,
+        min_structure_eigen: 4.0,
+        ..ppb_settings()
+    };
+    let mut mapper = PatchDepthMapper::new(camera, intr, 32, 32, settings).unwrap();
+    // Left half textured, right half flat (up to +-1 gray of noise).
+    let shifted = |shift: f64| -> Vec<u8> {
+        let tex = plane_texture(shift);
+        let mut data = vec![0u8; 32 * 32];
+        for y in 0..32 {
+            for x in 0..32 {
+                data[y * 32 + x] = if x < 16 {
+                    tex[y * 32 + x]
+                } else {
+                    (100 + (x * 7 + y * 13) % 3) as u8
+                };
+            }
+        }
+        data
+    };
+    assert!(
+        mapper
+            .update_with_priors(frame(0, 0.0, shifted(0.0)), &[], None, 0.0)
+            .is_none()
+    );
+    let out = mapper
+        .update_with_priors(frame(1, 0.2, shifted(4.0)), &[], None, 0.0)
+        .unwrap();
+    let count = |lo: usize, hi: usize| {
+        (4..28)
+            .flat_map(|y| (lo..hi).map(move |x| y * 32 + x))
+            .filter(|&i| out.status.data[i] == PatchStatus::PhotoOnly)
+            .count()
+    };
+    assert!(count(4, 12) > 0, "textured half must be solved");
+    assert_eq!(count(20, 28), 0, "flat half must fail quietly");
+}
+
+#[test]
+fn parallax_keyframe_pool_waits_for_enough_baseline() {
+    let (camera, intr) = camera();
+    let settings = PatchDepthSettings {
+        keyframe_pool_size: 4,
+        min_parallax_px: 3.0,
+        max_parallax_px: 10.0,
+        keyframe_spacing_px: 1.0,
+        fallback_scene_depth: 2.0,
+        ..ppb_settings()
+    };
+    // f = 40 px, depth 2 m: one pixel of parallax per 5 cm of baseline.
+    let mut mapper = PatchDepthMapper::new(camera, intr, 32, 32, settings).unwrap();
+    let img = textured_image();
+    assert!(
+        mapper
+            .update_with_priors(frame(0, 0.0, img.clone()), &[], None, 0.0)
+            .is_none()
+    );
+    // 5 cm: stored as a keyframe (spacing 1 px) but 1 px of parallax is below
+    // the 3 px minimum, so there is no reference to solve against yet.
+    assert!(
+        mapper
+            .update_with_priors(frame(1, 0.05, img.clone()), &[], None, 0.0)
+            .is_none()
+    );
+    assert_eq!(mapper.keyframe_count(), 2);
+    assert!(
+        mapper
+            .update_with_priors(frame(2, 0.10, img.clone()), &[], None, 0.0)
+            .is_none()
+    );
+    // 16 cm from the first keyframe > 3 px: solvable.
+    assert!(
+        mapper
+            .update_with_priors(frame(3, 0.16, img.clone()), &[], None, 0.0)
+            .is_some()
+    );
+    assert_eq!(mapper.keyframe_count(), 4);
+    mapper.update_with_priors(frame(4, 0.20, img.clone()), &[], None, 0.0);
+    assert_eq!(mapper.keyframe_count(), 4, "pool is bounded");
+}
+
+#[test]
+fn photo_only_temporal_check_holds_back_the_first_frame_and_keeps_consistent_depths() {
+    let (camera, intr) = camera();
+    let settings = PatchDepthSettings {
+        photo_only: true,
+        search_step_px: 1.0,
+        max_search_candidates: 200,
+        search_max_disp_px: 12.0,
+        min_structure_eigen: 1.0,
+        photo_temporal_tol: 0.2,
+        keyframe_pool_size: 4,
+        ..ppb_settings()
+    };
+    let mut mapper = PatchDepthMapper::new(camera, intr, 32, 32, settings).unwrap();
+    let z = 2.0;
+    let count = |out: &PatchDepthOutput| {
+        out.status
+            .data
+            .iter()
+            .filter(|s| **s == PatchStatus::PhotoOnly)
+            .count()
+    };
+    assert!(
+        mapper
+            .update_with_priors(frame(0, 0.0, plane_texture(0.0)), &[], None, 0.0)
+            .is_none()
+    );
+    // First solved frame: nothing to agree with yet.
+    let first = mapper
+        .update_with_priors(frame(1, 0.2, plane_texture(40.0 * 0.2 / z)), &[], None, 0.0)
+        .unwrap();
+    assert_eq!(count(&first), 0);
+    // Second frame, same plane: the estimates agree and pass.
+    let second = mapper
+        .update_with_priors(
+            frame(2, 0.25, plane_texture(40.0 * 0.25 / z)),
+            &[],
+            None,
+            0.0,
+        )
+        .unwrap();
+    assert!(count(&second) > 100, "{}", count(&second));
 }

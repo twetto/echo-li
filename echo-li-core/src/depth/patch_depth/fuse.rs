@@ -7,7 +7,6 @@ use super::{
 use crate::core_types::DepthMap;
 use rudolf_v::image::Image;
 
-#[cfg(feature = "parallel")]
 pub(super) fn patch_centers(
     width: usize,
     height: usize,
@@ -37,8 +36,8 @@ pub(super) struct PatchGrid {
     patches: Vec<PatchEstimate>,
     pub(super) n_u: usize,
     pub(super) n_v: usize,
-    half: usize,
-    stride: usize,
+    pub(super) half: usize,
+    pub(super) stride: usize,
 }
 
 impl PatchGrid {
@@ -62,6 +61,27 @@ impl PatchGrid {
             n_v,
             half,
             stride,
+        }
+    }
+
+    /// A copy keeping only the patches `keep` accepts; the rest become unknown.
+    pub(super) fn retain(&self, keep: impl Fn(&PatchEstimate) -> bool) -> Self {
+        Self {
+            patches: self
+                .patches
+                .iter()
+                .map(|p| {
+                    if keep(p) {
+                        *p
+                    } else {
+                        PatchEstimate::unknown()
+                    }
+                })
+                .collect(),
+            n_u: self.n_u,
+            n_v: self.n_v,
+            half: self.half,
+            stride: self.stride,
         }
     }
 
@@ -249,7 +269,7 @@ fn densify_pixels_generic(
     for iv in 0..grid.n_v {
         for iu in 0..grid.n_u {
             let patch = grid.get(iu, iv);
-            let Some(inv_var_w) = patch.inv_var_weight_f32() else {
+            let Some(inv_var_w) = patch.densify_weight_f32(&mapper.settings) else {
                 continue;
             };
             let patch_eta_f32 = patch.eta as f32;
@@ -269,7 +289,7 @@ fn densify_pixels_generic(
                 .unwrap_or(1.0);
             let rho_center = range_per_z * (-patch.eta).exp();
 
-            let affine = if patch.status == PatchStatus::PhotoRefined {
+            let affine = if patch.status.is_photometric() {
                 AffineWarp::new(cu, cv, rho_center, mapper, intr, rel_pose)
             } else {
                 AffineWarp {
@@ -312,7 +332,7 @@ fn densify_pixels_generic(
                                     &mut eta_buf[row_off..],
                                     &mut w_buf[row_off..],
                                     &mut status_buf[row_off..],
-                                    PatchStatus::PhotoRefined,
+                                    patch.status,
                                 );
                             }
                             px += 8;
@@ -469,7 +489,7 @@ fn densify_pixels_pinhole(
     for iv in 0..grid.n_v {
         for iu in 0..grid.n_u {
             let patch = grid.get(iu, iv);
-            let Some(inv_var_w) = patch.inv_var_weight_f32() else {
+            let Some(inv_var_w) = patch.densify_weight_f32(&mapper.settings) else {
                 continue;
             };
 
@@ -490,7 +510,7 @@ fn densify_pixels_pinhole(
             let range_per_z_center = (bx_c * bx_c + by_c * by_c + 1.0).sqrt();
             let z_center = patch.eta.exp() / range_per_z_center;
 
-            if patch.status == PatchStatus::PhotoRefined {
+            if patch.status.is_photometric() {
                 #[cfg(target_arch = "x86_64")]
                 let use_avx2 = std::arch::is_x86_feature_detected!("avx2")
                     && std::arch::is_x86_feature_detected!("fma");
@@ -523,7 +543,7 @@ fn densify_pixels_pinhole(
                                     &mut eta_buf[row_off..],
                                     &mut w_buf[row_off..],
                                     &mut status_buf[row_off..],
-                                    PatchStatus::PhotoRefined,
+                                    patch.status,
                                 );
                             }
                             px += 8;
@@ -547,7 +567,7 @@ fn densify_pixels_pinhole(
                                 &mut eta_buf[row_off..],
                                 &mut w_buf[row_off..],
                                 &mut status_buf[row_off..],
-                                PatchStatus::PhotoRefined,
+                                patch.status,
                             );
                         }
                         px += 4;
@@ -1039,7 +1059,7 @@ fn densify_pixels_pinhole_parallel(
             for iv in iv_start..=iv_end {
                 for iu in 0..grid.n_u {
                     let patch = grid.get(iu, iv);
-                    let Some(inv_var_w) = patch.inv_var_weight_f32() else {
+                    let Some(inv_var_w) = patch.densify_weight_f32(&mapper.settings) else {
                         continue;
                     };
 
@@ -1049,7 +1069,7 @@ fn densify_pixels_pinhole_parallel(
                     let px_start = iu * grid.stride;
                     let px_end = (px_start + patch_size).min(width);
 
-                    if patch.status == PatchStatus::PhotoRefined {
+                    if patch.status.is_photometric() {
                         let cu = (iu * grid.stride + grid.half) as f64;
                         let cv = (iv * grid.stride + grid.half) as f64;
                         let bx_c = (cu / intr.scale_from_original - mapper.intrinsics.cx)
@@ -1079,7 +1099,7 @@ fn densify_pixels_pinhole_parallel(
                                         &mut eta_row,
                                         &mut w_row,
                                         &mut status_row,
-                                        PatchStatus::PhotoRefined,
+                                        patch.status,
                                     );
                                 }
                                 px += 8;
@@ -1103,7 +1123,7 @@ fn densify_pixels_pinhole_parallel(
                                     &mut eta_row,
                                     &mut w_row,
                                     &mut status_row,
-                                    PatchStatus::PhotoRefined,
+                                    patch.status,
                                 );
                             }
                             px += 4;
@@ -1213,11 +1233,11 @@ fn densify_pixels_generic_parallel(
                 for iv in iv_start..=iv_end {
                     for iu in iu_start..=iu_end {
                         let patch = grid.get(iu, iv);
-                        let Some(inv_var_w) = patch.inv_var_weight_f32() else {
+                        let Some(inv_var_w) = patch.densify_weight_f32(&mapper.settings) else {
                             continue;
                         };
 
-                        let photo_w = if patch.status == PatchStatus::PhotoRefined {
+                        let photo_w = if patch.status.is_photometric() {
                             let cu = iu * grid.stride + grid.half;
                             let cv = iv * grid.stride + grid.half;
                             let range_per_z = mapper
