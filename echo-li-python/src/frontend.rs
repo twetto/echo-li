@@ -219,7 +219,8 @@ impl FrontendConfig {
         cfg.klt_max_iter = self.klt_max_iter;
         cfg.klt_method = LkMethod::InverseCompositional;
         cfg.klt_residual_enabled = self.klt_residual;
-        cfg.klt_fb_threshold_px = self.klt_fb_threshold_px;
+        // The pinned Rudolf-V has no forward-backward KLT gate; the Python-side
+        // klt_fb_threshold_px is accepted for compatibility and has no effect.
         cfg.enable_internal_ransac = self.enable_ransac;
         cfg.epipolar_gate_threshold = self.epipolar_gate_threshold;
         cfg.epipolar_refine = self.epipolar_refine;
@@ -356,6 +357,11 @@ impl PyFrontend {
         stats_dict.set_item("new_detections", stats.new_detections)?;
         stats_dict.set_item("total", stats.total)?;
         stats_dict.set_item("timing_ms", stats.timing.total_ms())?;
+        stats_dict.set_item("histeq_ms", stats.timing.histeq_ms())?;
+        stats_dict.set_item("pyramid_ms", stats.timing.pyramid_ms())?;
+        stats_dict.set_item("klt_ms", stats.timing.klt_ms())?;
+        stats_dict.set_item("ransac_ms", stats.timing.ransac_ms())?;
+        stats_dict.set_item("detect_ms", stats.timing.detect_ms())?;
 
         Ok((feat_list, stats_dict.into_any().unbind()))
     }
