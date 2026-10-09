@@ -2444,3 +2444,78 @@ fn stereo_range_channel_informs_depth_with_correct_sign() {
         "measured-closer range must reduce the estimate: {range_after} vs true {true_range}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// VioBackend seam
+// ---------------------------------------------------------------------------
+
+/// Driving a filter THROUGH the `VioBackend` trait must be indistinguishable from
+/// calling its inherent methods. This is the invariant that lets the wrappers switch to
+/// the trait without changing behaviour; it is what makes a later second backend a
+/// capability change rather than a silent behaviour change.
+///
+/// Checked on state, not just on "it ran": attitude, position, velocity, bias, the
+/// landmark set, and the covariance, after an IMU+vision sequence.
+#[test]
+fn vio_backend_trait_is_byte_identical_to_the_inherent_calls() {
+    use crate::backend::VioBackend;
+
+    let build = || {
+        let settings = VIOFilterSettings::default();
+        let xi0 = make_xi0_with_landmarks(0);
+        VIOFilter::new(settings, xi0)
+    };
+    let cam = make_pinhole();
+    let frame = || {
+        let mut coords = HashMap::new();
+        coords.insert(10u64, Vector2::new(400.0f32, 250.0f32));
+        coords.insert(11u64, Vector2::new(350.0f32, 200.0f32));
+        coords
+    };
+
+    // Direct: inherent methods, as every wrapper calls them today.
+    let mut direct = build();
+    direct.process_imu(stationary_imu(0.0));
+    direct.process_imu(stationary_imu(0.005));
+    direct.process_vision(VisionMeasurement::new(0.005, frame()), &cam);
+    direct.process_imu(stationary_imu(0.010));
+    direct.process_vision(VisionMeasurement::new(0.010, frame()), &cam);
+
+    // Through the trait, as a dyn object -- the form a swappable backend takes.
+    let mut boxed = build();
+    {
+        let via: &mut dyn VioBackend = &mut boxed;
+        VioBackend::process_imu(via, stationary_imu(0.0));
+        VioBackend::process_imu(via, stationary_imu(0.005));
+        via.process_vision(VisionMeasurement::new(0.005, frame()), &cam);
+        VioBackend::process_imu(via, stationary_imu(0.010));
+        via.process_vision(VisionMeasurement::new(0.010, frame()), &cam);
+    }
+
+    let a = direct.eqf.state_estimate();
+    let b = boxed.eqf.state_estimate();
+    assert_eq!(
+        a.get_ids(),
+        b.get_ids(),
+        "landmark sets diverged through the trait"
+    );
+    assert_abs_diff_eq!(
+        a.sensor.pose.rotation.as_matrix(),
+        b.sensor.pose.rotation.as_matrix(),
+        epsilon = 0.0
+    );
+    assert_abs_diff_eq!(a.sensor.pose.translation, b.sensor.pose.translation, epsilon = 0.0);
+    assert_abs_diff_eq!(a.sensor.velocity, b.sensor.velocity, epsilon = 0.0);
+    assert_abs_diff_eq!(a.sensor.input_bias, b.sensor.input_bias, epsilon = 0.0);
+    assert_abs_diff_eq!(direct.eqf.sigma, boxed.eqf.sigma, epsilon = 0.0);
+    assert_eq!(direct.vision_count, boxed.vision_count);
+
+    // The optional accessor must agree too -- it is what feeds the depth filter.
+    let ca = VioBackend::camera_pose_covariances(&direct);
+    let cb = VioBackend::camera_pose_covariances(&boxed);
+    assert_eq!(ca.is_some(), cb.is_some());
+    if let (Some((va, wa)), Some((vb, wb))) = (ca, cb) {
+        assert_abs_diff_eq!(va, vb, epsilon = 0.0);
+        assert_abs_diff_eq!(wa, wb, epsilon = 0.0);
+    }
+}

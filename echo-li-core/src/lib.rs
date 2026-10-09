@@ -1,4 +1,5 @@
 pub mod alignment;
+pub mod backend;
 pub mod config;
 pub mod coordinate_suite;
 pub mod core_types;
