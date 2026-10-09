@@ -55,7 +55,14 @@ eqf:
     useDiscreteVelocityLift: false
     useEquivariantOutput: true
     useFeaturePredictions: true
-    useMedianDepth: true
+    # Fixed sceneDepth, not the running median depth of the tracked landmarks. This
+    # key was inert until 2026-09-24 -- parsed and never read -- so the `true` that sat
+    # here was an inherited EqVIO default that never took effect, not a measured choice;
+    # false is the behaviour every result in this repo was measured under. Enable it
+    # per-config only where it has been tested: it rescues a seed that is badly too
+    # small (0.7 m seed on a corridor, 3.34x short -> 0.95x) but is not free -- on an
+    # outdoor bike bag it cost ~20 deg of yaw.
+    useMedianDepth: false
     riccatiVariant: faster
     stereoMeasurement: true
     rangeGateChi2: 6.63
