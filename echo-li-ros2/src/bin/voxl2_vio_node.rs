@@ -13,7 +13,6 @@ use echo_li_core::depth::patch_depth::{
     SparseDepthPrior,
 };
 use echo_li_core::depth::sparse_3d::{Sparse3DChart, Sparse3DFilter};
-use echo_li_core::initialization::estimate_initial_pose;
 use echo_li_core::mathematical::camera::CameraModel;
 use echo_li_core::mathematical::imu_velocity::IMUVelocity;
 use echo_li_core::mathematical::vio_state::{VIOSensorState, VIOState};
@@ -387,8 +386,12 @@ struct VioNode {
     frontend: FrontendBackend,
     t_bc: Matrix4<f64>,
     initialized: bool,
+    /// Also gates vision: no frame is processed until this many IMU samples have gone
+    /// through the filter.
     n_init: usize,
-    imu_buffer: Vec<IMUVelocity>,
+    /// Shared start-up policy -- the same code the CLI and the pyo3 bindings use, so
+    /// the three cannot drift apart again.
+    init: echo_li_core::initialization::StationaryInit,
 
     // Sparse 3D
     sparse_3d: Option<Sparse3DFilter>,
@@ -687,7 +690,10 @@ impl VioNode {
             t_bc: params.t_bs,
             initialized: false,
             n_init: params.n_init,
-            imu_buffer: Vec::new(),
+            init: echo_li_core::initialization::StationaryInit::new(
+                params.n_init,
+                SE3::from_matrix(&params.t_bs),
+            ),
             sparse_3d,
             depth_mapper,
             depth_seed_coords,
@@ -892,19 +898,10 @@ impl VioNode {
         );
 
         if !self.initialized {
-            self.imu_buffer.push(imu);
-            if self.imu_buffer.len() >= self.n_init {
-                let pose = estimate_initial_pose(&self.imu_buffer, self.n_init);
-                let cam_offset = SE3::from_matrix(&self.t_bc);
-                let sensor = VIOSensorState {
-                    input_bias: Vector6::zeros(),
-                    pose,
-                    velocity: Vector3::zeros(),
-                    camera_offset: cam_offset,
-                };
-                let xi0 = VIOState::new(sensor, vec![]);
-                self.filter = VIOFilter::new(self.filter.settings.clone(), xi0);
-                for buffered in self.imu_buffer.drain(..) {
+            if let Some(start) = self.init.push(imu) {
+                let settings = self.filter.settings.clone();
+                self.filter = VIOFilter::new(settings, start.state);
+                for buffered in start.replay {
                     self.filter.process_imu(buffered);
                 }
                 self.initialized = true;

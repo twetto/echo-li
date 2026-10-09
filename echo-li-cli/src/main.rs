@@ -10,7 +10,11 @@ use echo_li_core::depth::patch_depth::{
 };
 use echo_li_core::depth::sparse_3d::{Sparse3DChart, Sparse3DFilter};
 use echo_li_core::depth::sparse_gb::SparseVogSettings;
-use echo_li_core::initialization::{check_stationary, estimate_initial_pose};
+use echo_li_core::initialization::StationaryInit;
+
+/// Samples averaged for the gravity alignment at start-up. Matches the ROS 2 node's
+/// `initialization_imu_samples` default and the pyo3 binding's `n_init_samples`.
+const N_INIT_SAMPLES: usize = 100;
 use echo_li_core::mathematical::camera::CameraModel;
 use echo_li_core::mathematical::*;
 use echo_li_core::trajectory_metrics::TrajectoryMetrics;
@@ -24,8 +28,8 @@ use rudolf_v::image::Image as RudolfImage;
 use rudolf_v::klt::LkMethod;
 use rudolf_v::rigid_ransac::{Correspondence3d, Rigid3dRansacConfig};
 use rudolf_v::stereo::{StereoConfig as RudolfStereoConfig, StereoMatcher};
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -1262,38 +1266,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // every event (IMU + image) through it in time order. No batch IMU
     // replay; no dropping of early images.
     // ------------------------------------------------------------------
-    let initial_imu: Vec<IMUVelocity> = (&mut raw_imu_it).take(100).collect();
-    // Gravity-align from the FIRST accel reading, unconditionally. The old
-    // stationarity gate fell back to identity attitude when the start was in
-    // motion, which diverges immediately (gravity integrates as phantom
-    // acceleration; EuRoC MH_01/V2_03). Even an in-flight accel sample is
-    // within ~10-15 deg of gravity — inside the filter's initial attitude
-    // sigma — whereas identity can be 180 deg off. Moving starts additionally
-    // need a loose eqf initialVariance.velocity (the old 9e-8 asserts v=0).
-    let stationary = check_stationary(&initial_imu, 100, 0.1, 0.5);
-    let init_pose = estimate_initial_pose(&initial_imu, 1);
-    {
-        let r = init_pose.rotation.as_matrix();
-        let pitch_deg = (-r[(2, 0)]).clamp(-1.0, 1.0).asin().to_degrees();
-        let roll_deg = r[(2, 1)].atan2(r[(2, 2)]).to_degrees();
-        let t0 = initial_imu.first().map(|imu| imu.stamp).unwrap_or(0.0);
-        println!(
-            "IMU gravity-align at t={:.3} (first sample, stationary={}): roll={:.1}° pitch={:.1}°",
-            t0, stationary, roll_deg, pitch_deg
-        );
-    }
+    // Gravity-align unconditionally, stationary or not. The old stationarity gate fell
+    // back to identity attitude when the start was in motion, which diverges
+    // immediately -- gravity integrates as phantom acceleration (EuRoC MH_01/V2_03).
+    // Even an in-flight accel sample is within ~10-15 deg of gravity, inside the
+    // filter's initial attitude sigma, whereas identity can be 180 deg off. Moving
+    // starts additionally need a loose eqf initialVariance.velocity (the old 9e-8
+    // asserts v=0).
+    //
+    // The policy itself lives in echo_li_core::initialization so the CLI, the ROS 2
+    // node and the pyo3 bindings cannot drift apart; this file used to average ONE
+    // sample where the other two averaged a hundred.
+    let initial_imu: Vec<IMUVelocity> = (&mut raw_imu_it).take(N_INIT_SAMPLES).collect();
+    let start = StationaryInit::from_samples(
+        N_INIT_SAMPLES,
+        reader
+            .camera_extrinsics
+            .clone()
+            .unwrap_or_else(echo_lie::SE3::identity),
+        initial_imu,
+    );
+    println!(
+        "IMU gravity-align at t={:.3} ({} samples, stationary={}): roll={:.1}° pitch={:.1}°",
+        start.replay.first().map(|imu| imu.stamp).unwrap_or(0.0),
+        start.replay.len(),
+        start.stationary,
+        start.roll_deg,
+        start.pitch_deg
+    );
 
-    let mut xi0 = VIOState::new(VIOSensorState::identity(), Vec::new());
-    xi0.sensor.pose = init_pose;
-    if let Some(ext) = &reader.camera_extrinsics {
-        xi0.sensor.camera_offset = ext.clone();
-    }
-    let mut filter: Option<VIOFilter> = Some(VIOFilter::new(settings.clone(), xi0));
+    let mut filter: Option<VIOFilter> = Some(VIOFilter::new(settings.clone(), start.state));
 
-    // Re-attach the buffered IMU samples to the front of the stream so they
-    // pass through the filter at their original timestamps, interleaved with
-    // images, just like every other IMU sample.
-    let mut imu_it = initial_imu.into_iter().chain(raw_imu_it).peekable();
+    // Eager-init: the filter is built once, and the buffered samples are spliced back
+    // onto the FRONT of the event stream so they pass through at their original
+    // timestamps, interleaved with images, like every other sample. Deliberately not
+    // `start_filter`, which replays them into the filter directly -- doing both would
+    // integrate them twice.
+    let mut imu_it = start.replay.into_iter().chain(raw_imu_it).peekable();
 
     let mut patch_depth_mapper = build_patch_depth_mapper(
         patch_depth_enabled,
@@ -1577,8 +1586,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // subject of the range-covariance work -- and the core's prior/defer
                     // mechanism stays for stereo and for the python diagnostics that inject
                     // priors on purpose in order to measure them.
-                    let depth_priors: HashMap<u64, LandmarkDepthPrior> =
-                        stereo_depth_priors.iter().map(|(&id, p)| (id, *p)).collect();
+                    let depth_priors: HashMap<u64, LandmarkDepthPrior> = stereo_depth_priors
+                        .iter()
+                        .map(|(&id, p)| (id, *p))
+                        .collect();
                     let depth_prior_hash =
                         trace_determinism.then(|| hash_depth_priors(&depth_priors));
                     f.process_vision_with_depth_priors(

@@ -5,7 +5,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use echo_li_core::config::VIOConfig;
-use echo_li_core::initialization::estimate_initial_pose;
 use echo_li_core::mathematical::camera::CameraModel;
 use echo_li_core::mathematical::imu_velocity::IMUVelocity;
 use echo_li_core::mathematical::vio_state::{VIOSensorState, VIOState};
@@ -22,9 +21,11 @@ pub struct PyVIOFilter {
     filter: VIOFilter,
     camera: Arc<dyn CameraModel>,
     camera_extrinsics: Option<SE3>,
-    imu_buffer: Vec<IMUVelocity>,
+    /// Shared start-up policy. Buffers the first samples, gravity-aligns, and hands
+    /// back the initial state plus the samples to replay -- the same code the CLI and
+    /// the ROS 2 node use, so the three cannot drift apart again.
+    init: echo_li_core::initialization::StationaryInit,
     initialized: bool,
-    n_init_samples: usize,
     // Remembered so it survives set_initial_state, which REPLACES self.filter
     // and would otherwise silently discard the setting.
     gram_window: usize,
@@ -59,9 +60,11 @@ impl PyVIOFilter {
                 filter,
                 camera: cam,
                 camera_extrinsics: None,
-                imu_buffer: Vec::new(),
+                init: echo_li_core::initialization::StationaryInit::new(
+                    n_init_samples,
+                    SE3::identity(),
+                ),
                 initialized: false,
-                n_init_samples,
                 gram_window: 0,
             })
         } else {
@@ -80,7 +83,11 @@ impl PyVIOFilter {
         }
         let data = t_bs.as_slice()?;
         let m = Matrix4::from_row_slice(data);
-        self.camera_extrinsics = Some(SE3::from_matrix(&m));
+        let ext = SE3::from_matrix(&m);
+        // The initialiser bakes the offset into the state it builds, so it has to learn
+        // it here -- extrinsics arrive after construction on this path.
+        self.init.set_camera_offset(ext.clone());
+        self.camera_extrinsics = Some(ext);
         Ok(())
     }
 
@@ -114,7 +121,6 @@ impl PyVIOFilter {
         if self.gram_window > 0 {
             self.filter.enable_gramian(self.gram_window);
         }
-        self.imu_buffer.clear();
         self.initialized = true;
         Ok(())
     }
@@ -146,7 +152,10 @@ impl PyVIOFilter {
             ));
         }
         let r = SO3::from_matrix(&Matrix3::from_row_slice(rotation.as_slice()?));
-        let pose = SE3::new(r.clone(), Vector3::new(position[0], position[1], position[2]));
+        let pose = SE3::new(
+            r.clone(),
+            Vector3::new(position[0], position[1], position[2]),
+        );
         // World-frame velocity -> body frame (VIOSensorState.velocity is SE(3) body velocity).
         let v_world = Vector3::new(velocity_world[0], velocity_world[1], velocity_world[2]);
         let v_body = r.inverse().act(&v_world);
@@ -173,7 +182,6 @@ impl PyVIOFilter {
         if self.gram_window > 0 {
             self.filter.enable_gramian(self.gram_window);
         }
-        self.imu_buffer.clear();
         self.initialized = true;
         Ok(())
     }
@@ -234,8 +242,7 @@ impl PyVIOFilter {
         // x.a = xi0.pose⁻¹ ∘ pose_d   (sets estimate.pose = pose_d)
         let new_a = self.filter.eqf.xi0.sensor.pose.inverse().compose(&pose_d);
         // x.w = xi0.v − x.a.R · v_body_target   (sets estimate.v_body = v_body_target)
-        let new_w =
-            self.filter.eqf.xi0.sensor.velocity - new_a.rotation.act(&v_body_target);
+        let new_w = self.filter.eqf.xi0.sensor.velocity - new_a.rotation.act(&v_body_target);
         // x.b = xi0.camoff⁻¹ ∘ x.a ∘ camoff_cur   (preserves estimate.camoff exactly)
         let new_b = self
             .filter
@@ -257,12 +264,7 @@ impl PyVIOFilter {
     /// gain machinery (updates mean AND covariance), given GT world velocity. The
     /// harness converts world→body with the current attitude. `sign` (+1/−1) flips
     /// the velocity-tangent selector for empirical convergence validation.
-    fn velocity_pseudo_update(
-        &mut self,
-        velocity_world: [f64; 3],
-        sigma_v: f64,
-        sign: f64,
-    ) -> f64 {
+    fn velocity_pseudo_update(&mut self, velocity_world: [f64; 3], sigma_v: f64, sign: f64) -> f64 {
         if !self.initialized {
             return 0.0;
         }
@@ -288,22 +290,16 @@ impl PyVIOFilter {
         );
 
         if !self.initialized {
-            self.imu_buffer.push(imu);
-            if self.imu_buffer.len() >= self.n_init_samples {
-                let pose = estimate_initial_pose(&self.imu_buffer, self.n_init_samples);
-                let cam_offset = self.camera_extrinsics.clone().unwrap_or_else(SE3::identity);
-                let sensor = VIOSensorState {
-                    input_bias: nalgebra::Vector6::zeros(),
-                    pose,
-                    velocity: Vector3::zeros(),
-                    camera_offset: cam_offset,
-                };
-                let xi0 = VIOState::new(sensor, vec![]);
-                self.filter = VIOFilter::new(self.filter.settings.clone(), xi0);
+            if let Some(start) = self.init.push(imu) {
+                let settings = self.filter.settings.clone();
+                self.filter = VIOFilter::new(settings, start.state);
+                // enable_gramian must come BEFORE the replay: the filter was just
+                // replaced, and a gramian switched on afterwards would miss every
+                // buffered sample.
                 if self.gram_window > 0 {
                     self.filter.enable_gramian(self.gram_window);
                 }
-                for buffered_imu in self.imu_buffer.drain(..) {
+                for buffered_imu in start.replay {
                     self.filter.process_imu(buffered_imu);
                 }
                 self.initialized = true;
@@ -447,7 +443,11 @@ impl PyVIOFilter {
     /// leaving its covariance untouched. Lets the harness inject GT-relative clone
     /// geometry to separate an update-mechanics bug from EqVIO pose inconsistency.
     /// Returns True if the clone was live.
-    fn set_clone_pose_value(&mut self, clone_id: u64, pose: PyReadonlyArray2<'_, f64>) -> PyResult<bool> {
+    fn set_clone_pose_value(
+        &mut self,
+        clone_id: u64,
+        pose: PyReadonlyArray2<'_, f64>,
+    ) -> PyResult<bool> {
         let shape = pose.shape();
         if shape[0] != 4 || shape[1] != 4 {
             return Err(pyo3::exceptions::PyValueError::new_err(
@@ -455,7 +455,9 @@ impl PyVIOFilter {
             ));
         }
         let m = Matrix4::from_row_slice(pose.as_slice()?);
-        Ok(self.filter.set_clone_pose_value(clone_id, SE3::from_matrix(&m)))
+        Ok(self
+            .filter
+            .set_clone_pose_value(clone_id, SE3::from_matrix(&m)))
     }
 
     /// Current (post-update) stored world←camera pose (4x4) of a live clone, or None.
@@ -468,7 +470,9 @@ impl PyVIOFilter {
     ) -> Option<Bound<'py, PyArray2<f64>>> {
         self.filter.clone_pose_value(clone_id).map(|p| {
             let m = p.as_matrix();
-            let data: Vec<f64> = (0..4).flat_map(|r| (0..4).map(move |c| m[(r, c)])).collect();
+            let data: Vec<f64> = (0..4)
+                .flat_map(|r| (0..4).map(move |c| m[(r, c)]))
+                .collect();
             PyArray2::from_owned_array(py, Array2::from_shape_vec((4, 4), data).unwrap())
         })
     }
@@ -610,7 +614,9 @@ impl PyVIOFilter {
     fn get_full_covariance<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
         let sigma = &self.filter.eqf.sigma;
         let n = sigma.nrows();
-        let data: Vec<f64> = (0..n).flat_map(|r| (0..n).map(move |c| sigma[(r, c)])).collect();
+        let data: Vec<f64> = (0..n)
+            .flat_map(|r| (0..n).map(move |c| sigma[(r, c)]))
+            .collect();
         PyArray2::from_owned_array(py, Array2::from_shape_vec((n, n), data).unwrap())
     }
 

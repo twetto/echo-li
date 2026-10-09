@@ -70,6 +70,19 @@ Done:
   velocity, bias, landmark set and covariance after an IMU+vision sequence
 - `defer_fallback_ids` retired (`9f52ecb`) -- it existed only to make features wait for a
   Sparse3D prior that no longer arrives
+- **One start-up policy.** `initialization::StationaryInit` buffers the first IMU
+  samples, gravity-aligns, and hands back the initial state plus the samples to replay.
+  All three wrappers use it, so the divergence described above is gone: the CLI now
+  averages 100 samples like the other two, which on EuRoC V1 improves 2 of 3 (V1_02
+  0.155 -> 0.149 m, V1_03 0.206 -> 0.179 m) and costs 0.010 m on V1_01. The type also
+  enforces a 5-sample floor, because below that `estimate_initial_pose` silently returns
+  IDENTITY -- the one attitude the whole module exists to avoid, and 180 deg from gravity
+  in the worst case. A unit test pins that.
+
+  The CLI still differs in one respect, deliberately: it builds its filter eagerly and
+  splices `start.replay` onto the front of its own event stream, where the other two
+  replay into the filter via `start_filter`. Doing both would integrate those samples
+  twice.
 
 Owed, in dependency order:
 
@@ -85,11 +98,10 @@ Owed, in dependency order:
    state, not caller state, and it must come inside. Porting it must reproduce the
    harness's validated numbers -- note that the update span and the anchor window are
    independent, and tying them together breaks one or the other.
-2. **One constructor in core.** Fold the three copies of config-load, gravity-align,
-   buffer-rebuild-replay into a single entry point and delete the per-wrapper versions,
-   including the CLI's 1-sample divergence.
-3. **Wrappers hold `Box<dyn VioBackend>`.** Only after 1 and 2, so the switch is a
-   capability change rather than a silent behaviour change.
+2. **Wrappers hold `Box<dyn VioBackend>`.** Only after 1, so the switch is a capability
+   change rather than a silent behaviour change. Config loading is still duplicated --
+   each wrapper calls `VIOConfig::from_yaml` and `to_filter_settings` itself -- which is
+   worth folding in at the same time.
 
 ## Deferred: priors into `VisionMeasurement`
 

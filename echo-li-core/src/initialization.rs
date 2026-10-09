@@ -276,3 +276,284 @@ mod static_init_tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Shared filter start-up
+// ---------------------------------------------------------------------------
+
+/// Everything needed to start a filter from the first IMU samples.
+///
+/// Returned by [`StationaryInit`] once enough samples have arrived. `replay` is the
+/// buffer that was consumed to produce `state`: those samples have NOT been given to any
+/// filter yet, and dropping them loses the only evidence of bias the filter has before
+/// its first image.
+pub struct FilterStart {
+    /// Gravity-aligned initial state: zero position, zero velocity, zero bias, and the
+    /// caller's camera offset.
+    pub state: crate::mathematical::vio_state::VIOState,
+    /// The buffered samples, oldest first. Feed them to the filter, or splice them back
+    /// onto the front of an event stream -- but do exactly one of the two.
+    pub replay: Vec<IMUVelocity>,
+    /// Whether those samples looked stationary. Diagnostic only: alignment happens
+    /// either way, because a moving start aligned from an accel reading is within
+    /// ~10-15 deg of gravity -- inside the filter's initial attitude sigma -- whereas
+    /// falling back to identity can be 180 deg off and diverges immediately as gravity
+    /// integrates into phantom acceleration.
+    pub stationary: bool,
+    pub roll_deg: f64,
+    pub pitch_deg: f64,
+}
+
+/// Collects the first IMU samples and turns them into a filter's initial state.
+///
+/// This exists because the three wrappers each grew their own copy and drifted: before
+/// this type the CLI averaged ONE sample while the pyo3 bindings and the ROS 2 node
+/// averaged a hundred, and only the CLI reported stationarity at all. Nobody chose that;
+/// it is what three copies of a policy turn into. The policy lives here now, and
+/// `n_samples` is the only knob.
+pub struct StationaryInit {
+    n_samples: usize,
+    camera_offset: SE3,
+    buffer: Vec<IMUVelocity>,
+    done: bool,
+}
+
+impl StationaryInit {
+    /// Fewer readings than this and `estimate_initial_pose` short-circuits to identity.
+    pub const MIN_SAMPLES: usize = 5;
+
+    /// `n_samples` is clamped to at least [`Self::MIN_SAMPLES`]. Below that
+    /// [`estimate_initial_pose`] returns IDENTITY rather than an alignment, and an
+    /// identity start can be 180 deg from gravity, which diverges immediately as gravity
+    /// integrates into phantom acceleration. Silently handing back the one attitude the
+    /// rest of this module exists to avoid is not an acceptable answer to "I only have
+    /// three samples", so the floor is enforced here instead.
+    pub fn new(n_samples: usize, camera_offset: SE3) -> Self {
+        Self {
+            n_samples: n_samples.max(Self::MIN_SAMPLES),
+            camera_offset,
+            buffer: Vec::new(),
+            done: false,
+        }
+    }
+
+    /// Feed one sample. Returns the start-up data on the call that completes the buffer,
+    /// and `None` every other time -- including after it has fired once, so a caller
+    /// that keeps pushing cannot re-initialise the filter mid-run.
+    pub fn push(&mut self, imu: IMUVelocity) -> Option<FilterStart> {
+        if self.done {
+            return None;
+        }
+        self.buffer.push(imu);
+        if self.buffer.len() < self.n_samples {
+            return None;
+        }
+        self.done = true;
+        Some(self.finish())
+    }
+
+    /// Eager form: hand over an already-collected buffer. Used where the samples are
+    /// read up front rather than arriving one at a time.
+    pub fn from_samples(
+        n_samples: usize,
+        camera_offset: SE3,
+        samples: Vec<IMUVelocity>,
+    ) -> FilterStart {
+        let mut me = Self::new(n_samples, camera_offset);
+        me.buffer = samples;
+        // The floor applies to what is actually averaged, which is bounded by the
+        // buffer: asking for 100 from a 6-sample buffer averages 6, and that is fine,
+        // but a 3-sample buffer would silently align to identity.
+        me.n_samples = me.n_samples.min(me.buffer.len().max(Self::MIN_SAMPLES));
+        me.done = true;
+        me.finish()
+    }
+
+    /// Set the camera offset after construction, for callers that learn their
+    /// extrinsics later than they build the filter. No effect once initialisation has
+    /// fired -- by then the offset is already baked into the filter's state.
+    pub fn set_camera_offset(&mut self, camera_offset: SE3) {
+        self.camera_offset = camera_offset;
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.done
+    }
+
+    fn finish(&mut self) -> FilterStart {
+        let pose = estimate_initial_pose(&self.buffer, self.n_samples);
+        let stationary = check_stationary(&self.buffer, self.n_samples, 0.1, 0.5);
+        let r = pose.rotation.as_matrix();
+        let pitch_deg = (-r[(2, 0)]).clamp(-1.0, 1.0).asin().to_degrees();
+        let roll_deg = r[(2, 1)].atan2(r[(2, 2)]).to_degrees();
+
+        let sensor = crate::mathematical::vio_state::VIOSensorState {
+            input_bias: nalgebra::Vector6::zeros(),
+            pose,
+            velocity: Vector3::zeros(),
+            camera_offset: self.camera_offset.clone(),
+        };
+        FilterStart {
+            state: crate::mathematical::vio_state::VIOState::new(sensor, Vec::new()),
+            replay: std::mem::take(&mut self.buffer),
+            stationary,
+            roll_deg,
+            pitch_deg,
+        }
+    }
+}
+
+/// Build a filter at `start` and feed it the buffered samples.
+///
+/// For callers that replay into the filter directly. A caller that instead splices
+/// `start.replay` back onto its own event stream must NOT use this, or the samples are
+/// integrated twice.
+pub fn start_filter(settings: crate::VIOFilterSettings, start: FilterStart) -> crate::VIOFilter {
+    let mut filter = crate::VIOFilter::new(settings, start.state);
+    for imu in start.replay {
+        filter.process_imu(imu);
+    }
+    filter
+}
+
+#[cfg(test)]
+mod stationary_init_tests {
+    use super::*;
+    use approx::assert_abs_diff_eq;
+    use nalgebra::Vector3;
+
+    fn imu(stamp: f64, acc: Vector3<f64>) -> IMUVelocity {
+        IMUVelocity::new(stamp, Vector3::zeros(), acc)
+    }
+
+    /// A level, stationary rig: measured gravity along +z maps to world +z, so the
+    /// initial attitude is identity and roll/pitch are zero.
+    #[test]
+    fn level_rest_gives_identity_attitude() {
+        let mut init = StationaryInit::new(10, SE3::identity());
+        let mut out = None;
+        for k in 0..10 {
+            out = init.push(imu(k as f64 * 0.01, Vector3::new(0.0, 0.0, 9.81)));
+        }
+        let start = out.expect("should fire on the 10th sample");
+        assert!(start.stationary);
+        assert!(start.roll_deg.abs() < 1e-9, "roll {}", start.roll_deg);
+        assert!(start.pitch_deg.abs() < 1e-9, "pitch {}", start.pitch_deg);
+        assert_eq!(
+            start.replay.len(),
+            10,
+            "every buffered sample must come back"
+        );
+    }
+
+    /// Fires exactly once. A caller that keeps pushing must not be able to re-initialise
+    /// the filter mid-run.
+    #[test]
+    fn fires_once_and_only_once() {
+        let n = 6;
+        let mut init = StationaryInit::new(n, SE3::identity());
+        for k in 0..n - 1 {
+            assert!(
+                init.push(imu(k as f64 * 0.01, Vector3::new(0.0, 0.0, 9.81)))
+                    .is_none(),
+                "fired early at sample {k}"
+            );
+        }
+        assert!(
+            init.push(imu(0.05, Vector3::new(0.0, 0.0, 9.81))).is_some(),
+            "did not fire on the nth sample"
+        );
+        assert!(init.is_done());
+        for k in n..n + 7 {
+            assert!(
+                init.push(imu(k as f64 * 0.01, Vector3::new(0.0, 0.0, 9.81)))
+                    .is_none(),
+                "re-initialised after completing"
+            );
+        }
+    }
+
+    /// The floor is enforced: asking for 3 must not yield an identity alignment, which
+    /// is what `estimate_initial_pose` hands back below 5 readings.
+    #[test]
+    fn below_the_floor_still_aligns() {
+        let mut init = StationaryInit::new(3, SE3::identity());
+        let mut out = None;
+        for k in 0..StationaryInit::MIN_SAMPLES {
+            out = init.push(imu(k as f64 * 0.01, Vector3::new(9.81, 0.0, 0.0)));
+        }
+        let start = out.expect("must fire at the clamped floor, not at 3");
+        let g_world = start
+            .state
+            .sensor
+            .pose
+            .rotation
+            .act(&Vector3::new(9.81, 0.0, 0.0));
+        assert!(
+            (g_world - Vector3::new(0.0, 0.0, 9.81)).norm() < 1e-9,
+            "clamping failed; aligned to identity, got {g_world:?}"
+        );
+    }
+
+    /// Tilted rest: gravity read along the body x axis means the rig is pitched 90 deg,
+    /// and alignment must rotate measured gravity onto world +z regardless.
+    #[test]
+    fn tilted_rest_is_aligned_not_rejected() {
+        let mut init = StationaryInit::new(5, SE3::identity());
+        let mut out = None;
+        for k in 0..5 {
+            out = init.push(imu(k as f64 * 0.01, Vector3::new(9.81, 0.0, 0.0)));
+        }
+        let start = out.unwrap();
+        let g_world = start
+            .state
+            .sensor
+            .pose
+            .rotation
+            .act(&Vector3::new(9.81, 0.0, 0.0));
+        assert!(
+            (g_world - Vector3::new(0.0, 0.0, 9.81)).norm() < 1e-9,
+            "measured gravity must rotate onto world +z, got {g_world:?}"
+        );
+    }
+
+    /// Averaging must actually average: the eager and incremental paths agree, and
+    /// noise across samples is reduced rather than the first sample being taken.
+    #[test]
+    fn eager_and_incremental_paths_agree() {
+        let accs = [
+            Vector3::new(0.30, 0.0, 9.81),
+            Vector3::new(-0.30, 0.0, 9.81),
+            Vector3::new(0.15, 0.0, 9.81),
+            Vector3::new(-0.15, 0.0, 9.81),
+            Vector3::new(0.00, 0.0, 9.81),
+            Vector3::new(0.00, 0.0, 9.81),
+        ];
+        let samples: Vec<_> = accs
+            .iter()
+            .enumerate()
+            .map(|(k, a)| imu(k as f64 * 0.01, *a))
+            .collect();
+
+        let mut init = StationaryInit::new(6, SE3::identity());
+        let mut inc = None;
+        for s in samples.clone() {
+            inc = init.push(s);
+        }
+        let inc = inc.unwrap();
+        let eager = StationaryInit::from_samples(6, SE3::identity(), samples);
+
+        assert_abs_diff_eq!(
+            inc.state.sensor.pose.rotation.as_matrix(),
+            eager.state.sensor.pose.rotation.as_matrix(),
+            epsilon = 0.0
+        );
+        // The x-components cancel, so the average is level even though no single
+        // sample is. Taking only the first would have tilted by atan(0.30/9.81).
+        assert!(
+            inc.pitch_deg.abs() < 1e-9,
+            "averaging should cancel the x wobble, pitch {}",
+            inc.pitch_deg
+        );
+    }
+}
