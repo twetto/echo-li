@@ -9,6 +9,7 @@ from echo_li._echo_li import (
     Sparse3DFilter,
     PatchDepthMapper,
     Stereo,
+    static_initialize,
 )
 
 __all__ = [
@@ -22,4 +23,5 @@ __all__ = [
     "Sparse3DFilter",
     "PatchDepthMapper",
     "Stereo",
+    "static_initialize",
 ]
