@@ -84,20 +84,32 @@ Done:
   replay into the filter via `start_filter`. Doing both would integrate those samples
   twice.
 
+- **`MsceqfBackend`** -- the MSCEqF filter plus the track bookkeeping that turns its
+  primitives into one frame step. Owns `clone_ids`, `landmark_ids`, the structureless
+  observation buffer, the in-state SLAM set and the frame counter; implements
+  `VioBackend` and `LandmarkMap`. Settings are `MsceqfSettings`.
+
+  Two things the port had to get right and now pins with tests. MSCEqF carries velocity
+  in the WORLD frame while `NavEstimate` is BODY, so `nav_estimate` rotates -- the
+  difference is invisible to a position-only error metric and is one of the five bugs
+  the Python adapter shipped. And buffered observations are keyed by clone ID, never by
+  window position, because positions shift under marginalization.
+
+  **NOT YET VALIDATED against the Python adapter.** The tests below are invariants, not
+  equivalence. Before this backend is trusted for results it needs a run against one
+  MidAir trajectory scored next to the harness's recorded figure.
+
 Owed, in dependency order:
 
-1. **`MsceqfBackend`.** `MSCEqFFilter` is a primitives API -- `stochastic_clone`,
+1. **Validate `MsceqfBackend` against the Python adapter.** `MSCEqFFilter` is a primitives API -- `stochastic_clone`,
    `insert_landmark`, `marginalize_clone`, `msc_update`, `birth_landmark`,
    `landmark_stream_update`, `reanchor_landmark` -- with no `process_vision`. The policy
-   that turns those into one frame step is ~90 lines living in a Python test harness:
-   clone before update; buffer observations excluding in-state SLAM; promote
-   window-spanning tracks and re-anchor them to the current clone; stream-update live
-   SLAM and marginalize lost ones; flush a track for `msc_update` on any of lost /
-   too-long / touches-the-marginalized-clone / spanned; re-anchor SLAM landmarks off a
-   dying clone to the newest; marginalize clones down and prune buffers. That is backend
-   state, not caller state, and it must come inside. Porting it must reproduce the
-   harness's validated numbers -- note that the update span and the anchor window are
-   independent, and tying them together breaks one or the other.
+   that turns those into one frame step was ~90 lines living in a Python test harness.
+   The policy is ported; what remains is proving it reproduces the harness's numbers.
+   Note the port deliberately differs in one respect: it normalizes pixels through the
+   REAL camera model, where the Python harness used a bare inverse-K. Those agree on an
+   undistorted pinhole (MidAir) and diverge on a distorted one, so MidAir is the right
+   place to compare.
 2. **Wrappers hold `Box<dyn VioBackend>`.** Only after 1, so the switch is a capability
    change rather than a silent behaviour change. Config loading is still duplicated --
    each wrapper calls `VIOConfig::from_yaml` and `to_filter_settings` itself -- which is
