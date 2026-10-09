@@ -78,7 +78,7 @@ eqf:
     velocity: 1.0e-2        # MSCEqF extended_pose_std vel 1e-1 -> var 1e-2
   measurementNoise:
     feature: 2.0
-    featureOutlierAbs: 5.0
+    featureOutlierAbs: 10.0
     featureOutlierProb: 0.03229809583062128
     featureRetention: 0.18594708334486176
   processVariance:

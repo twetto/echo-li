@@ -79,7 +79,7 @@ eqf:
     # heavy-tailed at occlusions/depth edges; traj1/traj2 A/B favored 4 px over
     # 0.5/1/2 px for this stereo-birth configuration.
     feature: 4.0
-    featureOutlierAbs: 5.0
+    featureOutlierAbs: 20.0
     featureOutlierProb: 0.03229809583062128
     featureRetention: 0.18594708334486176
   processVariance:

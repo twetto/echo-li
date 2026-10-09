@@ -1,6 +1,6 @@
-use nalgebra::{Matrix3, Matrix4, Matrix6, Vector3, Vector6, U6};
+use nalgebra::{Matrix3, Matrix4, Matrix6, U6, Vector3, Vector6};
 
-use crate::base::{skew, vex, LieGroup};
+use crate::base::{LieGroup, skew, vex};
 use crate::so3::SO3;
 
 /// SE(3) — Special Euclidean Group in 3D (rotation + translation).
@@ -259,8 +259,7 @@ impl SE3 {
         let mut m = Matrix4::identity();
         m.fixed_view_mut::<3, 3>(0, 0)
             .copy_from(&self.rotation.as_matrix());
-        m.fixed_view_mut::<3, 1>(0, 3)
-            .copy_from(&self.translation);
+        m.fixed_view_mut::<3, 1>(0, 3).copy_from(&self.translation);
         m
     }
 

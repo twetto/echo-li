@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "echo-li"
 version = "0.1.0"
-requires-python = ">=3.9"
+requires-python = ">=3.8"
 dependencies = ["numpy"]
 
 [project.optional-dependencies]

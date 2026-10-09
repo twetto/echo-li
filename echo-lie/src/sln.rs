@@ -141,7 +141,11 @@ impl SLn {
     }
 
     pub fn act_inverse(&self, point: &nalgebra::DVector<f64>) -> nalgebra::DVector<f64> {
-        self.matrix.clone().lu().solve(point).expect("SLn must be invertible")
+        self.matrix
+            .clone()
+            .lu()
+            .solve(point)
+            .expect("SLn must be invertible")
     }
 
     pub fn as_matrix(&self) -> DMatrix<f64> {
@@ -156,10 +160,7 @@ impl SLn {
         for i in 0..cdim {
             let mut ei = nalgebra::DVector::zeros(cdim);
             ei[i] = 1.0;
-            let col = Self::vee(
-                self.n,
-                &(&self.matrix * Self::wedge(self.n, &ei) * &h_inv),
-            );
+            let col = Self::vee(self.n, &(&self.matrix * Self::wedge(self.n, &ei) * &h_inv));
             ad.set_column(i, &col);
         }
         ad

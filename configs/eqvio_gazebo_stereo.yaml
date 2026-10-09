@@ -1,0 +1,92 @@
+RudolfV:
+  equaliseImageHistogram: false
+  histeq: global
+  claheTileSize: 256
+  claheClipLimit: 4.0
+  featureDist: 16.0
+  featureSearchThreshold: 0.8
+  fastThreshold: 20
+  detector: shi_tomasi
+  shiTomasiThreshold: 0.0001
+  shiTomasiBlockSize: 5
+  lbpPolicy: HardReject
+  kltResidual: true
+  enableRansac: true
+  epipolarGateThreshold: 0.0
+  epipolarRefine: false
+  epipolarMinBaseline: 0.001
+  epipolarMaxRejectFrac: 0.5
+  maxFeatures: 300
+  maxLevel: 3
+
+eqf:
+  maxFeatures: 40
+  initialValue:
+    sceneDepth: 3.0
+  initialVariance:
+    attitude: 0.13565029126052572
+    biasAcc: 1.0e-10
+    biasGyr: 1.0e-12
+    cameraAttitude: 1.0e-12
+    cameraPosition: 1.0e-12
+    point: 129.90415638150924
+    pointDepth: 0.25
+    position: 0.1
+    velocity: 8.974852995731e-08
+  measurementNoise:
+    feature: 2.0
+    featureOutlierAbs: 10.0
+    featureOutlierProb: 0.03229809583062128
+    featureRetention: 0.18594708334486176
+  processVariance:
+    attitude: 6.025875320811407e-05
+    biasAcc: 0.0
+    biasGyr: 0.0
+    cameraAttitude: 0.0
+    cameraPosition: 0.0
+    point: 0.00029845436136043135
+    position: 9.981466095928483e-06
+    velocity: 0.025317333863551263
+  settings:
+    coordinateChoice: Normal
+    fastRiccati: false
+    imuBiasGroup: additive
+    useDiscreteInnovationLift: false
+    useDiscreteVelocityLift: false
+    useEquivariantOutput: true
+    useFeaturePredictions: true
+    useMedianDepth: true
+    riccatiVariant: faster
+    stereoMeasurement: true
+    rangeGateChi2: 6.63
+  velocityNoise:
+    acc: 2.0e-5
+    accBias: 0.0
+    gyr: 1.0e-9
+    gyrBias: 0.0
+
+main:
+  writeState: false
+  cameraLag: 0.0
+
+Stereo:
+  enabled: true
+  pyramid_levels: 3
+  patch_half_size: 4
+  max_iterations: 30
+  min_inv_depth: 0.05
+  max_inv_depth: 10.0
+  init_inv_depth: 0.3333333333
+  n_search_candidates: 64
+  knn_propagation: 5
+  max_residual: 20.0
+  histeq: global
+
+SparseVog:
+  enabled: false
+
+PatchDepth:
+  enabled: false
+
+LocalOccupancy:
+  enabled: false

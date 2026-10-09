@@ -1,14 +1,14 @@
 use echo_lie::{SE3, SO3, SOT3};
 use nalgebra::{DMatrix, DVector, Matrix2x3, Matrix3, SMatrix, Vector2, Vector3};
 
+use crate::ImuBiasGroup;
 use crate::coordinate_suite::base_skew;
 use crate::mathematical::bias_group_ops::BiasGroupOps;
 use crate::mathematical::camera::CameraModel;
 use crate::mathematical::eqf_matrices::{EqFCoordinateSuite, RiccatiPropagationBlocks};
 use crate::mathematical::imu_velocity::IMUVelocity;
-use crate::mathematical::vio_group::{state_group_action, VIOAlgebra, VIOGroup};
-use crate::mathematical::vio_state::{VIOSensorState, VIOState, GRAVITY_CONSTANT};
-use crate::ImuBiasGroup;
+use crate::mathematical::vio_group::{VIOAlgebra, VIOGroup, state_group_action};
+use crate::mathematical::vio_state::{GRAVITY_CONSTANT, VIOSensorState, VIOState};
 
 pub struct EuclideanSuite;
 

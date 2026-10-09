@@ -307,7 +307,9 @@ mod tests {
         assert!((intr.fx - 190.97).abs() < 1e-6);
 
         // camera_offset = inverse(T_cam_imu); with identity rotation, t -> -t.
-        let ext = reader.camera_extrinsics.expect("camchain extrinsics loaded");
+        let ext = reader
+            .camera_extrinsics
+            .expect("camchain extrinsics loaded");
         assert!((ext.translation.x + 0.1).abs() < 1e-9);
         assert!((ext.translation.z + 0.3).abs() < 1e-9);
 

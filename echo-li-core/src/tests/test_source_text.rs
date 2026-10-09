@@ -51,6 +51,11 @@ fn scan_dir(path: &Path, failures: &mut Vec<String>) {
         let path = entry.path();
         let name = entry.file_name();
         let name = name.to_string_lossy();
+        // Never follow symlinks. `docs` points at a separate personal checkout,
+        // and a test must not depend on files outside this workspace.
+        if entry.file_type().map(|t| t.is_symlink()).unwrap_or(true) {
+            continue;
+        }
         if name == ".git"
             || name == "target"
             || name == ".venv"

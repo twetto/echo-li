@@ -148,10 +148,7 @@ impl GLn {
         for i in 0..cdim {
             let mut ei = nalgebra::DVector::zeros(cdim);
             ei[i] = 1.0;
-            let col = Self::vee(
-                self.n,
-                &(&self.matrix * Self::wedge(self.n, &ei) * &a_inv),
-            );
+            let col = Self::vee(self.n, &(&self.matrix * Self::wedge(self.n, &ei) * &a_inv));
             ad.set_column(i, &col);
         }
         ad

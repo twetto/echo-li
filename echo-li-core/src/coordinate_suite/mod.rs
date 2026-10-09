@@ -1,4 +1,4 @@
-use nalgebra::{Matrix3x2, Matrix2x3, Vector2, Vector3};
+use nalgebra::{Matrix2x3, Matrix3x2, Vector2, Vector3};
 
 pub mod euclid;
 pub mod invdepth;

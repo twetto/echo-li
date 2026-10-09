@@ -8,6 +8,7 @@ from echo_li._echo_li import (
     MSCEqFNativeFilter,
     Sparse3DFilter,
     PatchDepthMapper,
+    LocalOccupancyMap,
     Stereo,
     static_initialize,
 )
@@ -22,6 +23,7 @@ __all__ = [
     "MSCEqFNativeFilter",
     "Sparse3DFilter",
     "PatchDepthMapper",
+    "LocalOccupancyMap",
     "Stereo",
     "static_initialize",
 ]

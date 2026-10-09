@@ -1,0 +1,29 @@
+# VOXL2 tracking front camera + /voxl/raw_imu, from the Kalibr camera-IMU run
+# on voxl_20260907_162901, which reached Kalibr as
+# imu_cam_calib.bag (~/Downloads/VOXL/VOXL_0902/calibration). The calib.bag
+# symlink there still points at the superseded 121803 run — don't follow it.
+#   cam0 reprojection error 0.89 px mean, gyro 0.0032 rad/s, accel 0.048 m/s^2
+#   t_bs is Kalibr's T_ic (cam0 -> imu0); its rotation differs from the ideal
+#   axis permutation by 1.6 deg, and the camera sits 1.5 cm above the IMU.
+#   camera_time_offset_sec is Kalibr's timeshift, t_imu = t_cam + shift.
+#
+# Which unit this is: fx 467.2 sits 1 % from the ID 1 factory intrinsics and
+# 10 % from ID 2, so the calibration bag was shot with an ID 1-class board. The
+# RC V1.8 bundle's README (CCLoLab/rc-v15-orin, 2026-09-21) says the board that
+# flies at the site is ID 2. If that holds, these intrinsics and this mount
+# geometry belong to a different unit than the 0914 flight bags, and the site
+# drone needs its own Kalibr run. Replaying the flights could not separate the
+# three intrinsics sets: run-to-run spread is +-0.07 m, larger than the gap.
+echo_li_voxl2:
+  ros__parameters:
+    image_width: 1280
+    image_height: 800
+    camera_model: equidistant
+    intrinsics: [467.21636648663133, 465.5855505350616, 650.1470820776115, 401.10056952631885]
+    distortion_coefficients: [0.0724057032727899, -0.008974195130143298,
+                              0.01653481221998721, -0.007403590108297363]
+    camera_time_offset_sec: 0.0042822815561731065
+    t_bs: [ 0.000126103, -0.025462280,  0.999675776,  0.038304778,
+            0.999939950,  0.010957791,  0.000152964, -0.000578662,
+           -0.010958133,  0.999615726,  0.025462133, -0.014795479,
+            0.0,          0.0,          0.0,          1.0]

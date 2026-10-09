@@ -300,9 +300,9 @@ impl PyVIOFilter {
                 };
                 let xi0 = VIOState::new(sensor, vec![]);
                 self.filter = VIOFilter::new(self.filter.settings.clone(), xi0);
-        if self.gram_window > 0 {
-            self.filter.enable_gramian(self.gram_window);
-        }
+                if self.gram_window > 0 {
+                    self.filter.enable_gramian(self.gram_window);
+                }
                 for buffered_imu in self.imu_buffer.drain(..) {
                     self.filter.process_imu(buffered_imu);
                 }
@@ -314,7 +314,7 @@ impl PyVIOFilter {
         self.filter.process_imu(imu);
     }
 
-    fn process_vision(&mut self, stamp: f64, feature_uvs: HashMap<u64, [f32; 2]>) {
+    fn process_vision(&mut self, py: Python<'_>, stamp: f64, feature_uvs: HashMap<u64, [f32; 2]>) {
         if !self.initialized {
             return;
         }
@@ -324,8 +324,10 @@ impl PyVIOFilter {
             .map(|(id, uv)| (id, Vector2::new(uv[0], uv[1])))
             .collect();
         let measurement = VisionMeasurement::new(stamp, cam_coords);
-        self.filter
-            .process_vision(measurement, self.camera.as_ref());
+        py.allow_threads(|| {
+            self.filter
+                .process_vision(measurement, self.camera.as_ref());
+        });
     }
 
     /// Vision update with per-landmark range priors. Use this to seed new
@@ -389,19 +391,22 @@ impl PyVIOFilter {
             .map(|(id, rv)| {
                 (
                     id,
-                    LandmarkDepthPrior { range: rv[0], range_var: rv[1] },
+                    LandmarkDepthPrior {
+                        range: rv[0],
+                        range_var: rv[1],
+                    },
                 )
             })
             .collect();
-        let deferred: std::collections::HashSet<u64> =
-            defer_fallback_ids.into_iter().collect();
+        let deferred: std::collections::HashSet<u64> = defer_fallback_ids.into_iter().collect();
         let measurement = VisionMeasurement::new(stamp, cam_coords);
-        self.filter.process_vision_with_depth_priors_and_deferred_fallbacks(
-            measurement,
-            self.camera.as_ref(),
-            &priors,
-            &deferred,
-        );
+        self.filter
+            .process_vision_with_depth_priors_and_deferred_fallbacks(
+                measurement,
+                self.camera.as_ref(),
+                &priors,
+                &deferred,
+            );
     }
 
     fn get_pose<'py>(

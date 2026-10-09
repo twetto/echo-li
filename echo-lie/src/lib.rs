@@ -1,6 +1,6 @@
 pub mod base;
 pub mod gln;
-pub mod matfn;
+mod matfn;
 pub mod se3;
 pub mod semi_direct_bias;
 pub mod sen3;

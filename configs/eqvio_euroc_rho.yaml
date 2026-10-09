@@ -66,7 +66,7 @@ eqf:
     velocity: 1.0
   measurementNoise:
     feature: 2.0
-    featureOutlierAbs: 5.0
+    featureOutlierAbs: 10.0
     featureOutlierProb: 0.03229809583062128
     featureRetention: 0.18594708334486176
   processVariance:

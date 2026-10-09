@@ -29,9 +29,9 @@ mod tiled_bearing;
 pub(in crate::depth::patch_depth) use geometry::*;
 pub(in crate::depth::patch_depth) use tiled_bearing::*;
 
+use fuse::PatchGrid;
 #[cfg(not(feature = "parallel"))]
 use fuse::densify_pixels;
-use fuse::PatchGrid;
 #[cfg(feature = "parallel")]
 use fuse::{densify_pixels_parallel, patch_centers};
 use image_ops::{
@@ -40,11 +40,11 @@ use image_ops::{
     sample_bilinear_valid, sample_bilinear_valid_with_grad, sample_nearest, sample_valid_nearest,
     scaled_intrinsics, undistort_level_specs,
 };
-use seeds::{median_seed_depth, nearby_seed_weights, scale_seeds, SeedGrid};
+use seeds::{SeedGrid, median_seed_depth, nearby_seed_weights, scale_seeds};
 #[cfg(target_arch = "x86_64")]
 use simd::{
-    fast_translation_accum_avx2_if_available, per_patch_affine_accum_avx2_if_available,
-    PerPatchAffineGeom,
+    PerPatchAffineGeom, fast_translation_accum_avx2_if_available,
+    per_patch_affine_accum_avx2_if_available,
 };
 #[cfg(target_arch = "aarch64")]
 use simd_neon::fast_translation_accum_neon_if_available;
