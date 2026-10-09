@@ -153,6 +153,29 @@ impl PySparse3DFilter {
     /// (min_track_length, conv_inlier_ratio, conv_variance_threshold). Returns
     /// (-1, inf) when the landmark is not usable as a prior. `query` applies the same
     /// gates but to DEPTH; seeding reads range, so expose both.
+    /// Re-anchor every landmark anchored to `old_clone_id` onto `t_wc_new`. Call this
+    /// BEFORE marginalizing that clone, so the anchor->new relative pose is still known.
+    /// Returns how many landmarks moved. Passing `rel_pose_cov` as (P_vv, P_ww) of the
+    /// old->new relative pose folds that uncertainty in; omitting it claims the two
+    /// anchors are perfectly known relative to each other.
+    #[pyo3(signature = (old_clone_id, t_wc_new, new_clone_id, rel_pose_cov=None))]
+    fn reanchor_clone(
+        &mut self,
+        old_clone_id: u64,
+        t_wc_new: [[f64; 4]; 4],
+        new_clone_id: Option<u64>,
+        rel_pose_cov: Option<([[f64; 3]; 3], [[f64; 3]; 3])>,
+    ) -> usize {
+        let t = array_to_matrix4(&t_wc_new);
+        let cov = rel_pose_cov.map(|(v, w)| (array_to_matrix3(&v), array_to_matrix3(&w)));
+        self.inner.reanchor_clone(
+            old_clone_id,
+            &t,
+            new_clone_id,
+            cov.as_ref().map(|(v, w)| (v, w)),
+        )
+    }
+
     fn query_range(&self, fid: u64) -> (f64, f64) {
         self.inner.query_range(fid)
     }
@@ -224,7 +247,68 @@ impl PySparse3DFilter {
                     ]),
                 ),
             )?;
+            // The EKF state ITSELF: (eta1, eta2, rho) in the anchor chart, and its
+            // covariance. `position`/`covariance` above are a delta-method push-forward
+            // of these; the Gaussian actually lives HERE, so any consistency test of the
+            // depth filter belongs in this space.
+            feat_dict.set_item(
+                "inv_s",
+                PyArray1::from_owned_array(
+                    py,
+                    Array1::from_vec(vec![feat.inv_s[0], feat.inv_s[1], feat.inv_s[2]]),
+                ),
+            )?;
+            let ip = feat.inv_p;
+            feat_dict.set_item(
+                "inv_p",
+                PyArray2::from_owned_array(
+                    py,
+                    Array2::from_shape_vec(
+                        (3, 3),
+                        vec![
+                            ip[(0, 0)],
+                            ip[(0, 1)],
+                            ip[(0, 2)],
+                            ip[(1, 0)],
+                            ip[(1, 1)],
+                            ip[(1, 2)],
+                            ip[(2, 0)],
+                            ip[(2, 1)],
+                            ip[(2, 2)],
+                        ],
+                    )
+                    .expect("3x3 shape is valid"),
+                ),
+            )?;
+            let at = feat.anchor_t_wc;
+            feat_dict.set_item(
+                "anchor_t_wc",
+                PyArray2::from_owned_array(
+                    py,
+                    Array2::from_shape_vec(
+                        (4, 4),
+                        (0..4)
+                            .flat_map(|r| (0..4).map(move |c| (r, c)))
+                            .map(|(r, c)| at[(r, c)])
+                            .collect::<Vec<f64>>(),
+                    )
+                    .expect("4x4 shape is valid"),
+                ),
+            )?;
+            // Range variance the filter REPORTS = its own estimate variance + the
+            // exogenous (scale_sigma * r)^2. Exposed as a SEPARATE key so `covariance`
+            // and `covariance_euclidean` keep meaning "the filter's own state" and
+            // nothing changes silently for existing consumers.
+            feat_dict.set_item(
+                "range_var_reported",
+                self.inner.reported_range_variance(feat),
+            )?;
             feat_dict.set_item("track_length", feat.track_length)?;
+            // Which pose clone this landmark is anchored to. Sparse3D never re-anchors,
+            // so the clone window must outlive the longest track or resolve_pose_cov
+            // silently falls back to the absolute covariance. Exposed so a harness can
+            // measure how many DISTINCT anchors are actually live.
+            feat_dict.set_item("anchor_clone_id", feat.anchor_clone_id)?;
             feat_dict.set_item("inlier_ratio", feat.inlier_ratio())?;
             feat_dict.set_item("nis", feat.last_nis)?;
             dict.set_item(feat.feat_id, feat_dict)?;
@@ -295,6 +379,11 @@ fn parse_settings(kwargs: Option<&Bound<'_, pyo3::types::PyDict>>) -> PyResult<S
     set!("min_depth", min_depth);
     set!("max_depth", max_depth);
     set!("birth_min_flow_px", birth_min_flow_px);
+    set!("pose_range_direct", pose_range_direct);
+    set!("scale_sigma", scale_sigma);
+    set!("conv_range_sigma_frac", conv_range_sigma_frac);
+    set!("civera_birth_depth", civera_birth_depth);
+    set!("civera_rho_sigma_frac", civera_rho_sigma_frac);
     set!("use_equivariant_output", use_equivariant_output);
     set!("iekf_iterations", iekf_iterations);
     set!("range_walk_var", range_walk_var);

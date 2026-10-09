@@ -240,6 +240,16 @@ pub struct SparseVogConfig {
     #[serde(default, alias = "reanchor_flow_px")]
     pub birth_min_flow_px: Option<f64>,
     #[serde(default)]
+    pub pose_range_direct: Option<bool>,
+    #[serde(default)]
+    pub scale_sigma: Option<f64>,
+    #[serde(default)]
+    pub conv_range_sigma_frac: Option<f64>,
+    #[serde(default)]
+    pub civera_birth_depth: Option<f64>,
+    #[serde(default)]
+    pub civera_rho_sigma_frac: Option<f64>,
+    #[serde(default)]
     pub vis_min_depth: Option<f64>,
     #[serde(default)]
     pub vis_max_depth: Option<f64>,
@@ -338,6 +348,21 @@ impl SparseVogConfig {
         }
         if let Some(v) = self.max_depth {
             settings.max_depth = v;
+        }
+        if let Some(v) = self.pose_range_direct {
+            settings.pose_range_direct = v;
+        }
+        if let Some(v) = self.scale_sigma {
+            settings.scale_sigma = v;
+        }
+        if let Some(v) = self.conv_range_sigma_frac {
+            settings.conv_range_sigma_frac = v;
+        }
+        if let Some(v) = self.civera_birth_depth {
+            settings.civera_birth_depth = v;
+        }
+        if let Some(v) = self.civera_rho_sigma_frac {
+            settings.civera_rho_sigma_frac = v;
         }
         if let Some(v) = self.birth_min_flow_px {
             settings.birth_min_flow_px = v;

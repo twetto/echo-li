@@ -21,6 +21,10 @@ use crate::mathematical::vision_measurement::VisionMeasurement;
 /// `conv_variance_threshold` do the quality gating.
 const BEARING_MIN_PARALLAX_SIN: f64 = 0.02;
 
+fn skew3(v: &Vector3<f64>) -> Matrix3<f64> {
+    Matrix3::new(0.0, -v[2], v[1], v[2], 0.0, -v[0], -v[1], v[0], 0.0)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sparse3DChart {
     /// Static-anchor SOT(3) IEKF, range carried multiplicatively (log-depth).
@@ -87,6 +91,13 @@ pub struct FeatureState3D {
     /// squared). Should be close to chi2(2) when the filter is consistent.
     /// NaN before the first update.
     pub last_nis: f64,
+    /// Last evaluated pose-driven range variance `f = G*(r^2 sig_phi^2 + sig_b^2)`
+    /// under `pose_range_direct`. Injecting `f_k - f_{k-1}` makes the ACCUMULATED range
+    /// variance equal `f_k`, so it follows the true relative-pose growth curve rather
+    /// than a sum of increments. Reset to 0 on re-anchor (a fresh anchor has zero
+    /// relative covariance to itself).
+    pose_q_prev: f64,
+
     // --- Per-track correspondence-bias state (BearingInvDepthAdditive only,
     // enabled by settings.bias_walk_var > 0). Augments the 3-DOF landmark to a
     // 5-DOF state s5 = (inv_s, bias). All zero / unused when disabled. ---
@@ -384,35 +395,48 @@ impl Sparse3DFilter {
                 let Some(cam) = self.camera.clone() else {
                     continue;
                 };
-                if (uv_curr - pending.ref_uv).norm() < self.settings.birth_min_flow_px {
-                    continue;
-                }
                 let b0 = cam.undistort(&uv_curr);
-                let b_prev = cam.undistort(&pending.ref_uv);
-                // Parallax gate: two-view triangulation is severely biased toward
-                // the camera at low parallax. Require enough ray-angle between the
-                // two bearings (in the current frame) before birthing.
-                let b_prev_c = (r_ref * b_prev).normalize();
-                if b0.cross(&b_prev_c).norm() < BEARING_MIN_PARALLAX_SIN {
-                    continue;
-                }
-                let Some((range_anchor, _)) =
-                    bearing_chart::two_ray_ranges(&b0, &b_prev, &r_ref, &t_ref)
-                else {
-                    continue;
+                let focal = 0.5 * (self.k[(0, 0)] + self.k[(1, 1)]);
+                let sigma_eta = self.settings.sigma_pixel / focal;
+                // Two birth modes. Civera (undelayed) births on first sight from a
+                // depth PRIOR; the classical path waits for parallax and triangulates.
+                let (range_anchor, rho_var) = if self.settings.civera_birth_depth > 0.0 {
+                    // Undelayed: no flow gate, no ray-angle gate, no triangulation.
+                    // rho0 = 1/d0 with sigma_rho = frac*rho0; at frac = 0.5 the 2-sigma
+                    // band spans rho in [0, 2*rho0], i.e. depth in [d0/2, infinity).
+                    let d0 = self.settings.civera_birth_depth;
+                    let rho0 = 1.0 / d0;
+                    let s_rho = self.settings.civera_rho_sigma_frac * rho0;
+                    (d0, (s_rho * s_rho).max(1e-12))
+                } else {
+                    if (uv_curr - pending.ref_uv).norm() < self.settings.birth_min_flow_px {
+                        continue;
+                    }
+                    let b_prev = cam.undistort(&pending.ref_uv);
+                    // Parallax gate: two-view triangulation is severely biased toward
+                    // the camera at low parallax. Require enough ray-angle between the
+                    // two bearings (in the current frame) before birthing.
+                    let b_prev_c = (r_ref * b_prev).normalize();
+                    if b0.cross(&b_prev_c).norm() < BEARING_MIN_PARALLAX_SIN {
+                        continue;
+                    }
+                    let Some((range_anchor, _)) =
+                        bearing_chart::two_ray_ranges(&b0, &b_prev, &r_ref, &t_ref)
+                    else {
+                        continue;
+                    };
+                    if !range_anchor.is_finite()
+                        || range_anchor < self.settings.min_depth
+                        || range_anchor > self.settings.max_depth
+                    {
+                        continue;
+                    }
+                    let rv = (self.settings.init_depth_var / range_anchor.powi(4)).max(1e-12);
+                    (range_anchor, rv)
                 };
-                if !range_anchor.is_finite()
-                    || range_anchor < self.settings.min_depth
-                    || range_anchor > self.settings.max_depth
-                {
-                    continue;
-                }
                 let u = bearing_chart::tangent_basis(&b0);
                 let rho = 1.0 / range_anchor;
                 let inv_s = Vector3::new(0.0, 0.0, rho);
-                let focal = 0.5 * (self.k[(0, 0)] + self.k[(1, 1)]);
-                let sigma_eta = self.settings.sigma_pixel / focal;
-                let rho_var = (self.settings.init_depth_var / range_anchor.powi(4)).max(1e-12);
                 let inv_p = Matrix3::from_diagonal(&Vector3::new(
                     sigma_eta * sigma_eta,
                     sigma_eta * sigma_eta,
@@ -443,6 +467,7 @@ impl Sparse3DFilter {
                     bias: Vector2::zeros(),
                     p_sb: Matrix3x2::zeros(),
                     p_bb: Matrix2::zeros(),
+                    pose_q_prev: 0.0,
                     // Bearing chart anchors at the CURRENT frame (anchor_t_wc =
                     // *t_wc), so the anchor clone is this frame's clone.
                     anchor_clone_id: current_clone_id,
@@ -531,6 +556,7 @@ impl Sparse3DFilter {
                 bias: Vector2::zeros(),
                 p_sb: Matrix3x2::zeros(),
                 p_bb: Matrix2::zeros(),
+                pose_q_prev: 0.0,
                 // Non-bearing charts also anchor at the current frame here.
                 anchor_clone_id: current_clone_id,
             };
@@ -555,6 +581,133 @@ impl Sparse3DFilter {
         self.prev_uvs = curr_uvs;
     }
 
+    /// Move a landmark's anchor to `t_wc_new`, leaving the world point it represents
+    /// unchanged. Returns false if the landmark is absent, the chart is not
+    /// `BearingInvDepthAdditive`, or the re-expressed range leaves `[min_depth, max_depth]`.
+    ///
+    /// WHY THIS EXISTS: Sparse3D anchors a landmark at birth and never moves it, but the
+    /// anchor->current relative-pose covariance only exists while the anchor CLONE is
+    /// alive. A landmark outliving its anchor clone silently falls back to the absolute
+    /// covariance in `resolve_pose_cov`. The historical workaround was to size the clone
+    /// window to outlive the longest track (~120 clones), which costs O(n^3) in the filter.
+    /// Re-anchoring decouples the two: the window then only has to serve the MSCKF update.
+    ///
+    /// MATH. With `p_old` the point in the old anchor frame and `R,t` the old->new
+    /// transform, `p_new = R p_old + t`. The new state is `(0, 0, 1/|p_new|)` because the
+    /// new anchor ray IS the point's own bearing, so eta is zero BY CONSTRUCTION -- its
+    /// uncertainty does not vanish, it moves into the covariance. Differentiating
+    /// `eta = u_new^T b` and `rho = 1/|p|` at eta = 0, where `u_new ⊥ b`:
+    ///     d eta / d p = rho * u_new^T          d rho / d p = -rho^2 * b^T
+    /// The landmark covariance maps through `J = (d state/d p) R (d p_old/d state_old)`,
+    /// and the old->new relative-pose uncertainty enters as
+    /// `[R p_old]_x P_ww [R p_old]_x^T + P_vv` pushed through `d state/d p`. Passing
+    /// `rel_pose_cov = None` asserts the two anchors are perfectly known relative to each
+    /// other, which they are not -- pass it whenever it is available.
+    pub fn reanchor_feature(
+        &mut self,
+        fid: u64,
+        t_wc_new: &Matrix4<f64>,
+        new_clone_id: Option<u64>,
+        rel_pose_cov: Option<(&Matrix3<f64>, &Matrix3<f64>)>,
+    ) -> bool {
+        if self.chart != Sparse3DChart::BearingInvDepthAdditive {
+            return false;
+        }
+        let Some(&slot) = self.feature_slots.get(&fid) else {
+            return false;
+        };
+        let feat = &mut self.features[slot];
+        let rho = feat.inv_s[2];
+        if !rho.is_finite() || rho <= 0.0 {
+            return false;
+        }
+        let eta = Vector2::new(feat.inv_s[0], feat.inv_s[1]);
+        let (p_old, j_old) =
+            bearing_chart::point_and_jacobian(&feat.anchor_ray, &feat.tangent_basis, &eta, rho);
+
+        let r_old = feat.anchor_t_wc.fixed_view::<3, 3>(0, 0).into_owned();
+        let t_old = feat.anchor_t_wc.fixed_view::<3, 1>(0, 3).into_owned();
+        let r_new = t_wc_new.fixed_view::<3, 3>(0, 0).into_owned();
+        let t_new = t_wc_new.fixed_view::<3, 1>(0, 3).into_owned();
+        let r_rel = r_new.transpose() * r_old;
+        let t_rel = r_new.transpose() * (t_old - t_new);
+        let p_new = r_rel * p_old + t_rel;
+
+        let range = p_new.norm();
+        if !range.is_finite() || range < self.settings.min_depth || range > self.settings.max_depth
+        {
+            return false;
+        }
+        let b_new = p_new / range;
+        let u_new = bearing_chart::tangent_basis(&b_new);
+        let rho_new = 1.0 / range;
+
+        let mut j_from_p = Matrix3::zeros();
+        j_from_p
+            .fixed_view_mut::<2, 3>(0, 0)
+            .copy_from(&(u_new.transpose() * rho_new));
+        j_from_p
+            .fixed_view_mut::<1, 3>(2, 0)
+            .copy_from(&(-(rho_new * rho_new) * b_new.transpose()));
+
+        let j = j_from_p * r_rel * j_old;
+        let mut inv_p_new = j * feat.inv_p * j.transpose();
+        if let Some((pvv, pww)) = rel_pose_cov {
+            let sk = skew3(&(r_rel * p_old));
+            let mut cov_p = sk * pww * sk.transpose() + pvv;
+            // Under `pose_range_direct` the RADIAL share of this same anchor->current
+            // transition has already been injected into the range channel over the
+            // epoch; adding the full 3D block here would count it twice. Project the
+            // radial direction out and keep only the transverse part, which the range
+            // process term never carries (it is a pure r_hat r_hat^T injection).
+            if self.settings.pose_range_direct {
+                let perp = Matrix3::identity() - b_new * b_new.transpose();
+                cov_p = perp * cov_p * perp.transpose();
+            }
+            inv_p_new += j_from_p * cov_p * j_from_p.transpose();
+        }
+        inv_p_new = 0.5 * (inv_p_new + inv_p_new.transpose());
+
+        // Correspondence-bias cross-covariance is in the same 3-dof landmark block.
+        feat.p_sb = j * feat.p_sb;
+        feat.inv_s = Vector3::new(0.0, 0.0, rho_new);
+        feat.inv_p = inv_p_new;
+        feat.anchor_ray = b_new;
+        feat.tangent_basis = u_new;
+        feat.anchor_t_wc = *t_wc_new;
+        feat.anchor_clone_id = new_clone_id;
+        // The landmark is now anchored HERE, so its anchor->current relative pose
+        // covariance restarts at zero. Carrying the old running value would keep
+        // injecting variance that the new (short) baseline does not have.
+        feat.pose_q_prev = 0.0;
+        true
+    }
+
+    /// Re-anchor every landmark currently anchored to `old_clone_id`. Call this
+    /// immediately BEFORE marginalizing that clone, while its relative pose to the new
+    /// anchor is still computable. Returns the number of landmarks moved.
+    pub fn reanchor_clone(
+        &mut self,
+        old_clone_id: u64,
+        t_wc_new: &Matrix4<f64>,
+        new_clone_id: Option<u64>,
+        rel_pose_cov: Option<(&Matrix3<f64>, &Matrix3<f64>)>,
+    ) -> usize {
+        let ids: Vec<u64> = self
+            .features
+            .iter()
+            .filter(|f| f.anchor_clone_id == Some(old_clone_id))
+            .map(|f| f.feat_id)
+            .collect();
+        let mut n = 0;
+        for fid in ids {
+            if self.reanchor_feature(fid, t_wc_new, new_clone_id, rel_pose_cov) {
+                n += 1;
+            }
+        }
+        n
+    }
+
     pub fn query(&self, fid: u64) -> (f64, f64) {
         let Some(feat) = self.feature(fid) else {
             return (-1.0, f64::INFINITY);
@@ -565,10 +718,14 @@ impl Sparse3DFilter {
             return (-1.0, f64::INFINITY);
         }
         if feat.inlier_ratio() < self.settings.conv_inlier_ratio
-            || depth_var > self.settings.conv_variance_threshold
+            || unconverged(&self.settings, depth, depth_var)
         {
             return (-1.0, f64::INFINITY);
         }
+        // Exogenous multiplicative scale uncertainty (see `scale_sigma`). Applied to what
+        // the filter REPORTS, after the convergence gates, so it never changes the gates'
+        // behaviour -- only the honesty of the number handed to a consumer.
+        let depth_var = depth_var + (self.settings.scale_sigma * depth).powi(2);
         (depth, depth_var)
     }
 
@@ -582,11 +739,37 @@ impl Sparse3DFilter {
             return (-1.0, f64::INFINITY);
         }
         if feat.inlier_ratio() < self.settings.conv_inlier_ratio
-            || range_var > self.settings.conv_variance_threshold
+            || unconverged(&self.settings, range, range_var)
         {
             return (-1.0, f64::INFINITY);
         }
+        // Enforce the DECLARED operating range on the way out, not only at birth.
+        // Birth rejects a triangulated range outside [min_depth, max_depth], but a
+        // landmark born just inside the cap can drift far beyond it, and the far field
+        // is exactly where this filter is least trustworthy: once r >> baseline the
+        // triangulation is ill-conditioned, yet Eq (11)'s r^2/b^2 gain SHRINKS the
+        // injected variance as the baseline grows, so a long track out there reports a
+        // confident estimate (sigma/est ~0.17 measured) against a ~57% true error.
+        // Reporting a range the filter would refuse to birth is an inconsistency, not a
+        // capability; a consumer asking "how far is this" should get "unusable" instead.
+        if range < self.settings.min_depth || range > self.settings.max_depth {
+            return (-1.0, f64::INFINITY);
+        }
+        let range_var = range_var + (self.settings.scale_sigma * range).powi(2);
         (range, range_var)
+    }
+
+    /// The configured exogenous scale uncertainty (1-sigma fraction of range).
+    pub fn scale_sigma(&self) -> f64 {
+        self.settings.scale_sigma
+    }
+
+    /// Range variance the filter REPORTS for this landmark: its own estimate variance
+    /// plus the exogenous `(scale_sigma * r)^2`. This is the quantity a consumer should
+    /// score, not the bare chart covariance.
+    pub fn reported_range_variance(&self, feat: &FeatureState3D) -> f64 {
+        let r = feat.position.norm();
+        feat.range_variance_for_chart(self.chart) + (self.settings.scale_sigma * r).powi(2)
     }
 
     pub fn feature(&self, fid: u64) -> Option<&FeatureState3D> {
@@ -637,6 +820,103 @@ fn position_from_depth(k: &Matrix3<f64>, uv: &Vector2<f64>, depth: f64) -> Vecto
     let x = (uv[0] - k[(0, 2)]) / k[(0, 0)];
     let y = (uv[1] - k[(1, 2)]) / k[(1, 1)];
     Vector3::new(x * depth, y * depth, depth)
+}
+
+/// Range-direction process variance contributed by anchor->current pose uncertainty.
+///
+/// Two modes, selected by `settings.pose_range_direct`:
+///
+/// * LEGACY (default): `pose_range_scale * G * dSigma`, the per-frame clipped increment
+///   scaled by the inverse-parallax gain `G = r^2/b^2`. A cumulative sum of clipped
+///   increments grows ~linearly in window length by construction, whereas the true
+///   relative-pose error is near-ballistic, so the free scalar slides the curve without
+///   changing its slope.
+///
+/// * DIRECT: evaluate `f = G * (r^2 sig_phi^2 + sig_b^2)` from the FULL relative
+///   covariance at the CURRENT separation and inject `max(0, f - f_prev)`. The
+///   accumulated range variance then equals `f` itself, following the true growth curve
+///   including its exponent, with no free scalar. `f` is monotone-clamped because an EKF
+///   process step can only add variance; a decrease (e.g. the pose filter tightening)
+///   is held rather than subtracted.
+///
+/// `b2` is the squared anchor->current baseline, floored to bound the `1/b^2` blow-up at
+/// zero parallax. Returns the variance to add to the radial channel.
+/// Is this landmark's range estimate too uncertain to hand to a consumer?
+///
+/// Relative form (`conv_range_sigma_frac > 0`) when configured: `sigma / value > frac`.
+/// Otherwise the legacy absolute form `var > conv_variance_threshold`, kept so existing
+/// configs behave exactly as before. See `conv_range_sigma_frac` for why the absolute
+/// form cannot survive a change to the covariance model.
+fn unconverged(settings: &SparseVogSettings, value: f64, var: f64) -> bool {
+    if settings.conv_range_sigma_frac > 0.0 {
+        if value <= 0.0 {
+            return true;
+        }
+        var.sqrt() / value > settings.conv_range_sigma_frac
+    } else {
+        var > settings.conv_variance_threshold
+    }
+}
+
+/// Excitation -> multiplicative scale uncertainty, the `sigma_s(E)` envelope.
+///
+/// `E = std(omega_z) * std(a_y)` computed over the WHOLE trajectory on raw IMU (the same
+/// excitation metric the scale-memory work uses). It is a trajectory-level property, not a
+/// per-frame one, so the caller supplies it; this function only holds the fitted map.
+///
+/// `sigma_s(E) = max(0.02, 0.0072 * E^-0.710)`
+///
+/// Fitted to the ROBUST CENTRE (`median |relerr|`), not the RMS: the RMS was non-monotone
+/// in `E` only because the heavy aperture-correspondence tail leaked into it, while the
+/// median is monotone across the measured anchors (3.1 -> 4.2 -> 10.7 -> 44.0 % as `E`
+/// falls) and fits within +-20%. The 0.02 floor keeps a well-excited trajectory from
+/// claiming better-than-2% scale knowledge, which no monocular system has.
+///
+/// Returns a 1-sigma FRACTION of range, to be used as `sigma_range += (sigma_s * r)`.
+pub fn sigma_s_from_excitation(e: f64) -> f64 {
+    if !e.is_finite() || e <= 0.0 {
+        return 0.02;
+    }
+    (0.0072 * e.powf(-0.710)).max(0.02)
+}
+
+fn pose_range_q(
+    settings: &SparseVogSettings,
+    feat: &mut FeatureState3D,
+    r2: f64,
+    b2: f64,
+    p_vv: Option<&Matrix3<f64>>,
+    p_ww: Option<&Matrix3<f64>>,
+    p_vv_inc: Option<&Matrix3<f64>>,
+    p_ww_inc: Option<&Matrix3<f64>>,
+) -> f64 {
+    let gain = r2 / b2;
+    if settings.pose_range_direct {
+        let (Some(pv), Some(pw)) = (p_vv, p_ww) else {
+            return 0.0;
+        };
+        let sig_t2 = pv.trace() / 3.0;
+        let sig_phi2 = pw.trace() / 3.0;
+        let f = gain * (r2 * sig_phi2 + sig_t2);
+        if !f.is_finite() {
+            return 0.0;
+        }
+        let dq = (f - feat.pose_q_prev).max(0.0);
+        feat.pose_q_prev = f.max(feat.pose_q_prev);
+        return dq.min(4.0 * r2);
+    }
+    let (Some(pvi), Some(pwi)) = (p_vv_inc, p_ww_inc) else {
+        return 0.0;
+    };
+    let sig_t2 = pvi.trace() / 3.0;
+    let sig_phi2 = pwi.trace() / 3.0;
+    let x = gain * (r2 * sig_phi2 + sig_t2);
+    let mut pose_q = settings.pose_range_scale * x;
+    if settings.pose_range_coherent > 0.0 {
+        let age = feat.track_length as f64;
+        pose_q += 2.0 * age * settings.pose_range_coherent * x;
+    }
+    pose_q.min(4.0 * r2)
 }
 
 fn chart_to_euc_jac(chart: Sparse3DChart, q: &Vector3<f64>) -> Matrix3<f64> {
@@ -951,7 +1231,11 @@ fn bearing_invdepth_additive_update_3d(
     // (the measurement term proj*P*proj^T below is radial-blind, d(pi)/dq * r_hat = 0).
     // Combines the fixed range-walk floor with the pose-driven, parallax-scaled term
     // (eq. 10-11 of the formulation) when per-frame incremental pose covariances are supplied.
-    let pose_range_on = settings.pose_range_scale > 0.0 && p_vv_inc.is_some() && p_ww_inc.is_some();
+    let pose_range_on = if settings.pose_range_direct {
+        p_vv.is_some() && p_ww.is_some()
+    } else {
+        settings.pose_range_scale > 0.0 && p_vv_inc.is_some() && p_ww_inc.is_some()
+    };
     if dt > 0.0 && (settings.range_walk_var > 0.0 || pose_range_on) {
         let (pa, jpa) = pj_of(&feat.inv_s);
         let q_c = r_ca * pa + t_ca_t;
@@ -961,19 +1245,7 @@ fn bearing_invdepth_additive_update_3d(
             if pose_range_on {
                 // baseline (anchor->current) with a 1%-parallax floor bounding 1/b^2.
                 let b2 = t_ca_t.norm_squared().max(1e-4 * r2);
-                let sig_t2 = p_vv_inc.unwrap().trace() / 3.0; // incremental translation var (m^2)
-                let sig_phi2 = p_ww_inc.unwrap().trace() / 3.0; // incremental rotation var (rad^2)
-                let x = (r2 / b2) * (r2 * sig_phi2 + sig_t2);
-                // Diffusive part: constant per frame -> accumulates ~N (random walk).
-                let mut pose_q = settings.pose_range_scale * x;
-                // Coherent part: a persistent pose bias gives range error ~N, variance ~N^2.
-                // 2*N*c*x per frame telescopes to N^2*c*x, so the total grows as
-                // scale*x*N + coherent*x*N^2 and the exponent interpolates 1..2.
-                if settings.pose_range_coherent > 0.0 {
-                    let age = feat.track_length as f64;
-                    pose_q += 2.0 * age * settings.pose_range_coherent * x;
-                }
-                q_range += pose_q.min(4.0 * r2); // cap fractional range var at (2r)^2
+                q_range += pose_range_q(settings, feat, r2, b2, p_vv, p_ww, p_vv_inc, p_ww_inc);
             }
             if q_range > 0.0 {
                 let j_g = r_ca * jpa;
@@ -1110,7 +1382,11 @@ fn bearing_bias_update_3d(
     // (the measurement term proj*P*proj^T below is radial-blind, d(pi)/dq * r_hat = 0).
     // Combines the fixed range-walk floor with the pose-driven, parallax-scaled term
     // (eq. 10-11 of the formulation) when per-frame incremental pose covariances are supplied.
-    let pose_range_on = settings.pose_range_scale > 0.0 && p_vv_inc.is_some() && p_ww_inc.is_some();
+    let pose_range_on = if settings.pose_range_direct {
+        p_vv.is_some() && p_ww.is_some()
+    } else {
+        settings.pose_range_scale > 0.0 && p_vv_inc.is_some() && p_ww_inc.is_some()
+    };
     if dt > 0.0 && (settings.range_walk_var > 0.0 || pose_range_on) {
         let (pa, jpa) = pj_of(&feat.inv_s);
         let q_c = r_ca * pa + t_ca_t;
@@ -1120,19 +1396,7 @@ fn bearing_bias_update_3d(
             if pose_range_on {
                 // baseline (anchor->current) with a 1%-parallax floor bounding 1/b^2.
                 let b2 = t_ca_t.norm_squared().max(1e-4 * r2);
-                let sig_t2 = p_vv_inc.unwrap().trace() / 3.0; // incremental translation var (m^2)
-                let sig_phi2 = p_ww_inc.unwrap().trace() / 3.0; // incremental rotation var (rad^2)
-                let x = (r2 / b2) * (r2 * sig_phi2 + sig_t2);
-                // Diffusive part: constant per frame -> accumulates ~N (random walk).
-                let mut pose_q = settings.pose_range_scale * x;
-                // Coherent part: a persistent pose bias gives range error ~N, variance ~N^2.
-                // 2*N*c*x per frame telescopes to N^2*c*x, so the total grows as
-                // scale*x*N + coherent*x*N^2 and the exponent interpolates 1..2.
-                if settings.pose_range_coherent > 0.0 {
-                    let age = feat.track_length as f64;
-                    pose_q += 2.0 * age * settings.pose_range_coherent * x;
-                }
-                q_range += pose_q.min(4.0 * r2); // cap fractional range var at (2r)^2
+                q_range += pose_range_q(settings, feat, r2, b2, p_vv, p_ww, p_vv_inc, p_ww_inc);
             }
             if q_range > 0.0 {
                 let j_g = r_ca * jpa;
@@ -1908,6 +2172,414 @@ mod tests {
         assert_relative_eq!(p_bear, p_true, epsilon = 0.01);
     }
 
+    /// Civera undelayed birth: a feature must be born from a STATIONARY camera,
+    /// where two-view triangulation has no parallax to work with and the classical
+    /// path holds the feature pending forever. Also pins the property that makes
+    /// undelayed birth safe -- the 2-sigma band on rho reaches 0, i.e. infinity.
+    #[test]
+    fn civera_birth_needs_no_parallax_and_band_reaches_infinity() {
+        use crate::mathematical::camera::{CameraModel, PinholeModel};
+        use std::sync::Arc;
+
+        let cam: Arc<dyn CameraModel> = Arc::new(PinholeModel {
+            fx: 458.0,
+            fy: 458.0,
+            cx: 376.0,
+            cy: 240.0,
+        });
+        let point_w = Vector3::new(0.5, 0.1, 4.0);
+
+        // Feed the SAME pose twice: zero baseline, hence zero parallax.
+        let stationary = |filter: &mut Sparse3DFilter| {
+            for i in 0..2 {
+                let t_wc = Matrix4::identity();
+                let mut coords = HashMap::new();
+                coords.insert(42u64, project(&k(), point_w));
+                filter.update(
+                    &VisionMeasurement::new(i as f64 * 0.05, coords),
+                    &t_wc,
+                    None,
+                    None,
+                );
+            }
+        };
+
+        // Control: classical delayed birth cannot birth without parallax.
+        let mut f_delayed = Sparse3DFilter::bearing_invdepth3d(k(), cam.clone(), settings());
+        stationary(&mut f_delayed);
+        assert!(
+            f_delayed.feature(42).is_none(),
+            "delayed triangulated birth must stay pending at zero parallax"
+        );
+
+        // Civera: births on first sight at the prior depth.
+        let d0 = 5.0;
+        let mut st = settings();
+        st.civera_birth_depth = d0;
+        st.civera_rho_sigma_frac = 0.5;
+        let mut f_civera = Sparse3DFilter::bearing_invdepth3d(k(), cam, st);
+        stationary(&mut f_civera);
+        let feat = f_civera
+            .feature(42)
+            .expect("civera birth must succeed with no parallax");
+
+        // Born at the prior depth, not at a triangulated one.
+        let rho0 = 1.0 / d0;
+        assert!(
+            (feat.inv_s[2] - rho0).abs() < 1e-9,
+            "born rho {} != prior rho {rho0}",
+            feat.inv_s[2]
+        );
+        // sigma_rho = rho0/2 => rho0 - 2*sigma_rho = 0 => depth band reaches infinity.
+        let sigma_rho = feat.inv_p[(2, 2)].sqrt();
+        assert!(
+            (rho0 - 2.0 * sigma_rho).abs() < 1e-9,
+            "2-sigma band must reach rho=0 (infinity); rho0 {rho0} sigma {sigma_rho}"
+        );
+    }
+
+    /// Re-anchoring is a change of PARAMETRIZATION: the world point must not move, and
+    /// the uncertainty must be conserved (not silently dropped when eta is reset to 0).
+    #[test]
+    fn reanchor_preserves_the_world_point_and_conserves_uncertainty() {
+        use crate::mathematical::camera::{CameraModel, PinholeModel};
+        use approx::assert_relative_eq;
+        use std::sync::Arc;
+
+        let cam: Arc<dyn CameraModel> = Arc::new(PinholeModel {
+            fx: 458.0,
+            fy: 458.0,
+            cx: 376.0,
+            cy: 240.0,
+        });
+        let point_w = Vector3::new(0.5, 0.1, 4.0);
+        let mut f = Sparse3DFilter::bearing_invdepth3d(k(), cam, settings());
+        for i in 0..20 {
+            update_with_point(&mut f, i, point_w);
+        }
+
+        let feat = f.feature(42).expect("track").clone();
+        // World point implied by the CURRENT anchor parametrization.
+        let (p_a, _) = bearing_chart::point_and_jacobian(
+            &feat.anchor_ray,
+            &feat.tangent_basis,
+            &Vector2::new(feat.inv_s[0], feat.inv_s[1]),
+            feat.inv_s[2],
+        );
+        let r_a = feat.anchor_t_wc.fixed_view::<3, 3>(0, 0).into_owned();
+        let t_a = feat.anchor_t_wc.fixed_view::<3, 1>(0, 3).into_owned();
+        let p_w_before = r_a * p_a + t_a;
+
+        // Re-anchor onto a DIFFERENT pose (the one 5 steps later).
+        let t_wc_new = pose(25.0 * 0.05);
+        assert!(f.reanchor_feature(42, &t_wc_new, Some(7), None));
+
+        let feat2 = f.feature(42).expect("track after reanchor");
+        assert_eq!(feat2.anchor_clone_id, Some(7));
+        // eta is reset to zero by construction: the new anchor ray IS the bearing.
+        assert_relative_eq!(feat2.inv_s[0], 0.0, epsilon = 1e-12);
+        assert_relative_eq!(feat2.inv_s[1], 0.0, epsilon = 1e-12);
+
+        let (p_a2, _) = bearing_chart::point_and_jacobian(
+            &feat2.anchor_ray,
+            &feat2.tangent_basis,
+            &Vector2::zeros(),
+            feat2.inv_s[2],
+        );
+        let r_a2 = feat2.anchor_t_wc.fixed_view::<3, 3>(0, 0).into_owned();
+        let t_a2 = feat2.anchor_t_wc.fixed_view::<3, 1>(0, 3).into_owned();
+        let p_w_after = r_a2 * p_a2 + t_a2;
+
+        // THE point: same world point, different parametrization.
+        assert_relative_eq!(p_w_before, p_w_after, epsilon = 1e-9);
+
+        // Uncertainty must survive the eta reset. Compare the EUCLIDEAN covariance in
+        // the world frame, which is parametrization-independent; resetting eta to 0
+        // without mapping its variance through would shrink this.
+        let euc = |ft: &FeatureState3D| {
+            let (_, j) = bearing_chart::point_and_jacobian(
+                &ft.anchor_ray,
+                &ft.tangent_basis,
+                &Vector2::new(ft.inv_s[0], ft.inv_s[1]),
+                ft.inv_s[2],
+            );
+            let r = ft.anchor_t_wc.fixed_view::<3, 3>(0, 0).into_owned();
+            r * (j * ft.inv_p * j.transpose()) * r.transpose()
+        };
+        let c_before = euc(&feat);
+        let c_after = euc(feat2);
+        assert_relative_eq!(c_before, c_after, epsilon = 1e-9);
+    }
+
+    /// `pose_range_direct` must make the ACCUMULATED range variance equal the pose-range
+    /// function evaluated at the current separation -- so it inherits the true
+    /// relative-pose growth EXPONENT. The legacy increment path cannot: with a gain that
+    /// changes as the baseline grows, a sum of gain-weighted increments is not the
+    /// gain-weighted total (`G dS` vs `d(G S)`), and no scalar repairs a slope.
+    #[test]
+    fn pose_range_direct_accumulates_to_the_current_relative_covariance() {
+        let r2 = 400.0; // r = 20 m
+        // Relative covariance grows BALLISTICALLY (~k^2), as measured for real VIO.
+        let sig = |k: f64| Matrix3::identity() * (1e-4 * k * k);
+        // Baseline grows with the window, so the inverse-parallax gain CHANGES.
+        let b2 = |k: f64| (0.3 * k).powi(2).max(1e-4 * r2);
+
+        let mut st = settings();
+        st.pose_range_direct = true;
+        st.pose_range_scale = 1.0; // must be IGNORED in direct mode
+
+        let mut f_direct = feature(1);
+        let mut acc_direct = 0.0;
+        for k in 1..=20 {
+            let kf = k as f64;
+            let full = sig(kf);
+            let inc = sig(kf) - sig(kf - 1.0);
+            acc_direct += pose_range_q(
+                &st,
+                &mut f_direct,
+                r2,
+                b2(kf),
+                Some(&full),
+                Some(&full),
+                Some(&inc),
+                Some(&inc),
+            );
+        }
+        // Contract: the accumulated total IS f at the final separation.
+        let kf = 20.0;
+        let s_end = sig(kf);
+        let f_end = (r2 / b2(kf)) * (r2 * s_end.trace() / 3.0 + s_end.trace() / 3.0);
+        assert!(
+            (acc_direct - f_end).abs() / f_end < 1e-9,
+            "direct accumulation {acc_direct} should equal f_end {f_end}"
+        );
+
+        // The legacy path, fed the same increments, lands somewhere else entirely.
+        let mut st_legacy = settings();
+        st_legacy.pose_range_direct = false;
+        st_legacy.pose_range_scale = 1.0;
+        let mut f_leg = feature(2);
+        let mut acc_legacy = 0.0;
+        for k in 1..=20 {
+            let kf = k as f64;
+            let full = sig(kf);
+            let inc = sig(kf) - sig(kf - 1.0);
+            acc_legacy += pose_range_q(
+                &st_legacy,
+                &mut f_leg,
+                r2,
+                b2(kf),
+                Some(&full),
+                Some(&full),
+                Some(&inc),
+                Some(&inc),
+            );
+        }
+        assert!(
+            (acc_legacy - f_end).abs() / f_end > 0.1,
+            "legacy {acc_legacy} vs f_end {f_end}: the two paths must differ materially, \
+             otherwise this test proves nothing"
+        );
+
+        // Direct mode must not respond to pose_range_scale at all.
+        let mut st2 = st;
+        st2.pose_range_scale = 37.0;
+        let mut f2 = feature(3);
+        let mut acc2 = 0.0;
+        for k in 1..=20 {
+            let kf = k as f64;
+            let full = sig(kf);
+            acc2 += pose_range_q(
+                &st2,
+                &mut f2,
+                r2,
+                b2(kf),
+                Some(&full),
+                Some(&full),
+                None,
+                None,
+            );
+        }
+        assert!(
+            (acc2 - acc_direct).abs() / acc_direct < 1e-12,
+            "direct mode must be free of pose_range_scale"
+        );
+    }
+
+    /// The scale term must (a) be multiplicative in range, (b) reach what the filter
+    /// REPORTS, and (c) NOT touch the convergence gates or the filter's own estimate --
+    /// a common-mode systematic bias cannot be fixed by making the recursion less
+    /// confident, only by reporting it.
+    #[test]
+    fn scale_sigma_inflates_reported_range_quadratically_and_leaves_the_estimate_alone() {
+        use crate::mathematical::camera::{CameraModel, PinholeModel};
+        use std::sync::Arc;
+
+        let cam: Arc<dyn CameraModel> = Arc::new(PinholeModel {
+            fx: 458.0,
+            fy: 458.0,
+            cx: 376.0,
+            cy: 240.0,
+        });
+        let point_w = Vector3::new(0.5, 0.1, 4.0);
+
+        let run = |sigma_s: f64| {
+            let mut st = settings();
+            st.scale_sigma = sigma_s;
+            st.min_track_length = 3;
+            let mut f = Sparse3DFilter::bearing_invdepth3d(k(), cam.clone(), st);
+            for i in 0..20 {
+                update_with_point(&mut f, i, point_w);
+            }
+            let (r, var) = f.query_range(42);
+            let p = f.feature(42).expect("track").position;
+            (r, var, p)
+        };
+
+        let (r0, v0, p0) = run(0.0);
+        assert!(
+            r0 > 0.0,
+            "baseline must converge for the test to mean anything"
+        );
+        let s = 0.10;
+        let (r1, v1, p1) = run(s);
+
+        // (c) the ESTIMATE is untouched -- reporting-only.
+        assert!(
+            (r1 - r0).abs() < 1e-12,
+            "range estimate changed: {r0} vs {r1}"
+        );
+        assert!((p1 - p0).norm() < 1e-12, "position estimate changed");
+
+        // (a)+(b) reported variance grows by exactly (sigma_s * r)^2.
+        let expected = v0 + (s * r0).powi(2);
+        assert!(
+            (v1 - expected).abs() / expected < 1e-12,
+            "reported var {v1} != baseline {v0} + (s*r)^2 {expected}"
+        );
+        // Multiplicative: doubling sigma_s quadruples the ADDED part.
+        let (_, v2, _) = run(2.0 * s);
+        let added1 = v1 - v0;
+        let added2 = v2 - v0;
+        assert!(
+            (added2 / added1 - 4.0).abs() < 1e-9,
+            "added variance should scale as sigma_s^2; got ratio {}",
+            added2 / added1
+        );
+    }
+
+    /// The fitted envelope, pinned at the anchors the fit was made on.
+    #[test]
+    fn sigma_s_envelope_matches_the_fitted_map_and_floors_at_two_percent() {
+        // Values computed directly from the fitted map. (The recorded per-trajectory
+        // numbers 0.396 / 0.131 / 0.030 / 0.039 are sigma_s OUTPUTS, not E inputs --
+        // they correspond to E = 0.0035 / 0.0168 / 0.134 / 0.0926.)
+        assert!((sigma_s_from_excitation(0.01) - 0.18938).abs() < 1e-4);
+        assert!((sigma_s_from_excitation(0.1) - 0.036926).abs() < 1e-5);
+        // A low-excitation trajectory must be told its scale is badly known.
+        assert!(sigma_s_from_excitation(0.0035) > 0.35);
+        // Monotone decreasing in E.
+        assert!(sigma_s_from_excitation(0.0001) > sigma_s_from_excitation(0.01));
+        assert!(sigma_s_from_excitation(0.01) > sigma_s_from_excitation(0.04));
+        // Floor: no monocular system knows scale better than 2%.
+        assert!((sigma_s_from_excitation(1e6) - 0.02).abs() < 1e-12);
+        // Degenerate input falls back to the floor rather than exploding.
+        assert!((sigma_s_from_excitation(0.0) - 0.02).abs() < 1e-12);
+        assert!((sigma_s_from_excitation(f64::NAN) - 0.02).abs() < 1e-12);
+    }
+
+    /// Birth refuses a range outside [min_depth, max_depth]; REPORTING must refuse it
+    /// too. A landmark born just inside the cap can drift far beyond it, and the far
+    /// field is where the covariance model is least trustworthy -- so reporting a range
+    /// the filter would not have birthed is an inconsistency, not extra capability.
+    #[test]
+    fn query_range_refuses_what_birth_would_have_refused() {
+        use crate::mathematical::camera::{CameraModel, PinholeModel};
+        use std::sync::Arc;
+
+        let cam: Arc<dyn CameraModel> = Arc::new(PinholeModel {
+            fx: 458.0,
+            fy: 458.0,
+            cx: 376.0,
+            cy: 240.0,
+        });
+        let point_w = Vector3::new(0.5, 0.1, 4.0);
+        let mut st = settings();
+        st.min_track_length = 3;
+        st.max_depth = 100.0;
+        let mut f = Sparse3DFilter::bearing_invdepth3d(k(), cam, st);
+        for i in 0..20 {
+            update_with_point(&mut f, i, point_w);
+        }
+        let (r, _) = f.query_range(42);
+        assert!(
+            r > 0.0,
+            "a ~4 m landmark must be reportable under a 100 m cap"
+        );
+
+        // Drive the stored range past the cap and confirm it is withheld.
+        let slot = *f.feature_slots.get(&42).expect("slot");
+        let p = f.features[slot].position;
+        f.features[slot].position = p * (200.0 / p.norm()); // 200 m, beyond max_depth
+        let (r2, v2) = f.query_range(42);
+        assert!(
+            r2 < 0.0 && !v2.is_finite(),
+            "range beyond max_depth must report unusable, got ({r2}, {v2})"
+        );
+
+        // ... and below min_depth likewise.
+        f.features[slot].position = p * (0.01 / p.norm());
+        let (r3, _) = f.query_range(42);
+        assert!(
+            r3 < 0.0,
+            "range below min_depth must report unusable, got {r3}"
+        );
+    }
+
+    /// The convergence gate must be SCALE-FREE. The absolute form fails two ways that
+    /// the relative form does not: it rejects a perfectly-conditioned far landmark, and
+    /// it has to be re-tuned whenever the covariance model changes.
+    #[test]
+    fn relative_convergence_gate_is_scale_free_where_the_absolute_one_is_not() {
+        let mut abs_st = settings();
+        abs_st.conv_variance_threshold = 2.0; // the shipped value, in m^2
+        abs_st.conv_range_sigma_frac = 0.0; // legacy path
+        let mut rel_st = settings();
+        rel_st.conv_range_sigma_frac = 0.5; // 2-sigma band reaches infinity
+
+        // A landmark known to 10% relative. Equally well conditioned at every range.
+        for r in [5.0_f64, 50.0, 500.0] {
+            let var = (0.10 * r).powi(2);
+            assert!(
+                !unconverged(&rel_st, r, var),
+                "relative gate must accept a 10%-known landmark at r = {r}"
+            );
+        }
+        // The absolute gate accepts it up close and REJECTS it far away -- same quality.
+        assert!(!unconverged(&abs_st, 5.0, (0.10 * 5.0f64).powi(2)));
+        assert!(
+            unconverged(&abs_st, 500.0, (0.10 * 500.0f64).powi(2)),
+            "this is the defect: absolute gate rejects a 10%-known landmark at 500 m"
+        );
+
+        // The relative gate still rejects genuinely useless depth (2-sigma to infinity).
+        assert!(unconverged(&rel_st, 50.0, (0.60 * 50.0f64).powi(2)));
+        assert!(!unconverged(&rel_st, 50.0, (0.40 * 50.0f64).powi(2)));
+
+        // Honest-covariance regression: sigma_r 3-7 m at ~50 m range is 6-14% relative,
+        // which the shipped absolute 2.0 m^2 rejects outright -- the bug that silently
+        // emptied query_range.
+        let honest_var = 5.0_f64.powi(2);
+        assert!(
+            unconverged(&abs_st, 50.0, honest_var),
+            "pins the old failure"
+        );
+        assert!(
+            !unconverged(&rel_st, 50.0, honest_var),
+            "relative form accepts it"
+        );
+    }
+
     fn feature(fid: u64) -> FeatureState3D {
         FeatureState3D {
             feat_id: fid,
@@ -1930,6 +2602,7 @@ mod tests {
             bias: Vector2::zeros(),
             p_sb: Matrix3x2::zeros(),
             p_bb: Matrix2::zeros(),
+            pose_q_prev: 0.0,
             anchor_clone_id: None,
         }
     }

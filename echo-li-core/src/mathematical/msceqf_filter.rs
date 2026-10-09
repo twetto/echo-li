@@ -29,7 +29,9 @@
 
 use echo_lie::base::LieGroup;
 use echo_lie::{SE3, SE23, SO3, SOT3, SemiDirectBias};
-use nalgebra::{DMatrix, DVector, Matrix3, SMatrix, SVector, Vector2, Vector3, Vector4, Vector6};
+use nalgebra::{
+    DMatrix, DVector, Matrix3, Matrix6, SMatrix, SVector, Vector2, Vector3, Vector4, Vector6,
+};
 
 use crate::coordinate_suite::invdepth::{conv_euc2ind, conv_ind2euc};
 use crate::mathematical::camera::CameraModel;
@@ -264,7 +266,6 @@ impl MSCEqFFilter {
     pub fn dim(&self) -> usize {
         self.landmark_base() + LM_DOF * self.x.landmarks.len()
     }
-
 
     /// Covariance index of the clone at position `i` (0 = oldest).
     pub fn clone_idx(&self, i: usize) -> usize {
@@ -1440,8 +1441,7 @@ impl MSCEqFFilter {
         let c = conv_euc2ind(&f_a);
         let y0 = bearing;
         let sig_t = depth_prior * pixel_std;
-        let p_euc_t =
-            (sig_t * sig_t) * (Matrix3::identity() - y0 * y0.transpose());
+        let p_euc_t = (sig_t * sig_t) * (Matrix3::identity() - y0 * y0.transpose());
         let p_mapped = c * p_euc_t * c.transpose();
 
         let mut p_ll = SMatrix::<f64, LM_DOF, LM_DOF>::zeros();
@@ -1463,6 +1463,104 @@ impl MSCEqFFilter {
             origin: f_a,
         };
         Some(self.insert_landmark(lm, &p_ll, None))
+    }
+
+    /// Current camera pose `T_wc = T_wb · S`, from the filter's own `phi()`.
+    pub fn camera_pose(&self) -> SE3 {
+        let nav = self.phi();
+        SE3::new(nav.t.rotation.clone(), nav.t.position).compose(&nav.s)
+    }
+
+    /// Anchor->current RELATIVE camera-pose covariance, between two CLONES.
+    ///
+    /// This is the quantity Sparse3D consumes (EqVIO sibling:
+    /// `sparse_relative_pose_covariance`), but the construction differs and the reason
+    /// is structural. EqVIO builds the current camera pose from its core state via a
+    /// 6x21 Jacobian. That is IMPOSSIBLE here: `phi()` gives `t = T0.D` and
+    /// `s = C(D)^-1.S0.E`, so `D` cancels exactly in `SE3(t).s` and the camera pose is
+    /// INVARIANT to the whole 15-dim navigation direction (verified by finite
+    /// difference: perturbing Dd position by 0.5 moves the body pose +0.5 and the
+    /// extrinsics -0.5, leaving the camera pose bit-identical). In an MSCKF the current
+    /// camera pose IS a clone, so both ends live in the clone tail and no Jacobian is
+    /// needed:
+    ///
+    /// ```text
+    /// Cov_rel = A Sig_aa A^T + Sig_cc - A Sig_ac^T - Sig_ac A^T,  A = Ad_{T_rel^-1}
+    /// T_rel   = T_anchor^-1 . T_current
+    /// ```
+    ///
+    /// The cross term `Sig_ac` is the point: it cancels the gauge the two clones share,
+    /// which neither marginal can. Returns `(p_vv, p_ww)` (translation, rotation) to
+    /// match the binding Sparse3D already calls.
+    pub fn relative_pose_covariance(
+        &self,
+        anchor_pos: usize,
+        current_pos: usize,
+    ) -> Option<(Matrix3<f64>, Matrix3<f64>)> {
+        let n = self.x.clones.len();
+        if anchor_pos >= n || current_pos >= n {
+            return None;
+        }
+        let ai = self.clone_idx(anchor_pos);
+        let ci = self.clone_idx(current_pos);
+        let sig_aa = self.cov.fixed_view::<6, 6>(ai, ai).into_owned();
+        let sig_cc = self.cov.fixed_view::<6, 6>(ci, ci).into_owned();
+        let sig_ac = self.cov.fixed_view::<6, 6>(ai, ci).into_owned();
+
+        let t_a = &self.x.clones[anchor_pos].pose;
+        let t_c = &self.x.clones[current_pos].pose;
+        let t_rel = t_a.inverse().compose(t_c);
+        let a = t_rel.inverse().adjoint();
+
+        // delta_rel = delta_c - A delta_a  with  A = Ad_{T_rel^-1}, so
+        //   Cov = Sig_cc + A Sig_aa A' - Sig_ac' A' - A Sig_ac.
+        // NOTE the SIDE of A on the cross terms. Writing `A Sig_ac' + Sig_ac A'` instead
+        // is also symmetric -- so it survives both the symmetrization below and any test
+        // that only checks symmetry -- but it is a DIFFERENT matrix unless A commutes with
+        // Sig_ac, and it was wrong by ~43% against a Monte-Carlo reference.
+        let mut cov =
+            a * sig_aa * a.transpose() + sig_cc - sig_ac.transpose() * a.transpose() - a * sig_ac;
+        cov = 0.5 * (cov + cov.transpose());
+        if !cov.iter().all(|v| v.is_finite()) {
+            return None;
+        }
+        // echo-lie SE3 tangent order is [rot(0:3), trans(3:6)].
+        let p_ww = cov.fixed_view::<3, 3>(0, 0).into_owned();
+        let p_vv = cov.fixed_view::<3, 3>(3, 3).into_owned();
+        Some((p_vv, p_ww))
+    }
+
+    /// The FULL 6x6 anchor->current relative-pose covariance, tangent order
+    /// `[rot(0:3), trans(3:6)]`. [`Self::relative_pose_covariance`] returns only the two
+    /// diagonal blocks; consumers that combine rotation and translation contributions
+    /// (e.g. a range-variance sensitivity) need the off-diagonal `Sigma_{phi,t}` too,
+    /// because adding the two in quadrature assumes an independence that the filter does
+    /// not have. Same construction, nothing dropped.
+    pub fn relative_pose_covariance_full(
+        &self,
+        anchor_pos: usize,
+        current_pos: usize,
+    ) -> Option<Matrix6<f64>> {
+        let n = self.x.clones.len();
+        if anchor_pos >= n || current_pos >= n {
+            return None;
+        }
+        let ai = self.clone_idx(anchor_pos);
+        let ci = self.clone_idx(current_pos);
+        let sig_aa = self.cov.fixed_view::<6, 6>(ai, ai).into_owned();
+        let sig_cc = self.cov.fixed_view::<6, 6>(ci, ci).into_owned();
+        let sig_ac = self.cov.fixed_view::<6, 6>(ai, ci).into_owned();
+        let t_a = &self.x.clones[anchor_pos].pose;
+        let t_c = &self.x.clones[current_pos].pose;
+        let t_rel = t_a.inverse().compose(t_c);
+        let a = t_rel.inverse().adjoint();
+        let mut cov =
+            a * sig_aa * a.transpose() + sig_cc - sig_ac.transpose() * a.transpose() - a * sig_ac;
+        cov = 0.5 * (cov + cov.transpose());
+        if !cov.iter().all(|v| v.is_finite()) {
+            return None;
+        }
+        Some(cov)
     }
 
     /// In-state (SLAM) landmark measurement update — the equivariant analog of
@@ -1908,7 +2006,9 @@ impl MSCEqFFilter {
         // Write back the L rows, the L columns (= rcᵀ by symmetry) and the corner.
         // (O,O) is untouched; symmetrize only the tiny 3×3 corner (float hygiene).
         self.cov.view_mut((li, 0), (3, dim)).copy_from(&rc);
-        self.cov.view_mut((0, li), (dim, 3)).copy_from(&rc.transpose());
+        self.cov
+            .view_mut((0, li), (dim, 3))
+            .copy_from(&rc.transpose());
         let cll_sym = (&cll + cll.transpose()) * 0.5;
         self.cov.view_mut((li, li), (3, 3)).copy_from(&cll_sym);
 
@@ -2403,7 +2503,10 @@ mod tests {
         let li = f.landmark_idx(j);
         let rho0 = 1.0 / d0;
         let sig_rho = f.cov[(li + 2, li + 2)].sqrt();
-        assert!((sig_rho - rho0).abs() < 1e-12, "σ_ρ {sig_rho} must equal ρ₀ {rho0}");
+        assert!(
+            (sig_rho - rho0).abs() < 1e-12,
+            "σ_ρ {sig_rho} must equal ρ₀ {rho0}"
+        );
 
         let lm = &f.x.landmarks[j];
         for rel in [0.5_f64, 1.0, 3.0] {
@@ -2427,6 +2530,146 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn camera_pose_is_invariant_to_the_navigation_direction() {
+        // STRUCTURAL: phi() gives t = T0.D and s = C(D)^-1.S0.E, so D cancels in
+        // SE3(t).s. This is why EqVIO's 6x21 camera-pose Jacobian has no analogue here
+        // and the relative covariance must be built clone-to-clone. Pinning it so the
+        // next person does not port that Jacobian and get a silently mis-transported
+        // covariance (which reads downstream as mere miscalibration, not as a bug).
+        let (f, _t, _x) = scene_filter();
+        let base = f.camera_pose();
+        for i in 0..DD_DOF {
+            let mut g = f.clone();
+            let mut dv = DVector::<f64>::zeros(f.dim());
+            dv[i] = 0.3;
+            g.apply_left_increment(&dv);
+            let d = g.camera_pose().compose(&base.inverse()).log().norm();
+            assert!(d < 1e-9, "camera pose moved {d} along nav direction {i}");
+        }
+        // ...while the EXTRINSICS direction does move it.
+        let mut g = f.clone();
+        let mut dv = DVector::<f64>::zeros(f.dim());
+        dv[E_IDX + 3] = 0.3;
+        g.apply_left_increment(&dv);
+        assert!(g.camera_pose().compose(&base.inverse()).log().norm() > 1e-3);
+    }
+
+    /// The cross-covariance terms of the anchor->current relative pose must carry the
+    /// adjoint on the CORRECT side. `A Sig_ac' + Sig_ac A'` is symmetric and "looks right",
+    /// so symmetry tests pass while the value is wrong -- this checks the VALUE, against a
+    /// deterministic reference built from the definition delta_rel = delta_c - A delta_a.
+    #[test]
+    fn relative_pose_covariance_matches_the_propagated_definition() {
+        use nalgebra::{Matrix6, Vector6};
+
+        // A joint covariance over (delta_a, delta_c) with genuinely non-symmetric
+        // cross-correlation -- if Sig_ac were symmetric the bug would be invisible.
+        let mut joint = nalgebra::SMatrix::<f64, 12, 12>::zeros();
+        for i in 0..12 {
+            for j in 0..12 {
+                joint[(i, j)] = 0.35_f64.powi((i as i32 - j as i32).abs())
+                    * (1.0 + 0.11 * ((i * 7 + j * 3) % 5) as f64);
+            }
+        }
+        let joint = 0.5 * (joint + joint.transpose())
+            + Matrix6::<f64>::identity().kronecker(&nalgebra::Matrix2::identity()) * 0.0;
+        let joint = joint + nalgebra::SMatrix::<f64, 12, 12>::identity() * 0.5;
+
+        let sig_aa = joint.fixed_view::<6, 6>(0, 0).into_owned();
+        let sig_cc = joint.fixed_view::<6, 6>(6, 6).into_owned();
+        let sig_ac = joint.fixed_view::<6, 6>(0, 6).into_owned();
+
+        // An adjoint that does NOT commute with sig_ac.
+        let t_rel = SE3::new(
+            SO3::exp(&Vector3::new(0.3, -0.2, 0.45)),
+            Vector3::new(1.5, -0.7, 2.1),
+        );
+        let a = t_rel.inverse().adjoint();
+
+        // Reference: propagate the definition through the 6x12 Jacobian [-A | I].
+        let mut jac = nalgebra::SMatrix::<f64, 6, 12>::zeros();
+        jac.fixed_view_mut::<6, 6>(0, 0).copy_from(&(-a));
+        jac.fixed_view_mut::<6, 6>(0, 6)
+            .copy_from(&Matrix6::<f64>::identity());
+        let reference = jac * joint * jac.transpose();
+
+        let got =
+            a * sig_aa * a.transpose() + sig_cc - sig_ac.transpose() * a.transpose() - a * sig_ac;
+
+        let err = (got - reference).norm() / reference.norm();
+        assert!(
+            err < 1e-12,
+            "relative-pose covariance mismatch, rel err {err:e}"
+        );
+
+        // And pin that the WRONG side is materially different, so this test has teeth.
+        let wrong =
+            a * sig_aa * a.transpose() + sig_cc - a * sig_ac.transpose() - sig_ac * a.transpose();
+        let wrong_err = (wrong - reference).norm() / reference.norm();
+        assert!(
+            wrong_err > 1e-3,
+            "adjoint-on-wrong-side should be materially different; got {wrong_err:e}"
+        );
+        let _ = Vector6::<f64>::zeros();
+    }
+
+    #[test]
+    fn relative_pose_covariance_is_symmetric_and_cross_term_tightens() {
+        let (f, _t, _x) = scene_filter();
+        let n = f.x.clones.len();
+        assert!(n >= 2);
+        let (p_vv, p_ww) = f.relative_pose_covariance(0, n - 1).expect("live clones");
+        for m in [&p_vv, &p_ww] {
+            assert!(m.iter().all(|v| v.is_finite()));
+            assert!((m - m.transpose()).abs().max() < 1e-12);
+            assert!(m[(0, 0)] >= -1e-12 && m[(1, 1)] >= -1e-12 && m[(2, 2)] >= -1e-12);
+        }
+        // Self-relative (anchor == current) must be ~0: T_rel = I so A = I and the
+        // formula collapses to Sig + Sig - 2 Sig = 0. This is the gauge cancellation
+        // in its purest form and it is what a per-pose marginal CANNOT do.
+        let (s_vv, s_ww) = f.relative_pose_covariance(n - 1, n - 1).unwrap();
+        let tr = |m: &Matrix3<f64>| m[(0, 0)] + m[(1, 1)] + m[(2, 2)];
+        assert!(
+            tr(&s_vv).abs() < 1e-12 && tr(&s_ww).abs() < 1e-12,
+            "self-relative must vanish, got {} / {}",
+            tr(&s_vv),
+            tr(&s_ww)
+        );
+
+        // With Sig_ac = 0 the formula must reduce EXACTLY to A Sig_aa A^T + Sig_cc.
+        // (Do NOT assert that injecting a positive-diagonal Sig_ac "tightens": A mixes
+        // rotation into translation, so the sign of its effect on the translation
+        // trace is a property of A, not an invariant of the code.)
+        let mut g = f.clone();
+        let (ai, ci) = (g.clone_idx(0), g.clone_idx(n - 1));
+        for r in 0..6 {
+            for c in 0..6 {
+                g.cov[(ai + r, ci + c)] = 0.0;
+                g.cov[(ci + c, ai + r)] = 0.0;
+            }
+        }
+        let (z_vv, z_ww) = g.relative_pose_covariance(0, n - 1).unwrap();
+        let t_rel = g.x.clones[0]
+            .pose
+            .inverse()
+            .compose(&g.x.clones[n - 1].pose);
+        let a = t_rel.inverse().adjoint();
+        let sig_aa = g.cov.fixed_view::<6, 6>(ai, ai).into_owned();
+        let sig_cc = g.cov.fixed_view::<6, 6>(ci, ci).into_owned();
+        let expect = a * sig_aa * a.transpose() + sig_cc;
+        assert!((z_ww - expect.fixed_view::<3, 3>(0, 0)).abs().max() < 1e-12);
+        assert!((z_vv - expect.fixed_view::<3, 3>(3, 3)).abs().max() < 1e-12);
+        // ...and dropping the cross term must make it NO TIGHTER than with it kept,
+        // i.e. the cross term carries real information in at least one channel.
+        assert!(
+            tr(&z_vv) + tr(&z_ww) >= tr(&p_vv) + tr(&p_ww) - 1e-9,
+            "zeroing the cross-cov should not tighten the relative cov"
+        );
+
+        assert!(f.relative_pose_covariance(0, n + 3).is_none());
     }
 
     #[test]
@@ -2564,7 +2807,9 @@ mod tests {
         // mean and covariance untouched.
         let (mut f, mut track, _x_f) = scene_filter();
         let cam = norm_cam();
-        let j = f.birth_landmark(&track, &cam, 1e-3, 1.0, None).expect("birth");
+        let j = f
+            .birth_landmark(&track, &cam, 1e-3, 1.0, None)
+            .expect("birth");
         let pt_before = f.x.landmarks[j].point();
         let tr_before = f.cov.trace();
 
@@ -2593,7 +2838,9 @@ mod tests {
         // the estimate toward truth; a flipped sign pushes it away.
         let (mut f, track, x_f) = scene_filter();
         let cam = norm_cam();
-        let j = f.birth_landmark(&track, &cam, 1e-3, 1.0, None).expect("birth");
+        let j = f
+            .birth_landmark(&track, &cam, 1e-3, 1.0, None)
+            .expect("birth");
         assert_eq!(f.x.landmarks[j].anchor, f.x.clones[0].stamp);
 
         let origin = f.x.landmarks[j].origin;
@@ -2641,7 +2888,9 @@ mod tests {
     fn landmark_stream_update_ignores_anchor_only_and_rejects_outlier() {
         let (mut f, mut track, _x_f) = scene_filter();
         let cam = norm_cam();
-        let j = f.birth_landmark(&track, &cam, 1e-3, 1.0, None).expect("birth");
+        let j = f
+            .birth_landmark(&track, &cam, 1e-3, 1.0, None)
+            .expect("birth");
         let pt_before = f.x.landmarks[j].point();
         let tr_before = f.cov.trace();
 
@@ -2689,7 +2938,9 @@ mod tests {
         // still pulls the estimate toward truth.
         let (mut f, track, x_f) = scene_filter();
         let cam = norm_cam();
-        let j = f.birth_landmark(&track, &cam, 1e-3, 1.0, None).expect("birth");
+        let j = f
+            .birth_landmark(&track, &cam, 1e-3, 1.0, None)
+            .expect("birth");
         assert_eq!(
             f.x.landmarks[j].anchor, f.x.clones[0].stamp,
             "born on clone 0"
@@ -2774,7 +3025,9 @@ mod tests {
         // from the equivariant change-of-variables it replaces.
         let (mut f, track, _x_f) = scene_filter();
         let cam = norm_cam();
-        let j = f.birth_landmark(&track, &cam, 1e-3, 1.0, None).expect("birth");
+        let j = f
+            .birth_landmark(&track, &cam, 1e-3, 1.0, None)
+            .expect("birth");
         let (old_pos, new_pos) = (0usize, 2usize);
 
         // Reconstruct Φ exactly as reanchor_landmark builds its blocks.
@@ -2825,7 +3078,8 @@ mod tests {
         // must stay symmetric/finite with the state dim unchanged.
         let (mut f, track, _x_f) = scene_filter();
         let cam = norm_cam();
-        f.birth_landmark(&track, &cam, 1e-3, 1.0, None).expect("births");
+        f.birth_landmark(&track, &cam, 1e-3, 1.0, None)
+            .expect("births");
         let li = f.landmark_idx(0);
         let lm_diag_before = f.cov.view((li, li), (LM_DOF, LM_DOF)).into_owned();
         let dim_before = f.dim();

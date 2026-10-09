@@ -179,12 +179,6 @@ impl PyMSCEqFNativeFilter {
         self.filter.stereo_baseline
     }
 
-
-
-
-
-
-
     /// Propagate one IMU step (covariance then mean). `gyro`/`accel` are body-frame.
     fn process_imu(
         &mut self,
@@ -351,12 +345,10 @@ impl PyMSCEqFNativeFilter {
             return false;
         }
         let track = MscTrack { obs };
-        match self.filter.birth_landmark_civera(
-            &track,
-            pixel_std,
-            depth_prior,
-            inv_depth_rel_std,
-        ) {
+        match self
+            .filter
+            .birth_landmark_civera(&track, pixel_std, depth_prior, inv_depth_rel_std)
+        {
             Some(j) => {
                 debug_assert_eq!(j, self.landmark_ids.len(), "birth appends at tail");
                 self.landmark_ids.push(track_id);
@@ -590,11 +582,92 @@ impl PyMSCEqFNativeFilter {
         PyArray2::from_array(py, &m)
     }
 
+    /// Anchor->current RELATIVE camera-pose covariance between two clones, as
+    /// `(p_vv, p_ww)` 3x3 each (translation, rotation) — the quantity Sparse3D
+    /// consumes. Mirrors EqVIO's `get_relative_pose_covariance`, but takes TWO clone
+    /// ids instead of a clone id plus a pose matrix: in this filter the current camera
+    /// pose IS a clone, and `phi()`'s camera pose is structurally invariant to the
+    /// navigation state (D cancels between `t = T0.D` and `s = C(D)^-1.S0.E`), so
+    /// there is no core-state Jacobian to build it from. Returns None if either id is
+    /// not a live clone.
+    #[pyo3(signature = (anchor_clone_id, current_clone_id))]
+    fn relative_pose_covariance<'py>(
+        &self,
+        py: Python<'py>,
+        anchor_clone_id: u64,
+        current_clone_id: u64,
+    ) -> Option<(Bound<'py, PyArray2<f64>>, Bound<'py, PyArray2<f64>>)> {
+        let a = self.clone_ids.iter().position(|&c| c == anchor_clone_id)?;
+        let c = self.clone_ids.iter().position(|&c| c == current_clone_id)?;
+        let (p_vv, p_ww) = self.filter.relative_pose_covariance(a, c)?;
+        let m3 = |m: &Matrix3<f64>| {
+            let d: Vec<f64> = (0..3)
+                .flat_map(|r| (0..3).map(move |cc| m[(r, cc)]))
+                .collect();
+            PyArray2::from_owned_array(py, Array2::from_shape_vec((3, 3), d).unwrap())
+        };
+        Some((m3(&p_vv), m3(&p_ww)))
+    }
+
+    /// The FULL 6x6 anchor->current relative-pose covariance, tangent order
+    /// [rot(0:3), trans(3:6)]. `relative_pose_covariance` drops the rotation-translation
+    /// cross-block; this keeps it, so a consumer can test whether combining the two
+    /// contributions in quadrature (which assumes independence) is justified.
+    fn relative_pose_covariance_full<'py>(
+        &self,
+        py: Python<'py>,
+        anchor_clone_id: u64,
+        current_clone_id: u64,
+    ) -> Option<Bound<'py, PyArray2<f64>>> {
+        let ai = self.clone_ids.iter().position(|&c| c == anchor_clone_id)?;
+        let ci = self.clone_ids.iter().position(|&c| c == current_clone_id)?;
+        let m = self.filter.relative_pose_covariance_full(ai, ci)?;
+        let mut arr = Array2::<f64>::zeros((6, 6));
+        for r in 0..6 {
+            for c in 0..6 {
+                arr[[r, c]] = m[(r, c)];
+            }
+        }
+        Some(PyArray2::from_array(py, &arr))
+    }
+
+    /// A clone's OWN 6x6 marginal as `(p_vv, p_ww)` (translation, rotation). The
+    /// current camera pose IS the newest clone here, so this is what stands in for
+    /// EqVIO's `get_camera_pose_covariance`.
+    #[pyo3(signature = (clone_id))]
+    fn clone_pose_covariance<'py>(
+        &self,
+        py: Python<'py>,
+        clone_id: u64,
+    ) -> Option<(Bound<'py, PyArray2<f64>>, Bound<'py, PyArray2<f64>>)> {
+        let pos = self.clone_ids.iter().position(|&c| c == clone_id)?;
+        let ci = self.filter.clone_idx(pos);
+        if ci + 6 > self.filter.dim() {
+            return None;
+        }
+        let blk = |r0: usize, c0: usize| {
+            let d: Vec<f64> = (0..3)
+                .flat_map(|r| (0..3).map(move |c| self.filter.cov[(r0 + r, c0 + c)]))
+                .collect();
+            PyArray2::from_owned_array(py, Array2::from_shape_vec((3, 3), d).unwrap())
+        };
+        // echo-lie SE3 tangent order [rot(0:3), trans(3:6)].
+        Some((blk(ci + 3, ci + 3), blk(ci, ci)))
+    }
+
+    /// Current camera pose `T_wc = T_wb . S` as a 4x4.
+    fn camera_pose<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
+        let m = self.filter.camera_pose().as_matrix();
+        let d: Vec<f64> = (0..4)
+            .flat_map(|r| (0..4).map(move |c| m[(r, c)]))
+            .collect();
+        PyArray2::from_owned_array(py, Array2::from_shape_vec((4, 4), d).unwrap())
+    }
+
     /// Total covariance dimension (`21 + 6*n_clones`).
     fn cov_dim(&self) -> usize {
         self.filter.dim()
     }
-
 
     /// DIAGNOSTIC: per-accepted-landmark-update nav-correction-vs-baseline log,
     /// as an (N, 9) array. Columns: `[baseline_m, range_m, yaw_inc,

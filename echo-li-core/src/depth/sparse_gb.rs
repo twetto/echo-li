@@ -65,6 +65,86 @@ pub struct SparseVogSettings {
     /// triangulated and anchored in the frame where it is born. Despite the historical
     /// name this never re-anchors an existing landmark: anchors are fixed at birth.
     pub birth_min_flow_px: f64,
+    /// Civera-style UNDELAYED inverse-depth birth (T-RO 2008 "Inverse Depth
+    /// Parametrization for Monocular SLAM"). When > 0, a feature is birthed on its
+    /// FIRST observation at depth `civera_birth_depth` with no parallax and no
+    /// two-view triangulation, instead of being held pending until it has moved
+    /// `birth_min_flow_px` and cleared the ray-angle gate.
+    ///
+    /// The point of the inverse-depth chart is that a Gaussian on rho represents
+    /// "somewhere between `civera_birth_depth`/2 and infinity" honestly, which a
+    /// Gaussian on depth cannot. Civera's proposed prior sets sigma_rho = rho0/2,
+    /// so rho0 - 2*sigma_rho = 0 -- the 95% band reaches all the way to infinity.
+    /// That reach is what makes undelayed birth safe: a distant feature is not
+    /// claimed to be near, it is claimed to be unknown-but-bounded-below.
+    ///
+    /// This is only representable because this chart is additive in rho. On a
+    /// multiplicative (log-depth) chart the band is [d0*e^-r, d0*e^+r], which can
+    /// never reach rho = 0, so the same prior does NOT transfer there.
+    ///
+    /// 0 disables (delayed triangulated birth, the historical behaviour).
+    /// Drive the range-direction process noise from the FULL anchor->current relative
+    /// pose covariance evaluated at the CURRENT separation, instead of accumulating
+    /// per-frame clipped increments.
+    ///
+    /// WHY. The shipped path adds `pose_range_scale * G_k * dSigma_k` each frame, where
+    /// `G_k = r^2/b^2` is the inverse-parallax gain and `dSigma_k` a clipped covariance
+    /// increment. Two things break. (i) A cumulative sum of clipped increments can only
+    /// grow ~linearly in the window length, while the measured relative-pose error grows
+    /// near-ballistically (p = 1.70-1.99 vs surrogate 1.00-1.01, filter_formulation
+    /// Section X.1) -- the deficit is in the EXPONENT, so no scalar repairs it. (ii) The
+    /// gain is applied to the increment, `G dSigma`, but the quantity that should
+    /// accumulate is `d(G Sigma)` = `G dSigma + Sigma dG`; the `Sigma dG` term is dropped,
+    /// and `G` changes every frame as the baseline `b` grows.
+    ///
+    /// Direct mode evaluates `f_k = G_k * (r^2 sig_phi^2 + sig_b^2)` from the FULL
+    /// relative covariance and injects `max(0, f_k - f_{k-1})`, so the accumulated range
+    /// variance tracks the true relative-pose curve including its exponent, with no free
+    /// scalar. Requires a kept-pose window supplying the true anchor->current covariance
+    /// (MSCEqF clones); with the absolute-marginal surrogate it is not meaningful.
+    pub pose_range_direct: bool,
+    /// Exogenous multiplicative SCALE uncertainty, as a 1-sigma fraction of range.
+    /// Adds `(scale_sigma * r)^2` to the REPORTED range variance (and `(scale_sigma * d)^2`
+    /// to reported depth variance). Default 0 = off.
+    ///
+    /// WHY IT CANNOT COME FROM THE POSE COVARIANCE. A monocular VIO's range error is
+    /// dominated by a systematic BASELINE-SCALE error that is common to every landmark;
+    /// measurement shows the depth error tracks it 1:1 with no parallax amplification.
+    /// The pose covariance `P_vv` structurally cannot carry it -- the scale direction is
+    /// the unobservable one, and its reported along-baseline variance is exactly the
+    /// channel that is over-confident. So this term is sourced OUTSIDE the filter, from
+    /// trajectory excitation, via [`sigma_s_from_excitation`].
+    ///
+    /// WHY IT IS REPORTING-ONLY, NOT PROCESS NOISE. A scale bias is common-mode and
+    /// systematic: inflating the per-landmark covariance inside the recursion would only
+    /// make the filter under-weight its measurements without removing the bias, and it
+    /// would accumulate frame over frame. The honest treatment is to carry it into what
+    /// the filter REPORTS, which is what an obstacle mapper consumes.
+    pub scale_sigma: f64,
+    /// RELATIVE convergence gate: a landmark is unusable when `sigma_r / r` exceeds this
+    /// fraction. `0` = disabled, fall back to the absolute `conv_variance_threshold`.
+    ///
+    /// WHY THE ABSOLUTE FORM IS WRONG. `conv_variance_threshold` is in m^2, but depth
+    /// uncertainty is multiplicative in range: a fixed 2.0 m^2 demands `sigma_r <= 1.4 m`
+    /// whether the landmark is at 5 m or 500 m -- 0.3% relative at the far end, which no
+    /// monocular system achieves. It also has to be re-tuned every time the covariance
+    /// model changes: once the pose-driven range noise made `sigma_r` honest (3-7 m), the
+    /// shipped 2.0 rejected EVERY landmark and `query_range` returned nothing at all,
+    /// silently, because the NEES harness scores the raw state and never calls it.
+    ///
+    /// WHY 0.5 IS THE NATURAL VALUE, not a knob. At `sigma_r / r = 0.5` the 2-sigma band
+    /// reaches zero inverse depth, i.e. the landmark "could be at infinity" and carries no
+    /// range information. That is the same constant the Civera birth prior uses
+    /// (`civera_rho_sigma_frac`), for the same reason.
+    ///
+    /// Evaluated on the filter's OWN variance, BEFORE `scale_sigma` is added: a
+    /// trajectory-level common-mode scale uncertainty must not make a well-converged
+    /// landmark look unconverged.
+    pub conv_range_sigma_frac: f64,
+    pub civera_birth_depth: f64,
+    /// Fraction of rho0 used as the birth sigma on rho. Civera's proposed value is
+    /// 0.5 (band reaches rho = 0 at 2 sigma). Only used when `civera_birth_depth` > 0.
+    pub civera_rho_sigma_frac: f64,
     /// Average the perspective output Jacobian between the predicted and the
     /// measured normalized image coords in the 3D bearing update, like the EqF
     /// coordinate suite's `output_matrix_ci_star`. NOTE: experiments show this
@@ -162,6 +242,11 @@ impl Default for SparseVogSettings {
             min_depth: 0.1,
             max_depth: 100.0,
             birth_min_flow_px: 3.0,
+            pose_range_direct: false,
+            scale_sigma: 0.0,
+            conv_range_sigma_frac: 0.0,
+            civera_birth_depth: 0.0,
+            civera_rho_sigma_frac: 0.5,
             use_equivariant_output: false,
             iekf_iterations: 1,
             second_order_mode: SecondOrderMode::Off,
