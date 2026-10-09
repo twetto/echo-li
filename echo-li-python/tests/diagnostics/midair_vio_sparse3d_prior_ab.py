@@ -327,23 +327,6 @@ def median_depth_birth_priors(vio_uvs, existing, median_depth, f, cx, cy, rel_si
     return priors
 
 
-def fallback_births_to_defer(vio_uvs, existing_ids, priors, wait_floor, W, H):
-    """Defer excess scene-depth births while preserving established tracks."""
-    if wait_floor <= 0:
-        return []
-    fallback_new = {
-        fid: uv for fid, uv in vio_uvs.items()
-        if fid not in existing_ids and fid not in priors
-    }
-    allowance = max(int(wait_floor) - len(existing_ids), 0)
-    if allowance >= len(fallback_new):
-        return []
-    allowed = cap_eqf_observations(
-        fallback_new, set(), {}, allowance, "grid", W, H
-    ) if allowance > 0 else {}
-    return [fid for fid in fallback_new if fid not in allowed]
-
-
 def open_writer(path, w, h, fps):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -605,14 +588,12 @@ def run_once(mode, args, ds, f, cx, cy, W, H, ext, events, map_xy):
         )
 
     rec = []
-    n_deferred = 0
     n_noprior = 0
     n_tracked_noprior = 0
     prior_births = 0
     deferred_new = 0
     admitted_new = 0
     prior_candidates_total = 0
-    wait_deferred_total = 0
     live_landmark_counts = []
     prior_rel_sigmas = []
     seed_q = []  # (frame, prior_range, gt_range) for seeded births
@@ -741,21 +722,7 @@ def run_once(mode, args, ds, f, cx, cy, W, H, ext, events, map_xy):
                 n_noprior += len(_noprior)
                 n_tracked_noprior += sum(1 for f in _noprior if sparse is not None
                                          and sparse.has_track(f))
-                _defer = set()
-                if args.defer_fallback and sparse is not None:
-                    _defer.update(f for f in _noprior if sparse.has_track(f))
-                if args.wait_floor > 0:
-                    _wait_defer = fallback_births_to_defer(
-                        vio_uvs, existing, priors, args.wait_floor, W, H)
-                    _defer.update(_wait_defer)
-                    wait_deferred_total += len(_wait_defer)
-                if _defer:
-                    _defer = sorted(_defer)
-                    n_deferred += len(_defer)
-                    vio.process_vision_with_depth_priors_and_deferred(
-                        stamp, vio_uvs, priors, _defer)
-                else:
-                    vio.process_vision_with_depth_priors(stamp, vio_uvs, priors)
+                vio.process_vision_with_depth_priors(stamp, vio_uvs, priors)
                 after = {int(x) for x in vio.get_landmarks().keys()}
                 births = after - existing
                 prior_births += len(births & set(priors))
@@ -793,13 +760,7 @@ def run_once(mode, args, ds, f, cx, cy, W, H, ext, events, map_xy):
                 n_noprior += len(_noprior)
                 n_tracked_noprior += sum(1 for f in _noprior if sparse is not None
                                          and sparse.has_track(f))
-                if args.defer_fallback and sparse is not None:
-                    _defer = [f for f in _noprior if sparse.has_track(f)]
-                    n_deferred += len(_defer)
-                    vio.process_vision_with_depth_priors_and_deferred(
-                        stamp, vio_uvs, priors, _defer)
-                else:
-                    vio.process_vision_with_depth_priors(stamp, vio_uvs, priors)
+                vio.process_vision_with_depth_priors(stamp, vio_uvs, priors)
                 after = {int(x) for x in vio.get_landmarks().keys()}
                 births = after - existing
                 admitted_new += len(births)
@@ -904,7 +865,7 @@ def run_once(mode, args, ds, f, cx, cy, W, H, ext, events, map_xy):
     final = float(np.linalg.norm((R @ est[-1] + t) - gtp[-1]))
     print(f"[defer] {mode}: candidates lacking a prior = {n_noprior}; "
           f"of those, Sparse3D IS tracking (defer-eligible) = {n_tracked_noprior} "
-          f"({100.0 * n_tracked_noprior / max(n_noprior, 1):.1f}%); actually deferred = {n_deferred}")
+          f"({100.0 * n_tracked_noprior / max(n_noprior, 1):.1f}%)")
     return {"mode": mode, "n": len(rec), "ate": ate, "path": path, "final": final,
             "prior_births": prior_births, "deferred_new": deferred_new,
             "admitted_new": admitted_new, "prior_candidates": prior_candidates_total,
@@ -943,15 +904,6 @@ def main():
     ap.add_argument("--anchor-census", action="store_true",
                     help="per frame, count live Sparse3D features and how many DISTINCT anchor "
                     "poses they use -- the state cost of keeping every anchor as a pose clone.")
-    ap.add_argument("--defer-fallback", action="store_true",
-                    help="skip fallback birth for features Sparse3D is tracking but has not "
-                         "converged, instead of birthing them at the constant sceneDepth. "
-                         "The CLI already does this; the Python path could not until the "
-                         "deferred binding was exposed.")
-    ap.add_argument("--wait-floor", type=int, default=0,
-                    help="Python-only experiment: admit sceneDepth fallback births only "
-                         "to replenish this live-landmark floor; prior-backed births "
-                         "remain eligible and existing landmarks remain observed. 0 disables.")
     ap.add_argument("--far-gate", type=float, default=0.0,
                     help="reject Sparse3D priors farther than k x the frame median prior "
                     "range (scale-free far-outlier gate). 0 disables.")

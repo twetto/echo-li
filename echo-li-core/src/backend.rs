@@ -24,7 +24,7 @@
 //! the clone-id counter and the windowing policy are BACKEND state, not caller state.
 //! They live in a test harness today; an implementor must bring them inside.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use nalgebra::Matrix3;
 
@@ -50,7 +50,6 @@ pub trait VioBackend {
         measurement: VisionMeasurement,
         cam: &dyn CameraModel,
         depth_priors: &HashMap<u64, LandmarkDepthPrior>,
-        defer_fallback_ids: &HashSet<u64>,
     );
 
     /// Current state estimate.
@@ -63,9 +62,9 @@ pub trait VioBackend {
         None
     }
 
-    /// Convenience: a frame with no depth priors and no deferred fallbacks.
+    /// Convenience: a frame with no depth priors.
     fn process_vision(&mut self, measurement: VisionMeasurement, cam: &dyn CameraModel) {
-        self.process_vision_full(measurement, cam, &HashMap::new(), &HashSet::new());
+        self.process_vision_full(measurement, cam, &HashMap::new());
     }
 }
 
@@ -79,14 +78,12 @@ impl VioBackend for crate::VIOFilter {
         measurement: VisionMeasurement,
         cam: &dyn CameraModel,
         depth_priors: &HashMap<u64, LandmarkDepthPrior>,
-        defer_fallback_ids: &HashSet<u64>,
     ) {
-        crate::VIOFilter::process_vision_with_depth_priors_and_deferred_fallbacks(
+        crate::VIOFilter::process_vision_with_depth_priors(
             self,
             measurement,
             cam,
             depth_priors,
-            defer_fallback_ids,
         );
     }
 

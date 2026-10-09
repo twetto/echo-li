@@ -431,21 +431,6 @@ impl VIOFilter {
         cam: &dyn CameraModel,
         depth_priors: &HashMap<u64, LandmarkDepthPrior>,
     ) {
-        self.process_vision_with_depth_priors_and_deferred_fallbacks(
-            measurement,
-            cam,
-            depth_priors,
-            &HashSet::new(),
-        );
-    }
-
-    pub fn process_vision_with_depth_priors_and_deferred_fallbacks(
-        &mut self,
-        measurement: VisionMeasurement,
-        cam: &dyn CameraModel,
-        depth_priors: &HashMap<u64, LandmarkDepthPrior>,
-        defer_fallback_ids: &HashSet<u64>,
-    ) {
         if self.eqf.current_time < 0.0 {
             return;
         }
@@ -482,7 +467,6 @@ impl VIOFilter {
             &measurement.cam_coordinates,
             &current_ids_after,
             depth_priors,
-            defer_fallback_ids,
             self.settings.initial_scene_depth > 0.0,
             remaining_slots,
         );
@@ -1023,7 +1007,6 @@ fn select_new_landmark_ids(
     cam_coordinates: &HashMap<u64, Vector2<f32>>,
     current_ids: &HashSet<u64>,
     depth_priors: &HashMap<u64, LandmarkDepthPrior>,
-    defer_fallback_ids: &HashSet<u64>,
     allow_fallback_init: bool,
     capacity: usize,
 ) -> Vec<u64> {
@@ -1073,8 +1056,6 @@ fn select_new_landmark_ids(
         };
         if candidate.has_depth_prior {
             sparse_candidates.push(candidate);
-        } else if defer_fallback_ids.contains(&id) {
-            continue;
         } else if !allow_fallback_init {
             continue;
         } else {
@@ -1158,7 +1139,6 @@ mod landmark_init_selection_tests {
             &coords,
             &current_ids,
             &HashMap::new(),
-            &HashSet::new(),
             true,
             2,
         );
@@ -1182,7 +1162,7 @@ mod landmark_init_selection_tests {
         );
 
         let selected =
-            select_new_landmark_ids(&coords, &HashSet::new(), &priors, &HashSet::new(), true, 1);
+            select_new_landmark_ids(&coords, &HashSet::new(), &priors, true, 1);
 
         assert_eq!(selected, vec![1]);
     }
@@ -1211,7 +1191,6 @@ mod landmark_init_selection_tests {
             &coords_a,
             &HashSet::new(),
             &HashMap::new(),
-            &HashSet::new(),
             true,
             3,
         );
@@ -1219,7 +1198,6 @@ mod landmark_init_selection_tests {
             &coords_b,
             &HashSet::new(),
             &HashMap::new(),
-            &HashSet::new(),
             true,
             3,
         );
@@ -1228,26 +1206,7 @@ mod landmark_init_selection_tests {
     }
 
     #[test]
-    fn landmark_selection_defers_sparse_tracks_without_valid_prior() {
-        let mut coords = HashMap::new();
-        coords.insert(1, uv(20.0, 50.0));
-        coords.insert(2, uv(80.0, 50.0));
-
-        let deferred = HashSet::from([1]);
-        let selected = select_new_landmark_ids(
-            &coords,
-            &HashSet::new(),
-            &HashMap::new(),
-            &deferred,
-            true,
-            2,
-        );
-
-        assert_eq!(selected, vec![2]);
-    }
-
-    #[test]
-    fn landmark_selection_allows_deferred_track_with_valid_prior() {
+    fn landmark_selection_prefers_a_track_with_a_valid_prior() {
         let mut coords = HashMap::new();
         coords.insert(1, uv(20.0, 50.0));
         coords.insert(2, uv(80.0, 50.0));
@@ -1260,9 +1219,9 @@ mod landmark_init_selection_tests {
                 range_var: 1.0,
             },
         );
-        let deferred = HashSet::from([1]);
-        let selected =
-            select_new_landmark_ids(&coords, &HashSet::new(), &priors, &deferred, true, 1);
+        // Only one slot: the prior-bearing candidate must win it over the
+        // fallback-depth one, independent of id order.
+        let selected = select_new_landmark_ids(&coords, &HashSet::new(), &priors, true, 1);
 
         assert_eq!(selected, vec![1]);
     }
@@ -1277,7 +1236,6 @@ mod landmark_init_selection_tests {
             &coords,
             &HashSet::new(),
             &HashMap::new(),
-            &HashSet::new(),
             false,
             2,
         );
@@ -1300,7 +1258,7 @@ mod landmark_init_selection_tests {
         );
 
         let selected =
-            select_new_landmark_ids(&coords, &HashSet::new(), &priors, &HashSet::new(), false, 1);
+            select_new_landmark_ids(&coords, &HashSet::new(), &priors, false, 1);
 
         assert_eq!(selected, vec![1]);
     }
