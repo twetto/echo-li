@@ -216,11 +216,23 @@ fn load_params(node: &r2r::Node) -> NodeParams {
         // sensor_msgs/CompressedImage (JPEG/PNG), decoded in-process — no
         // image_transport republisher, which costs most of a core.
         image_transport: get_str(node, "image_transport", "raw"),
-        // forward_additive is the FrontendConfig default and is the only KLT
-        // variant with no SIMD on any architecture -- it is scalar bilinear
-        // loops. inverse_compositional reaches extract_template_gradients and
-        // ic_iterate_patch, both of which have NEON kernels on aarch64.
-        klt_method: get_str(node, "klt_method", "forward_additive"),
+        // inverse_compositional, NOT rudolf-v's ForwardAdditive default.
+        // forward_additive is the only LK variant with no SIMD on any
+        // architecture -- scalar bilinear loops -- while IC reaches
+        // extract_template_gradients and ic_iterate_patch, both of which have
+        // NEON kernels on aarch64. Measured on a 106 s / 40.3 m myrig bag at
+        // 320x200, 21 features, single core, interleaved A/B/A/B: KLT 3.02 ->
+        // 0.42 ms, pipeline total 7.10 -> 5.00 ms, at an identical 5.3 cm ATE
+        // rmse. The 7.2x on KLT exceeds 4-lane NEON's ceiling, so most of it is
+        // algorithmic (IC computes template gradients once per level and reuses
+        // them across iterations) rather than SIMD.
+        //
+        // This default previously disagreed with every caller: run_vio_live.sh
+        // passes KLT_METHOD, itself defaulting to inverse_compositional, and the
+        // python binding hardcodes InverseCompositional. Only launching this node
+        // directly got the slow path, which is the case least likely to be
+        // measured.
+        klt_method: get_str(node, "klt_method", "inverse_compositional"),
         trajectory_output: get_str(node, "trajectory_output", ""),
         mapping_stride: (get_i64(node, "mapping_stride", 1) as usize).max(1),
         mocap_topic: get_str(node, "mocap_topic", ""),
