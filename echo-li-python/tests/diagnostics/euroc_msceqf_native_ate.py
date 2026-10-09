@@ -121,11 +121,23 @@ def main():
                          "inverse-depth init with this depth PRIOR (m) instead of "
                          "triangulating. Needs no parallax, so it works at motion onset. "
                          "Pick it as the scene's rough scale (EuRoC rooms ~2-4 m).")
+    ap.add_argument("--dump-lmdiag", default="",
+                    help="dump the per-accepted-landmark-update log (baseline_m, "
+                         "range_m, yaw_inc, vel_along_vhat_inc, ...). Tests whether the "
+                         "update claims SCALE information at zero parallax: the "
+                         "along-vhat nav correction should vanish with baseline.")
     ap.add_argument("--diag-csv", default="",
                     help="per-FRAME update ledger: attempted vs accepted updates, "
                          "in-state landmark depth distribution, and state-vs-GT error. "
                          "This is the 'when does it go bad, and what differs' probe -- "
                          "aggregate end-of-run ATE cannot localise a divergence.")
+    ap.add_argument("--max-births-per-frame", type=int, default=0,
+                    help="cap landmark births per frame (0 = unlimited). Batch-birthing "
+                         "the whole feature set at one depth prior makes the depth errors "
+                         "perfectly CORRELATED, and a uniform depth error is a map-SCALE "
+                         "error that is unobservable at zero parallax. EqVIO births a "
+                         "trickle into an already-scaled map and is scale-robust; this "
+                         "caps our births the same way.")
     ap.add_argument("--civera-frames", type=int, default=0,
                     help="apply Civera+immediate promotion ONLY for the first N frames "
                          "(the initialization phase), then revert to the normal "
@@ -307,6 +319,17 @@ def main():
     n_upd = n_slam_upd = n_promoted = n_stereo = n_stream_range = 0
     imu_i = int(np.searchsorted(its, t0))
 
+    def _scale_var(f, ev):
+        """v-hat^T P_vv v-hat: variance along the VELOCITY direction = the scale channel.
+        If this collapses while parallax is gone, the filter has closed the one direction
+        it cannot observe, and can no longer accept the correction when motion resumes."""
+        n = float(np.linalg.norm(ev))
+        if n < 1e-6:
+            return np.nan
+        vh = ev / n
+        P = np.asarray(f.nav_cov())[3:6, 3:6]
+        return float(vh @ P @ vh)
+
     def snap(t):
         p, Rm, vv = filt.nav_body_pose()
         gp, gR, gv = gt_at(t)
@@ -371,7 +394,10 @@ def main():
                     if t in cur and len(o) >= slam_min_len
                     and (immediate or any(fk == marg for (fk, *_) in o))]
             cand.sort(key=lambda t: len(buf[t]), reverse=True)
-            for tid in cand[: args.max_slam - len(slam)]:
+            room = args.max_slam - len(slam)
+            if args.max_births_per_frame > 0:
+                room = min(room, args.max_births_per_frame)
+            for tid in cand[:room]:
                 rp = None
                 if pri is not None and tid in pri:
                     rr, vv = pri[tid]
@@ -441,7 +467,7 @@ def main():
                          len(slam), n_promoted_k,
                          np.nanmedian(dep), np.nanmin(dep), np.nanmax(dep),
                          np.linalg.norm(ev), np.linalg.norm(gv), tilt,
-                         float(np.trace(filt.nav_vel_cov())) if hasattr(filt, "nav_vel_cov") else np.nan])
+                         _scale_var(filt, ev)])
         snap(tk)
         if k % 400 == 0:
             print(f"  frame {k}/{nimg}  feats {len(feats)}  updates {n_upd}")
@@ -460,6 +486,9 @@ def main():
     print(f"ATE RMSE (SE3)   = {rmse:8.4f} m    [EqVIO-path baseline V1_01 ~0.12 m]")
     print(f"ATE %            = {100*rmse/max(plen,1e-9):7.3f} %")
     print(f"ATE median/mean/max = {np.median(err):.4f} / {err.mean():.4f} / {err.max():.4f} m")
+    if args.dump_lmdiag:
+        np.save(args.dump_lmdiag, np.asarray(filt.lm_upd_diag()))
+        print(f"lm_upd_diag -> {args.dump_lmdiag}")
     if diag:
         hdr = ("k,t,msc_try,msc_acc,slam_try,slam_acc,n_slam,promoted,"
                "dep_med,dep_min,dep_max,est_speed,gt_speed,tilt_deg,vel_cov_tr")

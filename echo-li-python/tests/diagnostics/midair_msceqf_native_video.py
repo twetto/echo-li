@@ -168,6 +168,12 @@ def main():
     ap.add_argument("--acc-rw", type=float, default=3.0e-3)
     ap.add_argument("--gyr-density", type=float, default=1.2724e-3)
     ap.add_argument("--gyr-rw", type=float, default=1.0e-4)
+    ap.add_argument("--sparse3d-config", default="",
+                    help="if set, colour features by SPARSE3D's depth estimate instead "
+                         "of explicit multi-view triangulation. Sparse3D is driven with "
+                         "the SAME MSCEqF camera poses the filter produces, so the "
+                         "colour shows what the depth filter believes -- including where "
+                         "it is wrong -- rather than a geometric re-derivation.")
     ap.add_argument("--tracks", default=str(TRACKS))
     ap.add_argument("--tracks-t0", type=float, default=0.0)
     ap.add_argument("--frontend", choices=["msceqf", "rudolf"], default="msceqf",
@@ -185,6 +191,7 @@ def main():
     # Rendering / colour scale
     ap.add_argument("--out", default="msceqf_native_slam_traj2.mp4")
     ap.add_argument("--stride", type=int, default=2)
+    ap.add_argument("--dump-s3diag", default="")   # npz: Sparse3D colour-coverage ledger
     ap.add_argument("--fps", type=float, default=15.0)
     ap.add_argument("--tri-window", type=int, default=40,
                     help="max recent observations per track used for triangulation")
@@ -264,6 +271,26 @@ def main():
                 continue
             buf.setdefault(tid, []).append((k, un, vn))
 
+    sparse = None
+    if args.sparse3d_config:
+        import yaml as _yaml
+        _cfg = _yaml.safe_load(open(args.sparse3d_config))
+        _set = dict(_cfg.get("SparseVog", {}) or {})
+        _set.pop("parametrization", None)
+        # This harness works in NORMALIZED coords and builds no camera object; the
+        # track dump's convention is (u-CX)/FX at 1024 px. Give Sparse3D the matching
+        # pinhole so the pixels fed below invert that convention exactly.
+        _cam = echo_li.PinholeCamera(FX, FX, CX, CX)
+        sparse = echo_li.Sparse3DFilter.bearing_invdepth_additive3d(_cam, **_set)
+        print(f"Sparse3D ON ({args.sparse3d_config}) — colour = Sparse3D range")
+    s3_rng = {}          # k -> {tid: range}   (ungated: everything held)
+    s3_conv = {}         # k -> {tid: range}   (gated: passes query_range)
+    s3_reset, s3_live = {}, {}
+    _prevlive_h = set()
+    _s3diag = []         # (k, n_visible, n_live, n_coloured, n_reset, n_converged)
+    _prevlive = set()
+    _nis, _tl = [], []
+
     add_frame(0)
     record_pose(0)
     slam_at[0] = frozenset()
@@ -304,6 +331,55 @@ def main():
             filt.msc_update(ready, pixel_std, args.chi2_mult, bool(args.curvature))
         for tid in done:
             del buf[tid]
+
+        # (1b) Sparse3D, driven by the SAME MSCEqF camera pose the filter just produced.
+        #      Sparse3D wants PIXELS (it owns the camera model); by_frame holds the
+        #      normalized (u-CX)/FX convention of the track dump, so invert it here.
+        if sparse is not None:
+            uvs = {int(t): (un * FX + CX, vn * FX + CX)
+                   for t, (un, vn) in by_frame.get(k, {}).items()}
+            p_wb, R_wb_, _v = filt.nav_body_pose()
+            T_wc = np.eye(4)
+            T_wc[:3, :3] = np.asarray(R_wb_, float) @ R_bc
+            T_wc[:3, 3] = np.asarray(p_wb, float) + np.asarray(R_wb_, float) @ t_bc
+            sparse.update(k * DT * IPI, uvs, T_wc.tolist(), None, None, None, {})
+            fr = {}
+            for fid, fd in sparse.get_features().items():
+                q = np.asarray(fd["position"], float)
+                r = float(np.linalg.norm(q))
+                if np.isfinite(r) and r > 1e-6:
+                    fr[int(fid)] = r
+            s3_rng[k] = fr
+            # CONVERGED subset: query_range applies the gates the EqF seeding path
+            # actually consumes (min_track_length, conv_inlier_ratio,
+            # conv_variance_threshold) and returns (-1, inf) when the landmark is not
+            # usable as a prior. get_features() above applies NONE of them, so the
+            # difference between the two is exactly "held but not yet trustworthy".
+            cv = {}
+            for fid in fr:
+                rq, _vq = sparse.query_range(int(fid))
+                if rq > 0.0:
+                    cv[int(fid)] = float(rq)
+            s3_conv[k] = cv
+            _vis_h = set(by_frame.get(k, {}).keys())
+            _live_h = set(fr)
+            # Live features that are still visible but dropped out since last frame =
+            # update_feature_3d rejected them at mahalanobis_reset_chi2, sending them
+            # back to pending. This is the on-screen colour flicker, counted.
+            s3_reset[k] = len((_prevlive_h - _live_h) & _vis_h)
+            s3_live[k] = len(_live_h)
+            _prevlive_h = _live_h
+            if args.dump_s3diag:
+                _vis = set(by_frame.get(k, {}).keys())
+                _live = set(fr)
+                # A RESET is a feature that was live last frame, is still visible now,
+                # but is no longer live -- i.e. update_feature_3d returned false.
+                _reset = (_prevlive - _live) & _vis
+                _s3diag.append((k, len(_vis), len(fr), len(_vis & _live), len(_reset),
+                                len(cv)))
+                for _fd in sparse.get_features().values():
+                    _nis.append(float(_fd["nis"])); _tl.append(int(_fd["track_length"]))
+                _prevlive = _live
 
         # (2) Streaming SLAM update: fresh bearing per in-state landmark; evict lost.
         if slam:
@@ -352,13 +428,32 @@ def main():
     # then triangulate against the recorded camera trajectory. obs_hist accumulates on
     # EVERY frame (history must be complete), but the expensive triangulation only runs
     # on frames we will actually render (diag mode wants all of them).
+    if args.dump_s3diag and _s3diag:
+        np.savez(args.dump_s3diag, diag=np.array(_s3diag, dtype=np.int64),
+                 nis=np.array(_nis), tl=np.array(_tl, dtype=np.int64))
+        print(f"wrote s3 diag {args.dump_s3diag}  ({len(_s3diag)} frames)")
+
     want = set(range(nimg)) if args.diag else set(range(0, nimg, args.stride))
     obs_hist = defaultdict(list)   # tid -> [(k, un, vn)]  (append-only, capped later)
     range_at = {}                  # k -> {tid: range_m or nan}
+    conv_at = {}                   # k -> frozenset(tid) passing query_range
+    if sparse is not None:
+        # Sparse3D already produced a range per feature per frame, online, from the
+        # filter's own poses. Use it directly -- no re-triangulation. This is the point
+        # of the --sparse3d-config mode: the colour is what the DEPTH FILTER believes,
+        # so a wrong colour is a real defect rather than a visualisation artifact.
+        range_at = {k: dict(s3_rng.get(k, {})) for k in want}
+        conv_at = {k: frozenset(s3_conv.get(k, {})) for k in want}
+        _nc = sum(len(v) for v in conv_at.values())
+        _nl = sum(len(v) for v in range_at.values())
+        print(f"  CONVERGED (query_range gates) {_nc} of {_nl} held "
+              f"= {100.0 * _nc / max(_nl, 1):.1f}%")
+        print(f"colour source: SPARSE3D ({sum(len(v) for v in range_at.values())} "
+              f"feature-ranges over {len(range_at)} rendered frames)")
     for k in range(nimg):
         for tid, (un, vn) in by_frame.get(k, {}).items():
             obs_hist[tid].append((k, un, vn))
-        if k not in want:
+        if k not in want or sparse is not None:
             continue
         rr = {}
         for tid in by_frame.get(k, {}):
@@ -514,19 +609,33 @@ def main():
             left = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
             vlo, vhi, rr = frame_clim(k)
             sset = slam_at.get(k, frozenset())
-            nn = ns = 0
+            cset = conv_at.get(k, frozenset())
+            nn = ns = nu = npd = 0
             for tid, (un, vn) in by_frame.get(k, {}).items():
                 uf, vf = to_px(un, vn); u = int(round(uf)); v = int(round(vf))
                 r = rr.get(tid, np.nan)
                 color = (140, 140, 140) if not np.isfinite(r) else \
                     clut(jetr, (r - vlo) / (vhi - vlo + 1e-9))
-                if tid in sset:
+                # Three classes, visually distinct: a feature Sparse3D merely HOLDS is
+                # not the same claim as one whose depth has converged. Undelayed birth
+                # creates many of the former, so drawing them identically would inflate
+                # the apparent density with depths the filter does not yet know.
+                if not np.isfinite(r):
+                    cv2.circle(left, (u, v), 2, (110, 110, 110), 1, cv2.LINE_AA)
+                    npd += 1
+                elif tid not in cset:
+                    dim = tuple(int(0.55 * c) for c in color)   # held, NOT converged
+                    cv2.circle(left, (u, v), 2, dim, -1, cv2.LINE_AA); nu += 1
+                elif tid in sset:
                     cv2.circle(left, (u, v), 3, color, -1, cv2.LINE_AA)
                     cv2.circle(left, (u, v), 3, (0, 0, 0), 1, cv2.LINE_AA); ns += 1
                 else:
                     cv2.circle(left, (u, v), 4, color, 1, cv2.LINE_AA); nn += 1
-            txt(left, f"frame {k}  norm(o) {nn}  SLAM(*) {ns}  "
-                      f"depth {vlo:.0f}-{vhi:.0f}m", (6, 18))
+            txt(left, f"frame {k}  conv(o) {nn}  SLAM(*) {ns}  "
+                      f"unconv(.) {nu}  pending {npd}  {vlo:.0f}-{vhi:.0f}m", (6, 18))
+            if s3_live:
+                txt(left, f"sparse3d live {s3_live.get(k,0)}/{nn+ns}  "
+                          f"reset {s3_reset.get(k,0)}", (6, 36))
             cbar = np.full((H, CBW, 3), 30, np.uint8)
             cbar[:, 8:30] = cbar_grad[:, None, :]
             cv2.rectangle(cbar, (8, 0), (29, H - 1), (255, 255, 255), 1)
