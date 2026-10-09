@@ -2458,7 +2458,8 @@ fn stereo_range_channel_informs_depth_with_correct_sign() {
 /// landmark set, and the covariance, after an IMU+vision sequence.
 #[test]
 fn vio_backend_trait_is_byte_identical_to_the_inherent_calls() {
-    use crate::backend::VioBackend;
+    use crate::backend::{CameraPoseCovariance, EqvioBackend, VioBackend};
+    use std::sync::Arc;
 
     let build = || {
         let settings = VIOFilterSettings::default();
@@ -2472,6 +2473,7 @@ fn vio_backend_trait_is_byte_identical_to_the_inherent_calls() {
         coords.insert(11u64, Vector2::new(350.0f32, 200.0f32));
         coords
     };
+    let no_priors = HashMap::new();
 
     // Direct: inherent methods, as every wrapper calls them today.
     let mut direct = build();
@@ -2482,18 +2484,18 @@ fn vio_backend_trait_is_byte_identical_to_the_inherent_calls() {
     direct.process_vision(VisionMeasurement::new(0.010, frame()), &cam);
 
     // Through the trait, as a dyn object -- the form a swappable backend takes.
-    let mut boxed = build();
+    let mut wrapped = EqvioBackend::new(build(), Arc::new(make_pinhole()));
     {
-        let via: &mut dyn VioBackend = &mut boxed;
-        VioBackend::process_imu(via, stationary_imu(0.0));
-        VioBackend::process_imu(via, stationary_imu(0.005));
-        via.process_vision(VisionMeasurement::new(0.005, frame()), &cam);
-        VioBackend::process_imu(via, stationary_imu(0.010));
-        via.process_vision(VisionMeasurement::new(0.010, frame()), &cam);
+        let via: &mut dyn VioBackend = &mut wrapped;
+        via.process_imu(stationary_imu(0.0));
+        via.process_imu(stationary_imu(0.005));
+        via.process_vision(VisionMeasurement::new(0.005, frame()), &no_priors);
+        via.process_imu(stationary_imu(0.010));
+        via.process_vision(VisionMeasurement::new(0.010, frame()), &no_priors);
     }
 
     let a = direct.eqf.state_estimate();
-    let b = boxed.eqf.state_estimate();
+    let b = wrapped.filter().eqf.state_estimate();
     assert_eq!(
         a.get_ids(),
         b.get_ids(),
@@ -2504,15 +2506,30 @@ fn vio_backend_trait_is_byte_identical_to_the_inherent_calls() {
         b.sensor.pose.rotation.as_matrix(),
         epsilon = 0.0
     );
-    assert_abs_diff_eq!(a.sensor.pose.translation, b.sensor.pose.translation, epsilon = 0.0);
+    assert_abs_diff_eq!(
+        a.sensor.pose.translation,
+        b.sensor.pose.translation,
+        epsilon = 0.0
+    );
     assert_abs_diff_eq!(a.sensor.velocity, b.sensor.velocity, epsilon = 0.0);
     assert_abs_diff_eq!(a.sensor.input_bias, b.sensor.input_bias, epsilon = 0.0);
-    assert_abs_diff_eq!(direct.eqf.sigma, boxed.eqf.sigma, epsilon = 0.0);
-    assert_eq!(direct.vision_count, boxed.vision_count);
+    assert_abs_diff_eq!(direct.eqf.sigma, wrapped.filter().eqf.sigma, epsilon = 0.0);
+    assert_eq!(direct.vision_count, wrapped.filter().vision_count);
+
+    // NavEstimate must be the same facts, not a re-derivation that drifts.
+    let nav = wrapped.nav_estimate();
+    assert_abs_diff_eq!(
+        nav.pose.translation,
+        a.sensor.pose.translation,
+        epsilon = 0.0
+    );
+    assert_abs_diff_eq!(nav.velocity, a.sensor.velocity, epsilon = 0.0);
+    assert_abs_diff_eq!(nav.gyro_bias, a.sensor.gyro_bias(), epsilon = 0.0);
+    assert_abs_diff_eq!(nav.accel_bias, a.sensor.accel_bias(), epsilon = 0.0);
 
     // The optional accessor must agree too -- it is what feeds the depth filter.
-    let ca = VioBackend::camera_pose_covariances(&direct);
-    let cb = VioBackend::camera_pose_covariances(&boxed);
+    let ca = direct.sparse_camera_pose_covariances();
+    let cb = CameraPoseCovariance::camera_pose_covariances(&wrapped);
     assert_eq!(ca.is_some(), cb.is_some());
     if let (Some((va, wa)), Some((vb, wb))) = (ca, cb) {
         assert_abs_diff_eq!(va, vb, epsilon = 0.0);
