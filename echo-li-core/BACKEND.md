@@ -95,13 +95,23 @@ Done:
   the Python adapter shipped. And buffered observations are keyed by clone ID, never by
   window position, because positions shift under marginalization.
 
-  **NOT YET VALIDATED against the Python adapter.** The tests below are invariants, not
-  equivalence. Before this backend is trusted for results it needs a run against one
-  MidAir trajectory scored next to the harness's recorded figure.
+  **VALIDATED against the Python reference loop.** `midair_msceqf_backend_ab.py` drives
+  both over identical MidAir data and compares trajectories pointwise:
 
-Owed, in dependency order:
+  | arm | frames | SLAM | max difference |
+  |---|---|---|---|
+  | structureless | 400 | 0 | 0.000000 m |
+  | structureless | 7866 (full) | 0 | 0.000001 m |
+  | with SLAM | 400 | 50 | 0.000000 m |
+  | with SLAM | 7866 (full) | 100 | 0.000000 m |
 
-1. **Validate `MsceqfBackend` against the Python adapter.** `MSCEqFFilter` is a primitives API -- `stochastic_clone`,
+  Two convention differences had to be settled to get there, and both are worth knowing.
+  The backend derives `dt` from consecutive IMU stamps, so its FIRST sample propagates
+  nothing, where the Python loop passes `dt=DT` for every sample including the first --
+  a driver primes the stamp. And the backend breaks promotion ties by track id, giving a
+  total order, where the reference inherited dict insertion order from a stable sort.
+
+Owed, in dependency order: `MSCEqFFilter` is a primitives API -- `stochastic_clone`,
    `insert_landmark`, `marginalize_clone`, `msc_update`, `birth_landmark`,
    `landmark_stream_update`, `reanchor_landmark` -- with no `process_vision`. The policy
    that turns those into one frame step was ~90 lines living in a Python test harness.

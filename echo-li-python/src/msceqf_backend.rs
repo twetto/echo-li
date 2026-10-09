@@ -1,0 +1,176 @@
+//! Python binding for [`echo_li_core::backend::MsceqfBackend`].
+//!
+//! This exists to VALIDATE the Rust port against the Python orchestration it replaces.
+//! The reference harness drives `MSCEqFNativeFilter` primitives from a Python loop;
+//! this class drives the same filter from the Rust frame step, so the two can be run on
+//! identical data and scored against each other. Once the port is trusted, this is also
+//! how a harness picks the MSCEqF backend.
+//!
+//! Feature coordinates are RAW PIXELS here, not the normalized pairs the primitive
+//! binding takes: the backend owns a camera model and normalizes internally.
+
+use numpy::ndarray::Array2;
+use numpy::{PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
+use pyo3::prelude::*;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use echo_li_core::backend::{MsceqfBackend, MsceqfSettings, VioBackend};
+use echo_li_core::mathematical::camera::{CameraModel, PinholeModel};
+use echo_li_core::mathematical::imu_velocity::IMUVelocity;
+use echo_li_core::mathematical::msceqf_filter::{MSCEqFFilter, ProcessNoise, SystemOrigin};
+use echo_li_core::mathematical::vision_measurement::VisionMeasurement;
+use echo_lie::{SE3, SE23, SO3};
+use nalgebra::{Matrix3, Matrix4, SMatrix, Vector2, Vector3, Vector6};
+
+fn mat3(a: PyReadonlyArray2<'_, f64>) -> Matrix3<f64> {
+    let v = a.as_array();
+    Matrix3::from_fn(|i, j| v[[i, j]])
+}
+fn mat4(a: PyReadonlyArray2<'_, f64>) -> Matrix4<f64> {
+    let v = a.as_array();
+    Matrix4::from_fn(|i, j| v[[i, j]])
+}
+fn vec3(a: &PyReadonlyArray1<'_, f64>) -> Vector3<f64> {
+    let v = a.as_array();
+    Vector3::new(v[0], v[1], v[2])
+}
+fn vec6(a: &PyReadonlyArray1<'_, f64>) -> Vector6<f64> {
+    let v = a.as_array();
+    Vector6::new(v[0], v[1], v[2], v[3], v[4], v[5])
+}
+
+#[pyclass(name = "MsceqfBackend")]
+pub struct PyMsceqfBackend {
+    inner: MsceqfBackend,
+}
+
+#[pymethods]
+impl PyMsceqfBackend {
+    #[new]
+    #[pyo3(signature = (
+        r0, p0, v0, b0, s0, g, d_std, delta_std, e_std,
+        accel_density, gyro_density, accel_rw, gyro_rw, transition_order,
+        fx, fy, cx, cy,
+        num_clones=11, pixel_std=1.0, chi2_mult=1.0, slam_chi2_mult=0.0,
+        max_track=200, slam_min_len=0, max_slam=0, curvature=true, update_span=0
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        r0: PyReadonlyArray2<'_, f64>,
+        p0: PyReadonlyArray1<'_, f64>,
+        v0: PyReadonlyArray1<'_, f64>,
+        b0: PyReadonlyArray1<'_, f64>,
+        s0: PyReadonlyArray2<'_, f64>,
+        g: PyReadonlyArray1<'_, f64>,
+        d_std: PyReadonlyArray1<'_, f64>,
+        delta_std: PyReadonlyArray1<'_, f64>,
+        e_std: PyReadonlyArray1<'_, f64>,
+        accel_density: f64,
+        gyro_density: f64,
+        accel_rw: f64,
+        gyro_rw: f64,
+        transition_order: usize,
+        fx: f64,
+        fy: f64,
+        cx: f64,
+        cy: f64,
+        num_clones: usize,
+        pixel_std: f64,
+        chi2_mult: f64,
+        slam_chi2_mult: f64,
+        max_track: usize,
+        slam_min_len: usize,
+        max_slam: usize,
+        curvature: bool,
+        update_span: usize,
+    ) -> Self {
+        let t0 = SE23::new(SO3::from_matrix(&mat3(r0)), vec3(&p0), vec3(&v0));
+        let origin = SystemOrigin::new(t0, vec6(&b0), SE3::from_matrix(&mat4(s0)), vec3(&g));
+
+        let ds = d_std.as_array();
+        let d_init = SMatrix::<f64, 9, 9>::from_fn(|i, j| if i == j { ds[i] * ds[i] } else { 0.0 });
+        let dl = delta_std.as_array();
+        let delta_init =
+            SMatrix::<f64, 6, 6>::from_fn(|i, j| if i == j { dl[i] * dl[i] } else { 0.0 });
+        let es = e_std.as_array();
+        let e_init = SMatrix::<f64, 6, 6>::from_fn(|i, j| if i == j { es[i] * es[i] } else { 0.0 });
+
+        let noise = ProcessNoise {
+            angular_velocity_std: gyro_density,
+            acceleration_std: accel_density,
+            angular_velocity_bias_std: gyro_rw,
+            acceleration_bias_std: accel_rw,
+            state_transition_order: transition_order,
+        };
+        let filter = MSCEqFFilter::new(origin, &d_init, &delta_init, &e_init, noise);
+        let cam: Arc<dyn CameraModel> = Arc::new(PinholeModel { fx, fy, cx, cy });
+        let settings = MsceqfSettings {
+            num_clones,
+            pixel_std,
+            chi2_mult,
+            slam_chi2_mult: (slam_chi2_mult > 0.0).then_some(slam_chi2_mult),
+            max_track,
+            slam_min_len: (slam_min_len > 0).then_some(slam_min_len),
+            max_slam,
+            curvature,
+            update_span,
+        };
+        Self {
+            inner: MsceqfBackend::new(filter, cam, settings),
+        }
+    }
+
+    /// One IMU sample. The backend derives dt from consecutive stamps, so the FIRST
+    /// call only establishes a timestamp and propagates nothing.
+    fn process_imu(
+        &mut self,
+        stamp: f64,
+        gyro: PyReadonlyArray1<'_, f64>,
+        accel: PyReadonlyArray1<'_, f64>,
+    ) {
+        self.inner
+            .process_imu(IMUVelocity::new(stamp, vec3(&gyro), vec3(&accel)));
+    }
+
+    /// One frame: `{track_id: (u_px, v_px)}` in RAW PIXELS.
+    fn process_vision(&mut self, stamp: f64, features: HashMap<u64, (f64, f64)>) {
+        let coords = features
+            .into_iter()
+            .map(|(id, (u, v))| (id, Vector2::new(u as f32, v as f32)))
+            .collect();
+        self.inner
+            .process_vision(VisionMeasurement::new(stamp, coords), &HashMap::new());
+    }
+
+    /// `(position, R_body_to_world, velocity_BODY)`.
+    fn nav_pose<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> (
+        Bound<'py, PyArray1<f64>>,
+        Bound<'py, PyArray2<f64>>,
+        Bound<'py, PyArray1<f64>>,
+    ) {
+        let nav = self.inner.nav_estimate();
+        let r = nav.pose.rotation.as_matrix();
+        let mut rm = Array2::<f64>::zeros((3, 3));
+        for i in 0..3 {
+            for j in 0..3 {
+                rm[[i, j]] = r[(i, j)];
+            }
+        }
+        (
+            PyArray1::from_slice(py, nav.pose.translation.as_slice()),
+            PyArray2::from_array(py, &rm),
+            PyArray1::from_slice(py, nav.velocity.as_slice()),
+        )
+    }
+
+    fn n_clones(&self) -> usize {
+        self.inner.n_clones()
+    }
+    fn n_slam(&self) -> usize {
+        self.inner.n_slam()
+    }
+}

@@ -2,6 +2,7 @@ use pyo3::prelude::*;
 
 mod camera;
 mod frontend;
+mod msceqf_backend;
 mod msceqf_native;
 mod occupancy;
 mod patch_depth;
@@ -18,6 +19,7 @@ fn _echo_li(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<frontend::PyFrontend>()?;
     m.add_class::<vio_filter::PyVIOFilter>()?;
     m.add_class::<msceqf_native::PyMSCEqFNativeFilter>()?;
+    m.add_class::<msceqf_backend::PyMsceqfBackend>()?;
     m.add_class::<sparse_3d::PySparse3DFilter>()?;
     m.add_class::<patch_depth::PyPatchDepthMapper>()?;
     m.add_class::<occupancy::PyLocalOccupancyMap>()?;

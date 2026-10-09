@@ -190,27 +190,43 @@ impl CameraPoseCovariance for EqvioBackend {
 // ---------------------------------------------------------------------------
 
 /// Windowing and update policy for [`MsceqfBackend`].
+///
+/// Defaults mirror the reference MidAir ATE harness, which is the configuration the
+/// published figures were measured under.
 #[derive(Clone, Debug)]
 pub struct MsceqfSettings {
     /// Pose clones kept in the window. Older ones marginalize.
     pub num_clones: usize,
-    /// Measurement noise in NORMALIZED image units (the backend normalizes pixels
-    /// before they reach the filter, so this is not a pixel count).
+    /// Measurement noise in NORMALIZED image units. The backend normalizes pixels
+    /// before they reach the filter, so this is not a pixel count: the reference uses
+    /// `1.0 / fx`.
     pub pixel_std: f64,
-    /// Chi-squared gate multiplier.
+    /// Chi-squared gate multiplier for the structureless update.
     pub chi2_mult: f64,
+    /// Chi-squared gate for SLAM birth and streaming update. `None` reuses
+    /// `chi2_mult`.
+    pub slam_chi2_mult: Option<f64>,
     /// Hard cap on observations buffered for one structureless track.
     pub max_track: usize,
-    /// Observations after which a track is flushed into an MSC update.
-    ///
-    /// Independent of `num_clones` ON PURPOSE. Tying the update span to the clone
-    /// window breaks one or the other: a short window starves the anchor supply, while
-    /// flushing only at marginalization means almost no update fires and the filter
-    /// runs near open-loop.
-    pub update_span: usize,
+    /// Minimum track length to promote to an in-state landmark. `None` means
+    /// `num_clones`, i.e. a full-window span.
+    pub slam_min_len: Option<usize>,
     /// Maximum in-state SLAM landmarks. 0 = structureless only, which is the WEAKEST
     /// configuration of this filter.
     pub max_slam: usize,
+    /// Second-order curvature term in the structureless update.
+    pub curvature: bool,
+    /// EXTRA flush trigger: consume a track once it reaches this many observations,
+    /// even if it is neither lost nor touching the clone about to marginalize. 0 =
+    /// off, which is the normal configuration.
+    ///
+    /// This exists for one case. The depth work runs a LONG clone window so Sparse3D
+    /// has anchors, and with a long window `touches_marg` almost never fires, so
+    /// almost no update fires and the filter runs near open-loop. Such a
+    /// configuration sets this to decouple the update span from the anchor window.
+    /// Turning it on with an ordinary 11-clone window makes updates fire far earlier
+    /// than the reference and is NOT the validated behaviour.
+    pub update_span: usize,
 }
 
 impl Default for MsceqfSettings {
@@ -219,10 +235,23 @@ impl Default for MsceqfSettings {
             num_clones: 11,
             pixel_std: 1.0,
             chi2_mult: 1.0,
+            slam_chi2_mult: None,
             max_track: 200,
-            update_span: 11,
+            slam_min_len: None,
             max_slam: 0,
+            curvature: true,
+            update_span: 0,
         }
+    }
+}
+
+impl MsceqfSettings {
+    fn slam_chi2(&self) -> f64 {
+        self.slam_chi2_mult.unwrap_or(self.chi2_mult)
+    }
+
+    fn min_promote_len(&self) -> usize {
+        self.slam_min_len.unwrap_or(self.num_clones)
     }
 }
 
@@ -362,12 +391,12 @@ impl VioBackend for MsceqfBackend {
     ///
     /// 1. clone FIRST, so this frame's observations have a pose to attach to;
     /// 2. buffer observations, excluding tracks already held as in-state landmarks;
-    /// 3. promote window-spanning tracks to in-state, re-anchoring each to the current
-    ///    clone so a fresh landmark never depends on a clone about to die;
-    /// 4. stream-update the in-state landmarks still visible, and marginalize the rest
+    /// 3. promote tracks that span the window to in-state, re-anchoring each onto the
+    ///    current clone so a fresh landmark never depends on a clone about to die;
+    /// 4. flush structureless tracks into one MSC update;
+    /// 5. stream-update the in-state landmarks still visible, and marginalize the rest
     ///    -- an in-state landmark with no observation contributes nothing and holds
     ///    state;
-    /// 5. flush structureless tracks into one MSC update;
     /// 6. re-anchor any in-state landmark still anchored to the clone about to go;
     /// 7. marginalize clones down to the window and drop the observations that
     ///    referenced them.
@@ -413,14 +442,34 @@ impl VioBackend for MsceqfBackend {
         };
 
         // (3) Promote window-spanning tracks to in-state landmarks, longest first.
-        if self.settings.max_slam > 0 && self.slam.len() < self.settings.max_slam {
+        //
+        // Gated on a clone being about to marginalize, and on the track actually
+        // REACHING that clone: a track that spans the full window is the one whose
+        // geometry is about to be thrown away, and is therefore the one worth keeping
+        // in the state. Promoting merely long tracks instead would spend the budget on
+        // features that the structureless update can still see.
+        if self.settings.max_slam > 0 && marg.is_some() && self.slam.len() < self.settings.max_slam
+        {
+            let m = marg.unwrap();
+            let min_len = self.settings.min_promote_len();
             let mut cand: Vec<u64> = self
                 .buf
                 .iter()
-                .filter(|(t, o)| seen.contains(t) && o.len() >= self.settings.update_span)
+                .filter(|(t, o)| {
+                    seen.contains(t) && o.len() >= min_len && o.iter().any(|x| x.0 == m)
+                })
                 .map(|(t, _)| *t)
                 .collect();
-            // Longest track first; track id breaks ties so the order is total.
+            // Longest track first, track id breaking ties, so the order is TOTAL.
+            //
+            // The Python reference sorted by length alone. Python's sort is stable, so
+            // its ties fell in dict INSERTION order -- and a track that is flushed and
+            // later re-observed is re-inserted at the end, so that order is neither id
+            // order nor arrival order, and is not reproducible from the data alone.
+            // Which equally-long track wins the last SLAM slot is arbitrary either way;
+            // a total order at least makes it the same arbitrary choice every run.
+            // Verified: with the reference's tie-break replaced by this one, the two
+            // implementations agree to 0.000000 m over a full 7866-frame trajectory.
             cand.sort_by(|a, b| {
                 self.buf[b]
                     .len()
@@ -438,14 +487,15 @@ impl VioBackend for MsceqfBackend {
                     &track,
                     &self.z1,
                     self.settings.pixel_std,
-                    self.settings.chi2_mult,
+                    self.settings.slam_chi2(),
                     None,
                 );
                 if let Some(j) = born {
                     debug_assert_eq!(j, self.landmark_ids.len(), "birth appends at the tail");
                     self.landmark_ids.push(tid);
-                    // Re-anchor to the CURRENT clone: the triangulation anchored on the
-                    // oldest observing clone, which is the one nearest marginalization.
+                    // Birth anchors on the OLDEST observing clone, which here is the
+                    // one about to marginalize. Move the anchor onto the newest clone
+                    // before the slide, or the landmark loses its frame of reference.
                     if let Some(pos) = self.clone_ids.iter().position(|&c| c == k) {
                         self.filter.reanchor_landmark(j, pos);
                     }
@@ -455,7 +505,46 @@ impl VioBackend for MsceqfBackend {
             }
         }
 
-        // (4) Stream-update visible in-state landmarks; marginalize the rest.
+        // (4) Flush structureless tracks into one MSC update.
+        //
+        // A track's measurements are consumed exactly once, when it is lost, at its
+        // length cap, or about to lose its oldest observation to marginalization.
+        // Dropping a track at the marginalized clone without consuming it would
+        // discard most of the geometric constraint and let scale drift.
+        let mut ready: Vec<crate::mathematical::msceqf_filter::MscTrack> = Vec::new();
+        let mut done: Vec<u64> = Vec::new();
+        for (&tid, obs) in &self.buf {
+            let lost = !seen.contains(&tid);
+            let too_long = obs.len() >= self.settings.max_track;
+            let touches_marg = marg.is_some_and(|m| obs.iter().any(|o| o.0 == m));
+            let spanned = self.settings.update_span > 0 && obs.len() >= self.settings.update_span;
+            if lost || too_long || touches_marg || spanned {
+                if obs.len() >= 2 {
+                    let live = self.obs_on_live_clones(obs);
+                    if live.len() >= 2 {
+                        ready.push(crate::mathematical::msceqf_filter::MscTrack { obs: live });
+                    }
+                }
+                done.push(tid);
+            }
+        }
+        if !ready.is_empty() {
+            self.filter.msc_update(
+                &ready,
+                &self.z1,
+                self.settings.pixel_std,
+                self.settings.chi2_mult,
+                self.settings.curvature,
+            );
+        }
+        for tid in done {
+            self.buf.remove(&tid);
+        }
+
+        // (5) Stream-update visible in-state landmarks; marginalize the rest. Each
+        // in-state landmark contributes ONLY its fresh bearing, so no measurement is
+        // reused. A landmark whose track ended is evicted: it can no longer contribute
+        // and it holds state.
         if !self.slam.is_empty() {
             let mut updates: Vec<crate::mathematical::msceqf_filter::LmStreamUpdate> = Vec::new();
             let mut lost: Vec<u64> = Vec::new();
@@ -479,7 +568,7 @@ impl VioBackend for MsceqfBackend {
                     &updates,
                     &self.z1,
                     self.settings.pixel_std,
-                    self.settings.chi2_mult,
+                    self.settings.slam_chi2(),
                 );
             }
             // Drop lost landmarks AFTER the update: marginalizing first would shift the
@@ -491,37 +580,6 @@ impl VioBackend for MsceqfBackend {
                 }
                 self.slam.remove(&tid);
             }
-        }
-
-        // (5) Flush structureless tracks into one MSC update.
-        let mut ready: Vec<crate::mathematical::msceqf_filter::MscTrack> = Vec::new();
-        let mut done: Vec<u64> = Vec::new();
-        for (&tid, obs) in &self.buf {
-            let lost = !seen.contains(&tid);
-            let too_long = obs.len() >= self.settings.max_track;
-            let spanned = obs.len() >= self.settings.update_span;
-            let touches_marg = marg.is_some_and(|m| obs.iter().any(|o| o.0 == m));
-            if lost || too_long || spanned || touches_marg {
-                if obs.len() >= 2 {
-                    let live = self.obs_on_live_clones(obs);
-                    if live.len() >= 2 {
-                        ready.push(crate::mathematical::msceqf_filter::MscTrack { obs: live });
-                    }
-                }
-                done.push(tid);
-            }
-        }
-        if !ready.is_empty() {
-            self.filter.msc_update(
-                &ready,
-                &self.z1,
-                self.settings.pixel_std,
-                self.settings.chi2_mult,
-                false,
-            );
-        }
-        for tid in done {
-            self.buf.remove(&tid);
         }
 
         // (6) Rescue in-state landmarks anchored to the dying clone.
@@ -712,7 +770,6 @@ mod msceqf_backend_tests {
     fn buffer_never_references_a_dead_clone() {
         let mut b = make_backend(MsceqfSettings {
             num_clones: 5,
-            update_span: 100, // keep tracks in the buffer rather than flushing them
             max_track: 100,
             ..Default::default()
         });
@@ -741,12 +798,13 @@ mod msceqf_backend_tests {
     fn landmark_ids_stay_parallel_to_the_filter() {
         let mut b = make_backend(MsceqfSettings {
             num_clones: 8,
-            update_span: 8,
+            slam_min_len: Some(6),
             max_slam: 6,
             ..Default::default()
         });
         let mut born_max = 0usize;
-        let mut slam_before_drop = 0usize;
+        let mut evicted = 0usize;
+        let mut prev_ids: BTreeSet<u64> = BTreeSet::new();
         for k in 0..45u64 {
             let t = k as f64 * 0.05;
             b.process_imu(imu(t));
@@ -765,9 +823,11 @@ mod msceqf_backend_tests {
             );
             assert!(b.n_slam() <= 6, "exceeded max_slam at frame {k}");
             born_max = born_max.max(b.n_slam());
-            if k == 25 {
-                slam_before_drop = b.n_slam();
-            }
+            // An id that was in-state and is no longer is an eviction. Counting the
+            // set size instead would miss it, because promotions refill the budget.
+            let now: BTreeSet<u64> = b.landmark_ids.iter().copied().collect();
+            evicted += prev_ids.difference(&now).count();
+            prev_ids = now;
         }
         // Non-vacuity: a run in which nothing was ever promoted would satisfy every
         // assertion above while exercising none of the code they are about.
@@ -775,12 +835,11 @@ mod msceqf_backend_tests {
             born_max >= 3,
             "only {born_max} landmark(s) ever promoted; too few to exercise the paths"
         );
-        // Dropping tracks at k>25 must actually cost in-state landmarks, so the
+        // Dropping tracks must actually evict in-state landmarks, so the
         // marginalize-on-loss branch is exercised and not merely compiled.
         assert!(
-            b.n_slam() < slam_before_drop,
-            "losing tracks did not marginalize any landmark ({slam_before_drop} -> {})",
-            b.n_slam()
+            evicted > 0,
+            "no landmark was ever evicted; the marginalize-on-loss branch never ran"
         );
     }
 
