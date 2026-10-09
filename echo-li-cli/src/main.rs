@@ -25,7 +25,7 @@ use rudolf_v::klt::LkMethod;
 use rudolf_v::rigid_ransac::{Correspondence3d, Rigid3dRansacConfig};
 use rudolf_v::stereo::{StereoConfig as RudolfStereoConfig, StereoMatcher};
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -1550,31 +1550,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                         Vec::new()
                     };
-                    let (mut depth_priors, defer_fallback_ids) =
-                        if let Some(sparse) = &sparse_filter {
-                            let mut priors = HashMap::new();
-                            let mut deferred = HashSet::new();
-                            for &fid in measurement.cam_coordinates.keys() {
-                                let (range, range_var) = sparse.query_range(fid);
-                                if range > 0.0 && range_var.is_finite() {
-                                    priors.insert(fid, LandmarkDepthPrior { range, range_var });
-                                } else if sparse.has_track(fid) {
-                                    deferred.insert(fid);
-                                }
-                            }
-                            (priors, deferred)
-                        } else {
-                            (HashMap::new(), HashSet::new())
-                        };
-                    // Stereo priors override SparseVog (known baseline, tighter variance).
-                    depth_priors.extend(stereo_depth_priors.iter().map(|(&id, p)| (id, *p)));
+                    // Sparse3D deliberately does NOT seed the EqF, even though it is running
+                    // right here with a range for most of these features.
+                    //
+                    // Its range is triangulated against EqVIO's own poses, so it carries
+                    // EqVIO's scale error rather than any independent measurement of scale.
+                    // Feeding it back as a birth prior closes a loop on the one direction the
+                    // mono filter cannot observe: the seed error is COHERENT across landmarks
+                    // (every landmark is wrong by the same factor, since they share the pose
+                    // scale that produced them), so it does not average out the way independent
+                    // per-landmark noise does, and it lands directly on the scale direction,
+                    // where nothing restores it. Measured on MidAir VO_test: the prior/GT range
+                    // ratio COMPOUNDS over a run, 0.598 early to 0.095 late on traj_1
+                    // (corr(frame, log ratio) = -0.43), and traj_2 diverged at 648% ATE against
+                    // a 3.01% baseline without the seeding. Gating the far tail stops the
+                    // divergence but cannot touch the bias -- traj_0 floors at 2.59% against a
+                    // 1.20% unseeded baseline -- because a range gate is scale-free by
+                    // construction and so inherits the very scale it would need to check.
+                    // Coherent bias is also the worst kind to inject: at matched magnitude a
+                    // coherent x0.5 seed costs 4.4% ATE where incoherent lognormal sigma=0.5
+                    // costs 3.3%.
+                    //
+                    // Only a source with its OWN metric scale can seed depth: stereo (known
+                    // baseline), a range sensor, or accel-vs-gravity. Hence stereo only below.
+                    // Sparse3D keeps running -- it is the out-of-state depth product and the
+                    // subject of the range-covariance work -- and the core's prior/defer
+                    // mechanism stays for stereo and for the python diagnostics that inject
+                    // priors on purpose in order to measure them.
+                    let depth_priors: HashMap<u64, LandmarkDepthPrior> =
+                        stereo_depth_priors.iter().map(|(&id, p)| (id, *p)).collect();
                     let depth_prior_hash =
                         trace_determinism.then(|| hash_depth_priors(&depth_priors));
-                    f.process_vision_with_depth_priors_and_deferred_fallbacks(
+                    f.process_vision_with_depth_priors(
                         measurement.clone(),
                         cam_model.as_ref(),
                         &depth_priors,
-                        &defer_fallback_ids,
                     );
                     vision_count += 1;
 
