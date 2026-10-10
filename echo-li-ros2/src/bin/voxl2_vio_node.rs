@@ -5,6 +5,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use camera_geometry::CameraProjection;
+use echo_li_core::backend::EqvioBackend;
+use echo_li_core::backend::VioBackendFull;
 use echo_li_core::config::VIOConfig;
 use echo_li_core::core_types::CameraIntrinsics;
 use echo_li_core::depth::occupancy::LocalOccupancyMap;
@@ -17,7 +19,7 @@ use echo_li_core::mathematical::camera::CameraModel;
 use echo_li_core::mathematical::imu_velocity::IMUVelocity;
 use echo_li_core::mathematical::vio_state::{VIOSensorState, VIOState};
 use echo_li_core::mathematical::vision_measurement::VisionMeasurement;
-use echo_li_core::{VIOFilter, landmarks_to_global};
+use echo_li_core::{VIOFilter, VIOFilterSettings};
 use echo_li_ros2::{NSEC_PER_SEC, best_effort_qos, quat_to_se3, stamp_ns, to_stamp, xyzi_cloud};
 use echo_lie::SE3;
 use futures::StreamExt;
@@ -381,7 +383,13 @@ impl ReferenceTrack {
 
 struct VioNode {
     // VIO pipeline
-    filter: VIOFilter,
+    /// The pose backend behind the seam. The node no longer names a filter type: it
+    /// feeds IMU and frames and reads a NavEstimate, so a second backend is a
+    /// construction change here and nothing else.
+    filter: Box<dyn VioBackendFull>,
+    /// Kept because initialisation REBUILDS the backend once gravity alignment
+    /// completes, and the settings are otherwise consumed by the first construction.
+    filter_settings: VIOFilterSettings,
     camera: Arc<dyn CameraModel>,
     frontend: FrontendBackend,
     t_bc: Matrix4<f64>,
@@ -620,7 +628,10 @@ impl VioNode {
             camera_offset: cam_offset,
         };
         let xi0 = VIOState::new(sensor, vec![]);
-        let filter = VIOFilter::new(filter_settings, xi0);
+        let filter: Box<dyn VioBackendFull> = Box::new(EqvioBackend::new(
+            VIOFilter::new(filter_settings.clone(), xi0),
+            camera.clone(),
+        ));
 
         // Sparse 3D filter
         let sparse_3d = vio_config.sparse_vog.as_ref().and_then(|sv| {
@@ -687,6 +698,7 @@ impl VioNode {
             filter,
             camera,
             frontend,
+            filter_settings,
             t_bc: params.t_bs,
             initialized: false,
             n_init: params.n_init,
@@ -899,8 +911,10 @@ impl VioNode {
 
         if !self.initialized {
             if let Some(start) = self.init.push(imu) {
-                let settings = self.filter.settings.clone();
-                self.filter = VIOFilter::new(settings, start.state);
+                self.filter = Box::new(EqvioBackend::new(
+                    VIOFilter::new(self.filter_settings.clone(), start.state),
+                    self.camera.clone(),
+                ));
                 for buffered in start.replay {
                     self.filter.process_imu(buffered);
                 }
@@ -952,8 +966,7 @@ impl VioNode {
         let measurement = VisionMeasurement::new(stamp, observations);
 
         let vision_started = Instant::now();
-        self.filter
-            .process_vision(measurement, self.camera.as_ref());
+        self.filter.process_vision(measurement, &HashMap::new());
         let vision_ms = vision_started.elapsed().as_secs_f64() * 1000.0;
 
         self.images_processed += 1;
@@ -979,10 +992,10 @@ impl VioNode {
             return;
         }
 
-        let state = self.filter.state_estimate();
-        let pos = state.sensor.pose.translation;
-        let q = state.sensor.pose.rotation.as_xyzw();
-        let vel = state.sensor.velocity;
+        let nav = self.filter.nav_estimate();
+        let pos = nav.pose.translation;
+        let q = nav.pose.rotation.as_xyzw();
+        let vel = nav.velocity;
         let position = [pos[0], pos[1], pos[2]];
         let quaternion = [q[0], q[1], q[2], q[3]];
         let velocity = [vel[0], vel[1], vel[2]];
@@ -1004,11 +1017,16 @@ impl VioNode {
             tf_pub,
         );
 
-        let n_lm = state.camera_landmarks.len();
-        push_capped(&mut self.landmark_counts, n_lm, 300);
-        let (global_landmarks, _, _) = landmarks_to_global(&state);
+        let global_landmarks = self.filter.landmarks_world();
+        push_capped(&mut self.landmark_counts, global_landmarks.len(), 300);
 
-        // Camera pose: T_wc = T_wb @ T_bc
+        // Camera pose: T_wc = T_wb @ T_bc.
+        //
+        // Deliberately the FIXED extrinsic, not VioBackend::camera_pose(), which would
+        // use the filter's online estimate of the body-to-camera transform. The
+        // estimated one is arguably the better input here, but swapping it changes what
+        // the node publishes and what the depth filter is fed; that is a numerics
+        // decision with its own validation, not part of moving to the backend seam.
         let t_wc = quat_to_se3(&position, &quaternion) * self.t_bc;
         let cam_origin = [t_wc[(0, 3)], t_wc[(1, 3)], t_wc[(2, 3)]];
         Self::publish_landmarks(
@@ -1025,9 +1043,12 @@ impl VioNode {
                 .iter()
                 .map(|f| (f.id, Vector2::new(f.x, f.y)))
                 .collect();
+            // None means the backend cannot report pose uncertainty, which the depth
+            // filter must treat as missing information rather than as certainty.
             let (p_vv, p_ww) = self
                 .filter
-                .sparse_camera_pose_covariances()
+                .pose_covariance()
+                .and_then(|c| c.camera_pose_covariances())
                 .map(|(v, w)| (Some(v), Some(w)))
                 .unwrap_or((None, None));
             let measurement = VisionMeasurement::new(stamp, feature_uvs);
@@ -1112,9 +1133,8 @@ impl VioNode {
             }
         }
 
-        // Fill from EqF landmarks
-        let state = self.filter.state_estimate();
-        let (global_lm, _, _) = landmarks_to_global(&state);
+        // Fill from the backend's landmark map.
+        let global_lm = self.filter.landmarks_world();
         for feat in features {
             if sparse3d_fids.contains(&feat.id) {
                 continue;

@@ -95,6 +95,14 @@ pub trait VioBackend {
 
     /// Current navigation estimate.
     fn nav_estimate(&self) -> NavEstimate;
+
+    /// Pose of the CAMERA in the world frame.
+    ///
+    /// Not derivable from [`NavEstimate`]: that carries the body pose, and the
+    /// body-to-camera transform is part of the backend's state -- both implementors
+    /// estimate it online rather than holding it fixed. Consumers that reproject into
+    /// the image, or feed a depth filter, need this one and not the body pose.
+    fn camera_pose(&self) -> SE3;
 }
 
 /// Backends that hold a map of landmarks and can report it in the world frame.
@@ -113,6 +121,21 @@ pub trait CameraPoseCovariance {
     /// camera-fixed frame. `None` means unavailable, which a consumer must treat as
     /// missing information, NOT as certainty.
     fn camera_pose_covariances(&self) -> Option<(Matrix3<f64>, Matrix3<f64>)>;
+}
+
+/// What a full wrapper needs behind a trait object.
+///
+/// `Box<dyn VioBackend>` cannot reach the capability traits -- a trait object carries
+/// exactly one vtable -- so a wrapper that stores one needs a single trait naming
+/// everything it requires. Landmarks are required, because every wrapper publishes or
+/// renders them. Camera-pose covariance stays OPTIONAL and is reached through
+/// [`Self::pose_covariance`], which returns `None` for a backend that cannot supply it:
+/// collapsing that into a required method would force an implementor to invent a
+/// covariance, and "I cannot tell you" must not become "my uncertainty is zero".
+pub trait VioBackendFull: VioBackend + LandmarkMap {
+    fn pose_covariance(&self) -> Option<&dyn CameraPoseCovariance> {
+        None
+    }
 }
 
 /// The EqVIO filter plus the camera it was built against.
@@ -161,6 +184,11 @@ impl VioBackend for EqvioBackend {
             .process_vision_with_depth_priors(measurement, self.cam.as_ref(), depth_priors);
     }
 
+    fn camera_pose(&self) -> SE3 {
+        let state = self.filter.eqf.state_estimate();
+        state.sensor.pose.compose(&state.sensor.camera_offset)
+    }
+
     fn nav_estimate(&self) -> NavEstimate {
         let state = self.filter.eqf.state_estimate();
         NavEstimate {
@@ -169,6 +197,12 @@ impl VioBackend for EqvioBackend {
             gyro_bias: state.sensor.gyro_bias(),
             accel_bias: state.sensor.accel_bias(),
         }
+    }
+}
+
+impl VioBackendFull for EqvioBackend {
+    fn pose_covariance(&self) -> Option<&dyn CameraPoseCovariance> {
+        Some(self)
     }
 }
 
@@ -620,6 +654,10 @@ impl VioBackend for MsceqfBackend {
         }
     }
 
+    fn camera_pose(&self) -> SE3 {
+        self.filter.camera_pose()
+    }
+
     fn nav_estimate(&self) -> NavEstimate {
         let nav = self.filter.phi();
         let rotation = nav.t.rotation;
@@ -637,6 +675,12 @@ impl VioBackend for MsceqfBackend {
         }
     }
 }
+
+/// Landmarks yes, camera-pose covariance not yet: MSCEqF carries covariance on the
+/// group algebra over its clone window, and projecting that onto a single camera pose
+/// is a derivation this backend does not do. Reporting `None` is the honest answer
+/// until it does.
+impl VioBackendFull for MsceqfBackend {}
 
 impl LandmarkMap for MsceqfBackend {
     fn landmarks_world(&self) -> HashMap<u64, Vector3<f64>> {

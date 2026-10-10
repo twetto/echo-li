@@ -128,10 +128,28 @@ Owed, in dependency order: `MSCEqFFilter` is a primitives API -- `stochastic_clo
    REAL camera model, where the Python harness used a bare inverse-K. Those agree on an
    undistorted pinhole (MidAir) and diverge on a distorted one, so MidAir is the right
    place to compare.
-2. **Wrappers hold `Box<dyn VioBackend>`.** Only after 1, so the switch is a capability
-   change rather than a silent behaviour change. Config loading is still duplicated --
-   each wrapper calls `VIOConfig::from_yaml` and `to_filter_settings` itself -- which is
-   worth folding in at the same time.
+2. **A backend choice the ROS 2 node can actually make.** The node holds the seam, but
+   EqVIO is the only thing it can construct: `MsceqfBackend` needs a `SystemOrigin`
+   (R0, p0, v0, b0, S0, g) and a `ProcessNoise`, none of which `VIOConfig` carries. The
+   remaining work is config plumbing, not architecture.
+
+3. **`MsceqfBackend::pose_covariance`.** It returns `None` today, so a node running
+   MSCEqF would starve the Sparse3D depth filter of pose uncertainty. MSCEqF carries
+   covariance on the group algebra over its clone window; projecting that onto a single
+   camera pose is the missing derivation.
+
+### Not converted, on purpose
+
+**The CLI keeps a concrete `VIOFilter`.** It is the EqVIO replay and diagnostic tool: it
+hashes filter state for determinism traces, reads `eqf.current_time` and the covariance
+blocks, and writes trajectories as `VIOState`. Putting it behind a trait object would
+mean widening the shared trait with EqVIO-only methods, which is the thing the seam
+exists to avoid. A consumer that needs one backend's internals should hold that
+backend -- `EqvioBackend::filter()` is there for exactly this.
+
+**Config loading stays per-wrapper.** It is two lines each (`VIOConfig::from_yaml` then
+`to_filter_settings`), and the part that actually drifted -- initialisation -- is now
+shared. A wrapper type for two lines would be cost without benefit.
 
 ## Deferred: priors into `VisionMeasurement`
 
