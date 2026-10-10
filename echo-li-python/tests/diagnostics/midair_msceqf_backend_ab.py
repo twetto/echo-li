@@ -118,6 +118,7 @@ def run_python(a, by_frame, gyr_body, acc, nimg, cfg):
     pixel_std = 1.0 / FX
     slam_min_len = cfg.num_clones
     buf, slam, est = {}, set(), []
+    n_upd = 0
 
     def add_frame(k):
         f.clone_pose(k, k * DT * IMU_PER_IMG)
@@ -159,7 +160,7 @@ def run_python(a, by_frame, gyr_body, acc, nimg, cfg):
                     ready[tid] = list(obs)
                 done.append(tid)
         if ready:
-            f.msc_update(ready, pixel_std, cfg.chi2_mult, bool(cfg.curvature))
+            n_upd += f.msc_update(ready, pixel_std, cfg.chi2_mult, bool(cfg.curvature))
         for tid in done:
             del buf[tid]
 
@@ -190,6 +191,7 @@ def run_python(a, by_frame, gyr_body, acc, nimg, cfg):
                 else:
                     del buf[tid]
         est.append(f.nav_body_pose()[0].copy())
+    print(f'    [py arm] accepted_updates={n_upd}')
     return np.array(est), f.n_clones(), len(slam)
 
 
@@ -209,11 +211,16 @@ def main():
     ap.add_argument("--chi2-mult", type=float, default=1.0)
     ap.add_argument("--max-slam", type=int, default=0)
     ap.add_argument("--curvature", type=int, default=1)
+    # These MUST match midair_msceqf_native_ate.py. An earlier version of this file
+    # carried Allan-variance figures from elsewhere, leaving the process noise 9-55x
+    # too small; the filter then drifted to 24.7% ATE over the full trajectory and the
+    # fault looked like the filter rather than the harness.
     ap.add_argument("--acc-density", type=float, default=1.6798e-3)
-    ap.add_argument("--gyr-density", type=float, default=1.1591e-4)
-    ap.add_argument("--acc-rw", type=float, default=5.4448e-5)
-    ap.add_argument("--gyr-rw", type=float, default=1.1267e-5)
+    ap.add_argument("--acc-rw", type=float, default=3.0e-3)
+    ap.add_argument("--gyr-density", type=float, default=1.2724e-3)
+    ap.add_argument("--gyr-rw", type=float, default=1.0e-4)
     ap.add_argument("--tracks", default=str(TRACKS))
+    ap.add_argument("--dump", default="")
     cfg = ap.parse_args()
 
     traj = f"trajectory_{cfg.traj:04d}"
@@ -235,6 +242,9 @@ def main():
     print(f"  rust backend  ATE {r_rs:.4f} m  ({p_rs:.3f}% of path)  clones {c_rs} slam {s_rs}")
     print(f"  trajectory difference: median {np.median(d):.6f} m, max {d.max():.6f} m")
     print(f"  VERDICT: {'MATCH' if d.max() < 1e-6 else 'DIFFER'}")
+    if cfg.dump:
+        np.savez(cfg.dump, est_py=e_py, est_rs=e_rs, gt=gt)
+        print(f"  dumped -> {cfg.dump}")
 
 
 if __name__ == "__main__":

@@ -98,12 +98,20 @@ Done:
   **VALIDATED against the Python reference loop.** `midair_msceqf_backend_ab.py` drives
   both over identical MidAir data and compares trajectories pointwise:
 
-  | arm | frames | SLAM | max difference |
-  |---|---|---|---|
-  | structureless | 400 | 0 | 0.000000 m |
-  | structureless | 7866 (full) | 0 | 0.000001 m |
-  | with SLAM | 400 | 50 | 0.000000 m |
-  | with SLAM | 7866 (full) | 100 | 0.000000 m |
+  | arm | frames | SLAM | ATE | max difference |
+  |---|---|---|---|---|
+  | structureless | 400 | 0 | 0.303% | 0.000000 m |
+  | structureless | 7866 (full) | 0 | 0.624% | 0.000000 m |
+  | with SLAM | 400 | 50 | 0.317% | 0.000000 m |
+  | with SLAM | 7866 (full) | 100 | 0.401% | 0.000000 m |
+
+  The ATE column matches the reference harness exactly (0.303% at 400 frames, 0.624%
+  full), and accepted-update counts agree to the unit (2569 at 400 frames). Keep the
+  noise defaults in the A/B harness tied to the reference: a first version carried
+  Allan-variance figures from elsewhere, leaving acc_rw 55x, gyr_density 11x and gyr_rw
+  9x too small. Both arms still agreed byte-for-byte -- the equivalence result was
+  unaffected -- but the absolute ATE read 24.7% on the full trajectory and looked like
+  the filter being inaccurate rather than the harness being misconfigured.
 
   Two convention differences had to be settled to get there, and both are worth knowing.
   The backend derives `dt` from consecutive IMU stamps, so its FIRST sample propagates
