@@ -92,6 +92,12 @@ def main():
                     help="override RudolfV.maxFeatures. The rig config sets 21 because "
                          "EqVIO holds 21 landmarks IN STATE; a structureless MSCKF "
                          "consumes every track and wants far more (MidAir fed it ~118).")
+    ap.add_argument("--feature-dist", type=float, default=0.0,
+                    help="override RudolfV.featureDist (minimum feature spacing, px). "
+                         "The rig sets 32 on a 320x200 image, which caps the detector "
+                         "at ~60 features regardless of maxFeatures.")
+    ap.add_argument("--no-lbp", action="store_true",
+                    help="disable the frontend's LBP descriptor verification")
     ap.add_argument("--msceqf-pixel-std", type=float, default=1.0,
                     help="MSCEqF feature noise in PIXELS (divided by fx internally)")
     ap.add_argument("--msceqf-chi2", type=float, default=1.0,
@@ -126,6 +132,12 @@ def main():
     cam = echo_li.RadTanCamera(FX, FY, CX, CY, *DIST)
     fcfg = echo_li.FrontendConfig.from_yaml(cfg_path)
     fcfg.set_camera(FX, FY, CX, CY, W, H, list(DIST))
+    if args.no_lbp:
+        fcfg.lbp_verification = False
+        print("frontend LBP verification DISABLED")
+    if args.feature_dist > 0:
+        fcfg.cell_size = int(args.feature_dist)
+        print(f"frontend featureDist overridden -> {args.feature_dist} px")
     if args.frontend_features > 0:
         fcfg.max_features = args.frontend_features
         print(f"frontend maxFeatures overridden -> {args.frontend_features}")
