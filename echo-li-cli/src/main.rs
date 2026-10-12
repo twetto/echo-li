@@ -15,6 +15,9 @@ use echo_li_core::initialization::StationaryInit;
 /// Samples averaged for the gravity alignment at start-up. Matches the ROS 2 node's
 /// `initialization_imu_samples` default and the pyo3 binding's `n_init_samples`.
 const N_INIT_SAMPLES: usize = 100;
+use echo_li_core::backend::{
+    CameraPoseCovariance, EqvioBackend, LandmarkMap, NavEstimate, VioBackend,
+};
 use echo_li_core::mathematical::camera::CameraModel;
 use echo_li_core::mathematical::*;
 use echo_li_core::trajectory_metrics::TrajectoryMetrics;
@@ -83,15 +86,15 @@ struct Args {
     occupancy_map: bool,
 }
 
-fn write_trajectory(path: &std::path::Path, entries: &[(f64, VIOState)]) -> std::io::Result<()> {
+fn write_trajectory(path: &std::path::Path, entries: &[(f64, NavEstimate)]) -> std::io::Result<()> {
     use std::io::Write;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let mut f = std::fs::File::create(path)?;
-    for (t, state) in entries {
-        let pos = state.sensor.pose.translation;
-        let q = state.sensor.pose.rotation.as_xyzw();
+    for (t, nav) in entries {
+        let pos = nav.pose.translation;
+        let q = nav.pose.rotation.as_xyzw();
         writeln!(
             f,
             "{:.9} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6}",
@@ -223,39 +226,6 @@ fn hash_sparse_filter(sparse: Option<&Sparse3DFilter>) -> u64 {
         }
     }
     hasher.finish()
-}
-
-fn hash_state(state: &VIOState) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    let pose = &state.sensor.pose;
-    let q = pose.rotation.as_xyzw();
-    for v in q.iter() {
-        hash_f64(&mut hasher, *v);
-    }
-    for v in pose.translation.iter() {
-        hash_f64(&mut hasher, *v);
-    }
-    for v in state.sensor.velocity.iter() {
-        hash_f64(&mut hasher, *v);
-    }
-    for v in state.sensor.input_bias.iter() {
-        hash_f64(&mut hasher, *v);
-    }
-    for lm in &state.camera_landmarks {
-        hash_u64(&mut hasher, lm.id);
-        for v in lm.p.iter() {
-            hash_f64(&mut hasher, *v);
-        }
-    }
-    hasher.finish()
-}
-
-fn camera_pose_matrix(state: &VIOState) -> Matrix4<f64> {
-    state
-        .sensor
-        .pose
-        .compose(&state.sensor.camera_offset)
-        .as_matrix()
 }
 
 fn undistorted_pinhole_measurement(
@@ -1033,7 +1003,7 @@ fn build_local_occupancy_map(
 
 fn write_outputs(
     output_dir: &std::path::Path,
-    states_out: &[(f64, VIOState)],
+    states_out: &[(f64, NavEstimate)],
     gt_poses: &[StampedPose],
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !states_out.is_empty() {
@@ -1050,15 +1020,15 @@ fn write_outputs(
         if !states_out.is_empty() {
             let est_poses: Vec<(f64, echo_lie::SE3)> = states_out
                 .iter()
-                .map(|(t, s)| (*t, s.sensor.pose.clone()))
+                .map(|(t, nav)| (*t, nav.pose.clone()))
                 .collect();
             let alignment = echo_li_core::alignment::align_trajectories(&est_poses, gt_poses);
-            let aligned: Vec<(f64, VIOState)> = states_out
+            let aligned: Vec<(f64, NavEstimate)> = states_out
                 .iter()
-                .map(|(t, s)| {
-                    let mut s_aligned = s.clone();
-                    s_aligned.sensor.pose = alignment.compose(&s.sensor.pose);
-                    (*t, s_aligned)
+                .map(|(t, nav)| {
+                    let mut a = nav.clone();
+                    a.pose = alignment.compose(&nav.pose);
+                    (*t, a)
                 })
                 .collect();
             let aligned_file = output_dir.join("aligned_trajectory.txt");
@@ -1295,7 +1265,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         start.pitch_deg
     );
 
-    let mut filter: Option<VIOFilter> = Some(VIOFilter::new(settings.clone(), start.state));
+    // The backend owns the camera, so the per-frame call no longer passes one.
+    let mut filter: Option<EqvioBackend> = Some(EqvioBackend::new(
+        VIOFilter::new(settings.clone(), start.state),
+        cam_model.clone(),
+    ));
 
     // Eager-init: the filter is built once, and the buffered samples are spliced back
     // onto the FRONT of the event stream so they pass through at their original
@@ -1334,7 +1308,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &cam_model,
         tracker_max_features,
     );
-    let mut states_out: Vec<(f64, VIOState)> = Vec::new();
+    let mut states_out: Vec<(f64, NavEstimate)> = Vec::new();
     let mut imu_count: usize = 0;
     let mut vision_count: usize = 0;
     let mut sparse_pose_cov_count: usize = 0;
@@ -1405,7 +1379,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // the IMU-propagated (pre-vision) EqF prediction.
                 if use_pose_prior {
                     if let (Some(f), Some(prev)) = (&filter, &prev_cam_pose) {
-                        let pred = camera_pose_matrix(&f.eqf.state_estimate());
+                        let pred = f.camera_pose().as_matrix();
                         if let Some(pred_inv) = pred.try_inverse() {
                             let t_rel = pred_inv * prev;
                             let mut r = [[0.0f64; 3]; 3];
@@ -1592,17 +1566,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .collect();
                     let depth_prior_hash =
                         trace_determinism.then(|| hash_depth_priors(&depth_priors));
-                    f.process_vision_with_depth_priors(
-                        measurement.clone(),
-                        cam_model.as_ref(),
-                        &depth_priors,
-                    );
+                    f.process_vision(measurement.clone(), &depth_priors);
                     vision_count += 1;
 
-                    let state = f.eqf.state_estimate();
-                    let state_hash = trace_determinism.then(|| hash_state(&state));
-                    let t_wc = camera_pose_matrix(&state);
-                    let sparse_pose_cov = f.sparse_camera_pose_covariances();
+                    let state_hash = trace_determinism.then(|| f.state_fingerprint());
+                    let t_wc = f.camera_pose().as_matrix();
+                    let sparse_pose_cov = f.camera_pose_covariances();
                     prev_cam_pose = Some(t_wc);
                     if let Some(sparse) = &mut sparse_filter {
                         if sparse_pose_cov.is_some() {
@@ -1691,6 +1660,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                     }
+                    let feat_global = f.landmarks_world();
                     if trace_determinism {
                         eprintln!(
                             "det frame={} stamp={:.9} features={} feature_hash={:016x} tracked={} lost={} rejected={} new={} occupied={}/{} priors={} prior_hash={:016x} sparse_hash={:016x} eqf_landmarks={} state_hash={:016x}",
@@ -1707,16 +1677,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             depth_priors.len(),
                             depth_prior_hash.unwrap_or(0),
                             hash_sparse_filter(sparse_filter.as_ref()),
-                            state.camera_landmarks.len(),
+                            feat_global.len(),
                             state_hash.unwrap_or(0),
                         );
                     }
 
                     #[cfg(feature = "rerun")]
-                    let (feat_global, p_cam, r_cam) = echo_li_core::landmarks_to_global(&state);
-                    #[cfg(not(feature = "rerun"))]
-                    let (feat_global, _, _) = echo_li_core::landmarks_to_global(&state);
-                    states_out.push((f.eqf.current_time, state));
+                    let (p_cam, r_cam) = (f.camera_pose().translation, f.camera_pose().rotation);
+                    // The frame stamp, which the caller already has -- no need to ask the
+                    // filter for its own clock.
+                    states_out.push((measurement.stamp, f.nav_estimate()));
 
                     // Rerun per-frame logging
                     #[cfg(feature = "rerun")]
@@ -2029,8 +1999,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     if vision_count % 100 == 0 || vision_count <= 5 {
-                        let pos = states_out.last().unwrap().1.sensor.pose.translation;
-                        let vel = states_out.last().unwrap().1.sensor.velocity;
+                        let pos = states_out.last().unwrap().1.pose.translation;
+                        let vel = states_out.last().unwrap().1.velocity;
                         let occ_suffix = last_occupancy_counts
                             .map(|(unk, free, occ)| {
                                 format!("  occ=(occ:{} free:{} unk:{})", occ, free, unk)

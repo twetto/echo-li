@@ -153,24 +153,30 @@ to manufacture. The fix was not "never widen", it was to return what the questio
 actually is (`NavEstimate`, `landmarks_world()`, `camera_pose()`) rather than one
 implementor's container.
 
-### The CLI, not yet converted
+### The CLI
 
-It keeps a concrete `VIOFilter`, but NOT because the trait would have to grow
-EqVIO-only methods -- an earlier version of this file claimed that and it is wrong.
-Checked, every use is already expressible:
+Converted. It holds a concrete `EqvioBackend` rather than `Box<dyn VioBackendFull>`,
+because it only ever runs EqVIO and the concrete type keeps `filter()` available; the
+point was to stop it reading EqVIO's state layout, and it no longer does:
 
-| CLI use | needs | available as |
-|---|---|---|
-| `write_trajectory` | pose | `NavEstimate.pose` |
-| `camera_pose_matrix(&state)` | `pose · camera_offset` | `camera_pose()` |
-| `landmarks_to_global(&state)` | world landmarks | `landmarks_world()` |
-| `eqf.current_time` | the frame stamp | the caller already has it |
-| `hash_state(&state)` | a determinism fingerprint | would want `state_fingerprint() -> u64`, which any backend can provide over its own state |
+| was | now |
+|---|---|
+| `camera_pose_matrix(&f.eqf.state_estimate())` | `f.camera_pose()` |
+| `hash_state(&state)` | `f.state_fingerprint()` |
+| `landmarks_to_global(&state)` | `f.landmarks_world()` |
+| `f.sparse_camera_pose_covariances()` | `f.camera_pose_covariances()` |
+| `f.eqf.current_time` | `measurement.stamp`, which the caller already had |
+| `Vec<(f64, VIOState)>` | `Vec<(f64, NavEstimate)>` |
 
-The only genuine addition is `state_fingerprint`, and that is a general question, not an
-EqVIO one. The real reason it is unconverted is smaller: it changes the output path's
-types (`Vec<(f64, VIOState)>` through `write_outputs`/`write_trajectory`) and nothing
-forced it yet. It is work, not a design obstacle.
+`hash_state` and `camera_pose_matrix` are deleted. `state_fingerprint` was the one
+genuinely new trait method, and it is a general question -- "hash your own state" --
+not an EqVIO one; the EqVIO implementation reproduces the CLI's old field order
+(attitude xyzw, position, velocity, bias, then each landmark id and camera-frame point)
+so determinism traces recorded either side of the change stay comparable.
+
+Verified digit-identical on EuRoC V1 after conversion: V1_01 0.2073 m, V1_02 0.1494 m,
+V1_03 0.1785 m, all unchanged, and two traced runs produce byte-identical 2912-line
+determinism logs.
 
 ## Deferred: priors into `VisionMeasurement`
 

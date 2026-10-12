@@ -96,6 +96,15 @@ pub trait VioBackend {
     /// Current navigation estimate.
     fn nav_estimate(&self) -> NavEstimate;
 
+    /// Order-independent fingerprint of the backend's own state, for determinism
+    /// traces: two runs of one build over one input must produce the same sequence.
+    ///
+    /// Deliberately NOT a structured state dump. What a backend should hash is its own
+    /// state in its own representation; the only contract is that the value is stable
+    /// for identical runs and changes when the state does. Comparing fingerprints
+    /// ACROSS backends is meaningless and is not the point.
+    fn state_fingerprint(&self) -> u64;
+
     /// Pose of the CAMERA in the world frame.
     ///
     /// Not derivable from [`NavEstimate`]: that carries the body pose, and the
@@ -187,6 +196,35 @@ impl VioBackend for EqvioBackend {
     fn camera_pose(&self) -> SE3 {
         let state = self.filter.eqf.state_estimate();
         state.sensor.pose.compose(&state.sensor.camera_offset)
+    }
+
+    /// Byte-compatible with the hash the CLI computed inline before this seam existed,
+    /// so determinism traces recorded either side of the change stay comparable:
+    /// attitude as xyzw, then position, velocity, bias, then each landmark's id and its
+    /// CAMERA-frame point, in state order.
+    fn state_fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let state = self.filter.eqf.state_estimate();
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for v in state.sensor.pose.rotation.as_xyzw().iter() {
+            v.to_bits().hash(&mut h);
+        }
+        for v in state.sensor.pose.translation.iter() {
+            v.to_bits().hash(&mut h);
+        }
+        for v in state.sensor.velocity.iter() {
+            v.to_bits().hash(&mut h);
+        }
+        for v in state.sensor.input_bias.iter() {
+            v.to_bits().hash(&mut h);
+        }
+        for lm in &state.camera_landmarks {
+            lm.id.hash(&mut h);
+            for v in lm.p.iter() {
+                v.to_bits().hash(&mut h);
+            }
+        }
+        h.finish()
     }
 
     fn nav_estimate(&self) -> NavEstimate {
@@ -656,6 +694,33 @@ impl VioBackend for MsceqfBackend {
 
     fn camera_pose(&self) -> SE3 {
         self.filter.camera_pose()
+    }
+
+    /// Nav state plus the in-state landmarks in their own anchor frame. Track ids come
+    /// from `landmark_ids`, which is kept parallel to the filter's landmark list.
+    fn state_fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let nav = self.filter.phi();
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for v in nav.t.rotation.as_xyzw().iter() {
+            v.to_bits().hash(&mut h);
+        }
+        for v in nav.t.position.iter() {
+            v.to_bits().hash(&mut h);
+        }
+        for v in nav.t.velocity.iter() {
+            v.to_bits().hash(&mut h);
+        }
+        for v in nav.b.iter() {
+            v.to_bits().hash(&mut h);
+        }
+        for (j, &tid) in self.landmark_ids.iter().enumerate() {
+            tid.hash(&mut h);
+            for v in self.filter.x.landmarks[j].point().iter() {
+                v.to_bits().hash(&mut h);
+            }
+        }
+        h.finish()
     }
 
     fn nav_estimate(&self) -> NavEstimate {
