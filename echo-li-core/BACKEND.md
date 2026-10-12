@@ -161,6 +161,39 @@ update was chi2-rejected and both arms agreed by doing nothing.
 Starting the node with MSCEqF while Sparse3D is enabled logs a warning: this backend
 reports no camera-pose covariance yet, so the depth filter runs on missing information.
 
+### MSCEqF needs a ZUPT; EqVIO is papering over not having one
+
+On a bag that starts with 25 s of rest, MSCEqF reaches 61 km where EqVIO reaches
+43 m. Measured over the stationary window alone (1400 frames):
+
+| arm | path |
+|---|---|
+| MSCEqF with vision | 764.0 m |
+| MSCEqF without vision | 764.0 m -- IDENTICAL |
+| EqVIO with vision | 0.5 m |
+| EqVIO without vision | 764.6 m |
+
+MSCEqF's vision contributes NOTHING at rest: 2447 triangulations, every one rejected
+by the condition-number gate (`ECHO_MSC_TRIFAIL=1` tallies them). That is correct
+behaviour -- a structureless MSCKF has no update without parallax -- so it dead-reckons
+for 25 s and never recovers. An earlier note here guessed that degenerate zero-baseline
+updates were being ACCEPTED; that is refuted, they are all gated.
+
+Stationary initialisation does not help, and is not supposed to: both backends get the
+identical initial state from `StationaryInit`. It fixes the attitude at t=0 and says
+nothing about the 25 s after.
+
+EqVIO survives because its update does not need parallax -- it births at a fixed scene
+depth, and zero optical flow is consistent with zero motion, which pins the state. That
+is the EqVIO formulation masking a missing component, not a property MSCEqF should be
+expected to share.
+
+**There is no zero-velocity update anywhere in this tree.** OpenVINS has
+`zero_velocity_updater.cpp` for exactly this. The gap is already recorded as fatal on
+EuRoC sequences that start at rest; it now also decides whether MSCEqF is usable on a
+rig that idles before it moves. This is the blocker for running MSCEqF on real
+recordings, ahead of the pose-covariance derivation.
+
 ### Widening the trait
 
 Adding a method that only one backend implements is NOT forbidden, and
