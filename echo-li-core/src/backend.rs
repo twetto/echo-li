@@ -105,6 +105,18 @@ pub trait VioBackend {
     /// ACROSS backends is meaningless and is not the point.
     fn state_fingerprint(&self) -> u64;
 
+    /// Assert "the body is not moving" as a measurement. The caller decides WHEN,
+    /// from a [`crate::initialization::ZeroVelocityDetector`]; the backend decides
+    /// whether the state agrees enough to accept it. Returns false if unsupported or
+    /// gated out.
+    ///
+    /// Default is "unsupported", not "did nothing": a backend that silently ignored
+    /// this would leave a caller believing the rig was being held at rest when it was
+    /// free-running.
+    fn zero_velocity_update(&mut self, _sigma_v: f64) -> bool {
+        false
+    }
+
     /// Pose of the CAMERA in the world frame.
     ///
     /// Not derivable from [`NavEstimate`]: that carries the body pose, and the
@@ -196,6 +208,14 @@ impl VioBackend for EqvioBackend {
     fn camera_pose(&self) -> SE3 {
         let state = self.filter.eqf.state_estimate();
         state.sensor.pose.compose(&state.sensor.camera_offset)
+    }
+
+    /// EqVIO already had the machinery, as a GT-velocity injection diagnostic: a ZUPT
+    /// is that measurement with v = 0.
+    fn zero_velocity_update(&mut self, sigma_v: f64) -> bool {
+        self.filter
+            .velocity_pseudo_update(Vector3::zeros(), sigma_v, 1.0);
+        true
     }
 
     /// Byte-compatible with the hash the CLI computed inline before this seam existed,
@@ -780,6 +800,10 @@ impl VioBackend for MsceqfBackend {
 
     fn camera_pose(&self) -> SE3 {
         self.filter.camera_pose()
+    }
+
+    fn zero_velocity_update(&mut self, sigma_v: f64) -> bool {
+        self.filter.zero_velocity_update(sigma_v, 1.0)
     }
 
     /// Nav state plus the in-state landmarks in their own anchor frame. Track ids come

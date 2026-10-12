@@ -173,6 +173,11 @@ impl PyMsceqfBackend {
         )
     }
 
+    /// Assert zero velocity. Returns False if the chi2 gate refused it.
+    fn zero_velocity_update(&mut self, sigma_v: f64) -> bool {
+        self.inner.zero_velocity_update(sigma_v)
+    }
+
     fn n_clones(&self) -> usize {
         self.inner.n_clones()
     }

@@ -557,3 +557,123 @@ mod stationary_init_tests {
         );
     }
 }
+
+/// Rolling stationarity detector, for deciding when a zero-velocity update applies.
+///
+/// A structureless MSCKF has no vision update at rest -- every triangulation is
+/// rank-deficient -- so it dead-reckons until the rig moves. This is what tells the
+/// filter it may instead assert `v = 0`. OpenVINS carries the same component.
+///
+/// Thresholds are on the IMU alone. A detector that also used image disparity would be
+/// stricter, but it would couple this to the front-end; IMU-only is what both wrappers
+/// can supply, and the update it gates is itself chi2-gated, so a false positive while
+/// the state disagrees is rejected rather than applied.
+pub struct ZeroVelocityDetector {
+    window: std::collections::VecDeque<IMUVelocity>,
+    capacity: usize,
+    gyro_std_threshold: f64,
+    acc_std_threshold: f64,
+}
+
+impl ZeroVelocityDetector {
+    /// `capacity` samples of history. Thresholds are the standard deviations below
+    /// which the window counts as at rest: gyro in rad/s, accelerometer NORM in m/s^2
+    /// (the norm, so a constant gravity vector does not count as motion).
+    pub fn new(capacity: usize, gyro_std_threshold: f64, acc_std_threshold: f64) -> Self {
+        Self {
+            window: std::collections::VecDeque::with_capacity(capacity.max(10)),
+            capacity: capacity.max(10),
+            gyro_std_threshold,
+            acc_std_threshold,
+        }
+    }
+
+    /// Thresholds that worked on the Pi 4 rig, whose measured at-rest levels are
+    /// |w| 0.043 rad/s of constant BIAS with ~0.01 m/s^2 of accelerometer noise. The
+    /// gyro threshold is on the standard deviation, not the magnitude, so a large
+    /// constant bias does not defeat it.
+    pub fn with_default_thresholds(capacity: usize) -> Self {
+        Self::new(capacity, 0.05, 0.15)
+    }
+
+    /// Push one sample and report whether the rig currently looks stationary. Returns
+    /// false until the window is full, so a run never starts by asserting rest it has
+    /// not observed.
+    pub fn push(&mut self, imu: IMUVelocity) -> bool {
+        if self.window.len() == self.capacity {
+            self.window.pop_front();
+        }
+        self.window.push_back(imu);
+        if self.window.len() < self.capacity {
+            return false;
+        }
+        let samples: Vec<IMUVelocity> = self.window.iter().cloned().collect();
+        check_stationary(
+            &samples,
+            samples.len(),
+            self.gyro_std_threshold,
+            self.acc_std_threshold,
+        )
+    }
+}
+
+#[cfg(test)]
+mod zupt_detector_tests {
+    use super::*;
+    use nalgebra::Vector3;
+
+    fn imu(t: f64, g: Vector3<f64>, a: Vector3<f64>) -> IMUVelocity {
+        IMUVelocity::new(t, g, a)
+    }
+
+    /// At rest with a LARGE constant gyro bias -- the Pi 4 rig reads 0.043 rad/s -- the
+    /// detector must still say stationary. A threshold on magnitude rather than
+    /// standard deviation would fail here, and would never fire on that rig.
+    #[test]
+    fn constant_gyro_bias_still_counts_as_rest() {
+        let mut d = ZeroVelocityDetector::with_default_thresholds(20);
+        let bias = Vector3::new(-0.0004, -0.0308, 0.0303); // measured rig bias
+        let mut last = false;
+        for k in 0..40 {
+            let n = (k as f64 * 0.7).sin() * 0.004; // small sensor noise
+            last = d.push(imu(
+                k as f64 * 0.01,
+                bias + Vector3::new(n, -n, n),
+                Vector3::new(n, n, 9.93 + n),
+            ));
+        }
+        assert!(last, "a constant gyro bias must not look like motion");
+    }
+
+    #[test]
+    fn real_motion_is_not_rest() {
+        let mut d = ZeroVelocityDetector::with_default_thresholds(20);
+        let mut last = true;
+        for k in 0..40 {
+            let t = k as f64 * 0.01;
+            last = d.push(imu(
+                t,
+                Vector3::new(0.6 * (10.0 * t).sin(), 0.4, -0.3),
+                Vector3::new(2.0 * (7.0 * t).cos(), 1.0, 9.8),
+            ));
+        }
+        assert!(!last, "shaking must not be reported as rest");
+    }
+
+    /// Never asserts rest before it has a full window of evidence.
+    #[test]
+    fn says_nothing_until_the_window_fills() {
+        let mut d = ZeroVelocityDetector::with_default_thresholds(30);
+        for k in 0..29 {
+            assert!(
+                !d.push(imu(
+                    k as f64 * 0.01,
+                    Vector3::zeros(),
+                    Vector3::new(0.0, 0.0, 9.81)
+                )),
+                "fired at sample {k} with an unfilled window"
+            );
+        }
+        assert!(d.push(imu(0.29, Vector3::zeros(), Vector3::new(0.0, 0.0, 9.81))));
+    }
+}

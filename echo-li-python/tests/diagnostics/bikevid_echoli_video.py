@@ -84,6 +84,12 @@ def main():
                          "the MSCKF-style filter, on the same frames and IMU.")
     ap.add_argument("--num-clones", type=int, default=11)
     ap.add_argument("--max-slam", type=int, default=0)
+    ap.add_argument("--zupt", action="store_true",
+                    help="zero-velocity update while the IMU says the rig is at rest. "
+                         "A structureless MSCKF has no vision update without parallax, "
+                         "so without this it dead-reckons through the bag's 25 s idle.")
+    ap.add_argument("--zupt-sigma", type=float, default=1e-2,
+                    help="assumed stddev of the zero-velocity measurement, m/s")
     args = ap.parse_args()
 
     z = np.load(args.sensors)
@@ -160,6 +166,20 @@ def main():
         print(f"backend=MSCEqF  clones={args.num_clones}  max_slam={args.max_slam}")
     else:
         vio.set_initial_state([0.0, 0.0, 0.0], np.ascontiguousarray(R0), [0.0, 0.0, 0.0])
+    # Rolling IMU stationarity detector, mirroring what the wrappers would own.
+    zupt_window, ZUPT_N = [], 25
+    zupt_fired = [0]
+
+    def stationary(row):
+        zupt_window.append(row)
+        if len(zupt_window) > ZUPT_N:
+            zupt_window.pop(0)
+        if len(zupt_window) < ZUPT_N:
+            return False
+        w = np.array(zupt_window)
+        return (np.linalg.norm(w[:, 1:4] - w[:, 1:4].mean(axis=0), axis=1).std() < 0.05
+                and np.linalg.norm(w[:, 4:7], axis=1).std() < 0.15)
+
     def push_imu(row):
         if use_msceqf:
             vio.process_imu(float(row[0]),
@@ -167,6 +187,9 @@ def main():
                             np.ascontiguousarray(row[4:7]))
         else:
             vio.process_imu(float(row[0]), row[1:4].tolist(), row[4:7].tolist())
+        if args.zupt and stationary(row) and use_msceqf:
+            if vio.zero_velocity_update(args.zupt_sigma):
+                zupt_fired[0] += 1
 
     for j in range(i0 - N_INIT, i0):
         push_imu(imu[j])
@@ -215,6 +238,8 @@ def main():
                   f"|p| {np.linalg.norm(p):.2f} m")
     traj = np.array(traj)
     stamps = np.array(stamps)
+    if args.zupt:
+        print(f"ZUPT accepted on {zupt_fired[0]} IMU samples")
     print(f"run done in {time.perf_counter()-t0:.1f}s   path length "
           f"{np.sum(np.linalg.norm(np.diff(traj,axis=0),axis=1)):.1f} m")
 

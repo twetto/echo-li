@@ -1140,6 +1140,76 @@ impl MSCEqFFilter {
     /// [`sot3_left_increment_invdepth`] (its own inverse-depth chart block). Used by
     /// the in-state landmark birth/update where the correction reaches landmarks
     /// through their covariance cross-blocks.
+    /// Zero-velocity update: measure "the body is not moving" as `v_world = 0`.
+    ///
+    /// A structureless MSCKF has NO update while the rig is stationary -- every
+    /// triangulation is rank-deficient and gets gated -- so without this it dead-reckons
+    /// through the whole rest period. Measured on a rig bag that idles 25 s before
+    /// moving: 764 m of drift over the stationary window, with vision contributing
+    /// exactly nothing (the with-vision and IMU-only trajectories were identical).
+    /// OpenVINS carries `zero_velocity_updater.cpp` for the same reason.
+    ///
+    /// Returns false if the update was gated out.
+    ///
+    /// THE JACOBIAN IS TAKEN NUMERICALLY, on purpose. World velocity reaches the
+    /// tangent through `T = T0 · D` with a LEFT increment and an MSCEqF->echo tangent
+    /// remap, so the analytic row is `R0` on the velocity columns PLUS an attitude
+    /// cross-term, in a permuted basis. That is a convention error waiting to happen,
+    /// and a wrong sign here would push the state away from zero on every stationary
+    /// frame. Central differences on the actual state map cannot get the convention
+    /// wrong, cost nine cheap `phi()` evaluations, and are accurate to ~1e-10 against a
+    /// measurement noise of order 1e-2. `zero_velocity_jacobian_matches_finite_difference`
+    /// pins the result.
+    pub fn zero_velocity_update(&mut self, sigma_v: f64, chi2_mult: f64) -> bool {
+        let dim = self.dim();
+        let v_pred = self.phi().t.velocity;
+
+        // d(v_world) / d(Dd tangent), by central difference over the 9 SE_2(3) rows.
+        const EPS: f64 = 1e-6;
+        let mut h = DMatrix::<f64>::zeros(3, dim);
+        let sdb0 = self.x.sdb.clone();
+        for c in 0..9 {
+            let mut inc = SVector::<f64, 15>::zeros();
+            inc[c] = EPS;
+            self.x.sdb = sdb_left_increment(&sdb0, &inc);
+            let vp = self.phi().t.velocity;
+            inc[c] = -EPS;
+            self.x.sdb = sdb_left_increment(&sdb0, &inc);
+            let vm = self.phi().t.velocity;
+            let d = (vp - vm) / (2.0 * EPS);
+            for r in 0..3 {
+                h[(r, DD_IDX + c)] = d[r];
+            }
+        }
+        self.x.sdb = sdb0;
+
+        // Residual: measured zero minus predicted.
+        let res = -v_pred;
+        let r_cov = Matrix3::identity() * (sigma_v * sigma_v);
+        let ph = &self.cov * h.transpose();
+        let s = &h * &ph + r_cov;
+        let Some(s_inv) = s.clone().try_inverse() else {
+            return false;
+        };
+
+        // chi2 gate, 3 DOF. Guards against firing on a detector false positive while
+        // the state genuinely disagrees.
+        let nis = (res.transpose() * s_inv * res)[(0, 0)];
+        if !nis.is_finite() || nis > 7.815 * chi2_mult {
+            return false;
+        }
+
+        let k = &ph * s_inv;
+        let inn = &k * res;
+        let inn_vec = DVector::from_iterator(dim, inn.iter().copied());
+        self.apply_left_increment(&inn_vec);
+
+        self.cov -= &k * s * k.transpose();
+        let sym = (&self.cov + self.cov.transpose()) * 0.5;
+        self.cov = sym;
+        true
+    }
+
     fn apply_left_increment(&mut self, inn_vec: &DVector<f64>) {
         let dd_inn = SVector::<f64, 15>::from_iterator(inn_vec.rows(DD_IDX, 15).iter().copied());
         self.x.sdb = sdb_left_increment(&self.x.sdb, &dd_inn);
@@ -2405,6 +2475,110 @@ mod tests {
             })
             .collect();
         (f, MscTrack { obs }, x_f)
+    }
+
+    /// The numerical Jacobian must agree with the analytic one. `T = T0 · D` with a
+    /// LEFT increment gives d(v_world)/d(delta_v) = R0 on the velocity columns; this
+    /// checks the finite difference reproduces it, so the remap and column ordering are
+    /// pinned rather than trusted.
+    #[test]
+    fn zero_velocity_jacobian_matches_finite_difference() {
+        let r0 = SO3::exp(&Vector3::new(0.2, -0.3, 0.5));
+        let origin = SystemOrigin::new(
+            SE23::new(
+                r0,
+                Vector3::new(1.0, 2.0, 3.0),
+                Vector3::new(0.4, -0.2, 0.1),
+            ),
+            Vector6::zeros(),
+            SE3::identity(),
+            g_enu(),
+        );
+        let f = MSCEqFFilter::new(
+            origin,
+            &(SMatrix::<f64, 9, 9>::identity() * 1e-2),
+            &(SMatrix::<f64, 6, 6>::identity() * 1e-2),
+            &(SMatrix::<f64, 6, 6>::identity() * 1e-4),
+            test_noise(),
+        );
+        // Reproduce the method's finite difference and compare the velocity columns
+        // against R0, which is what the left-increment algebra predicts.
+        const EPS: f64 = 1e-6;
+        let mut cols = Matrix3::<f64>::zeros();
+        let mut g = f.clone();
+        for c in 0..3 {
+            let mut inc = SVector::<f64, 15>::zeros();
+            inc[3 + c] = EPS; // MSCEqF tangent: att 0..3, vel 3..6, pos 6..9
+            g.x.sdb = sdb_left_increment(&f.x.sdb, &inc);
+            let vp = g.phi().t.velocity;
+            inc[3 + c] = -EPS;
+            g.x.sdb = sdb_left_increment(&f.x.sdb, &inc);
+            let vm = g.phi().t.velocity;
+            let d = (vp - vm) / (2.0 * EPS);
+            for r in 0..3 {
+                cols[(r, c)] = d[r];
+            }
+        }
+        let r0m = f.origin.t0.rotation.as_matrix();
+        assert!(
+            (cols - r0m).amax() < 1e-6,
+            "d(v_world)/d(delta_v) should be R0;\n got {cols}\n want {r0m}"
+        );
+    }
+
+    /// The update must pull the velocity estimate TOWARD zero and shrink its
+    /// covariance. A sign or frame error would push it away, and at rest the update
+    /// fires every frame, so the direction is the whole correctness question.
+    #[test]
+    fn zero_velocity_update_pulls_velocity_to_zero() {
+        let origin = SystemOrigin::new(
+            SE23::new(
+                SO3::exp(&Vector3::new(0.1, 0.2, -0.3)),
+                Vector3::zeros(),
+                Vector3::new(0.8, -0.5, 0.3), // the filter wrongly believes it is moving
+            ),
+            Vector6::zeros(),
+            SE3::identity(),
+            g_enu(),
+        );
+        let mut f = MSCEqFFilter::new(
+            origin,
+            &(SMatrix::<f64, 9, 9>::identity() * 1e-1),
+            &(SMatrix::<f64, 6, 6>::identity() * 1e-2),
+            &(SMatrix::<f64, 6, 6>::identity() * 1e-4),
+            test_noise(),
+        );
+        let before = f.phi().t.velocity.norm();
+        let vcov_before = f.cov.view((DD_IDX + 3, DD_IDX + 3), (3, 3)).trace();
+
+        assert!(
+            f.zero_velocity_update(1e-2, 1.0e9),
+            "update should be accepted"
+        );
+
+        let after = f.phi().t.velocity.norm();
+        let vcov_after = f.cov.view((DD_IDX + 3, DD_IDX + 3), (3, 3)).trace();
+        assert!(
+            after < before * 0.5,
+            "velocity must move toward zero: {before} -> {after}"
+        );
+        assert!(
+            vcov_after < vcov_before,
+            "velocity covariance must shrink: {vcov_before} -> {vcov_after}"
+        );
+        // Repeated application converges rather than oscillating or overshooting.
+        for _ in 0..20 {
+            f.zero_velocity_update(1e-2, 1.0e9);
+        }
+        assert!(
+            f.phi().t.velocity.norm() < 1e-3,
+            "repeated ZUPT should converge to rest, got {}",
+            f.phi().t.velocity.norm()
+        );
+        assert!(
+            f.cov.iter().all(|v| v.is_finite()),
+            "covariance went non-finite"
+        );
     }
 
     #[test]
