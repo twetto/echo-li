@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use echo_li_core::backend::{MsceqfBackend, MsceqfSettings, VioBackend};
-use echo_li_core::mathematical::camera::{CameraModel, PinholeModel};
+use echo_li_core::mathematical::camera::CameraModel;
 use echo_li_core::mathematical::imu_velocity::IMUVelocity;
 use echo_li_core::mathematical::msceqf_filter::{MSCEqFFilter, ProcessNoise, SystemOrigin};
 use echo_li_core::mathematical::vision_measurement::VisionMeasurement;
@@ -47,11 +47,19 @@ pub struct PyMsceqfBackend {
 
 #[pymethods]
 impl PyMsceqfBackend {
+    /// `camera` is a real camera model (PinholeCamera / RadTanCamera /
+    /// EquidistantCamera), NOT four intrinsics. The backend undistorts through it to
+    /// get bearings, so handing a bare pinhole to a distorted lens silently biases
+    /// every observation -- which is what an earlier version of this binding did, and
+    /// it diverged on the first real-rig bag it met.
+    ///
+    /// `fx` is used only to convert `pixel_std` into the normalized units the filter
+    /// works in.
     #[new]
     #[pyo3(signature = (
         r0, p0, v0, b0, s0, g, d_std, delta_std, e_std,
         accel_density, gyro_density, accel_rw, gyro_rw, transition_order,
-        fx, fy, cx, cy,
+        camera, fx,
         num_clones=11, pixel_std=1.0, chi2_mult=1.0, slam_chi2_mult=0.0,
         max_track=200, slam_min_len=0, max_slam=0, curvature=true, update_span=0
     ))]
@@ -71,10 +79,8 @@ impl PyMsceqfBackend {
         accel_rw: f64,
         gyro_rw: f64,
         transition_order: usize,
+        camera: &Bound<'_, PyAny>,
         fx: f64,
-        fy: f64,
-        cx: f64,
-        cy: f64,
         num_clones: usize,
         pixel_std: f64,
         chi2_mult: f64,
@@ -84,7 +90,7 @@ impl PyMsceqfBackend {
         max_slam: usize,
         curvature: bool,
         update_span: usize,
-    ) -> Self {
+    ) -> PyResult<Self> {
         let t0 = SE23::new(SO3::from_matrix(&mat3(r0)), vec3(&p0), vec3(&v0));
         let origin = SystemOrigin::new(t0, vec6(&b0), SE3::from_matrix(&mat4(s0)), vec3(&g));
 
@@ -104,7 +110,7 @@ impl PyMsceqfBackend {
             state_transition_order: transition_order,
         };
         let filter = MSCEqFFilter::new(origin, &d_init, &delta_init, &e_init, noise);
-        let cam: Arc<dyn CameraModel> = Arc::new(PinholeModel { fx, fy, cx, cy });
+        let cam: Arc<dyn CameraModel> = crate::camera::to_camera_arc(camera)?;
         let settings = MsceqfSettings {
             num_clones,
             pixel_std,
@@ -116,9 +122,9 @@ impl PyMsceqfBackend {
             curvature,
             update_span,
         };
-        Self {
+        Ok(Self {
             inner: MsceqfBackend::new(filter, cam, settings),
-        }
+        })
     }
 
     /// One IMU sample. The backend derives dt from consecutive stamps, so the FIRST

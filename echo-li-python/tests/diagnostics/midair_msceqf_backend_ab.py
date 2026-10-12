@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from midair_msceqf_native_ate import (  # noqa: E402
     DT, FX, R_wb, ROOT, TRACKS, align_umeyama,
 )
-from echo_li import MSCEqFNativeFilter, MsceqfBackend  # noqa: E402
+from echo_li import MSCEqFNativeFilter, MsceqfBackend, PinholeCamera  # noqa: E402
 
 CX = FX
 IMU_PER_IMG = 4
@@ -85,7 +85,7 @@ def run_rust(a, by_frame, gyr_body, acc, nimg, cfg):
         a["r0"], a["p0"], a["v0"], a["b0"], a["s0"], a["g"],
         a["d_std"], a["delta_std"], a["e_std"],
         cfg.acc_density, cfg.gyr_density, cfg.acc_rw, cfg.gyr_rw, 0,
-        FX, FX, CX, CX,
+        PinholeCamera(FX, FX, CX, CX), FX,
         num_clones=cfg.num_clones, pixel_std=1.0 / FX, chi2_mult=cfg.chi2_mult,
         max_track=cfg.max_track_len, max_slam=cfg.max_slam,
         curvature=bool(cfg.curvature),
