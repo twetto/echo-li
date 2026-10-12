@@ -138,18 +138,39 @@ Owed, in dependency order: `MSCEqFFilter` is a primitives API -- `stochastic_clo
    covariance on the group algebra over its clone window; projecting that onto a single
    camera pose is the missing derivation.
 
-### Not converted, on purpose
+### Widening the trait
 
-**The CLI keeps a concrete `VIOFilter`.** It is the EqVIO replay and diagnostic tool: it
-hashes filter state for determinism traces, reads `eqf.current_time` and the covariance
-blocks, and writes trajectories as `VIOState`. Putting it behind a trait object would
-mean widening the shared trait with EqVIO-only methods, which is the thing the seam
-exists to avoid. A consumer that needs one backend's internals should hold that
-backend -- `EqvioBackend::filter()` is there for exactly this.
+Adding a method that only one backend implements is NOT forbidden, and
+`pose_covariance() -> Option<&dyn CameraPoseCovariance>` already is one. What matters is
+whether ABSENCE can be expressed. An `Option` return says "this backend cannot tell
+you", which a consumer must handle; that is honest and costs the other implementor
+nothing.
 
-**Config loading stays per-wrapper.** It is two lines each (`VIOConfig::from_yaml` then
-`to_filter_settings`), and the part that actually drifted -- initialisation -- is now
-shared. A wrapper type for two lines would be cost without benefit.
+The thing to avoid is narrower: a method that bakes one backend's REPRESENTATION into
+the interface. `state_estimate() -> VIOState` was exactly that -- EqVIO's struct, with
+camera-frame landmarks in EqVIO's parametrization, which every other backend would have
+to manufacture. The fix was not "never widen", it was to return what the question
+actually is (`NavEstimate`, `landmarks_world()`, `camera_pose()`) rather than one
+implementor's container.
+
+### The CLI, not yet converted
+
+It keeps a concrete `VIOFilter`, but NOT because the trait would have to grow
+EqVIO-only methods -- an earlier version of this file claimed that and it is wrong.
+Checked, every use is already expressible:
+
+| CLI use | needs | available as |
+|---|---|---|
+| `write_trajectory` | pose | `NavEstimate.pose` |
+| `camera_pose_matrix(&state)` | `pose · camera_offset` | `camera_pose()` |
+| `landmarks_to_global(&state)` | world landmarks | `landmarks_world()` |
+| `eqf.current_time` | the frame stamp | the caller already has it |
+| `hash_state(&state)` | a determinism fingerprint | would want `state_fingerprint() -> u64`, which any backend can provide over its own state |
+
+The only genuine addition is `state_fingerprint`, and that is a general question, not an
+EqVIO one. The real reason it is unconverted is smaller: it changes the output path's
+types (`Vec<(f64, VIOState)>` through `write_outputs`/`write_trajectory`) and nothing
+forced it yet. It is work, not a design obstacle.
 
 ## Deferred: priors into `VisionMeasurement`
 
