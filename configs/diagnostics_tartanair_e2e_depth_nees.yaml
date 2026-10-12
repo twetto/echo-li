@@ -28,12 +28,6 @@ RudolfV:
   enableRansac: true
   epipolarGateThreshold: 1.0e-5
   epipolarRefine: false
-  ransacParams:
-    inlierThreshold: 0.00001
-    maxIterations: 200
-    minDataPoints: 5
-    minInliers: 15
-  trackedFeatureDist: 16.0
 eqf:
   maxFeatures: 40
   initialValue:

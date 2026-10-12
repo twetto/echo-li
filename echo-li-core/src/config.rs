@@ -9,6 +9,7 @@ use crate::depth::sparse_gb::{DepthParametrization, SparseVogSettings};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct RudolfVConfig {
     pub equalise_image_histogram: bool,
     /// Histogram equalisation method: "none", "global", or "clahe". When
@@ -85,12 +86,14 @@ fn default_epipolar_max_reject_frac() -> f64 {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct EqfInitialValue {
     pub scene_depth: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct EqfInitialVariance {
     pub attitude: f64,
     pub bias_acc: f64,
@@ -106,6 +109,7 @@ pub struct EqfInitialVariance {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct EqfMeasurementNoise {
     pub feature: f64,
     pub feature_outlier_abs: f64,
@@ -115,6 +119,7 @@ pub struct EqfMeasurementNoise {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct EqfProcessVariance {
     pub attitude: f64,
     pub bias_acc: f64,
@@ -128,6 +133,7 @@ pub struct EqfProcessVariance {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct EqfSettings {
     pub coordinate_choice: String,
     pub fast_riccati: bool,
@@ -153,6 +159,7 @@ pub struct EqfSettings {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct EqfVelocityNoise {
     pub acc: f64,
     pub acc_bias: f64,
@@ -162,6 +169,7 @@ pub struct EqfVelocityNoise {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct EqfConfig {
     pub max_features: usize,
     pub initial_value: EqfInitialValue,
@@ -174,12 +182,14 @@ pub struct EqfConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct MainConfig {
     pub write_state: bool,
     pub camera_lag: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct SparseVogConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -372,7 +382,13 @@ impl SparseVogConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct PatchDepthConfig {
+    /// Run the patch-depth mapper. Two configs already set this to false and were
+    /// ignored, because the key was never a field and the section's mere PRESENCE did
+    /// the enabling -- so `enabled: false` switched the mapper ON. Honoured now.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     #[serde(default)]
     pub camera_mode: Option<String>,
     #[serde(default)]
@@ -558,6 +574,7 @@ impl PatchDepthConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct LocalOccupancyConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -677,6 +694,7 @@ impl LocalOccupancyConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct StereoConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -715,6 +733,7 @@ pub struct StereoConfig {
 /// start-up, and the camera extrinsic is the same `t_bs` the rest of the system uses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct MsceqfConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -757,6 +776,7 @@ pub struct MsceqfConfig {
 /// Initial standard deviations for the MSCEqF covariance blocks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct MsceqfInitialStd {
     /// Dd block, in MSCEqF tangent order: attitude, velocity, position.
     pub attitude: f64,
@@ -782,6 +802,7 @@ impl Default for MsceqfInitialStd {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct MsceqfProcessNoise {
     pub accel_density: f64,
     pub gyro_density: f64,
@@ -821,6 +842,7 @@ fn default_gravity() -> [f64; 3] {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VIOConfig {
     #[serde(rename = "RudolfV")]
     pub rudolf_v: RudolfVConfig,
@@ -846,6 +868,7 @@ pub struct VIOConfig {
 /// image instead of the raw frame when available.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
+#[serde(deny_unknown_fields)]
 pub struct RerunVisConfig {
     pub image: bool,
     pub histeq_image: bool,
@@ -966,5 +989,71 @@ mod tests {
         let settings = cfg.to_filter_settings();
         assert!(settings.use_stereo_measurement);
         assert!((settings.range_gate_chi2 - 6.63).abs() < 1e-9);
+    }
+}
+
+#[cfg(test)]
+mod config_strictness_tests {
+    use super::*;
+
+    /// Every config the repo ships must LOAD. With `deny_unknown_fields` this is no
+    /// longer a formality: a key the parser does not know is now an error, so this
+    /// test is what stops a config drifting away from the code that reads it.
+    ///
+    /// The failure it exists to prevent has happened twice. `useMedianDepth` sat in all
+    /// eleven configs for months with no reader anywhere, then silently changed every
+    /// baseline the day it was wired. A harness whitelist dropped `pose_range_direct`
+    /// and cost a retracted result table. In both cases the config said one thing, the
+    /// system did another, and nothing complained.
+    #[test]
+    fn every_shipped_config_loads() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("configs");
+        let mut checked = 0;
+        let mut failures = Vec::new();
+        for entry in std::fs::read_dir(&dir).expect("configs/ must exist") {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+                continue;
+            }
+            checked += 1;
+            if let Err(e) = VIOConfig::from_yaml(path.to_str().unwrap()) {
+                failures.push(format!(
+                    "  {}: {e}",
+                    path.file_name().unwrap().to_string_lossy()
+                ));
+            }
+        }
+        assert!(checked > 0, "no configs found in {}", dir.display());
+        assert!(
+            failures.is_empty(),
+            "{} of {checked} shipped configs no longer load:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    /// An unknown key is an ERROR, not a shrug. This is the whole point of the
+    /// attribute, so it is pinned rather than assumed.
+    #[test]
+    fn an_unknown_key_is_rejected() {
+        let yaml = r#"
+RudolfV:
+  maxFeatures: 10
+  thisKeyDoesNotExist: 42
+eqf:
+  maxFeatures: 10
+main:
+  writeState: false
+"#;
+        let err = serde_yaml::from_str::<VIOConfig>(yaml)
+            .expect_err("an unknown key must be rejected, not ignored");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("thisKeyDoesNotExist"),
+            "the error must NAME the offending key so it can be found; got: {msg}"
+        );
     }
 }

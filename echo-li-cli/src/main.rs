@@ -1114,10 +1114,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let patch_depth_enabled = !args.no_patch_depth
         && (args.patch_depth
             || occupancy_requested
+            // Section PRESENCE used to be the switch, so `enabled: false` turned the
+            // mapper ON. Honour the key.
             || vio_config
                 .as_ref()
                 .and_then(|conf| conf.patch_depth.as_ref())
-                .is_some());
+                .is_some_and(|conf| conf.enabled));
     let patch_depth_settings = vio_config
         .as_ref()
         .and_then(|conf| conf.patch_depth.as_ref())
