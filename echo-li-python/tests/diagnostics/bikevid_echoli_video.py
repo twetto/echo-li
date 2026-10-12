@@ -98,6 +98,9 @@ def main():
                          "at ~60 features regardless of maxFeatures.")
     ap.add_argument("--no-lbp", action="store_true",
                     help="disable the frontend's LBP descriptor verification")
+    ap.add_argument("--timeshift", type=float, default=None,
+                    help="override the camera-IMU time offset (s). A wrong offset costs "
+                         "v*dt of position, i.e. an error PROPORTIONAL TO SPEED.")
     ap.add_argument("--max-promote-range", type=float, default=0.0,
                     help="refuse to promote landmarks triangulated beyond this range (m)")
     ap.add_argument("--accel-bias-std", type=float, default=1e-2,
@@ -121,6 +124,10 @@ def main():
                     help="assumed stddev of the zero-velocity measurement, m/s")
     args = ap.parse_args()
 
+    global TIMESHIFT
+    if args.timeshift is not None:
+        TIMESHIFT = args.timeshift
+        print(f'camera-IMU timeshift overridden -> {TIMESHIFT*1e3:.2f} ms')
     z = np.load(args.sensors)
     imu, img_t, odom = z["imu"], z["img_t"], z["odom"]
     idx = np.load(f"{BIKE}/frames320_index.npy")
