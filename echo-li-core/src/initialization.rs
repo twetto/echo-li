@@ -302,6 +302,8 @@ pub struct FilterStart {
     pub stationary: bool,
     pub roll_deg: f64,
     pub pitch_deg: f64,
+    /// The seeded gyro bias (rad/s), i.e. the mean angular rate over the window.
+    pub gyro_bias: Vector3<f64>,
 }
 
 /// Collects the first IMU samples and turns them into a filter's initial state.
@@ -316,6 +318,7 @@ pub struct StationaryInit {
     camera_offset: SE3,
     buffer: Vec<IMUVelocity>,
     done: bool,
+    seed_gyro_bias: bool,
 }
 
 impl StationaryInit {
@@ -334,7 +337,23 @@ impl StationaryInit {
             camera_offset,
             buffer: Vec::new(),
             done: false,
+            seed_gyro_bias: true,
         }
+    }
+
+    /// Seed the gyro bias from the stationary window (default true).
+    ///
+    /// On by default because the quantity IS observable at rest and ignoring it is a
+    /// measurable error: the Pi 4 rig reads 0.043 rad/s, and leaving it at zero cost
+    /// 762 m of dead-reckoned drift over a 25 s idle against 37 m with it seeded.
+    ///
+    /// Off is offered because the benefit is not universal. On EuRoC V1, whose bias is
+    /// near the window's own noise floor and whose online estimator converges quickly,
+    /// seeding is a wash: V1_02 improved 0.1494 -> 0.1462 m, V1_01 was unchanged, and
+    /// V1_03 WORSENED 0.1785 -> 0.2064 m. V1_03's start reports stationary, so a
+    /// moving-start explanation is refuted and the cause is not established.
+    pub fn set_seed_gyro_bias(&mut self, on: bool) {
+        self.seed_gyro_bias = on;
     }
 
     /// Feed one sample. Returns the start-up data on the call that completes the buffer,
@@ -383,17 +402,55 @@ impl StationaryInit {
     fn finish(&mut self) -> FilterStart {
         let pose = estimate_initial_pose(&self.buffer, self.n_samples);
         let stationary = check_stationary(&self.buffer, self.n_samples, 0.1, 0.5);
+
         let r = pose.rotation.as_matrix();
         let pitch_deg = (-r[(2, 0)]).clamp(-1.0, 1.0).asin().to_degrees();
         let roll_deg = r[(2, 1)].atan2(r[(2, 2)]).to_degrees();
 
+        // GYRO BIAS IS OBSERVABLE AT REST AND MUST BE SEEDED. A stationary IMU's mean
+        // angular rate IS its gyro bias, and leaving it at zero lets the attitude drift
+        // at the bias rate, which tips gravity into the horizontal axes and makes
+        // position error grow as t^3 rather than t^2.
+        //
+        // Measured on the Pi 4 rig, whose gyro bias is 0.043 rad/s (2.5 deg/s): over a
+        // 25 s stationary start the dead-reckoned position reached 762 m, against the
+        // 44 m the accelerometer residual alone predicts. The t^3 signature is visible
+        // in the trace -- 7, 55, 183, 431, 762 m at 5 s intervals -- and
+        // (1/6)*g*omega*t^3 with those numbers is ~1100 m, the right mechanism and
+        // magnitude. Both backends inherited it, because both take their initial state
+        // from here.
+        //
+        // The ACCELEROMETER bias is deliberately left at zero: at rest it is parallel
+        // to measured gravity by construction and therefore unobservable, so seeding it
+        // would be inventing information rather than measuring it.
+        // ONLY WHEN ACTUALLY STATIONARY. The mean angular rate equals the bias at
+        // rest and nowhere else; on a start that is already turning it is the turn
+        // rate, and seeding that as bias injects a permanent error. Measured on EuRoC
+        // V1_03, which starts in motion: seeding unconditionally cost 16% ATE
+        // (0.1785 -> 0.2064 m), while V1_02 improved. Gated, the rig keeps its fix and
+        // the moving starts are untouched.
+        let mut input_bias = nalgebra::Vector6::zeros();
+        let n = self.buffer.len().min(self.n_samples).max(1);
+        let gyro_mean: Vector3<f64> = if stationary && self.seed_gyro_bias {
+            self.buffer
+                .iter()
+                .take(n)
+                .map(|s| s.gyr)
+                .sum::<Vector3<f64>>()
+                / (n as f64)
+        } else {
+            Vector3::zeros()
+        };
+        input_bias.fixed_rows_mut::<3>(0).copy_from(&gyro_mean);
+
         let sensor = crate::mathematical::vio_state::VIOSensorState {
-            input_bias: nalgebra::Vector6::zeros(),
+            input_bias,
             pose,
             velocity: Vector3::zeros(),
             camera_offset: self.camera_offset.clone(),
         };
         FilterStart {
+            gyro_bias: gyro_mean,
             state: crate::mathematical::vio_state::VIOState::new(sensor, Vec::new()),
             replay: std::mem::take(&mut self.buffer),
             stationary,
@@ -424,6 +481,66 @@ mod stationary_init_tests {
 
     fn imu(stamp: f64, acc: Vector3<f64>) -> IMUVelocity {
         IMUVelocity::new(stamp, Vector3::zeros(), acc)
+    }
+
+    /// The gyro bias is SEEDED from the stationary window, not left at zero. A rig
+    /// with a real bias -- the Pi 4 reads 0.043 rad/s -- otherwise drifts in attitude
+    /// at that rate, tipping gravity into the horizontal axes and turning position
+    /// error from t^2 into t^3. The accelerometer bias stays zero because at rest it
+    /// is parallel to measured gravity and so unobservable.
+    #[test]
+    fn gyro_bias_is_seeded_and_accel_bias_is_not() {
+        let bias = Vector3::new(-0.0004, -0.0308, 0.0303); // the measured rig bias
+        let samples: Vec<IMUVelocity> = (0..60)
+            .map(|k| {
+                let n = (k as f64 * 0.9).sin() * 0.002; // sensor noise, zero-mean
+                IMUVelocity::new(
+                    k as f64 * 0.01,
+                    bias + Vector3::new(n, -n, n),
+                    Vector3::new(n, n, 9.93 + n),
+                )
+            })
+            .collect();
+        let start = StationaryInit::from_samples(60, SE3::identity(), samples);
+
+        let seeded = start.state.sensor.gyro_bias();
+        assert!(
+            (seeded - bias).norm() < 5e-3,
+            "gyro bias must be recovered from the window: got {seeded:?}, want {bias:?}"
+        );
+        assert_eq!(
+            start.gyro_bias, seeded,
+            "reported bias must match the state"
+        );
+        assert_eq!(
+            start.state.sensor.accel_bias(),
+            Vector3::zeros(),
+            "accel bias is unobservable at rest and must NOT be invented"
+        );
+    }
+
+    /// A start that is already TURNING must not have its turn rate seeded as bias.
+    /// Mean gyro equals bias only at rest; on a moving start it is the motion, and
+    /// baking it in is a permanent error. EuRoC V1_03 is exactly this case.
+    #[test]
+    fn a_moving_start_seeds_no_gyro_bias() {
+        let samples: Vec<IMUVelocity> = (0..60)
+            .map(|k| {
+                let t = k as f64 * 0.01;
+                IMUVelocity::new(
+                    t,
+                    Vector3::new(0.8 * (6.0 * t).sin(), 0.5, -0.4), // real rotation
+                    Vector3::new(1.5 * (4.0 * t).cos(), 0.8, 9.8),
+                )
+            })
+            .collect();
+        let start = StationaryInit::from_samples(60, SE3::identity(), samples);
+        assert!(!start.stationary, "this window is not stationary");
+        assert_eq!(
+            start.state.sensor.gyro_bias(),
+            Vector3::zeros(),
+            "a moving start must not seed a bias from its own rotation"
+        );
     }
 
     /// A level, stationary rig: measured gravity along +z maps to world +z, so the

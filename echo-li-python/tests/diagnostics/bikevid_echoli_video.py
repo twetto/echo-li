@@ -88,6 +88,14 @@ def main():
                     help="zero-velocity update while the IMU says the rig is at rest. "
                          "A structureless MSCKF has no vision update without parallax, "
                          "so without this it dead-reckons through the bag's 25 s idle.")
+    ap.add_argument("--frontend-features", type=int, default=0,
+                    help="override RudolfV.maxFeatures. The rig config sets 21 because "
+                         "EqVIO holds 21 landmarks IN STATE; a structureless MSCKF "
+                         "consumes every track and wants far more (MidAir fed it ~118).")
+    ap.add_argument("--msceqf-pixel-std", type=float, default=1.0,
+                    help="MSCEqF feature noise in PIXELS (divided by fx internally)")
+    ap.add_argument("--msceqf-chi2", type=float, default=1.0,
+                    help="MSCEqF chi2 gate multiplier")
     ap.add_argument("--zupt-sigma", type=float, default=1e-2,
                     help="assumed stddev of the zero-velocity measurement, m/s")
     args = ap.parse_args()
@@ -118,6 +126,9 @@ def main():
     cam = echo_li.RadTanCamera(FX, FY, CX, CY, *DIST)
     fcfg = echo_li.FrontendConfig.from_yaml(cfg_path)
     fcfg.set_camera(FX, FY, CX, CY, W, H, list(DIST))
+    if args.frontend_features > 0:
+        fcfg.max_features = args.frontend_features
+        print(f"frontend maxFeatures overridden -> {args.frontend_features}")
     tracker = echo_li.Frontend(fcfg, W, H)
     use_msceqf = args.backend == "msceqf"
     vio = None if use_msceqf else echo_li.VIOFilter(cfg_path, cam)
@@ -145,6 +156,12 @@ def main():
     sn, c = np.linalg.norm(v), float(g_hat @ zc)
     K = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
     R0 = np.eye(3) if sn < 1e-9 else np.eye(3) + K + K @ K * ((1 - c) / sn**2)
+    # GYRO BIAS IS OBSERVABLE AT REST: the mean angular rate IS the bias. Leaving it
+    # at zero lets attitude drift at the bias rate, tipping gravity into the horizontal
+    # axes, and position error grows as t^3 instead of t^2. This rig reads 0.043 rad/s.
+    bg0 = imu[i0 - N_INIT:i0, 1:4].mean(axis=0)
+    print(f"init: gyro bias seeded [{bg0[0]:+.5f} {bg0[1]:+.5f} {bg0[2]:+.5f}] rad/s "
+          f"(|b|={np.linalg.norm(bg0):.5f} = {np.degrees(np.linalg.norm(bg0)):.2f} deg/s)")
     print(f"init: |a0| {np.linalg.norm(a0):.4f} m/s^2 vs local g {GRAVITY} "
           f"({100*(np.linalg.norm(a0)/GRAVITY-1):+.2f}%), "
           f"tilt-to-level {np.degrees(np.arccos(np.clip(c,-1,1))):.2f} deg")
@@ -152,7 +169,8 @@ def main():
         # Gravity-align maps measured specific force onto world +z, so world +z is UP
         # and the gravity ACCELERATION vector points down.
         vio = echo_li.MsceqfBackend(
-            np.ascontiguousarray(R0), np.zeros(3), np.zeros(3), np.zeros(6),
+            np.ascontiguousarray(R0), np.zeros(3), np.zeros(3),
+            np.ascontiguousarray(np.concatenate([bg0, np.zeros(3)])),
             np.ascontiguousarray(T_BS), np.array([0.0, 0.0, -GRAVITY]),
             np.array([1e-2, 1e-2, 1e-2, 1e-1, 1e-1, 1e-1, 1e-4, 1e-4, 1e-4]),
             np.full(6, 1e-2), np.full(6, 1e-4),
@@ -160,12 +178,14 @@ def main():
             7.47e-04, 1.63e-04, 2.08e-04, 6.80e-05, 0,
             cam, FX,   # the REAL radtan model -- this lens is distorted
             num_clones=args.num_clones,
-            pixel_std=1.0 / FX,          # config's measurementNoise.feature = 1.0 px
+            pixel_std=args.msceqf_pixel_std / FX,
+            chi2_mult=args.msceqf_chi2,
             max_slam=args.max_slam,
         )
         print(f"backend=MSCEqF  clones={args.num_clones}  max_slam={args.max_slam}")
     else:
-        vio.set_initial_state([0.0, 0.0, 0.0], np.ascontiguousarray(R0), [0.0, 0.0, 0.0])
+        vio.set_initial_state_full([0.0, 0.0, 0.0], np.ascontiguousarray(R0),
+                                   [0.0, 0.0, 0.0], bg0.tolist(), [0.0, 0.0, 0.0])
     # Rolling IMU stationarity detector, mirroring what the wrappers would own.
     zupt_window, ZUPT_N = [], 25
     zupt_fired = [0]
@@ -195,6 +215,7 @@ def main():
         push_imu(imu[j])
 
     traj, stamps, feats_per_frame, lm_rng = [], [], {}, {}
+    diag = []
     rr_all = {} if args.depth_trace else None
     ii = i0
     t0 = time.perf_counter()
@@ -215,6 +236,9 @@ def main():
         if use_msceqf:
             p, _rm, _v = vio.nav_pose()
             p = np.asarray(p, float)
+            diag.append((float(ts), float(np.linalg.norm(_v)),
+                         float(np.asarray(vio.nav_cov_diag())[3:6].sum()),
+                         vio.n_clones(), vio.n_slam()))
         else:
             p, q = vio.get_pose()
             p = np.asarray(p, float)
@@ -238,6 +262,12 @@ def main():
                   f"|p| {np.linalg.norm(p):.2f} m")
     traj = np.array(traj)
     stamps = np.array(stamps)
+    if diag:
+        np.savez(args.out.replace(".mp4", "_diag.npz"), diag=np.array(diag))
+    if use_msceqf:
+        off, acc = vio.msc_update_counts()
+        print(f"structureless tracks: offered {off}, accepted {acc} "
+              f"({100.0*acc/max(off,1):.1f}%)")
     if args.zupt:
         print(f"ZUPT accepted on {zupt_fired[0]} IMU samples")
     print(f"run done in {time.perf_counter()-t0:.1f}s   path length "

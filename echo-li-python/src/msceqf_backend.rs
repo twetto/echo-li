@@ -178,6 +178,20 @@ impl PyMsceqfBackend {
         self.inner.zero_velocity_update(sigma_v)
     }
 
+    /// Core-state covariance diagonal [att(3) vel(3) pos(3) bias(6) | E(6)], for
+    /// watching where a divergence starts.
+    fn nav_cov_diag<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
+        let c = &self.inner.filter().cov;
+        let n = 21.min(c.nrows());
+        let d: Vec<f64> = (0..n).map(|i| c[(i, i)]).collect();
+        PyArray1::from_slice(py, &d)
+    }
+
+    /// (offered, accepted) structureless tracks.
+    fn msc_update_counts(&self) -> (u64, u64) {
+        self.inner.msc_update_counts()
+    }
+
     fn n_clones(&self) -> usize {
         self.inner.n_clones()
     }

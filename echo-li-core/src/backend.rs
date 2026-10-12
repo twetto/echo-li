@@ -380,6 +380,11 @@ pub struct MsceqfBackend {
     slam: BTreeSet<u64>,
     /// Frame counter, used as the clone id.
     k: u64,
+    /// Running totals: tracks offered to the structureless update, and tracks the
+    /// filter actually accepted. A backend that is silently accepting nothing looks
+    /// exactly like one that is running well until the trajectory diverges.
+    msc_offered: u64,
+    msc_accepted: u64,
     last_stamp: Option<f64>,
 }
 
@@ -490,6 +495,8 @@ impl MsceqfBackend {
             buf: BTreeMap::new(),
             slam: BTreeSet::new(),
             k: 0,
+            msc_offered: 0,
+            msc_accepted: 0,
             last_stamp: None,
         }
     }
@@ -508,6 +515,11 @@ impl MsceqfBackend {
 
     pub fn n_slam(&self) -> usize {
         self.slam.len()
+    }
+
+    /// `(tracks offered, tracks accepted)` by the structureless update so far.
+    pub fn msc_update_counts(&self) -> (u64, u64) {
+        (self.msc_offered, self.msc_accepted)
     }
 
     /// Pixel -> normalized image coordinates, through the REAL camera model, so lens
@@ -707,13 +719,14 @@ impl VioBackend for MsceqfBackend {
             }
         }
         if !ready.is_empty() {
-            self.filter.msc_update(
+            self.msc_offered += ready.len() as u64;
+            self.msc_accepted += self.filter.msc_update(
                 &ready,
                 &self.z1,
                 self.settings.pixel_std,
                 self.settings.chi2_mult,
                 self.settings.curvature,
-            );
+            ) as u64;
         }
         for tid in done {
             self.buf.remove(&tid);
