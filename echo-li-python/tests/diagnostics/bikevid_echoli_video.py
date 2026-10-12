@@ -98,6 +98,12 @@ def main():
                          "at ~60 features regardless of maxFeatures.")
     ap.add_argument("--no-lbp", action="store_true",
                     help="disable the frontend's LBP descriptor verification")
+    ap.add_argument("--imu-noise", default="tuned", choices=["tuned", "allan"],
+                    help="tuned = the inflated values the rig's EqVIO config ships "
+                         "(acc 4.2e-3, gyr 1.7e-4, accRW 4.1e-3, gyrRW 1.2e-4); "
+                         "allan = raw static-bench Allan variance from imu0.yaml. "
+                         "The rig's own config inflates for a reason -- a bench floor "
+                         "understates a vibrating vehicle.")
     ap.add_argument("--msceqf-pixel-std", type=float, default=1.0,
                     help="MSCEqF feature noise in PIXELS (divided by fx internally)")
     ap.add_argument("--msceqf-chi2", type=float, default=1.0,
@@ -186,8 +192,8 @@ def main():
             np.ascontiguousarray(T_BS), np.array([0.0, 0.0, -GRAVITY]),
             np.array([1e-2, 1e-2, 1e-2, 1e-1, 1e-1, 1e-1, 1e-4, 1e-4, 1e-4]),
             np.full(6, 1e-2), np.full(6, 1e-4),
-            # Rig IMU noise, imu0.yaml (ICM42688P Allan variance).
-            7.47e-04, 1.63e-04, 2.08e-04, 6.80e-05, 0,
+            *( (4.2e-03, 1.7e-04, 4.1e-03, 1.2e-04) if args.imu_noise == "tuned"
+               else (7.47e-04, 1.63e-04, 2.08e-04, 6.80e-05) ), 0,
             cam, FX,   # the REAL radtan model -- this lens is distorted
             num_clones=args.num_clones,
             pixel_std=args.msceqf_pixel_std / FX,
