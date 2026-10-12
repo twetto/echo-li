@@ -762,6 +762,10 @@ pub struct MsceqfConfig {
     /// `MsceqfSettings::update_span`.
     #[serde(default)]
     pub update_span: usize,
+    /// Refuse to promote a landmark triangulated beyond this range, in metres. 0 = no
+    /// cap. See `MsceqfSettings::max_promote_range`.
+    #[serde(default)]
+    pub max_promote_range: f64,
     /// Gravity VECTOR in the world frame, m/s^2. Sign and axis are frame conventions,
     /// not preferences: NED wants +z, a z-up frame wants -z, and getting it backwards
     /// integrates gravity as phantom acceleration.

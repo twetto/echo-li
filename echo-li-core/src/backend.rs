@@ -308,6 +308,17 @@ pub struct MsceqfSettings {
     pub max_slam: usize,
     /// Second-order curvature term in the structureless update.
     pub curvature: bool,
+    /// Refuse to promote a landmark whose triangulated range exceeds this (metres).
+    /// 0 = no cap.
+    ///
+    /// Promotion picks the longest window-spanning tracks, and on a forward-moving
+    /// vehicle those are the DISTANT features -- near ones leave the frame quickly. The
+    /// budget then fills with points that carry attitude but not translation: measured
+    /// on the rig's ride segment, in-state landmarks sat at a median 138 m against
+    /// EqVIO's 9 m, which at fx=227 is 1.6 px of disparity per metre travelled. A
+    /// landmark that cannot see the camera move cannot hold the scale.
+    pub max_promote_range: f64,
+
     /// EXTRA flush trigger: consume a track once it reaches this many observations,
     /// even if it is neither lost nor touching the clone about to marginalize. 0 =
     /// off, which is the normal configuration.
@@ -333,6 +344,7 @@ impl Default for MsceqfSettings {
             max_slam: 0,
             curvature: true,
             update_span: 0,
+            max_promote_range: 0.0,
         }
     }
 }
@@ -471,6 +483,7 @@ impl MsceqfBackend {
             max_slam: cfg.max_slam,
             curvature: cfg.curvature,
             update_span: cfg.update_span,
+            max_promote_range: cfg.max_promote_range,
         };
         Self::new(filter, cam, settings)
     }
@@ -515,6 +528,11 @@ impl MsceqfBackend {
 
     pub fn n_slam(&self) -> usize {
         self.slam.len()
+    }
+
+    /// Track ids of the in-state landmarks, parallel to the filter's landmark list.
+    pub fn landmark_ids_snapshot(&self) -> Vec<u64> {
+        self.landmark_ids.clone()
     }
 
     /// `(tracks offered, tracks accepted)` by the structureless update so far.
@@ -681,6 +699,14 @@ impl VioBackend for MsceqfBackend {
                     None,
                 );
                 if let Some(j) = born {
+                    // Reject a landmark that was born too far to inform translation.
+                    if self.settings.max_promote_range > 0.0 {
+                        let r = self.filter.x.landmarks[j].point().norm();
+                        if !(r.is_finite() && r <= self.settings.max_promote_range) {
+                            self.filter.marginalize_landmark(j);
+                            continue;
+                        }
+                    }
                     debug_assert_eq!(j, self.landmark_ids.len(), "birth appends at the tail");
                     self.landmark_ids.push(tid);
                     // Birth anchors on the OLDEST observing clone, which here is the

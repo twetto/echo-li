@@ -98,6 +98,15 @@ def main():
                          "at ~60 features regardless of maxFeatures.")
     ap.add_argument("--no-lbp", action="store_true",
                     help="disable the frontend's LBP descriptor verification")
+    ap.add_argument("--max-promote-range", type=float, default=0.0,
+                    help="refuse to promote landmarks triangulated beyond this range (m)")
+    ap.add_argument("--accel-bias-std", type=float, default=1e-2,
+                    help="initial accel-bias std (m/s^2). The rig's EqVIO config uses "
+                         "1.258; the MidAir harness value of 1e-2 assumes a GT-seeded "
+                         "start and cannot absorb this rig's 0.14 m/s^2 gravity-"
+                         "magnitude error, which lands on scale.")
+    ap.add_argument("--gyro-bias-std", type=float, default=1e-2,
+                    help="initial gyro-bias std (rad/s)")
     ap.add_argument("--imu-noise", default="tuned", choices=["tuned", "allan"],
                     help="tuned = the inflated values the rig's EqVIO config ships "
                          "(acc 4.2e-3, gyr 1.7e-4, accRW 4.1e-3, gyrRW 1.2e-4); "
@@ -191,7 +200,9 @@ def main():
             np.ascontiguousarray(np.concatenate([bg0, np.zeros(3)])),
             np.ascontiguousarray(T_BS), np.array([0.0, 0.0, -GRAVITY]),
             np.array([1e-2, 1e-2, 1e-2, 1e-1, 1e-1, 1e-1, 1e-4, 1e-4, 1e-4]),
-            np.full(6, 1e-2), np.full(6, 1e-4),
+            np.ascontiguousarray(np.array([args.gyro_bias_std] * 3
+                                          + [args.accel_bias_std] * 3)),
+            np.full(6, 1e-4),
             *( (4.2e-03, 1.7e-04, 4.1e-03, 1.2e-04) if args.imu_noise == "tuned"
                else (7.47e-04, 1.63e-04, 2.08e-04, 6.80e-05) ), 0,
             cam, FX,   # the REAL radtan model -- this lens is distorted
@@ -199,6 +210,7 @@ def main():
             pixel_std=args.msceqf_pixel_std / FX,
             chi2_mult=args.msceqf_chi2,
             max_slam=args.max_slam,
+            max_promote_range=args.max_promote_range,
         )
         print(f"backend=MSCEqF  clones={args.num_clones}  max_slam={args.max_slam}")
     else:
@@ -264,7 +276,13 @@ def main():
         stamps.append(ts)
         feats_per_frame[k] = uvs
         # Landmark RANGE from the camera: get_landmarks() is in the world frame.
-        lms = {} if use_msceqf else vio.get_landmarks()
+        lms = None if use_msceqf else vio.get_landmarks()
+        if use_msceqf:
+            # Frame-clean anchor-frame range, not world-minus-body (which mixes frames).
+            rr = {int(k): float(v) for k, v in vio.landmark_ranges().items()}
+            if rr:
+                lm_rng[k] = rr
+            lms = {}
         if lms:
             rr = {}
             for lid, wp in lms.items():

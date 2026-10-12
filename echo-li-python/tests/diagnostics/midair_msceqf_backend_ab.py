@@ -66,11 +66,31 @@ def load_sequence(traj, nframes):
     return gyr_body, acc[:m], pos, vel, rwb, nimg
 
 
-def common_init(rwb, pos, vel):
+def common_init(rwb, pos, vel, gt_free=False, acc=None):
+    """GT-seeded by default, matching the reference harness.
+
+    `gt_free` starts the way a real rig must: attitude from gravity alignment over the
+    first 100 samples, zero velocity, origin position. This is THE difference between
+    this benchmark and the rig bag, and it is the one that can move SCALE -- mono scale
+    is carried by the accelerometer, and seeding the true initial velocity hands a large
+    part of it over for free.
+    """
+    if gt_free:
+        a0 = np.asarray(acc[:100]).mean(axis=0)
+        gh = a0 / np.linalg.norm(a0)
+        zc = np.array([0.0, 0.0, 1.0])
+        v = np.cross(gh, zc); sn = np.linalg.norm(v); c = float(gh @ zc)
+        K = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+        r0 = np.eye(3) if sn < 1e-9 else np.eye(3) + K + K @ K * ((1 - c) / sn ** 2)
+        base = dict(r0=np.ascontiguousarray(r0), p0=np.zeros(3), v0=np.zeros(3))
+    else:
+        base = dict(
+            r0=np.ascontiguousarray(rwb[0]),
+            p0=np.ascontiguousarray(pos[0].copy()),
+            v0=np.ascontiguousarray(vel[0].copy()),
+        )
     return dict(
-        r0=np.ascontiguousarray(rwb[0]),
-        p0=np.ascontiguousarray(pos[0].copy()),
-        v0=np.ascontiguousarray(vel[0].copy()),
+        **base,
         b0=np.zeros(6),
         s0=np.array([[0., 0., 1., 0.], [1., 0., 0., 0.], [0., 1., 0., 0.], [0., 0., 0., 1.]]),
         g=np.array([0., 0., 9.81]),
@@ -220,6 +240,8 @@ def main():
     ap.add_argument("--gyr-density", type=float, default=1.2724e-3)
     ap.add_argument("--gyr-rw", type=float, default=1.0e-4)
     ap.add_argument("--tracks", default=str(TRACKS))
+    ap.add_argument("--gt-free", action="store_true",
+                    help="gravity-align + zero velocity instead of GT seeding")
     ap.add_argument("--dump", default="")
     cfg = ap.parse_args()
 
@@ -227,7 +249,7 @@ def main():
     gyr_body, acc, pos, vel, rwb, nimg = load_sequence(traj, cfg.nframes)
     by_frame = load_pixel_tracks(nimg, cfg.tracks)
     gt = np.array([pos[k * IMU_PER_IMG].copy() for k in range(nimg)])
-    a = common_init(rwb, pos, vel)
+    a = common_init(rwb, pos, vel, cfg.gt_free, acc)
     print(f"{traj}: {nimg} frames, max_slam={cfg.max_slam}, "
           f"num_clones={cfg.num_clones}, curvature={cfg.curvature}")
 
@@ -240,6 +262,10 @@ def main():
     print(f"  path length {length:.1f} m")
     print(f"  python loop   ATE {r_py:.4f} m  ({p_py:.3f}% of path)  clones {c_py} slam {s_py}")
     print(f"  rust backend  ATE {r_rs:.4f} m  ({p_rs:.3f}% of path)  clones {c_rs} slam {s_rs}")
+    gl = float(np.sum(np.linalg.norm(np.diff(gt, axis=0), axis=1)))
+    for nm, e in (("python", e_py), ("rust", e_rs)):
+        el = float(np.sum(np.linalg.norm(np.diff(e, axis=0), axis=1)))
+        print(f"  SCALE {nm:7s} est/gt path = {el / gl:.3f}")
     print(f"  trajectory difference: median {np.median(d):.6f} m, max {d.max():.6f} m")
     print(f"  VERDICT: {'MATCH' if d.max() < 1e-6 else 'DIFFER'}")
     if cfg.dump:

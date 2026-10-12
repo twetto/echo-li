@@ -61,7 +61,8 @@ impl PyMsceqfBackend {
         accel_density, gyro_density, accel_rw, gyro_rw, transition_order,
         camera, fx,
         num_clones=11, pixel_std=1.0, chi2_mult=1.0, slam_chi2_mult=0.0,
-        max_track=200, slam_min_len=0, max_slam=0, curvature=true, update_span=0
+        max_track=200, slam_min_len=0, max_slam=0, curvature=true, update_span=0,
+        max_promote_range=0.0
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -90,6 +91,7 @@ impl PyMsceqfBackend {
         max_slam: usize,
         curvature: bool,
         update_span: usize,
+        max_promote_range: f64,
     ) -> PyResult<Self> {
         let t0 = SE23::new(SO3::from_matrix(&mat3(r0)), vec3(&p0), vec3(&v0));
         let origin = SystemOrigin::new(t0, vec6(&b0), SE3::from_matrix(&mat4(s0)), vec3(&g));
@@ -121,6 +123,7 @@ impl PyMsceqfBackend {
             max_slam,
             curvature,
             update_span,
+            max_promote_range,
         };
         Ok(Self {
             inner: MsceqfBackend::new(filter, cam, settings),
@@ -190,6 +193,31 @@ impl PyMsceqfBackend {
     /// (offered, accepted) structureless tracks.
     fn msc_update_counts(&self) -> (u64, u64) {
         self.inner.msc_update_counts()
+    }
+
+    /// In-state landmark positions in the world frame, by track id.
+    fn landmarks_world(&self, py: Python<'_>) -> PyResult<Py<pyo3::types::PyDict>> {
+        use echo_li_core::backend::LandmarkMap;
+        let d = pyo3::types::PyDict::new(py);
+        for (id, p) in self.inner.landmarks_world() {
+            d.set_item(id, PyArray1::from_slice(py, p.as_slice()))?;
+        }
+        Ok(d.unbind())
+    }
+
+    /// Metric range of each in-state landmark in its OWN anchor camera frame.
+    ///
+    /// Frame-clean: `landmarks_world` composes with the anchor clone pose and is then
+    /// usually differenced against the CURRENT body position, which mixes frames and
+    /// inflates the number for any landmark whose anchor is not the current pose. This
+    /// is the quantity the filter actually assigned.
+    fn landmark_ranges(&self, py: Python<'_>) -> PyResult<Py<pyo3::types::PyDict>> {
+        let d = pyo3::types::PyDict::new(py);
+        let f = self.inner.filter();
+        for (j, id) in self.inner.landmark_ids_snapshot().iter().enumerate() {
+            d.set_item(id, f.x.landmarks[j].point().norm())?;
+        }
+        Ok(d.unbind())
     }
 
     fn n_clones(&self) -> usize {
