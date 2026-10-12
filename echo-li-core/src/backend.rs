@@ -311,6 +311,23 @@ pub struct MsceqfSettings {
     /// Use a DIRECT-PRODUCT (static) bias chart instead of the semi-direct one.
     /// See `MSCEqFFilter::new_direct_product_bias`.
     pub direct_product_bias: bool,
+    /// Birth in-state landmarks from a DEPTH PRIOR instead of a triangulation, when
+    /// positive: the prior depth in metres, with `civera_birth_rel_std` the inverse-depth
+    /// relative std. Zero keeps the triangulated birth.
+    ///
+    /// Triangulated birth can only admit tracks whose geometry triangulates, and the
+    /// condition-number gate needs ~0.57 deg of bearing spread, so on an outdoor ride
+    /// with a 0.19 s clone window that is the NEAR scene only -- measured in-state range
+    /// 0.56-12.9 m, median 3.8 m. Which part of the scene is allowed to constrain the
+    /// filter is then a selection effect rather than a choice. EqVIO, on the same bag and
+    /// the same tracks, admits every track against a fixed `sceneDepth` prior and holds
+    /// scale to 1.04x where this backend reaches 0.90x, which is what makes the admission
+    /// rule worth testing rather than assuming.
+    pub civera_birth_depth: f64,
+    /// Inverse-depth relative std for `civera_birth_depth`. The band is
+    /// `[d0*exp(-rel), d0*exp(+rel)]`, so 1.0 spans 0.37x to 2.7x the prior. Wide priors
+    /// are known to be catastrophic in this chart, so this is not a free parameter.
+    pub civera_birth_rel_std: f64,
 
     /// Refuse to promote a landmark whose triangulated range exceeds this (metres).
     /// 0 = no cap.
@@ -350,6 +367,8 @@ impl Default for MsceqfSettings {
             update_span: 0,
             max_promote_range: 0.0,
             direct_product_bias: false,
+            civera_birth_depth: 0.0,
+            civera_birth_rel_std: 1.0,
         }
     }
 }
@@ -501,6 +520,8 @@ impl MsceqfBackend {
             update_span: cfg.update_span,
             max_promote_range: cfg.max_promote_range,
             direct_product_bias: cfg.direct_product_bias,
+            civera_birth_depth: cfg.civera_birth_depth,
+            civera_birth_rel_std: cfg.civera_birth_rel_std,
         };
         Self::new(filter, cam, settings)
     }
@@ -780,13 +801,22 @@ impl VioBackend for MsceqfBackend {
                     continue;
                 }
                 let track = crate::mathematical::msceqf_filter::MscTrack { obs };
-                let born = self.filter.birth_landmark(
-                    &track,
-                    &self.z1,
-                    self.settings.pixel_std,
-                    self.settings.slam_chi2(),
-                    None,
-                );
+                let born = if self.settings.civera_birth_depth > 0.0 {
+                    self.filter.birth_landmark_civera(
+                        &track,
+                        self.settings.pixel_std,
+                        self.settings.civera_birth_depth,
+                        self.settings.civera_birth_rel_std,
+                    )
+                } else {
+                    self.filter.birth_landmark(
+                        &track,
+                        &self.z1,
+                        self.settings.pixel_std,
+                        self.settings.slam_chi2(),
+                        None,
+                    )
+                };
                 if let Some(j) = born {
                     // Reject a landmark that was born too far to inform translation.
                     if self.settings.max_promote_range > 0.0 {
@@ -1122,6 +1152,87 @@ mod msceqf_backend_tests {
         IMUVelocity::new(stamp, Vector3::zeros(), Vector3::new(0.0, 0.0, 9.81))
     }
 
+    /// Civera birth must admit tracks the triangulated path REFUSES, or the setting is
+    /// a no-op dressed as a choice.
+    ///
+    /// A near-stationary camera gives almost no bearing spread, which is exactly what the
+    /// condition-number gate inside `triangulate` rejects, and it is also the regime that
+    /// dominates this rig's outdoor ride. Civera needs no parallax because the depth
+    /// comes from the prior, so the two paths must disagree here. Both arms see
+    /// byte-identical imagery and differ only in the birth rule.
+    #[test]
+    fn civera_birth_admits_what_triangulated_birth_refuses() {
+        // Camera essentially still: 30 frames x 0.05 s x 1 mm/s = 1.5 mm of baseline.
+        fn still_frame(t: f64, ids: &[u64]) -> VisionMeasurement {
+            let cam = test_cam();
+            let p_cam = Vector3::new(1.0e-3 * t, 0.0, 0.0);
+            let pts = world_points(40);
+            let mut coords = HashMap::new();
+            for &i in ids {
+                let p = pts[i as usize] - p_cam;
+                if p[2] < 0.5 {
+                    continue;
+                }
+                let uv = cam.project(&p);
+                if uv[0] > 0.0 && uv[0] < 640.0 && uv[1] > 0.0 && uv[1] < 480.0 {
+                    coords.insert(i, Vector2::new(uv[0] as f32, uv[1] as f32));
+                }
+            }
+            VisionMeasurement::new(t, coords)
+        }
+        // Zero initial velocity, so the filter is not propagating away from imagery that
+        // says it is still -- the arms must differ on the BIRTH RULE, nothing else.
+        let born = |civera: f64| -> usize {
+            let origin = SystemOrigin::new(
+                SE23::new(SO3::identity(), Vector3::zeros(), Vector3::zeros()),
+                Vector6::zeros(),
+                SE3::identity(),
+                Vector3::new(0.0, 0.0, -9.81),
+            );
+            let filter = MSCEqFFilter::new(
+                origin,
+                &(SMatrix::<f64, 9, 9>::identity() * 1e-4),
+                &(SMatrix::<f64, 6, 6>::identity() * 1e-4),
+                &(SMatrix::<f64, 6, 6>::identity() * 1e-6),
+                ProcessNoise {
+                    angular_velocity_std: 1e-4,
+                    acceleration_std: 1e-3,
+                    angular_velocity_bias_std: 1e-6,
+                    acceleration_bias_std: 1e-5,
+                    state_transition_order: 1,
+                },
+            );
+            let mut b = MsceqfBackend::new(
+                filter,
+                test_cam(),
+                MsceqfSettings {
+                    num_clones: 6,
+                    slam_min_len: Some(4),
+                    max_slam: 8,
+                    civera_birth_depth: civera,
+                    ..Default::default()
+                },
+            );
+            let ids: Vec<u64> = (0..20).collect();
+            for k in 0..30u64 {
+                let t = k as f64 * 0.05;
+                b.process_imu(imu(t));
+                b.process_vision(still_frame(t, &ids), &HashMap::new());
+            }
+            b.n_slam()
+        };
+        let tri = born(0.0);
+        let civ = born(6.0); // world_points sit a few metres out, so 6 m is a sane prior
+        assert_eq!(
+            tri, 0,
+            "triangulated birth should refuse a 1.5 mm baseline, admitted {tri}"
+        );
+        assert!(
+            civ > 0,
+            "Civera birth should admit tracks without parallax, admitted {civ}"
+        );
+    }
+
     /// The clone window is BOUNDED. An MSCKF whose window grows without limit is the
     /// failure this backend's step (7) exists to prevent, and it costs quadratic
     /// covariance work before it is noticed.
@@ -1250,6 +1361,8 @@ mod msceqf_backend_tests {
             update_span: 0,
             max_promote_range: 0.0,
             direct_product_bias: false,
+            civera_birth_depth: 0.0,
+            civera_birth_rel_std: 1.0,
             gravity: [0.0, 0.0, -9.81],
             initial_std: MsceqfInitialStd {
                 attitude: 2.0e-2,
@@ -1337,6 +1450,8 @@ mod msceqf_backend_tests {
                 update_span: 0,
                 max_promote_range: 0.0,
                 direct_product_bias: false,
+                civera_birth_depth: 0.0,
+                civera_birth_rel_std: 1.0,
             },
         );
 

@@ -2,10 +2,10 @@ use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::path::Path;
 
-use crate::ImuBiasGroup;
 use crate::depth::occupancy::{LocalOccupancySettings, OccupancyUpdateMode};
 use crate::depth::patch_depth::{PatchDepthCameraMode, PatchDepthSettings, PatchDepthWarpMode};
 use crate::depth::sparse_gb::{DepthParametrization, SparseVogSettings};
+use crate::ImuBiasGroup;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -66,6 +66,11 @@ pub struct RudolfVConfig {
     pub epipolar_max_reject_frac: f64,
     pub max_features: usize,
     pub max_level: usize,
+}
+
+/// Civera inverse-depth band is `[d0*exp(-rel), d0*exp(+rel)]`; 1.0 spans 0.37x-2.7x.
+fn default_civera_birth_rel_std() -> f64 {
+    1.0
 }
 
 fn default_epipolar_min_baseline() -> f64 {
@@ -769,6 +774,14 @@ pub struct MsceqfConfig {
     /// Direct-product (static) bias chart instead of semi-direct.
     #[serde(default)]
     pub direct_product_bias: bool,
+    /// Prior depth (m) for Civera in-state landmark birth; 0 = triangulated birth.
+    /// See `MsceqfSettings::civera_birth_depth`.
+    #[serde(default)]
+    pub civera_birth_depth: f64,
+    /// Inverse-depth relative std for Civera birth. See
+    /// `MsceqfSettings::civera_birth_rel_std`.
+    #[serde(default = "default_civera_birth_rel_std")]
+    pub civera_birth_rel_std: f64,
     /// Gravity VECTOR in the world frame, m/s^2. Sign and axis are frame conventions,
     /// not preferences: NED wants +z, a z-up frame wants -z, and getting it backwards
     /// integrates gravity as phantom acceleration.

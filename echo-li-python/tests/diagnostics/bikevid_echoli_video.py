@@ -112,6 +112,13 @@ def main():
                          "magnitude error, which lands on scale.")
     ap.add_argument("--gyro-bias-std", type=float, default=1e-2,
                     help="initial gyro-bias std (rad/s)")
+    ap.add_argument("--accel-bias-rw", type=float, default=0.0,
+                    help="override ONLY the accel bias random walk (m/s^3/sqrt(Hz)); "
+                         "0 = keep whatever --imu-noise selects. The shipped 4.1e-3 is "
+                         "64x this IMU's measured Allan floor of 6.44e-5 and was fitted "
+                         "on short handheld bags, so over a 560 s ride it permits "
+                         "0.097 m/s^2 of bias drift against the sensor's own 0.0015 -- "
+                         "enough for the bias to absorb a tilt.")
     ap.add_argument("--imu-noise", default="tuned", choices=["tuned", "allan"],
                     help="tuned = the inflated values the rig's EqVIO config ships "
                          "(acc 4.2e-3, gyr 1.7e-4, accRW 4.1e-3, gyrRW 1.2e-4); "
@@ -122,6 +129,18 @@ def main():
                     help="MSCEqF feature noise in PIXELS (divided by fx internally)")
     ap.add_argument("--msceqf-chi2", type=float, default=1.0,
                     help="MSCEqF chi2 gate multiplier")
+    ap.add_argument("--civera-birth-depth", type=float, default=0.0,
+                    help="birth in-state landmarks from this prior depth (m) instead of "
+                         "from a triangulation; 0 = triangulated. Triangulated birth can "
+                         "only admit the near scene here (measured in-state range "
+                         "0.56-12.9 m on an outdoor ride), so WHICH part of the scene "
+                         "constrains the filter is a selection effect. EqVIO, same bag "
+                         "and same tracks, admits every track against sceneDepth 5.0 and "
+                         "holds scale to 1.04x.")
+    ap.add_argument("--civera-birth-rel-std", type=float, default=1.0,
+                    help="inverse-depth relative std for --civera-birth-depth; the band "
+                         "is [d0*exp(-rel), d0*exp(+rel)], so 1.0 spans 0.37x-2.7x. Wide "
+                         "priors are known to be catastrophic in this chart.")
     ap.add_argument("--vision-stride", type=int, default=1,
                     help="give the filter only every Nth frame's observations (the "
                          "front-end still tracks every frame, so tracks stay long). "
@@ -230,7 +249,8 @@ def main():
                                           + [args.accel_bias_std] * 3)
                                  if not args.freeze_bias else np.full(6, 1e-9)),
             np.full(6, 1e-4),
-            *( (lambda t: (t[0], t[1], 0.0, 0.0) if args.freeze_bias else t)(
+            *( (lambda t: (t[0], t[1], 0.0, 0.0) if args.freeze_bias
+                 else (t[0], t[1], args.accel_bias_rw or t[2], t[3]))(
                  (4.2e-03, 1.7e-04, 4.1e-03, 1.2e-04) if args.imu_noise == "tuned"
                  else (7.47e-04, 1.63e-04, 2.08e-04, 6.80e-05)) ), 0,
             cam, FX,   # the REAL radtan model -- this lens is distorted
@@ -241,6 +261,8 @@ def main():
             max_promote_range=args.max_promote_range,
             direct_product_bias=args.direct_product_bias,
             clone_at_frame_stamp=args.clone_at_frame_stamp,
+            civera_birth_depth=args.civera_birth_depth,
+            civera_birth_rel_std=args.civera_birth_rel_std,
         )
         print(f"backend=MSCEqF  clones={args.num_clones}  max_slam={args.max_slam}")
     else:
@@ -278,6 +300,7 @@ def main():
     diag = []
     grav_audit = []
     bias_trace = []
+    yaw_trace = []
     rr_all = {} if args.depth_trace else None
     ii = i0
     t0 = time.perf_counter()
@@ -308,6 +331,18 @@ def main():
             if ii > 0:
                 grav_audit.append(np.asarray(_rm, float) @ imu[ii - 1, 4:7])
             bias_trace.append(np.asarray(vio.imu_bias(), float).copy())
+            # Gyro bias resolved along WORLD VERTICAL vs perpendicular. The semi-direct
+            # bias chart transports bias error as eps_b_dot = ad_psi eps_b, which
+            # CONSERVES the component along the rotation axis while the perpendicular
+            # part precesses away. A bike loop is a sequence of turns about gravity, so
+            # that axis is the vertical one, and a conserved vertical gyro bias
+            # integrates straight into yaw -- which does not leak gravity, but does wreck
+            # loop closure, the one metric that has not improved in any arm.
+            _R = np.asarray(_rm, float)
+            _bg = np.asarray(vio.imu_bias(), float)[:3]
+            _up = _R.T @ np.array([0.0, 0.0, 1.0])   # world vertical in BODY frame
+            _par = float(_bg @ _up)
+            yaw_trace.append((_par, float(np.linalg.norm(_bg - _par * _up))))
             _off, _acc = vio.msc_update_counts()
             diag.append((float(ts), float(np.linalg.norm(_v)),
                          float(np.asarray(vio.nav_cov_diag())[3:6].sum()),
@@ -344,7 +379,9 @@ def main():
     stamps = np.array(stamps)
     if diag:
         np.savez(args.out.replace(".mp4", "_diag.npz"), diag=np.array(diag),
-                 grav=np.array(grav_audit) if grav_audit else np.zeros((0, 3)))
+                 grav=np.array(grav_audit) if grav_audit else np.zeros((0, 3)),
+                 bias=np.array(bias_trace) if bias_trace else np.zeros((0, 6)),
+                 yaw=np.array(yaw_trace) if yaw_trace else np.zeros((0, 2)))
     if use_msceqf:
         off, acc = vio.msc_update_counts()
         print(f"structureless tracks: offered {off}, accepted {acc} "
@@ -441,6 +478,22 @@ def main():
                   f"|ba| {np.linalg.norm(m):.4f}  |ba_horiz| {np.linalg.norm(m[:2]):.4f}")
         print(f"  |ba| over the run: median {np.median(np.linalg.norm(ba,axis=1)):.4f}  "
               f"max {np.linalg.norm(ba,axis=1).max():.4f} m/s^2")
+    if yaw_trace:
+        yt = np.array(yaw_trace)
+        print("gyro bias resolved about WORLD VERTICAL (the axis a bike loop turns about;"
+              " the semi-direct chart conserves the parallel component):")
+        nb = 8
+        ed = np.linspace(0, len(yt), nb + 1).astype(int)
+        for b0, b1 in zip(ed[:-1], ed[1:]):
+            if b1 - b0 < 10:
+                continue
+            print(f"    t {float(stamps[b0])-float(stamps[0]):6.1f} s  "
+                  f"bg_parallel {yt[b0:b1, 0].mean():+.6f}  "
+                  f"|bg_perp| {yt[b0:b1, 1].mean():.6f} rad/s")
+        tot = float(stamps[-1] - stamps[0])
+        print(f"  mean bg_parallel {yt[:,0].mean():+.6f} rad/s -> "
+              f"{np.degrees(yt[:,0].mean()*tot):+.1f} deg of yaw if it integrates at unit "
+              "gain")
     if args.zupt:
         print(f"ZUPT accepted on {zupt_fired[0]} IMU samples")
     print(f"run done in {time.perf_counter()-t0:.1f}s   path length "
