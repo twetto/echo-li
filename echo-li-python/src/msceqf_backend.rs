@@ -195,9 +195,48 @@ impl PyMsceqfBackend {
         self.inner.msc_reject_counts()
     }
 
+    /// Drain the per-update `(|dv|, sigma_v, mahalanobis)` rows recorded since the last
+    /// call, as an (N, 3) array.
+    fn take_msc_vel_corr<'py>(&mut self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
+        let rows = self.inner.take_msc_vel_corr();
+        let mut out = Array2::<f64>::zeros((rows.len(), 3));
+        for (i, r) in rows.iter().enumerate() {
+            for j in 0..3 {
+                out[[i, j]] = r[j];
+            }
+        }
+        PyArray2::from_array(py, &out)
+    }
+
+    /// Drain the per-update correction-split rows as an (N, 12) array:
+    /// `[|d_att|,|d_vel|,|d_pos|,|d_bias|,|d_E|,|d_clones|,
+    ///   rho_*_oldest(3), rho_*_newest(3)]`.
+    fn take_msc_corr_split<'py>(&mut self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
+        let rows = self.inner.take_msc_corr_split();
+        let mut out = Array2::<f64>::zeros((rows.len(), 12));
+        for (i, r) in rows.iter().enumerate() {
+            for j in 0..12 {
+                out[[i, j]] = r[j];
+            }
+        }
+        PyArray2::from_array(py, &out)
+    }
+
     /// Drain the per-track `chi2 / gate` ratios recorded since the last call.
     fn take_msc_chi2_ratios<'py>(&mut self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
         PyArray1::from_vec(py, self.inner.take_msc_chi2_ratios())
+    }
+
+    /// The filter's IMU bias estimate `[gyro(3); accel(3)]`, as `phi` recovers it.
+    ///
+    /// The accel bias is seeded at zero and is structurally unobservable at rest, so on a
+    /// rig whose measured gravity magnitude is off by 1.4% the filter starts with a
+    /// 0.14 m/s^2 error it has to learn while moving. Whether it ever does is not
+    /// visible in the trajectory, because an unlearned accel bias in the horizontal body
+    /// axes is indistinguishable from a tilt.
+    fn imu_bias<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
+        let b = self.inner.filter().phi().b;
+        PyArray1::from_slice(py, b.as_slice())
     }
 
     /// Core-state covariance diagonal [att(3) vel(3) pos(3) bias(6) | E(6)], for

@@ -1300,6 +1300,91 @@ mod tests {
         );
     }
 
+    /// The same invariance for ROTATION, because a tilt bias is what actually hurts.
+    ///
+    /// Rotating the whole world -- every clone pose and the feature, about the anchor --
+    /// leaves every bearing unchanged just as a dilation does, so the projected
+    /// constraint must annihilate that direction too. If it does not, every structureless
+    /// update injects a little attitude error, and on this rig a sustained roll/pitch
+    /// bias of a tenth of a degree leaks `g*sin(theta)` into horizontal acceleration,
+    /// which the IMU integrates into velocity. So this is the Jacobian-level check behind
+    /// the measured gravity leak: it says whether the update CAN inject tilt.
+    #[test]
+    fn structureless_constraint_annihilates_global_rotation() {
+        let c = norm_cam_local();
+        let x_true = Vector3::new(0.7, -0.4, 6.0);
+        let poses = [
+            SE3::new(SO3::exp(&Vector3::new(0.01, -0.02, 0.0)), Vector3::new(0.1, 0.05, -0.02)),
+            SE3::new(SO3::exp(&Vector3::new(0.0, 0.05, 0.0)), Vector3::new(1.0, 0.1, 0.0)),
+            SE3::new(SO3::exp(&Vector3::new(-0.02, 0.09, 0.01)), Vector3::new(2.0, 0.2, -0.3)),
+            SE3::new(SO3::exp(&Vector3::new(0.03, 0.13, -0.02)), Vector3::new(3.1, 0.0, 0.1)),
+        ];
+        let obs: Vec<MscObs> = poses
+            .iter()
+            .map(|pose| {
+                let q = pose.inverse().act(&x_true);
+                MscObs {
+                    pose: pose.clone(),
+                    pose_fej: pose.clone(),
+                    uv: Vector2::new(q[0] / q[2], q[1] / q[2]),
+                }
+            })
+            .collect();
+        let (h_f, h_x, res) = feature_jacobians_anchored_left(&x_true, &obs, &c).unwrap();
+        assert!(res.norm() < 1e-12);
+        let (h_o, _) = left_nullspace_project(&h_f, &h_x, &res).unwrap();
+
+        // GROUND TRUTH: rotate the world about the origin and confirm the residual holds.
+        let axis = Vector3::new(0.3, -0.5, 0.81).normalize();
+        let e = 1e-6;
+        let rot = SO3::exp(&(axis * e));
+        let obs_r: Vec<MscObs> = poses
+            .iter()
+            .map(|pose| {
+                let moved = SE3::new(
+                    rot.clone() * pose.rotation.clone(),
+                    rot.act(&pose.translation),
+                );
+                let q = pose.inverse().act(&x_true); // bearings are unchanged by design
+                MscObs {
+                    pose: moved.clone(),
+                    pose_fej: moved,
+                    uv: Vector2::new(q[0] / q[2], q[1] / q[2]),
+                }
+            })
+            .collect();
+        let (_, _, res_r) =
+            feature_jacobians_anchored_left(&rot.act(&x_true), &obs_r, &c).unwrap();
+        let moved = (&res_r - &res).norm();
+        assert!(
+            moved < 1e-12,
+            "a global rotation must not change the residual, moved by {moved}"
+        );
+
+        // Matching tangent: a LEFT perturbation [w; v] rotates the pose by w and moves
+        // its centre by w x p, so a global rotation about the origin is w = axis,
+        // v = 0 -- the left chart carries the `w x p` part itself.
+        let n = obs.len();
+        let mut d = DVector::<f64>::zeros(6 * n);
+        for k in 0..n {
+            d.rows_mut(6 * k, 3).copy_from(&axis);
+        }
+        let got = (&h_o * &d).norm();
+        let scale_ref = h_o.norm() * d.norm();
+        assert!(
+            got < 1e-9 * scale_ref.max(1.0),
+            "h_o must annihilate global rotation: |h_o d| = {got:e} against |h_o||d| = \
+             {scale_ref:e}"
+        );
+        // Non-vacuity: rotating ONE clone alone is not a gauge direction and must move it.
+        let mut other = DVector::<f64>::zeros(6 * n);
+        other.rows_mut(6 * (n - 1), 3).copy_from(&axis);
+        assert!(
+            (&h_o * &other).norm() > 1e-6 * scale_ref,
+            "rotating a single clone should move the constraint"
+        );
+    }
+
     /// A synthetic 3-D point seen from a few poses triangulates back to itself.
     #[test]
     fn triangulation_recovers_synthetic_point() {

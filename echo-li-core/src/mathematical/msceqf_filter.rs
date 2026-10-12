@@ -268,6 +268,35 @@ pub struct MSCEqFFilter {
     /// is working until the trajectory drifts, and the five reasons call for completely
     /// different fixes, so the count has to be split.
     pub msc_reject: [u64; 5],
+    /// Per-MSC-update `(|dv|, sigma_v, mahalanobis)`: the size of the velocity
+    /// correction the update actually applies, the velocity uncertainty it claims, and
+    /// the correction's 3-DOF Mahalanobis norm against its own velocity block.
+    ///
+    /// This separates two failure modes that look identical in a trajectory. If the
+    /// Mahalanobis norm is routinely far above 3, the filter is applying velocity
+    /// corrections its own covariance calls impossible -- the covariance is too tight
+    /// and the scale channel is being throttled. If it is far below 3, the updates are
+    /// not asking the velocity channel for anything and the information is not reaching
+    /// it at all. Both quantities are taken in the filter's OWN chart, before the
+    /// update, so the ratio is self-consistent.
+    pub msc_vel_corr: Vec<[f64; 3]>,
+    /// Per-MSC-update: where the correction LANDS and how strongly each core block is
+    /// coupled to the clones that carry the measurement.
+    ///
+    /// `[|d_att|, |d_vel|, |d_pos|, |d_bias|, |d_E|, |d_clones|,
+    ///   rho_att_old, rho_vel_old, rho_pos_old, rho_att_new, rho_vel_new, rho_pos_new]`
+    /// -- the six correction norms, then the largest absolute correlation between that
+    /// core block's rows and the OLDEST clone (the anchor, which carries the baseline)
+    /// and the NEWEST clone, pre-update. The gain is `K = cov[:, clones] C^T S^-1`, so a
+    /// core block weakly correlated with the clones cannot be moved much by a
+    /// structureless update however good the residual is. The correction norms say where
+    /// the information went; the correlations say where it could have gone.
+    ///
+    /// Oldest and newest are reported separately on purpose: the newest clone is a fresh
+    /// copy of `E`, so its correlation to attitude and position is 1 by construction and
+    /// a max over all clones just reports that, which is why the first version of this
+    /// diagnostic measured nothing.
+    pub msc_corr_split: Vec<[f64; 12]>,
     /// Per-track `chi2 / gate` for every track that reached the gate, accepted or not.
     /// The COUNT of rejections says how much is thrown away; this says whether the
     /// rejected tracks sit just outside the gate (a gate too tight for an honest
@@ -428,6 +457,8 @@ impl MSCEqFFilter {
             lm_upd_diag: Vec::new(),
             msc_reject: [0; 5],
             msc_chi2_ratio: Vec::new(),
+            msc_vel_corr: Vec::new(),
+            msc_corr_split: Vec::new(),
         }
     }
 
@@ -1226,6 +1257,63 @@ impl MSCEqFFilter {
         // K = G·S⁻¹  ⇒  Kᵀ = S⁻¹·Gᵀ (solve with the SPD Cholesky), K = (S⁻¹Gᵀ)ᵀ.
         let k = chol.solve(&g.transpose()).transpose(); // (dim × rows)
         let inn_vec = &k * &delta; // (dim)
+
+        // Record what this update asks of the velocity channel, against what the channel
+        // claims to be worth. Pre-update covariance, same chart as the increment.
+        {
+            let vi = DD_IDX + 3;
+            let dv = Vector3::new(inn_vec[vi], inn_vec[vi + 1], inn_vec[vi + 2]);
+            let p_vv = self.cov.view((vi, vi), (3, 3)).into_owned();
+            let sigma_v = (p_vv.trace() / 3.0).max(0.0).sqrt();
+            let maha = match p_vv.clone().cholesky() {
+                Some(ch) => {
+                    let rhs = DVector::from_column_slice(dv.as_slice());
+                    dv.dot(&Vector3::from_iterator(ch.solve(&rhs).iter().copied()))
+                }
+                None => f64::NAN,
+            };
+            self.msc_vel_corr.push([dv.norm(), sigma_v, maha]);
+
+            // Where the correction lands, and whether any other block COULD have taken
+            // it. rho is taken against the pre-update covariance, same chart.
+            let blk = |i: usize, n: usize| -> f64 {
+                (0..n)
+                    .map(|j| inn_vec[i + j] * inn_vec[i + j])
+                    .sum::<f64>()
+                    .sqrt()
+            };
+            // `cbase` picks ONE clone block, so the oldest (anchor) and newest can be
+            // read apart; see `msc_corr_split` for why a max over all clones is blind.
+            let rho = |i: usize, n: usize, cbase: usize| -> f64 {
+                let mut m: f64 = 0.0;
+                for r in i..i + n {
+                    let sr = self.cov[(r, r)].max(0.0).sqrt();
+                    for c in cbase..cbase + CLONE_DOF {
+                        let sc = self.cov[(c, c)].max(0.0).sqrt();
+                        if sr > 1e-30 && sc > 1e-30 {
+                            m = m.max((self.cov[(r, c)] / (sr * sc)).abs());
+                        }
+                    }
+                }
+                m
+            };
+            let oldest = CLONE_BASE;
+            let newest = CLONE_BASE + CLONE_DOF * (nclones - 1);
+            self.msc_corr_split.push([
+                blk(DD_IDX, 3),
+                blk(DD_IDX + 3, 3),
+                blk(DD_IDX + 6, 3),
+                blk(DD_IDX + 9, 6),
+                blk(E_IDX, 6),
+                blk(CLONE_BASE, CLONE_DOF * nclones),
+                rho(DD_IDX, 3, oldest),
+                rho(DD_IDX + 3, 3, oldest),
+                rho(DD_IDX + 6, 3, oldest),
+                rho(DD_IDX, 3, newest),
+                rho(DD_IDX + 3, 3, newest),
+                rho(DD_IDX + 6, 3, newest),
+            ]);
+        }
 
         // Apply LEFT-multiply corrections.
         let dd_inn = SVector::<f64, 15>::from_iterator(inn_vec.rows(DD_IDX, 15).iter().copied());

@@ -565,6 +565,18 @@ impl MsceqfBackend {
         self.filter.msc_reject
     }
 
+    /// Take the recorded per-update `(|dv|, sigma_v, mahalanobis)` rows, emptying the
+    /// buffer. See `MSCEqFFilter::msc_vel_corr`.
+    pub fn take_msc_vel_corr(&mut self) -> Vec<[f64; 3]> {
+        std::mem::take(&mut self.filter.msc_vel_corr)
+    }
+
+    /// Take the per-update correction-split rows, emptying the buffer. See
+    /// `MSCEqFFilter::msc_corr_split`.
+    pub fn take_msc_corr_split(&mut self) -> Vec<[f64; 12]> {
+        std::mem::take(&mut self.filter.msc_corr_split)
+    }
+
     /// Take the recorded per-track `chi2 / gate` ratios, emptying the buffer.
     pub fn take_msc_chi2_ratios(&mut self) -> Vec<f64> {
         std::mem::take(&mut self.filter.msc_chi2_ratio)

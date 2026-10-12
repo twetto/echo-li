@@ -276,6 +276,8 @@ def main():
 
     traj, stamps, feats_per_frame, lm_rng = [], [], {}, {}
     diag = []
+    grav_audit = []
+    bias_trace = []
     rr_all = {} if args.depth_trace else None
     ii = i0
     t0 = time.perf_counter()
@@ -296,6 +298,16 @@ def main():
         if use_msceqf:
             p, _rm, _v = vio.nav_pose()
             p = np.asarray(p, float)
+            # GRAVITY-LEAK AUDIT, no ground truth needed. Over a closed 9-minute loop the
+            # long-time average of specific force MUST be vertical -- a sustained
+            # horizontal acceleration is impossible. So rotating the measured accel into
+            # the world frame with the filter's OWN attitude and averaging has to give
+            # (0, 0, g). Any horizontal residual is gravity leaking through a tilt bias,
+            # and it integrates straight into velocity: a mean residual `r` adds `r*T` of
+            # speed, which is why a 0.1 deg tilt is worth metres per second over a ride.
+            if ii > 0:
+                grav_audit.append(np.asarray(_rm, float) @ imu[ii - 1, 4:7])
+            bias_trace.append(np.asarray(vio.imu_bias(), float).copy())
             _off, _acc = vio.msc_update_counts()
             diag.append((float(ts), float(np.linalg.norm(_v)),
                          float(np.asarray(vio.nav_cov_diag())[3:6].sum()),
@@ -331,7 +343,8 @@ def main():
     traj = np.array(traj)
     stamps = np.array(stamps)
     if diag:
-        np.savez(args.out.replace(".mp4", "_diag.npz"), diag=np.array(diag))
+        np.savez(args.out.replace(".mp4", "_diag.npz"), diag=np.array(diag),
+                 grav=np.array(grav_audit) if grav_audit else np.zeros((0, 3)))
     if use_msceqf:
         off, acc = vio.msc_update_counts()
         print(f"structureless tracks: offered {off}, accepted {acc} "
@@ -351,6 +364,83 @@ def main():
                   "pct 5/25/50/75/90/95/99 " + "/".join(f"{v:.2f}" for v in q))
             for thr in (1.0, 2.0, 5.0, 20.0, 100.0):
                 print(f"    > {thr:6.1f}x gate: {100.0*np.mean(cr > thr):5.1f}%")
+        # Does the update ASK the velocity channel for anything, and does the channel
+        # claim that ask is possible? maha >> 3 = corrections the covariance calls
+        # impossible (channel throttled); maha << 3 = the updates are not asking.
+        vc = np.asarray(vio.take_msc_vel_corr(), float)
+        if len(vc):
+            dv, sv, mh = vc[:, 0], vc[:, 1], vc[:, 2]
+            q = lambda a: "/".join(f"{v:.3g}" for v in np.percentile(a, [5, 25, 50, 75, 95]))
+            print(f"  velocity correction over {len(vc)} MSC updates, chart units:")
+            print(f"    |dv| (m/s)   median {np.median(dv):.4g}  mean {dv.mean():.4g}  "
+                  f"pct 5/25/50/75/95 {q(dv)}")
+            print(f"    sigma_v      median {np.median(sv):.4g}  mean {sv.mean():.4g}  "
+                  f"pct 5/25/50/75/95 {q(sv)}")
+            print(f"    |dv|/sigma_v median {np.median(dv/np.maximum(sv,1e-12)):.3g}")
+            good = np.isfinite(mh)
+            if good.any():
+                m = mh[good]
+                print(f"    3-DOF Mahalanobis  median {np.median(m):.3g}  mean {m.mean():.3g}  "
+                      f"pct 5/25/50/75/95 {q(m)}   (ideal median 2.37, chi2_3 95% = 7.81)")
+                for thr in (7.81, 30.0, 100.0):
+                    print(f"      > {thr:6.2f}: {100.0*np.mean(m > thr):5.1f}%")
+        # K = cov[:, clones] C^T S^-1, so a core block uncorrelated with the clones
+        # cannot be corrected at all. Where did the correction land, and could it have
+        # landed anywhere else?
+        cs = np.asarray(vio.take_msc_corr_split(), float)
+        if len(cs):
+            names = ["att", "vel", "pos", "bias", "E", "clones"]
+            tot = cs[:, :6].sum(axis=1)
+            print(f"  where the correction lands, {len(cs)} MSC updates (median share of "
+                  "the per-update total):")
+            for i, nm in enumerate(names):
+                print(f"    {nm:7s} |d| median {np.median(cs[:, i]):.4g}   share "
+                      f"{100.0*np.median(cs[:, i]/np.maximum(tot,1e-30)):5.1f}%")
+            print("  largest |correlation| between each core block and one clone "
+                  "(oldest = the anchor that carries the baseline; the newest clone is a "
+                  "fresh copy of E, so its att/pos correlation is 1 by construction):")
+            for i, nm in zip((6, 7, 8), ("att", "vel", "pos")):
+                o, n_ = cs[:, i], cs[:, i + 3]
+                print(f"    rho({nm:3s}) oldest median {np.median(o):.4f} "
+                      "(5/95 " + "/".join(f"{v:.4f}" for v in np.percentile(o, [5, 95]))
+                      + f")   newest median {np.median(n_):.4f}")
+    if grav_audit:
+        ga = np.array(grav_audit)
+        m = ga.mean(axis=0)
+        hor = float(np.linalg.norm(m[:2]))
+        T = float(stamps[-1] - stamps[0])
+        print(f"gravity-leak audit over {len(ga)} frames, {T:.1f} s:")
+        print(f"  mean world-frame specific force [{m[0]:+.4f} {m[1]:+.4f} {m[2]:+.4f}] m/s^2"
+              f"  (|vertical| should be {GRAVITY}, horizontal should be 0)")
+        print(f"  horizontal residual {hor:.4f} m/s^2 -> {hor*T:.2f} m/s of speed over the "
+              f"ride, and {0.5*hor*T*T:.0f} m of position")
+        print(f"  implied tilt bias {np.degrees(np.arcsin(min(1.0, hor/GRAVITY))):.3f} deg")
+        # A CONSTANT tilt set at initialisation and a tilt that DRIFTS during the ride
+        # give the same mean, and call for completely different fixes, so bin it.
+        nb = 14
+        edges = np.linspace(0, len(ga), nb + 1).astype(int)
+        print("  horizontal residual by time bin (m/s^2), and its direction (deg):")
+        for b0, b1 in zip(edges[:-1], edges[1:]):
+            if b1 - b0 < 10:
+                continue
+            mb = ga[b0:b1].mean(axis=0)
+            hb = float(np.linalg.norm(mb[:2]))
+            ang = np.degrees(np.arctan2(mb[1], mb[0]))
+            t0b = float(stamps[b0]) - float(stamps[0])
+            print(f"    t {t0b:6.1f} s  |h| {hb:.4f}  dir {ang:+7.1f}  "
+                  f"tilt {np.degrees(np.arcsin(min(1.0, hb/GRAVITY))):.3f} deg")
+    if bias_trace:
+        bt = np.array(bias_trace)
+        ba = bt[:, 3:]
+        print("accel-bias estimate (seeded at ZERO; this rig's measured |g| is 1.43% high,"
+              " = 0.14 m/s^2, which is 0.82 deg of apparent tilt if it stays unlearned):")
+        for lab, sl in (("first 10 s", slice(0, min(len(ba), 620))),
+                        ("last 10 s", slice(max(0, len(ba) - 620), len(ba)))):
+            m = ba[sl].mean(axis=0)
+            print(f"  {lab:10s} ba [{m[0]:+.4f} {m[1]:+.4f} {m[2]:+.4f}]  "
+                  f"|ba| {np.linalg.norm(m):.4f}  |ba_horiz| {np.linalg.norm(m[:2]):.4f}")
+        print(f"  |ba| over the run: median {np.median(np.linalg.norm(ba,axis=1)):.4f}  "
+              f"max {np.linalg.norm(ba,axis=1).max():.4f} m/s^2")
     if args.zupt:
         print(f"ZUPT accepted on {zupt_fired[0]} IMU samples")
     print(f"run done in {time.perf_counter()-t0:.1f}s   path length "

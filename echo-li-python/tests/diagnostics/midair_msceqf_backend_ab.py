@@ -124,6 +124,32 @@ def run_rust(a, by_frame, gyr_body, acc, nimg, cfg):
             f.process_imu(i * DT, gyr_body[i], acc[i])
         f.process_vision(k * DT * IMU_PER_IMG, by_frame.get(k, {}))
         est.append(f.nav_pose()[0].copy())
+    # WORKING CONTROL for the bikevid diagnostics. MSCEqF holds scale here (est/gt
+    # ~1.03), so the same per-update numbers measured on a bag where it does not are
+    # only readable against these. Same accessors, same filter, no behaviour change.
+    rj = f.msc_reject_counts()
+    off = sum(rj) + 0  # offered is not counted here; report the reasons' shares instead
+    print("    [rs arm] structureless drops: " + "  ".join(
+        f"{nm} {c}" for nm, c in zip(
+            ["too_few_obs", "stale_clone", "triangulation", "jacobian", "chi2"], rj)))
+    vc = np.asarray(f.take_msc_vel_corr(), float)
+    if len(vc):
+        dv, sv, mh = vc[:, 0], vc[:, 1], vc[:, 2]
+        print(f"    [rs arm] velocity correction over {len(vc)} updates: "
+              f"|dv| median {np.median(dv):.4g}  sigma_v median {np.median(sv):.4g}  "
+              f"|dv|/sigma_v median {np.median(dv / np.maximum(sv, 1e-12)):.3g}  "
+              f"3-DOF maha median {np.median(mh[np.isfinite(mh)]):.3g}")
+    cs = np.asarray(f.take_msc_corr_split(), float)
+    if len(cs):
+        tot = cs[:, :6].sum(axis=1)
+        shares = "  ".join(
+            f"{nm} {100.0 * np.median(cs[:, i] / np.maximum(tot, 1e-30)):.1f}%"
+            for i, nm in enumerate(["att", "vel", "pos", "bias", "E", "clones"]))
+        print(f"    [rs arm] correction lands: {shares}")
+        print("    [rs arm] rho to OLDEST clone: " + "  ".join(
+            f"{nm} {np.median(cs[:, i]):.4f}" for i, nm in zip((6, 7, 8),
+                                                               ("att", "vel", "pos"))))
+    _ = off
     return np.array(est), f.n_clones(), f.n_slam()
 
 
