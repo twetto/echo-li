@@ -273,9 +273,11 @@ def main():
         if use_msceqf:
             p, _rm, _v = vio.nav_pose()
             p = np.asarray(p, float)
+            _off, _acc = vio.msc_update_counts()
             diag.append((float(ts), float(np.linalg.norm(_v)),
                          float(np.asarray(vio.nav_cov_diag())[3:6].sum()),
-                         vio.n_clones(), vio.n_slam()))
+                         vio.n_clones(), vio.n_slam(), float(_off), float(_acc),
+                         float(len(uvs))))
         else:
             p, q = vio.get_pose()
             p = np.asarray(p, float)
