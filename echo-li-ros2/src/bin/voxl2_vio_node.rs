@@ -5,8 +5,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use camera_geometry::CameraProjection;
-use echo_li_core::backend::EqvioBackend;
 use echo_li_core::backend::VioBackendFull;
+use echo_li_core::backend::{EqvioBackend, MsceqfBackend};
+use echo_li_core::config::MsceqfConfig;
 use echo_li_core::config::VIOConfig;
 use echo_li_core::core_types::CameraIntrinsics;
 use echo_li_core::depth::occupancy::LocalOccupancyMap;
@@ -390,6 +391,12 @@ struct VioNode {
     /// Kept because initialisation REBUILDS the backend once gravity alignment
     /// completes, and the settings are otherwise consumed by the first construction.
     filter_settings: VIOFilterSettings,
+    /// Present when the config selected MSCEqF; the rebuild then constructs that
+    /// backend instead of EqVIO.
+    msceqf_config: Option<MsceqfConfig>,
+    /// Focal length in pixels, for converting the MSCEqF section's PIXEL noise into
+    /// the normalized units that backend works in.
+    fx: f64,
     camera: Arc<dyn CameraModel>,
     frontend: FrontendBackend,
     t_bc: Matrix4<f64>,
@@ -628,6 +635,29 @@ impl VioNode {
             camera_offset: cam_offset,
         };
         let xi0 = VIOState::new(sensor, vec![]);
+        // Backend selection. The node drives whichever one it is handed; only the
+        // construction differs.
+        let msceqf_cfg = vio_config.msceqf.clone().filter(|c| c.enabled);
+        if let Some(ref c) = msceqf_cfg {
+            log::info!(
+                "backend=MSCEqF (clones={}, max_slam={}, pixel_std={} px, curvature={})",
+                c.num_clones,
+                c.max_slam,
+                c.pixel_std,
+                c.curvature
+            );
+            if vio_config.sparse_vog.as_ref().is_some_and(|s| s.enabled) {
+                // Sparse3D consumes camera-pose covariance, which this backend cannot
+                // report yet; it would run on missing information rather than wrong
+                // information, but it would not be doing its job either.
+                log::warn!(
+                    "MSCEqF backend does not report camera-pose covariance yet; the \
+                     Sparse3D depth filter will receive None for P_vv/P_ww"
+                );
+            }
+        } else {
+            log::info!("backend=EqVIO");
+        }
         let filter: Box<dyn VioBackendFull> = Box::new(EqvioBackend::new(
             VIOFilter::new(filter_settings.clone(), xi0),
             camera.clone(),
@@ -699,6 +729,8 @@ impl VioNode {
             camera,
             frontend,
             filter_settings,
+            msceqf_config: msceqf_cfg,
+            fx: params.intrinsics[0] * params.image_scale,
             t_bc: params.t_bs,
             initialized: false,
             n_init: params.n_init,
@@ -911,10 +943,18 @@ impl VioNode {
 
         if !self.initialized {
             if let Some(start) = self.init.push(imu) {
-                self.filter = Box::new(EqvioBackend::new(
-                    VIOFilter::new(self.filter_settings.clone(), start.state),
-                    self.camera.clone(),
-                ));
+                self.filter = match &self.msceqf_config {
+                    Some(cfg) => Box::new(MsceqfBackend::from_config(
+                        cfg,
+                        self.camera.clone(),
+                        self.fx,
+                        &start,
+                    )),
+                    None => Box::new(EqvioBackend::new(
+                        VIOFilter::new(self.filter_settings.clone(), start.state),
+                        self.camera.clone(),
+                    )),
+                };
                 for buffered in start.replay {
                     self.filter.process_imu(buffered);
                 }

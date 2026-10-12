@@ -128,15 +128,38 @@ Owed, in dependency order: `MSCEqFFilter` is a primitives API -- `stochastic_clo
    REAL camera model, where the Python harness used a bare inverse-K. Those agree on an
    undistorted pinhole (MidAir) and diverge on a distorted one, so MidAir is the right
    place to compare.
-2. **A backend choice the ROS 2 node can actually make.** The node holds the seam, but
-   EqVIO is the only thing it can construct: `MsceqfBackend` needs a `SystemOrigin`
-   (R0, p0, v0, b0, S0, g) and a `ProcessNoise`, none of which `VIOConfig` carries. The
-   remaining work is config plumbing, not architecture.
-
-3. **`MsceqfBackend::pose_covariance`.** It returns `None` today, so a node running
+2. **`MsceqfBackend::pose_covariance`.** It returns `None` today, so a node running
    MSCEqF would starve the Sparse3D depth filter of pose uncertainty. MSCEqF carries
    covariance on the group algebra over its clone window; projecting that onto a single
    camera pose is the missing derivation.
+
+### Selecting MSCEqF
+
+An `MSCEqF:` section in the YAML selects it; absent or `enabled: false` leaves EqVIO.
+The section carries only what no other section can supply -- `SystemOrigin` and
+`ProcessNoise` -- and deliberately NOT the initial attitude, position or extrinsic:
+those come from gravity alignment and from the `t_bs` the rest of the system already
+uses, and duplicating them is how two sources of truth start to disagree.
+
+`pixelStd` is in PIXELS, like EqVIO's `measurementNoise.feature`, and is divided by fx
+at construction because the backend normalizes observations before they reach the
+filter. Initial bias is zero, matching the EqVIO path: gravity alignment at rest cannot
+observe accelerometer bias, since the bias is parallel to measured gravity by
+construction.
+
+`config_path_matches_direct_construction` pins the mapping against direct construction
+-- covariance blocks first, then 30 driven frames compared by fingerprint. The config
+path has a transposition on every field (Dd tangent order, the pixel conversion, the
+gravity sign, density-vs-random-walk), each of which still runs and still produces a
+plausible trajectory. Three mutations were checked and all three fail the test.
+
+The test also carries a non-vacuity control, because the first version of it did not
+work: a backend with 100x the pixel noise must diverge. Without that, the comparison
+was empty -- the synthetic rig started at rest while the imagery implied 2 m/s, so every
+update was chi2-rejected and both arms agreed by doing nothing.
+
+Starting the node with MSCEqF while Sparse3D is enabled logs a warning: this backend
+reports no camera-pose covariance yet, so the depth filter runs on missing information.
 
 ### Widening the trait
 

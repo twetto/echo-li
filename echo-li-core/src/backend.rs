@@ -364,6 +364,92 @@ pub struct MsceqfBackend {
 }
 
 impl MsceqfBackend {
+    /// Build from an `MSCEqF:` config section and the state gravity alignment produced.
+    ///
+    /// `start` supplies the attitude, position and velocity; `fx` converts the config's
+    /// PIXEL noise into the normalized units the filter works in, because this backend
+    /// normalizes observations through `cam` before they reach the filter.
+    ///
+    /// Note the initial bias is zero, matching how the EqVIO path starts: gravity
+    /// alignment at rest cannot observe accelerometer bias -- the bias is parallel to
+    /// measured gravity by construction -- so seeding a non-zero one would be inventing
+    /// information.
+    pub fn from_config(
+        cfg: &crate::config::MsceqfConfig,
+        cam: Arc<dyn CameraModel>,
+        fx: f64,
+        start: &crate::initialization::FilterStart,
+    ) -> Self {
+        use crate::mathematical::msceqf_filter::{MSCEqFFilter, ProcessNoise, SystemOrigin};
+        use nalgebra::{SMatrix, Vector6};
+
+        let sensor = &start.state.sensor;
+        let origin = SystemOrigin::new(
+            echo_lie::SE23::new(
+                sensor.pose.rotation,
+                sensor.pose.translation,
+                sensor.velocity,
+            ),
+            Vector6::zeros(),
+            sensor.camera_offset.clone(),
+            Vector3::new(cfg.gravity[0], cfg.gravity[1], cfg.gravity[2]),
+        );
+
+        let sd = &cfg.initial_std;
+        // Dd block in MSCEqF tangent order: attitude, velocity, position.
+        let d_std = [
+            sd.attitude,
+            sd.attitude,
+            sd.attitude,
+            sd.velocity,
+            sd.velocity,
+            sd.velocity,
+            sd.position,
+            sd.position,
+            sd.position,
+        ];
+        let d_init =
+            SMatrix::<f64, 9, 9>::from_fn(|i, j| if i == j { d_std[i] * d_std[i] } else { 0.0 });
+        let delta_init =
+            SMatrix::<f64, 6, 6>::from_fn(|i, j| if i == j { sd.bias * sd.bias } else { 0.0 });
+        let e_init = SMatrix::<f64, 6, 6>::from_fn(|i, j| {
+            if i == j {
+                sd.extrinsics * sd.extrinsics
+            } else {
+                0.0
+            }
+        });
+
+        let pn = &cfg.process_noise;
+        let filter = MSCEqFFilter::new(
+            origin,
+            &d_init,
+            &delta_init,
+            &e_init,
+            ProcessNoise {
+                angular_velocity_std: pn.gyro_density,
+                acceleration_std: pn.accel_density,
+                angular_velocity_bias_std: pn.gyro_random_walk,
+                acceleration_bias_std: pn.accel_random_walk,
+                state_transition_order: pn.transition_order,
+            },
+        );
+
+        let settings = MsceqfSettings {
+            num_clones: cfg.num_clones,
+            // Config carries pixels; the filter wants normalized units.
+            pixel_std: cfg.pixel_std / fx,
+            chi2_mult: cfg.chi2_mult,
+            slam_chi2_mult: (cfg.slam_chi2_mult > 0.0).then_some(cfg.slam_chi2_mult),
+            max_track: cfg.max_track,
+            slam_min_len: (cfg.slam_min_len > 0).then_some(cfg.slam_min_len),
+            max_slam: cfg.max_slam,
+            curvature: cfg.curvature,
+            update_span: cfg.update_span,
+        };
+        Self::new(filter, cam, settings)
+    }
+
     pub fn new(
         filter: crate::mathematical::msceqf_filter::MSCEqFFilter,
         cam: Arc<dyn CameraModel>,
@@ -950,6 +1036,171 @@ mod msceqf_backend_tests {
             evicted > 0,
             "no landmark was ever evicted; the marginalize-on-loss branch never ran"
         );
+    }
+
+    /// The config path must build the SAME filter as direct construction. Every field
+    /// here is a chance to transpose something silently: the Dd block's tangent order
+    /// (attitude, velocity, position), the pixel-to-normalized conversion, the gravity
+    /// sign, and the noise mapping (gyro density -> angular_velocity_std, accel random
+    /// walk -> acceleration_bias_std). A misplaced one still runs, and still produces a
+    /// plausible trajectory.
+    #[test]
+    fn config_path_matches_direct_construction() {
+        use crate::config::{MsceqfConfig, MsceqfInitialStd, MsceqfProcessNoise};
+        use crate::initialization::StationaryInit;
+
+        let fx = 400.0;
+        let cfg = MsceqfConfig {
+            enabled: true,
+            num_clones: 7,
+            pixel_std: 1.5, // PIXELS; the filter must see 1.5/fx
+            chi2_mult: 1.3,
+            slam_chi2_mult: 0.0,
+            max_track: 123,
+            slam_min_len: 0,
+            max_slam: 4,
+            curvature: true,
+            update_span: 0,
+            gravity: [0.0, 0.0, -9.81],
+            initial_std: MsceqfInitialStd {
+                attitude: 2.0e-2,
+                velocity: 3.0e-1,
+                position: 4.0e-4,
+                bias: 5.0e-2,
+                extrinsics: 6.0e-4,
+            },
+            process_noise: MsceqfProcessNoise {
+                accel_density: 1.6798e-3,
+                gyro_density: 1.2724e-3,
+                accel_random_walk: 3.0e-3,
+                gyro_random_walk: 1.0e-4,
+                transition_order: 0,
+            },
+        };
+
+        // Gravity-align from a level rest, as the wrappers do, then set the velocity
+        // the synthetic imagery actually implies. StationaryInit zeroes velocity, which
+        // is right for a real rest start -- but leaving it zero here makes the frames
+        // describe a 2 m/s camera while the filter believes it is stationary, so every
+        // update is chi2-rejected and the comparison below becomes vacuous.
+        let samples: Vec<IMUVelocity> = (0..10)
+            .map(|k| {
+                IMUVelocity::new(
+                    k as f64 * 0.01,
+                    Vector3::zeros(),
+                    Vector3::new(0.0, 0.0, 9.81),
+                )
+            })
+            .collect();
+        let mut start = StationaryInit::from_samples(10, SE3::identity(), samples);
+        start.state.sensor.velocity = Vector3::new(VX, 0.0, 0.0);
+
+        let mut from_cfg = MsceqfBackend::from_config(&cfg, test_cam(), fx, &start);
+
+        // The same thing, spelled out.
+        let sd = &cfg.initial_std;
+        let d = [
+            sd.attitude,
+            sd.attitude,
+            sd.attitude,
+            sd.velocity,
+            sd.velocity,
+            sd.velocity,
+            sd.position,
+            sd.position,
+            sd.position,
+        ];
+        let origin = SystemOrigin::new(
+            SE23::new(
+                start.state.sensor.pose.rotation,
+                start.state.sensor.pose.translation,
+                start.state.sensor.velocity,
+            ),
+            Vector6::zeros(),
+            start.state.sensor.camera_offset.clone(),
+            Vector3::new(0.0, 0.0, -9.81),
+        );
+        let filter = MSCEqFFilter::new(
+            origin,
+            &SMatrix::<f64, 9, 9>::from_fn(|i, j| if i == j { d[i] * d[i] } else { 0.0 }),
+            &SMatrix::<f64, 6, 6>::from_fn(|i, j| if i == j { 5.0e-2 * 5.0e-2 } else { 0.0 }),
+            &SMatrix::<f64, 6, 6>::from_fn(|i, j| if i == j { 6.0e-4 * 6.0e-4 } else { 0.0 }),
+            ProcessNoise {
+                angular_velocity_std: 1.2724e-3,
+                acceleration_std: 1.6798e-3,
+                angular_velocity_bias_std: 1.0e-4,
+                acceleration_bias_std: 3.0e-3,
+                state_transition_order: 0,
+            },
+        );
+        let mut direct = MsceqfBackend::new(
+            filter,
+            test_cam(),
+            MsceqfSettings {
+                num_clones: 7,
+                pixel_std: 1.5 / fx,
+                chi2_mult: 1.3,
+                slam_chi2_mult: None,
+                max_track: 123,
+                slam_min_len: None,
+                max_slam: 4,
+                curvature: true,
+                update_span: 0,
+            },
+        );
+
+        assert_eq!(
+            from_cfg.filter().cov.shape(),
+            direct.filter().cov.shape(),
+            "covariance dimensions differ"
+        );
+        assert!(
+            (from_cfg.filter().cov.clone() - direct.filter().cov.clone()).amax() < 1e-18,
+            "initial covariance differs: the config mapping transposed something"
+        );
+
+        // Drive both and compare the fingerprint, so settings (not just covariance)
+        // are covered: pixel_std, chi2 and the window all act during the run.
+        let ids: Vec<u64> = (0..20).collect();
+        for k in 0..30u64 {
+            let t = k as f64 * 0.05;
+            from_cfg.process_imu(imu(t));
+            direct.process_imu(imu(t));
+            let frame = frame_at(t, &ids);
+            from_cfg.process_vision(frame.clone(), &HashMap::new());
+            direct.process_vision(frame, &HashMap::new());
+            assert_eq!(
+                from_cfg.state_fingerprint(),
+                direct.state_fingerprint(),
+                "diverged at frame {k}"
+            );
+        }
+        // NON-VACUITY. The loop above only proves equivalence if the settings it is
+        // comparing actually BITE. A control with a deliberately wrong pixel noise must
+        // diverge; if it does not, this scenario never exercises the update and the
+        // equivalence above is empty. (Found the hard way: mutating away the
+        // pixel-to-normalized conversion left the original version of this test green.)
+        let mut perturbed = MsceqfBackend::from_config(
+            &MsceqfConfig {
+                pixel_std: cfg.pixel_std * 100.0,
+                ..cfg.clone()
+            },
+            test_cam(),
+            fx,
+            &start,
+        );
+        for k in 0..30u64 {
+            let t = k as f64 * 0.05;
+            perturbed.process_imu(imu(t));
+            perturbed.process_vision(frame_at(t, &ids), &HashMap::new());
+        }
+        assert_ne!(
+            perturbed.state_fingerprint(),
+            direct.state_fingerprint(),
+            "a 100x pixel noise changed nothing: this scenario never exercises the \
+             update, so the equivalence check above proves nothing"
+        );
+        assert!(from_cfg.n_clones() > 1, "nothing ran");
     }
 
     /// `NavEstimate.velocity` is BODY frame; MSCEqF carries world. Rotating back is

@@ -704,6 +704,122 @@ pub struct StereoConfig {
     pub histeq: Option<String>,
 }
 
+/// The MSCEqF backend, as a config section.
+///
+/// Present and `enabled` selects it in place of the EqVIO filter. Everything here is
+/// what `VIOConfig`'s other sections cannot supply: MSCEqF needs a `SystemOrigin` and a
+/// `ProcessNoise`, neither of which has an EqVIO counterpart.
+///
+/// Three values are NOT here, because they come from elsewhere and must not be
+/// duplicated: the initial attitude and position come from gravity alignment at
+/// start-up, and the camera extrinsic is the same `t_bs` the rest of the system uses.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MsceqfConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_num_clones")]
+    pub num_clones: usize,
+    /// Feature noise in PIXELS. Converted to the normalized units the filter works in
+    /// by dividing by fx at construction, so this reads like EqVIO's
+    /// `measurementNoise.feature` rather than requiring a hand-computed 1/fx.
+    #[serde(default = "default_pixel_std")]
+    pub pixel_std: f64,
+    #[serde(default = "default_one")]
+    pub chi2_mult: f64,
+    /// 0 reuses `chi2Mult`.
+    #[serde(default)]
+    pub slam_chi2_mult: f64,
+    #[serde(default = "default_max_track")]
+    pub max_track: usize,
+    /// 0 means a full window span (`numClones`).
+    #[serde(default)]
+    pub slam_min_len: usize,
+    #[serde(default)]
+    pub max_slam: usize,
+    #[serde(default = "default_true")]
+    pub curvature: bool,
+    /// Extra flush trigger for long-clone-window configurations. 0 = off; see
+    /// `MsceqfSettings::update_span`.
+    #[serde(default)]
+    pub update_span: usize,
+    /// Gravity VECTOR in the world frame, m/s^2. Sign and axis are frame conventions,
+    /// not preferences: NED wants +z, a z-up frame wants -z, and getting it backwards
+    /// integrates gravity as phantom acceleration.
+    #[serde(default = "default_gravity")]
+    pub gravity: [f64; 3],
+    #[serde(default)]
+    pub initial_std: MsceqfInitialStd,
+    #[serde(default)]
+    pub process_noise: MsceqfProcessNoise,
+}
+
+/// Initial standard deviations for the MSCEqF covariance blocks.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MsceqfInitialStd {
+    /// Dd block, in MSCEqF tangent order: attitude, velocity, position.
+    pub attitude: f64,
+    pub velocity: f64,
+    pub position: f64,
+    /// Bias block (6).
+    pub bias: f64,
+    /// Camera-extrinsic block (6).
+    pub extrinsics: f64,
+}
+
+impl Default for MsceqfInitialStd {
+    fn default() -> Self {
+        Self {
+            attitude: 1.0e-2,
+            velocity: 1.0e-1,
+            position: 1.0e-4,
+            bias: 1.0e-2,
+            extrinsics: 1.0e-4,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MsceqfProcessNoise {
+    pub accel_density: f64,
+    pub gyro_density: f64,
+    pub accel_random_walk: f64,
+    pub gyro_random_walk: f64,
+    /// 1 uses `I + H*dt`; anything else uses the full matrix exponential.
+    #[serde(default)]
+    pub transition_order: usize,
+}
+
+impl Default for MsceqfProcessNoise {
+    fn default() -> Self {
+        Self {
+            accel_density: 1.6798e-3,
+            gyro_density: 1.2724e-3,
+            accel_random_walk: 3.0e-3,
+            gyro_random_walk: 1.0e-4,
+            transition_order: 0,
+        }
+    }
+}
+
+fn default_num_clones() -> usize {
+    11
+}
+fn default_pixel_std() -> f64 {
+    1.0
+}
+fn default_one() -> f64 {
+    1.0
+}
+fn default_max_track() -> usize {
+    200
+}
+fn default_gravity() -> [f64; 3] {
+    [0.0, 0.0, -9.81]
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VIOConfig {
     #[serde(rename = "RudolfV")]
@@ -716,6 +832,8 @@ pub struct VIOConfig {
     pub local_occupancy: Option<LocalOccupancyConfig>,
     #[serde(rename = "Stereo", default)]
     pub stereo: Option<StereoConfig>,
+    #[serde(rename = "MSCEqF", default)]
+    pub msceqf: Option<MsceqfConfig>,
     #[serde(rename = "Rerun", default)]
     pub rerun: RerunVisConfig,
     pub eqf: EqfConfig,
