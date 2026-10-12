@@ -20,7 +20,7 @@ use echo_li_core::mathematical::camera::CameraModel;
 use echo_li_core::mathematical::imu_velocity::IMUVelocity;
 use echo_li_core::mathematical::msceqf_filter::{MSCEqFFilter, ProcessNoise, SystemOrigin};
 use echo_li_core::mathematical::vision_measurement::VisionMeasurement;
-use echo_lie::{SE3, SE23, SO3};
+use echo_lie::{SE23, SE3, SO3};
 use nalgebra::{Matrix3, Matrix4, SMatrix, Vector2, Vector3, Vector6};
 
 fn mat3(a: PyReadonlyArray2<'_, f64>) -> Matrix3<f64> {
@@ -62,7 +62,8 @@ impl PyMsceqfBackend {
         camera, fx,
         num_clones=11, pixel_std=1.0, chi2_mult=1.0, slam_chi2_mult=0.0,
         max_track=200, slam_min_len=0, max_slam=0, curvature=true, update_span=0,
-        max_promote_range=0.0
+        max_promote_range=0.0, direct_product_bias=false,
+        clone_at_frame_stamp=false
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -92,6 +93,8 @@ impl PyMsceqfBackend {
         curvature: bool,
         update_span: usize,
         max_promote_range: f64,
+        direct_product_bias: bool,
+        clone_at_frame_stamp: bool,
     ) -> PyResult<Self> {
         let t0 = SE23::new(SO3::from_matrix(&mat3(r0)), vec3(&p0), vec3(&v0));
         let origin = SystemOrigin::new(t0, vec6(&b0), SE3::from_matrix(&mat4(s0)), vec3(&g));
@@ -111,7 +114,11 @@ impl PyMsceqfBackend {
             acceleration_bias_std: accel_rw,
             state_transition_order: transition_order,
         };
-        let filter = MSCEqFFilter::new(origin, &d_init, &delta_init, &e_init, noise);
+        let filter = if direct_product_bias {
+            MSCEqFFilter::new_direct_product_bias(origin, &d_init, &delta_init, &e_init, noise)
+        } else {
+            MSCEqFFilter::new(origin, &d_init, &delta_init, &e_init, noise)
+        };
         let cam: Arc<dyn CameraModel> = crate::camera::to_camera_arc(camera)?;
         let settings = MsceqfSettings {
             num_clones,
@@ -124,10 +131,11 @@ impl PyMsceqfBackend {
             curvature,
             update_span,
             max_promote_range,
+            direct_product_bias,
         };
-        Ok(Self {
-            inner: MsceqfBackend::new(filter, cam, settings),
-        })
+        let mut inner = MsceqfBackend::new(filter, cam, settings);
+        inner.set_clone_at_frame_stamp(clone_at_frame_stamp);
+        Ok(Self { inner })
     }
 
     /// One IMU sample. The backend derives dt from consecutive stamps, so the FIRST
@@ -179,6 +187,17 @@ impl PyMsceqfBackend {
     /// Assert zero velocity. Returns False if the chi2 gate refused it.
     fn zero_velocity_update(&mut self, sigma_v: f64) -> bool {
         self.inner.zero_velocity_update(sigma_v)
+    }
+
+    /// Cumulative per-reason structureless drop counts:
+    /// `[too_few_obs, stale_clone, triangulation_failed, jacobian_failed, chi2_rejected]`.
+    fn msc_reject_counts(&self) -> [u64; 5] {
+        self.inner.msc_reject_counts()
+    }
+
+    /// Drain the per-track `chi2 / gate` ratios recorded since the last call.
+    fn take_msc_chi2_ratios<'py>(&mut self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
+        PyArray1::from_vec(py, self.inner.take_msc_chi2_ratios())
     }
 
     /// Core-state covariance diagonal [att(3) vel(3) pos(3) bias(6) | E(6)], for

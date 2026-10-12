@@ -28,7 +28,7 @@
 // Dd internal order.
 
 use echo_lie::base::LieGroup;
-use echo_lie::{SE3, SE23, SO3, SOT3, SemiDirectBias};
+use echo_lie::{SemiDirectBias, SE23, SE3, SO3, SOT3};
 use nalgebra::{
     DMatrix, DVector, Matrix3, Matrix6, SMatrix, SVector, Vector2, Vector3, Vector4, Vector6,
 };
@@ -259,6 +259,26 @@ pub struct MSCEqFFilter {
     ///   vel_inc_norm, pos_inc_norm, chi2_d, rows]`. Never read by the filter math;
     /// drained by the Python binding. Left empty unless populated.
     pub lm_upd_diag: Vec<[f64; 9]>,
+    /// Direct-product (static) bias chart instead of semi-direct. See
+    /// [`Self::new_direct_product_bias`].
+    pub direct_product_bias: bool,
+    /// Why `msc_update` dropped each track it was offered, cumulative:
+    /// `[too_few_obs, stale_clone, triangulation_failed, jacobian_failed, chi2_rejected]`.
+    /// A structureless filter that accepts almost nothing looks exactly like one that
+    /// is working until the trajectory drifts, and the five reasons call for completely
+    /// different fixes, so the count has to be split.
+    pub msc_reject: [u64; 5],
+    /// Per-track `chi2 / gate` for every track that reached the gate, accepted or not.
+    /// The COUNT of rejections says how much is thrown away; this says whether the
+    /// rejected tracks sit just outside the gate (a gate too tight for an honest
+    /// innovation) or far outside it (a covariance that is wrong, or real outliers).
+    pub msc_chi2_ratio: Vec<f64>,
+    /// Which of the direct-product term changes are active, as a bit mask. Exists
+    /// because the full set diverges and the terms were DERIVED, not ported, so each
+    /// has to be attributable. 1 = lift lambda_b, 2 = adb0 (A1/A3/B/origin),
+    /// 4 = A4 self-coupling, 8 = bias random-walk transport. Set by
+    /// ECHO_MSC_DP_TERMS, default all.
+    pub dp_terms: u8,
 }
 
 impl MSCEqFFilter {
@@ -300,12 +320,56 @@ impl MSCEqFFilter {
     /// ground truth. Covariance is then conjugated by the origin map `D` so the
     /// bias/extrinsics blocks inherit the correct cross-correlation to the SE_2(3)
     /// block whenever the origin is not identity.
+    /// As [`Self::new`], but with a DIRECT-PRODUCT (static) bias chart instead of the
+    /// semi-direct one.
+    ///
+    /// Semi-direct transports the bias by the geometry -- `eps_b_dot = ad_psi eps_b` --
+    /// which conserves the bias component along the rotation axis. Direct product makes
+    /// the bias factor abelian and static: `eps_b_dot = 0`. Six terms change, and they
+    /// are the only places a bias adjoint appears:
+    ///
+    ///   lift      lambda_b                 -> 0       (the code's own comment says so)
+    ///   A1        a[Dd,Dd]  psi - adb0     -> psi
+    ///   A3        a[delta,Dd]              -> 0       (bias error does not see geometry)
+    ///   A4        a[delta,delta] = ad_dpt  -> 0       (bias error is static)
+    ///   B         b[delta,0:6] adb0*AdD    -> 0       (geometry noise does not drive bias)
+    ///   B         b[delta,6:12] -AdD66     -> -I      (bias random walk enters untransported)
+    ///   origin D  D[delta,Dd] = ad_se3(b0) -> 0
+    ///
+    /// DERIVED HERE, not ported: the reference MSCEqF implements only the semi-direct
+    /// chart, so this variant has no upstream to check against. `Additive` in
+    /// `bias_group_ops.rs` is the same construction on the EqVIO path, and agrees on the
+    /// parts they share (abelian composition, identity noise transport, no left-Jacobian
+    /// in exp).
+    pub fn new_direct_product_bias(
+        origin: SystemOrigin,
+        d_init: &SMatrix<f64, 9, 9>,
+        delta_init: &SMatrix<f64, 6, 6>,
+        e_init: &SMatrix<f64, 6, 6>,
+        noise: ProcessNoise,
+    ) -> Self {
+        let mut f = Self::new_inner(origin, d_init, delta_init, e_init, noise, true);
+        f.direct_product_bias = true;
+        f
+    }
+
     pub fn new(
         origin: SystemOrigin,
         d_init: &SMatrix<f64, 9, 9>,
         delta_init: &SMatrix<f64, 6, 6>,
         e_init: &SMatrix<f64, 6, 6>,
         noise: ProcessNoise,
+    ) -> Self {
+        Self::new_inner(origin, d_init, delta_init, e_init, noise, false)
+    }
+
+    fn new_inner(
+        origin: SystemOrigin,
+        d_init: &SMatrix<f64, 9, 9>,
+        delta_init: &SMatrix<f64, 6, 6>,
+        e_init: &SMatrix<f64, 6, 6>,
+        noise: ProcessNoise,
+        direct_product_bias: bool,
     ) -> Self {
         let n = CLONE_BASE; // 21: Dd(15) + E(6), no clones at construction
         let mut cov = DMatrix::<f64>::zeros(n, n);
@@ -321,7 +385,17 @@ impl MSCEqFFilter {
         //   D[E+3,   pos]  (3x3) = AdS0inv[3:6, 3:6]
         // Indices are MSCEqF-native: att=Dd+0, vel=Dd+3, pos=Dd+6, delta=Dd+9.
         let ad_s0_inv = origin.s0.inverse().adjoint(); // AdS0inv = Ad(S0^{-1}) (6x6)
-        let ad_b0 = SE3::adjoint_algebra(&origin.b0); // ad_se3(b0) (6x6)
+                                                       // Under a direct-product bias the bias factor is abelian, so the origin
+                                                       // transform carries no delta<->Dd coupling.
+        let dp_mask = std::env::var("ECHO_MSC_DP_TERMS")
+            .ok()
+            .and_then(|v| v.parse::<u8>().ok())
+            .unwrap_or(0xFF);
+        let ad_b0 = if direct_product_bias && (dp_mask & 2) != 0 {
+            SMatrix::<f64, 6, 6>::zeros()
+        } else {
+            SE3::adjoint_algebra(&origin.b0) // ad_se3(b0) (6x6)
+        };
 
         let mut dmat = DMatrix::<f64>::identity(n, n);
         let delta_idx = DD_IDX + 9;
@@ -345,8 +419,15 @@ impl MSCEqFFilter {
             x: StateGroup::identity(),
             cov,
             noise,
+            direct_product_bias,
+            dp_terms: std::env::var("ECHO_MSC_DP_TERMS")
+                .ok()
+                .and_then(|v| v.parse::<u8>().ok())
+                .unwrap_or(0xFF),
             stereo_baseline: None,
             lm_upd_diag: Vec::new(),
+            msc_reject: [0; 5],
+            msc_chi2_ratio: Vec::new(),
         }
     }
 
@@ -519,7 +600,11 @@ impl MSCEqFFilter {
 
         // lambda_b = ad_se3(b) * lambda_T[0:6].  Under a direct-product bias the bias
         // factor is abelian, so its lift term vanishes (static bias chart).
-        let lambda_b = SE3::adjoint_algebra(&xi.b) * lambda_t.fixed_rows::<6>(0).into_owned();
+        let lambda_b = if self.direct_product_bias && (self.dp_terms & 1) != 0 {
+            Vector6::zeros()
+        } else {
+            SE3::adjoint_algebra(&xi.b) * lambda_t.fixed_rows::<6>(0).into_owned()
+        };
 
         Lift {
             lambda_t,
@@ -549,7 +634,11 @@ impl MSCEqFFilter {
         let b0 = self.origin.b0;
         let b0g = b0.fixed_rows::<3>(0).into_owned(); // gyro bias
 
-        let adb0 = SE3::adjoint_algebra(&b0); // ad_se3(b0)
+        let adb0 = if self.direct_product_bias && (self.dp_terms & 2) != 0 {
+            SMatrix::<f64, 6, 6>::zeros()
+        } else {
+            SE3::adjoint_algebra(&b0) // ad_se3(b0)
+        };
 
         // Psi: Psi[3:6,0:3] = wedge(R0Tg).
         let mut psi = SMatrix::<f64, 6, 6>::zeros();
@@ -582,8 +671,10 @@ impl MSCEqFFilter {
         a.view_mut((di + 9, di), (6, 6))
             .copy_from(&(adb0 * psi - ad_dpt * adb0));
 
-        // A4
-        a.view_mut((di + 9, di + 9), (6, 6)).copy_from(&ad_dpt);
+        // A4 -- the bias error's self-coupling. Static under a direct-product chart.
+        if !(self.direct_product_bias && (self.dp_terms & 4) != 0) {
+            a.view_mut((di + 9, di + 9), (6, 6)).copy_from(&ad_dpt);
+        }
 
         // A5..A7 (E block).
         let ad_s0_inv = self.origin.s0.inverse().adjoint(); // AdS0inv
@@ -626,7 +717,11 @@ impl MSCEqFFilter {
     pub fn input_matrix(&self) -> SMatrix<f64, 21, 12> {
         let d = &self.x.sdb;
         let ad_d = se23_group_adjoint_msceqf(&d.d); // AdD (9x9, MSCEqF order)
-        let adb0 = SE3::adjoint_algebra(&self.origin.b0);
+        let adb0 = if self.direct_product_bias && (self.dp_terms & 2) != 0 {
+            SMatrix::<f64, 6, 6>::zeros()
+        } else {
+            SE3::adjoint_algebra(&self.origin.b0)
+        };
         let s0r = self.origin.s0.rotation.as_matrix();
         let dr = d.d.rotation.as_matrix();
 
@@ -643,7 +738,13 @@ impl MSCEqFFilter {
         b.view_mut((di + 9, 0), (6, 6))
             .copy_from(&(adb0 * &ad_d_66));
         // B[delta, 6:12] = -AdD[0:6, 0:6].
-        b.view_mut((di + 9, 6), (6, 6)).copy_from(&(-ad_d_66));
+        // Bias random walk. Direct product: enters untransported.
+        if self.direct_product_bias && (self.dp_terms & 8) != 0 {
+            b.view_mut((di + 9, 6), (6, 6))
+                .copy_from(&(-SMatrix::<f64, 6, 6>::identity()));
+        } else {
+            b.view_mut((di + 9, 6), (6, 6)).copy_from(&(-ad_d_66));
+        }
         // B[E, 0:3] = S0.R^T * D.R.
         b.view_mut((ei, 0), (3, 3))
             .copy_from(&(s0r.transpose() * dr));
@@ -1003,12 +1104,14 @@ impl MSCEqFFilter {
 
         for track in tracks {
             if track.obs.len() < 2 {
+                self.msc_reject[0] += 1;
                 continue;
             }
             // Order observations by clone index; the front (oldest) is the anchor.
             let mut obs = track.obs.clone();
             obs.sort_by_key(|o| o.clone);
             if obs.iter().any(|o| o.clone >= nclones) {
+                self.msc_reject[1] += 1;
                 continue; // stale clone reference
             }
             let clone_of: Vec<usize> = obs.iter().map(|o| o.clone).collect();
@@ -1027,21 +1130,31 @@ impl MSCEqFFilter {
             // Triangulate the track into a WORLD point (anchor-frame gates inside).
             let x_f = match msckf::triangulate(&mscobs, cam) {
                 Some(p) => p,
-                None => continue,
+                None => {
+                    self.msc_reject[2] += 1;
+                    continue;
+                }
             };
             // LEFT-chart residual + feature Jacobians (per-observation 6-col bands).
             let (h_f, h_x_local, res) =
                 match msckf::feature_jacobians_anchored_left(&x_f, &mscobs, cam) {
                     Some(v) => v,
-                    None => continue,
+                    None => {
+                        self.msc_reject[3] += 1;
+                        continue;
+                    }
                 };
             // Null-project the feature out of the constraint.
             let (h_o, r_o) = match msckf::left_nullspace_project(&h_f, &h_x_local, &res) {
                 Some(v) => v,
-                None => continue,
+                None => {
+                    self.msc_reject[3] += 1;
+                    continue;
+                }
             };
             let rows = h_o.nrows();
             if rows == 0 {
+                self.msc_reject[3] += 1;
                 continue;
             }
             // Scatter the per-observation 6-col bands into the global clone columns.
@@ -1057,10 +1170,16 @@ impl MSCEqFFilter {
                 &c_track * &p_cc * c_track.transpose() + DMatrix::<f64>::identity(rows, rows) * r2;
             let chol = match s_t.clone().cholesky() {
                 Some(c) => c,
-                None => continue,
+                None => {
+                    self.msc_reject[3] += 1;
+                    continue;
+                }
             };
             let chi2 = r_o.dot(&chol.solve(&r_o));
-            if !chi2.is_finite() || chi2 > chi2_mult * msckf::chi2_095(rows) {
+            let gate = chi2_mult * msckf::chi2_095(rows);
+            self.msc_chi2_ratio.push(chi2 / gate);
+            if !chi2.is_finite() || chi2 > gate {
+                self.msc_reject[4] += 1;
                 continue;
             }
             c_rows.push(c_track);
@@ -1819,7 +1938,7 @@ impl MSCEqFFilter {
             // dG/dε (landmark chart) = R_a · J_lift.
             let jl = landmark_chart_jacobian(&lm.q, &lm.origin);
             let dg_deps = r_a * jl; // 3×3
-            // A = [ [G]× | −I ] (3×6): observing-clone pose Jacobian factor.
+                                    // A = [ [G]× | −I ] (3×6): observing-clone pose Jacobian factor.
             let mut a_mat = SMatrix::<f64, 3, 6>::zeros();
             a_mat.fixed_view_mut::<3, 3>(0, 0).copy_from(&skew(&g));
             a_mat
@@ -1889,7 +2008,7 @@ impl MSCEqFFilter {
                     let range_h_l = range_dz_dg * dg_deps; // 1×3 landmark chart
                     let range_clone = range_dz_dg * a_mat; // 1×6 observing clone
                     let d_ell = ell_obs - (-(q.norm().ln())); // ell_obs − ell_pred
-                    // Per-row χ²(1) gate: S = h Σ hᵀ + r_ell over this single row.
+                                                              // Per-row χ²(1) gate: S = h Σ hᵀ + r_ell over this single row.
                     let mut hrow = DVector::<f64>::zeros(dim);
                     for c in 0..3 {
                         hrow[lcol + c] = range_h_l[c];
@@ -2179,6 +2298,66 @@ mod tests {
     }
 
     #[test]
+    fn lambda_b_is_what_keeps_the_estimated_bias_constant() {
+        // `lift` sets lambda_b = ad_se3(b) * lambda_T[0:6], and `phi` recovers the
+        // bias as b = Ad(B(D))^{-1} (b0 - delta). B(D) is dragged by the geometry
+        // flow, so lambda_b is exactly the compensator that keeps `phi().b`
+        // CONSTANT -- the true bias is constant, and this is how a semi-direct
+        // group encodes that. Deleting it (the `dp_terms & 1` branch) does NOT
+        // give a static bias chart while the group composition is still
+        // semi-direct: it makes the estimated bias flow with attitude.
+        let b0 = Vector6::new(0.01, -0.02, 0.03, 0.1, -0.2, 0.15);
+        let d_init = SMatrix::<f64, 9, 9>::identity() * 1e-4;
+        let delta_init = SMatrix::<f64, 6, 6>::identity() * 1e-4;
+        let e_init = SMatrix::<f64, 6, 6>::identity() * 1e-6;
+        let mk = || {
+            MSCEqFFilter::new(
+                SystemOrigin::new(SE23::identity(), b0, SE3::identity(), g_enu()),
+                &d_init,
+                &delta_init,
+                &e_init,
+                test_noise(),
+            )
+        };
+        // Rotating + accelerating: ad_se3(b) * lambda_T must be non-trivial.
+        let u = Imu {
+            ang: Vector3::new(0.3, -0.2, 0.5),
+            acc: Vector3::new(0.4, 0.2, 9.81),
+        };
+        let dt = 0.005;
+        let n = 2000; // 10 s
+
+        let mut semidirect = mk();
+        assert!((semidirect.phi().b - b0).amax() < 1e-15, "b starts at b0");
+        for _ in 0..n {
+            semidirect.propagate_mean(&u, dt);
+        }
+        let drift_sd = (semidirect.phi().b - b0).amax();
+
+        let mut no_lift = mk();
+        no_lift.direct_product_bias = true;
+        no_lift.dp_terms = 1; // lift lambda_b -> 0 only
+        for _ in 0..n {
+            no_lift.propagate_mean(&u, dt);
+        }
+        let drift_nl = (no_lift.phi().b - b0).amax();
+
+        eprintln!("bias drift after 10 s: semi-direct {drift_sd:e}, lambda_b=0 {drift_nl:e}");
+
+        // Semi-direct lift: the estimated bias is invariant to machine precision.
+        assert!(
+            drift_sd < 1e-9,
+            "semi-direct lift must conserve the bias estimate, drifted {drift_sd:e}"
+        );
+        // Without it the bias estimate runs away -- orders of magnitude, not a
+        // small modelling difference.
+        assert!(
+            drift_nl > 1e3 * drift_sd.max(1e-12),
+            "zeroing lambda_b must break bias conservation, drift {drift_nl:e} vs {drift_sd:e}"
+        );
+    }
+
+    #[test]
     fn clone_shares_e_covariance() {
         let origin =
             SystemOrigin::new(SE23::identity(), Vector6::zeros(), SE3::identity(), g_enu());
@@ -2255,7 +2434,7 @@ mod tests {
         assert_eq!(f.x.clones.len(), 2);
         let l1 = f.landmark_idx(0);
         assert_eq!(l1, l0 + CLONE_DOF); // shifted down by the new clone block
-        // Landmark block intact at the new location.
+                                        // Landmark block intact at the new location.
         assert!((f.cov[(l1, l1)] - 7.0).abs() < 1e-12);
         assert!((f.cov[(l1 + 2, l1 + 2)] - 9.0).abs() < 1e-12);
         // The planted cross to E (E is before the split, index unchanged) survived.

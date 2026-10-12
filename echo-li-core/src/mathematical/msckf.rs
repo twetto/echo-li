@@ -1187,6 +1187,119 @@ mod tests {
         }
     }
 
+    /// One track's constraint carries no DIRECT reading of its own window's scale.
+    ///
+    /// Scaling the whole world -- every clone centre and the feature -- by `1+e` leaves
+    /// every bearing unchanged, so the residual is identically invariant. Differentiating
+    /// that invariance gives `h_x * d + h_f * G0 * e = 0` for the dilation direction `d`,
+    /// and the left-nullspace projection kills the `h_f` term, so the projected
+    /// constraint satisfies `h_o * d = 0` exactly.
+    ///
+    /// SCOPE, because the obvious over-reading of this is false. What it says is that a
+    /// single structureless constraint, in its own clone subspace, is blind to a uniform
+    /// dilation of that subspace -- it is the reason a monocular MSCKF needs an IMU at
+    /// all, and nothing more. It does NOT say the structureless channel is scale-blind in
+    /// the filter: monocular VIO scale IS observable, every MSCKF recovers it, and these
+    /// updates are how. The accelerometer supplies metric acceleration against a
+    /// fixed-magnitude gravity; vision supplies attitude and the SHAPE of the trajectory
+    /// the IMU integrates along; and the EKF's clone-to-core cross-covariance turns a
+    /// shape correction into a velocity correction, which is the scale channel. The
+    /// observability is conditional -- it needs acceleration excitation, constant
+    /// acceleration being the standard degenerate case -- but it is there.
+    ///
+    /// The finite-difference arm is the ground truth here -- it tests the claim against
+    /// the residual the filter actually forms, not against my algebra.
+    #[test]
+    fn structureless_constraint_annihilates_the_dilation_direction() {
+        let c = norm_cam_local();
+        let x_true = Vector3::new(0.7, -0.4, 6.0);
+        let poses = [
+            SE3::new(
+                SO3::exp(&Vector3::new(0.01, -0.02, 0.0)),
+                Vector3::new(0.1, 0.05, -0.02),
+            ),
+            SE3::new(
+                SO3::exp(&Vector3::new(0.0, 0.05, 0.0)),
+                Vector3::new(1.0, 0.1, 0.0),
+            ),
+            SE3::new(
+                SO3::exp(&Vector3::new(-0.02, 0.09, 0.01)),
+                Vector3::new(2.0, 0.2, -0.3),
+            ),
+            SE3::new(
+                SO3::exp(&Vector3::new(0.03, 0.13, -0.02)),
+                Vector3::new(3.1, 0.0, 0.1),
+            ),
+        ];
+        // Perfect (noise-free) observations of the true point, so the residual starts at
+        // zero and any change under the dilation is the effect being tested.
+        let mk = |scale: f64| -> Vec<MscObs> {
+            poses
+                .iter()
+                .map(|pose| {
+                    let q = pose.inverse().act(&x_true); // bearings are scale-free
+                    let scaled = SE3::new(pose.rotation.clone(), pose.translation * scale);
+                    MscObs {
+                        pose: scaled.clone(),
+                        pose_fej: scaled,
+                        uv: Vector2::new(q[0] / q[2], q[1] / q[2]),
+                    }
+                })
+                .collect()
+        };
+
+        let obs = mk(1.0);
+        let (h_f, h_x, res) = feature_jacobians_anchored_left(&x_true, &obs, &c).unwrap();
+        assert!(
+            res.norm() < 1e-12,
+            "noise-free residual should vanish: {}",
+            res.norm()
+        );
+        let (h_o, _r_o) = left_nullspace_project(&h_f, &h_x, &res).unwrap();
+
+        // GROUND TRUTH: dilate the world and confirm the residual does not move.
+        let e = 1e-6;
+        let obs_s = mk(1.0 + e);
+        let (_, _, res_s) =
+            feature_jacobians_anchored_left(&(x_true * (1.0 + e)), &obs_s, &c).unwrap();
+        let moved = (&res_s - &res).norm();
+        assert!(
+            moved < 1e-12,
+            "a uniform dilation must not change the residual, moved by {moved}"
+        );
+
+        // The matching tangent direction, in the LEFT chart the Jacobians use: a left
+        // perturbation [w; v] moves p by w x p + v, so a pure dilation of clone k is
+        // w = 0, v = p_k. One 6-column band per observation.
+        let n = obs.len();
+        let mut d = DVector::<f64>::zeros(6 * n);
+        for (k, o) in obs.iter().enumerate() {
+            d.rows_mut(6 * k + 3, 3).copy_from(&o.pose.translation);
+        }
+        let got = (&h_o * &d).norm();
+        let scale_ref = h_o.norm() * d.norm();
+        assert!(
+            got < 1e-9 * scale_ref.max(1.0),
+            "h_o must annihilate the dilation direction: |h_o d| = {got:e} against \
+             |h_o||d| = {scale_ref:e}"
+        );
+        // Non-vacuity: h_o is not simply zero, and a direction that is NOT the dilation
+        // does move the constraint -- otherwise the assert above would pass trivially.
+        assert!(
+            h_o.norm() > 1e-6,
+            "h_o is degenerate, the test proves nothing"
+        );
+        // A COMMON translation of every clone is also annihilated -- that is the
+        // anchored form's rigid gauge freedom, not a bug -- so the control has to be a
+        // direction that changes the RELATIVE geometry: move one clone alone.
+        let mut other = DVector::<f64>::zeros(6 * n);
+        other[6 * (n - 1) + 3] = 1.0;
+        assert!(
+            (&h_o * &other).norm() > 1e-6 * scale_ref,
+            "a non-dilation direction should move the constraint"
+        );
+    }
+
     /// A synthetic 3-D point seen from a few poses triangulates back to itself.
     #[test]
     fn triangulation_recovers_synthetic_point() {

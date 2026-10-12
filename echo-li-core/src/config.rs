@@ -766,6 +766,9 @@ pub struct MsceqfConfig {
     /// cap. See `MsceqfSettings::max_promote_range`.
     #[serde(default)]
     pub max_promote_range: f64,
+    /// Direct-product (static) bias chart instead of semi-direct.
+    #[serde(default)]
+    pub direct_product_bias: bool,
     /// Gravity VECTOR in the world frame, m/s^2. Sign and axis are frame conventions,
     /// not preferences: NED wants +z, a z-up frame wants -z, and getting it backwards
     /// integrates gravity as phantom acceleration.

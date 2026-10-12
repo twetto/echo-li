@@ -98,6 +98,8 @@ def main():
                          "at ~60 features regardless of maxFeatures.")
     ap.add_argument("--no-lbp", action="store_true",
                     help="disable the frontend's LBP descriptor verification")
+    ap.add_argument("--direct-product-bias", action="store_true",
+                    help="static (abelian) bias chart instead of semi-direct")
     ap.add_argument("--timeshift", type=float, default=None,
                     help="override the camera-IMU time offset (s). A wrong offset costs "
                          "v*dt of position, i.e. an error PROPORTIONAL TO SPEED.")
@@ -120,6 +122,23 @@ def main():
                     help="MSCEqF feature noise in PIXELS (divided by fx internally)")
     ap.add_argument("--msceqf-chi2", type=float, default=1.0,
                     help="MSCEqF chi2 gate multiplier")
+    ap.add_argument("--vision-stride", type=int, default=1,
+                    help="give the filter only every Nth frame's observations (the "
+                         "front-end still tracks every frame, so tracks stay long). "
+                         "11 clones at the full 62 Hz span 0.19 s = 0.9 m at riding "
+                         "speed, which is a very short baseline for an outdoor scene; "
+                         "a stride multiplies the window's baseline by N.")
+    ap.add_argument("--clone-at-frame-stamp", action="store_true",
+                    help="propagate to the frame's own stamp before cloning instead of "
+                         "cloning whatever the last IMU sample left behind. This rig's "
+                         "IMU is 122 Hz against a 62 Hz camera, so the default leaves "
+                         "each clone a median 3.7 ms / 1.8 cm-at-4.7-m/s behind the "
+                         "image it is attached to, and the lag varies per frame.")
+    ap.add_argument("--freeze-bias", action="store_true",
+                    help="BOUND on the whole bias-chart family: initial bias std and "
+                         "bias random walk -> 0, so the bias never moves from its "
+                         "seeded value. If the underscale survives this, no bias chart "
+                         "(semi-direct, direct-product, anything) can be its mechanism.")
     ap.add_argument("--zupt-sigma", type=float, default=1e-2,
                     help="assumed stddev of the zero-velocity measurement, m/s")
     args = ap.parse_args()
@@ -208,16 +227,20 @@ def main():
             np.ascontiguousarray(T_BS), np.array([0.0, 0.0, -GRAVITY]),
             np.array([1e-2, 1e-2, 1e-2, 1e-1, 1e-1, 1e-1, 1e-4, 1e-4, 1e-4]),
             np.ascontiguousarray(np.array([args.gyro_bias_std] * 3
-                                          + [args.accel_bias_std] * 3)),
+                                          + [args.accel_bias_std] * 3)
+                                 if not args.freeze_bias else np.full(6, 1e-9)),
             np.full(6, 1e-4),
-            *( (4.2e-03, 1.7e-04, 4.1e-03, 1.2e-04) if args.imu_noise == "tuned"
-               else (7.47e-04, 1.63e-04, 2.08e-04, 6.80e-05) ), 0,
+            *( (lambda t: (t[0], t[1], 0.0, 0.0) if args.freeze_bias else t)(
+                 (4.2e-03, 1.7e-04, 4.1e-03, 1.2e-04) if args.imu_noise == "tuned"
+                 else (7.47e-04, 1.63e-04, 2.08e-04, 6.80e-05)) ), 0,
             cam, FX,   # the REAL radtan model -- this lens is distorted
             num_clones=args.num_clones,
             pixel_std=args.msceqf_pixel_std / FX,
             chi2_mult=args.msceqf_chi2,
             max_slam=args.max_slam,
             max_promote_range=args.max_promote_range,
+            direct_product_bias=args.direct_product_bias,
+            clone_at_frame_stamp=args.clone_at_frame_stamp,
         )
         print(f"backend=MSCEqF  clones={args.num_clones}  max_slam={args.max_slam}")
     else:
@@ -264,7 +287,7 @@ def main():
         gray = np.ascontiguousarray(cache[k])
         fs, _ = tracker.process(gray)
         uvs = {int(f["id"]): [float(f["x"]), float(f["y"])] for f in fs}
-        if not args.no_vision:
+        if not args.no_vision and (k - args.start) % args.vision_stride == 0:
             if use_msceqf:
                 vio.process_vision(float(ts), {int(i): (float(u), float(v))
                                                for i, (u, v) in uvs.items()})
@@ -313,6 +336,21 @@ def main():
         off, acc = vio.msc_update_counts()
         print(f"structureless tracks: offered {off}, accepted {acc} "
               f"({100.0*acc/max(off,1):.1f}%)")
+        rj = vio.msc_reject_counts()
+        names = ["too_few_obs", "stale_clone", "triangulation", "jacobian", "chi2"]
+        print("  dropped by: " + "  ".join(
+            f"{nm} {c} ({100.0*c/max(off,1):.1f}%)" for nm, c in zip(names, rj)))
+        # A rejected track just outside the gate means the gate is too tight for an
+        # honest innovation; one far outside means the covariance is wrong or the track
+        # is a real outlier. The count alone cannot tell those apart.
+        cr = np.asarray(vio.take_msc_chi2_ratios(), float)
+        if len(cr):
+            q = np.percentile(cr, [5, 25, 50, 75, 90, 95, 99])
+            print(f"  chi2/gate over {len(cr)} gated tracks: "
+                  f"median {np.median(cr):.2f}  mean {cr.mean():.2f}  "
+                  "pct 5/25/50/75/90/95/99 " + "/".join(f"{v:.2f}" for v in q))
+            for thr in (1.0, 2.0, 5.0, 20.0, 100.0):
+                print(f"    > {thr:6.1f}x gate: {100.0*np.mean(cr > thr):5.1f}%")
     if args.zupt:
         print(f"ZUPT accepted on {zupt_fired[0]} IMU samples")
     print(f"run done in {time.perf_counter()-t0:.1f}s   path length "

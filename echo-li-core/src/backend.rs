@@ -29,10 +29,10 @@ use std::sync::Arc;
 
 use nalgebra::{Matrix3, Vector2, Vector3};
 
-use crate::LandmarkDepthPrior;
 use crate::mathematical::camera::CameraModel;
 use crate::mathematical::imu_velocity::IMUVelocity;
 use crate::mathematical::vision_measurement::VisionMeasurement;
+use crate::LandmarkDepthPrior;
 use echo_lie::SE3;
 
 /// What every VIO backend has by definition: where the body is, how fast it is moving,
@@ -308,6 +308,10 @@ pub struct MsceqfSettings {
     pub max_slam: usize,
     /// Second-order curvature term in the structureless update.
     pub curvature: bool,
+    /// Use a DIRECT-PRODUCT (static) bias chart instead of the semi-direct one.
+    /// See `MSCEqFFilter::new_direct_product_bias`.
+    pub direct_product_bias: bool,
+
     /// Refuse to promote a landmark whose triangulated range exceeds this (metres).
     /// 0 = no cap.
     ///
@@ -345,6 +349,7 @@ impl Default for MsceqfSettings {
             curvature: true,
             update_span: 0,
             max_promote_range: 0.0,
+            direct_product_bias: false,
         }
     }
 }
@@ -398,6 +403,12 @@ pub struct MsceqfBackend {
     msc_offered: u64,
     msc_accepted: u64,
     last_stamp: Option<f64>,
+    /// The most recent IMU reading, held so a frame can be propagated to its OWN
+    /// stamp before cloning. See [`Self::propagate_to`].
+    last_imu: Option<crate::mathematical::msceqf_filter::Imu>,
+    /// Propagate to the frame stamp before cloning instead of cloning whatever the
+    /// last IMU sample left behind. See [`Self::propagate_to`].
+    clone_at_frame_stamp: bool,
 }
 
 impl MsceqfBackend {
@@ -458,7 +469,12 @@ impl MsceqfBackend {
         });
 
         let pn = &cfg.process_noise;
-        let filter = MSCEqFFilter::new(
+        let mk = if cfg.direct_product_bias {
+            MSCEqFFilter::new_direct_product_bias
+        } else {
+            MSCEqFFilter::new
+        };
+        let filter = mk(
             origin,
             &d_init,
             &delta_init,
@@ -484,6 +500,7 @@ impl MsceqfBackend {
             curvature: cfg.curvature,
             update_span: cfg.update_span,
             max_promote_range: cfg.max_promote_range,
+            direct_product_bias: cfg.direct_product_bias,
         };
         Self::new(filter, cam, settings)
     }
@@ -511,6 +528,8 @@ impl MsceqfBackend {
             msc_offered: 0,
             msc_accepted: 0,
             last_stamp: None,
+            last_imu: None,
+            clone_at_frame_stamp: false,
         }
     }
 
@@ -538,6 +557,50 @@ impl MsceqfBackend {
     /// `(tracks offered, tracks accepted)` by the structureless update so far.
     pub fn msc_update_counts(&self) -> (u64, u64) {
         (self.msc_offered, self.msc_accepted)
+    }
+
+    /// Cumulative per-reason drop counts from the structureless update:
+    /// `[too_few_obs, stale_clone, triangulation_failed, jacobian_failed, chi2_rejected]`.
+    pub fn msc_reject_counts(&self) -> [u64; 5] {
+        self.filter.msc_reject
+    }
+
+    /// Take the recorded per-track `chi2 / gate` ratios, emptying the buffer.
+    pub fn take_msc_chi2_ratios(&mut self) -> Vec<f64> {
+        std::mem::take(&mut self.filter.msc_chi2_ratio)
+    }
+
+    /// Clone at the frame's own stamp rather than at the last IMU sample. Off by
+    /// default so existing traces stay comparable. See [`Self::propagate_to`].
+    pub fn set_clone_at_frame_stamp(&mut self, on: bool) {
+        self.clone_at_frame_stamp = on;
+    }
+
+    /// Advance the filter from the last IMU sample to `stamp`, holding the last IMU
+    /// reading constant over the sub-sample interval.
+    ///
+    /// The interval is at most one IMU period (8.2 ms on this rig), so the zero-order
+    /// hold costs `|a| dt^2 / 2` -- order 3e-5 m at 1 m/s^2 -- while the lag it removes
+    /// is `|v| dt`, order 1e-2 m at riding speed. Linear interpolation between the
+    /// bracketing samples would be better still, but a streaming backend has not seen
+    /// the next sample yet, and would have to hold the frame back to get it.
+    ///
+    /// One inconsistency is deliberate: [`Self::process_imu`] integrates each sample's
+    /// reading BACKWARDS over the interval ending at its own stamp, whereas this holds
+    /// the PREVIOUS reading forwards, because the next sample has not arrived. The two
+    /// differ by `jerk * dt^2`, below the term this removes by several orders.
+    fn propagate_to(&mut self, stamp: f64) {
+        if !self.clone_at_frame_stamp {
+            return;
+        }
+        let (Some(prev), Some(u)) = (self.last_stamp, self.last_imu) else {
+            return;
+        };
+        let dt = stamp - prev;
+        if dt > 0.0 && dt < 0.1 {
+            self.filter.propagate_step(&u, dt);
+            self.last_stamp = Some(stamp);
+        }
     }
 
     /// Pixel -> normalized image coordinates, through the REAL camera model, so lens
@@ -590,6 +653,10 @@ impl VioBackend for MsceqfBackend {
             }
         }
         self.last_stamp = Some(imu.stamp);
+        self.last_imu = Some(crate::mathematical::msceqf_filter::Imu {
+            ang: imu.gyr,
+            acc: imu.acc,
+        });
     }
 
     /// One frame, in the order the stages must run.
@@ -619,6 +686,16 @@ impl VioBackend for MsceqfBackend {
     ) {
         let k = self.k;
         self.k += 1;
+
+        // (0) Bring the state to THIS FRAME'S stamp before cloning. Without it the
+        // clone holds wherever the last IMU sample left the state, which on a
+        // 122 Hz IMU / 62 Hz camera rig is a median 3.7 ms behind the image -- a
+        // SPEED-PROPORTIONAL position lag (1.8 cm at 4.7 m/s, against a 7.5 cm
+        // frame-to-frame baseline). Because the lag resets with the IMU/frame phase it
+        // is per-clone jitter, not a common offset, so it corrupts the very relative
+        // geometry a structureless multi-view update is made of, and nothing in the
+        // clone covariance accounts for it.
+        self.propagate_to(measurement.stamp);
 
         // (1) Clone BEFORE the update.
         self.filter.stochastic_clone(measurement.stamp);
@@ -924,6 +1001,41 @@ mod msceqf_backend_tests {
     /// tests passed while exercising nothing.
     const VX: f64 = 2.0;
 
+    /// The flag must actually move the clone, by the amount the lag implies. A flag
+    /// that silently does nothing looks exactly like a mechanism that does not matter.
+    #[test]
+    fn clone_at_frame_stamp_advances_the_state_by_the_frame_lag() {
+        let lag = 0.004; // s -- this rig's median clone lag is 3.7 ms
+        let run = |on: bool| {
+            let mut b = make_backend(MsceqfSettings::default());
+            b.set_clone_at_frame_stamp(on);
+            // Two IMU samples establish dt and leave the state at t = 0.008.
+            for (i, t) in [0.0_f64, 0.008].iter().enumerate() {
+                let _ = i;
+                b.process_imu(IMUVelocity::new(
+                    *t,
+                    Vector3::zeros(),
+                    Vector3::new(0.0, 0.0, 9.81),
+                ));
+            }
+            // Frame stamped one lag later than the last IMU sample.
+            b.process_vision(
+                VisionMeasurement::new(0.008 + lag, Default::default()),
+                &HashMap::new(),
+            );
+            b.camera_pose().translation
+        };
+        let off = run(false);
+        let on = run(true);
+        // The origin carries vx = VX, so the lag is worth VX * lag along x.
+        let moved = (on - off).norm();
+        assert!(
+            (moved - VX * lag).abs() < 1e-6,
+            "expected the clone to advance by v*lag = {:.6} m, got {moved:.6} m",
+            VX * lag
+        );
+    }
+
     fn make_backend(settings: MsceqfSettings) -> MsceqfBackend {
         let origin = SystemOrigin::new(
             SE23::new(
@@ -1124,6 +1236,8 @@ mod msceqf_backend_tests {
             max_slam: 4,
             curvature: true,
             update_span: 0,
+            max_promote_range: 0.0,
+            direct_product_bias: false,
             gravity: [0.0, 0.0, -9.81],
             initial_std: MsceqfInitialStd {
                 attitude: 2.0e-2,
@@ -1209,6 +1323,8 @@ mod msceqf_backend_tests {
                 max_slam: 4,
                 curvature: true,
                 update_span: 0,
+                max_promote_range: 0.0,
+                direct_product_bias: false,
             },
         );
 
