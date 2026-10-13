@@ -690,7 +690,9 @@ impl MsceqfBackend {
             civera_birth_depth: cfg.civera_birth_depth,
             civera_birth_rel_std: cfg.civera_birth_rel_std,
         };
-        Self::new(filter, cam, settings)
+        let mut b = Self::new(filter, cam, settings);
+        b.set_clone_at_frame_stamp(cfg.clone_at_frame_stamp);
+        b
     }
 
     pub fn new(
@@ -1284,6 +1286,7 @@ mod msceqf_backend_tests {
             update_span: 0,
             max_promote_range: 0.0,
             direct_product_bias: false,
+            clone_at_frame_stamp: false,
             civera_birth_depth: 0.0,
             civera_birth_rel_std: 1.0,
             gravity: [0.0, 0.0, -9.81],
@@ -1717,6 +1720,7 @@ mod msceqf_backend_tests {
             update_span: 0,
             max_promote_range: 0.0,
             direct_product_bias: false,
+            clone_at_frame_stamp: false,
             civera_birth_depth: 0.0,
             civera_birth_rel_std: 1.0,
             gravity: [0.0, 0.0, -9.81],

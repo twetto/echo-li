@@ -808,6 +808,10 @@ pub struct MsceqfConfig {
     /// Direct-product (static) bias chart instead of semi-direct.
     #[serde(default)]
     pub direct_product_bias: bool,
+    /// Propagate to each frame's own stamp before cloning. See
+    /// `MsceqfBackend::set_clone_at_frame_stamp`; measured +2% scale on bikevid.
+    #[serde(default)]
+    pub clone_at_frame_stamp: bool,
     /// Prior depth (m) for Civera in-state landmark birth; 0 = triangulated birth.
     /// See `MsceqfSettings::civera_birth_depth`.
     #[serde(default)]

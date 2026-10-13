@@ -4,7 +4,9 @@ use pyo3::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use echo_li_core::backend::{backend_from_config, BackendKind, EqvioBackend, VioBackendFull};
+use echo_li_core::backend::{
+    backend_from_config, BackendKind, EqvioBackend, MsceqfBackend, VioBackendFull,
+};
 use echo_li_core::config::{MsceqfConfig, VIOConfig, ZuptConfig};
 use echo_li_core::initialization::{FilterStart, StationaryInit};
 use echo_li_core::mathematical::camera::CameraModel;
@@ -78,6 +80,31 @@ impl PyVIOFilter {
             .downcast_mut::<EqvioBackend>()
             .map(|b| b.filter_mut())
             .ok_or_else(|| eqvio_only(method, kind))
+    }
+
+    fn msceqf(&self, method: &str) -> PyResult<&MsceqfBackend> {
+        self.backend
+            .as_any()
+            .downcast_ref::<MsceqfBackend>()
+            .ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "VIOFilter.{method} is MSCEqF-only; this filter is running {}",
+                    self.kind.as_str()
+                ))
+            })
+    }
+
+    fn msceqf_mut(&mut self, method: &str) -> PyResult<&mut MsceqfBackend> {
+        let kind = self.kind;
+        self.backend
+            .as_any_mut()
+            .downcast_mut::<MsceqfBackend>()
+            .ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "VIOFilter.{method} is MSCEqF-only; this filter is running {}",
+                    kind.as_str()
+                ))
+            })
     }
 
     /// Build the configured backend from a start state, through the shared chooser.
@@ -620,9 +647,121 @@ impl PyVIOFilter {
             }))
     }
 
-    /// Number of live pose clones in the covariance window. EqVIO-only.
-    fn n_clones(&self) -> PyResult<usize> {
-        Ok(self.eqvio("n_clones")?.n_clones())
+    /// Number of live pose clones in the covariance window, under either backend.
+    fn n_clones(&self) -> usize {
+        match self.backend.as_any().downcast_ref::<MsceqfBackend>() {
+            Some(m) => m.n_clones(),
+            None => self.eqvio("n_clones").map(|f| f.n_clones()).unwrap_or(0),
+        }
+    }
+
+    /// `(position, R_body_to_world, velocity_BODY)`, under either backend.
+    fn nav_pose<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> (
+        Bound<'py, PyArray1<f64>>,
+        Bound<'py, PyArray2<f64>>,
+        Bound<'py, PyArray1<f64>>,
+    ) {
+        let nav = self.backend.nav_estimate();
+        let r = nav.pose.rotation.as_matrix();
+        let mut rm = Array2::<f64>::zeros((3, 3));
+        for i in 0..3 {
+            for j in 0..3 {
+                rm[[i, j]] = r[(i, j)];
+            }
+        }
+        (
+            PyArray1::from_slice(py, nav.pose.translation.as_slice()),
+            PyArray2::from_array(py, &rm),
+            PyArray1::from_slice(py, nav.velocity.as_slice()),
+        )
+    }
+
+    /// IMU bias estimate `[gyro(3); accel(3)]`, under either backend.
+    fn imu_bias<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
+        let nav = self.backend.nav_estimate();
+        let v: Vec<f64> = nav
+            .gyro_bias
+            .iter()
+            .chain(nav.accel_bias.iter())
+            .copied()
+            .collect();
+        PyArray1::from_vec(py, v)
+    }
+
+    /// Number of in-state SLAM landmarks. MSCEqF-only.
+    fn n_slam(&self) -> PyResult<usize> {
+        Ok(self.msceqf("n_slam")?.n_slam())
+    }
+
+    /// Core-state covariance diagonal [att(3) vel(3) pos(3) bias(6) | E(6)]. MSCEqF-only.
+    fn nav_cov_diag<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let c = &self.msceqf("nav_cov_diag")?.filter().cov;
+        let n = 21.min(c.nrows());
+        let d: Vec<f64> = (0..n).map(|i| c[(i, i)]).collect();
+        Ok(PyArray1::from_vec(py, d))
+    }
+
+    /// (offered, accepted) structureless tracks. MSCEqF-only.
+    fn msc_update_counts(&self) -> PyResult<(u64, u64)> {
+        Ok(self.msceqf("msc_update_counts")?.msc_update_counts())
+    }
+
+    /// Cumulative per-reason structureless drop counts
+    /// `[too_few_obs, stale_clone, triangulation_failed, jacobian_failed, chi2_rejected]`.
+    /// MSCEqF-only.
+    fn msc_reject_counts(&self) -> PyResult<[u64; 5]> {
+        Ok(self.msceqf("msc_reject_counts")?.msc_reject_counts())
+    }
+
+    /// Drain the per-track `chi2 / gate` ratios. MSCEqF-only.
+    fn take_msc_chi2_ratios<'py>(
+        &mut self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let v = self
+            .msceqf_mut("take_msc_chi2_ratios")?
+            .take_msc_chi2_ratios();
+        Ok(PyArray1::from_vec(py, v))
+    }
+
+    /// Drain the per-update `(|dv|, sigma_v, mahalanobis)` rows as an (N, 3) array. MSCEqF-only.
+    fn take_msc_vel_corr<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        let rows = self.msceqf_mut("take_msc_vel_corr")?.take_msc_vel_corr();
+        let mut out = Array2::<f64>::zeros((rows.len(), 3));
+        for (i, r) in rows.iter().enumerate() {
+            for j in 0..3 {
+                out[[i, j]] = r[j];
+            }
+        }
+        Ok(PyArray2::from_array(py, &out))
+    }
+
+    /// Drain the per-update correction-split rows as an (N, 12) array. MSCEqF-only.
+    fn take_msc_corr_split<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        let rows = self
+            .msceqf_mut("take_msc_corr_split")?
+            .take_msc_corr_split();
+        let mut out = Array2::<f64>::zeros((rows.len(), 12));
+        for (i, r) in rows.iter().enumerate() {
+            for j in 0..12 {
+                out[[i, j]] = r[j];
+            }
+        }
+        Ok(PyArray2::from_array(py, &out))
+    }
+
+    /// Metric range of each in-state landmark in its OWN anchor camera frame. MSCEqF-only.
+    fn landmark_ranges<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        let m = self.msceqf("landmark_ranges")?;
+        let d = pyo3::types::PyDict::new(py);
+        let f = m.filter();
+        for (j, id) in m.landmark_ids_snapshot().iter().enumerate() {
+            d.set_item(id, f.x.landmarks[j].point().norm())?;
+        }
+        Ok(d)
     }
 
     /// Ids of the live pose clones (block order). EqVIO-only.

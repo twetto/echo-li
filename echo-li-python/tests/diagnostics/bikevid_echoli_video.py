@@ -203,9 +203,6 @@ def main():
         print(f"frontend maxFeatures overridden -> {args.frontend_features}")
     tracker = echo_li.Frontend(fcfg, W, H)
     use_msceqf = args.backend == "msceqf"
-    vio = None if use_msceqf else echo_li.VIOFilter(cfg_path, cam)
-    if vio is not None:
-        vio.set_camera_extrinsics(np.ascontiguousarray(T_BS))
 
     # Init EXACTLY as the shipped node does (echo-li-ros2 voxl2_vio_node.rs:853).
     # It buffers IMU until n_init samples, calls estimate_initial_pose -- which averages
@@ -221,78 +218,58 @@ def main():
     # data it is about to see.
     i_start = int(np.searchsorted(imu[:, 0], img_t[args.start] + TIMESHIFT))
     i0 = max(N_INIT, i_start)
-    a0 = imu[i0 - N_INIT:i0, 4:7].mean(axis=0)
-    g_hat = a0 / np.linalg.norm(a0)
-    zc = np.array([0.0, 0.0, 1.0])
-    v = np.cross(g_hat, zc)
-    sn, c = np.linalg.norm(v), float(g_hat @ zc)
-    K = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
-    R0 = np.eye(3) if sn < 1e-9 else np.eye(3) + K + K @ K * ((1 - c) / sn**2)
-    # GYRO BIAS IS OBSERVABLE AT REST: the mean angular rate IS the bias. Leaving it
-    # at zero lets attitude drift at the bias rate, tipping gravity into the horizontal
-    # axes, and position error grows as t^3 instead of t^2. This rig reads 0.043 rad/s.
-    bg0 = imu[i0 - N_INIT:i0, 1:4].mean(axis=0)
-    print(f"init: gyro bias seeded [{bg0[0]:+.5f} {bg0[1]:+.5f} {bg0[2]:+.5f}] rad/s "
-          f"(|b|={np.linalg.norm(bg0):.5f} = {np.degrees(np.linalg.norm(bg0)):.2f} deg/s)")
-    print(f"init: |a0| {np.linalg.norm(a0):.4f} m/s^2 vs local g {GRAVITY} "
-          f"({100*(np.linalg.norm(a0)/GRAVITY-1):+.2f}%), "
-          f"tilt-to-level {np.degrees(np.arccos(np.clip(c,-1,1))):.2f} deg")
+    # Everything below used to be re-implemented here: a gravity-align from the rest
+    # window, a hand-seeded gyro bias, a hand-built MsceqfBackend with twenty-two typed
+    # arguments, and a Python zero-velocity detector. Two of this investigation's
+    # harness bugs were exactly those typed numbers. Now the harness writes its sweep
+    # flags into an `MSCEqF:` / `ZUPT:` section and hands the config to `VIOFilter`, the
+    # same chooser, initialiser and ZUPT the rig node runs.
+    with open(cfg_path) as fh:
+        full_cfg = yaml.safe_load(fh)
     if use_msceqf:
-        # Gravity-align maps measured specific force onto world +z, so world +z is UP
-        # and the gravity ACCELERATION vector points down.
-        vio = echo_li.MsceqfBackend(
-            np.ascontiguousarray(R0), np.zeros(3), np.zeros(3),
-            np.ascontiguousarray(np.concatenate([bg0, np.zeros(3)])),
-            np.ascontiguousarray(T_BS), np.array([0.0, 0.0, -GRAVITY]),
-            np.array([1e-2, 1e-2, 1e-2, 1e-1, 1e-1, 1e-1, 1e-4, 1e-4, 1e-4]),
-            np.ascontiguousarray(np.array([args.gyro_bias_std] * 3
-                                          + [args.accel_bias_std] * 3)
-                                 if not args.freeze_bias else np.full(6, 1e-9)),
-            np.full(6, 1e-4),
-            *( (lambda t: (t[0], t[1], 0.0, 0.0) if args.freeze_bias
-                 else (t[0], t[1], args.accel_bias_rw or t[2], t[3]))(
-                 (4.2e-03, 1.7e-04, 4.1e-03, 1.2e-04) if args.imu_noise == "tuned"
-                 else (7.47e-04, 1.63e-04, 2.08e-04, 6.80e-05)) ), 0,
-            cam, FX,   # the REAL radtan model -- this lens is distorted
-            num_clones=args.num_clones,
-            pixel_std=args.msceqf_pixel_std / FX,
-            chi2_mult=args.msceqf_chi2,
-            max_slam=args.max_slam,
-            max_promote_range=args.max_promote_range,
-            direct_product_bias=args.direct_product_bias,
-            clone_at_frame_stamp=args.clone_at_frame_stamp,
-            civera_birth_depth=args.civera_birth_depth,
-            civera_birth_rel_std=args.civera_birth_rel_std,
-        )
-        print(f"backend=MSCEqF  clones={args.num_clones}  max_slam={args.max_slam}")
-    else:
-        vio.set_initial_state_full([0.0, 0.0, 0.0], np.ascontiguousarray(R0),
-                                   [0.0, 0.0, 0.0], bg0.tolist(), [0.0, 0.0, 0.0])
-    # Rolling IMU stationarity detector, mirroring what the wrappers would own.
-    zupt_window, ZUPT_N = [], 25
-    zupt_fired = [0]
-
-    def stationary(row):
-        zupt_window.append(row)
-        if len(zupt_window) > ZUPT_N:
-            zupt_window.pop(0)
-        if len(zupt_window) < ZUPT_N:
-            return False
-        w = np.array(zupt_window)
-        return (np.linalg.norm(w[:, 1:4] - w[:, 1:4].mean(axis=0), axis=1).std() < 0.05
-                and np.linalg.norm(w[:, 4:7], axis=1).std() < 0.15)
+        acc_d, gyr_d, acc_rw, gyr_rw = ((4.2e-03, 1.7e-04, 4.1e-03, 1.2e-04) if args.imu_noise == "tuned"
+                                        else (7.47e-04, 1.63e-04, 2.08e-04, 6.80e-05))
+        if args.accel_bias_rw:
+            acc_rw = args.accel_bias_rw
+        if args.freeze_bias:
+            acc_rw, gyr_rw = 0.0, 0.0
+        full_cfg["MSCEqF"] = {
+            "enabled": True,
+            "numClones": args.num_clones,
+            "pixelStd": args.msceqf_pixel_std,
+            "chi2Mult": args.msceqf_chi2,
+            "maxSlam": args.max_slam,
+            "maxPromoteRange": args.max_promote_range,
+            "directProductBias": bool(args.direct_product_bias),
+            "cloneAtFrameStamp": bool(args.clone_at_frame_stamp),
+            "civeraBirthDepth": args.civera_birth_depth,
+            "civeraBirthRelStd": args.civera_birth_rel_std,
+            # World +z is UP after gravity alignment, so gravity ACCELERATION is -z.
+            "gravity": [0.0, 0.0, -GRAVITY],
+            # One bias std in the config; the accel value is the one this rig's 0.14 m/s^2
+            # gravity-magnitude error depends on (see --accel-bias-std).
+            "initialStd": {"attitude": 1e-2, "velocity": 1e-1, "position": 1e-4,
+                           "bias": 1e-9 if args.freeze_bias else args.accel_bias_std,
+                           "extrinsics": 1e-4},
+            "processNoise": {"accelDensity": acc_d, "gyroDensity": gyr_d,
+                             "accelRandomWalk": acc_rw, "gyroRandomWalk": gyr_rw,
+                             "transitionOrder": 0},
+        }
+    if args.zupt:
+        full_cfg["ZUPT"] = {"enabled": True, "window": 25, "gyroStdThreshold": 0.05,
+                            "accStdThreshold": 0.15, "sigmaV": args.zupt_sigma}
+    run_cfg = args.out.replace(".mp4", "_config.yaml")
+    with open(run_cfg, "w") as fh:
+        yaml.safe_dump(full_cfg, fh, sort_keys=False)
+    vio = echo_li.VIOFilter(run_cfg, cam, fx=FX)
+    vio.set_camera_extrinsics(np.ascontiguousarray(T_BS))
+    print(f"backend={vio.backend_kind}  zupt={bool(args.zupt)}  config={run_cfg}")
 
     def push_imu(row):
-        if use_msceqf:
-            vio.process_imu(float(row[0]),
-                            np.ascontiguousarray(row[1:4]),
-                            np.ascontiguousarray(row[4:7]))
-        else:
-            vio.process_imu(float(row[0]), row[1:4].tolist(), row[4:7].tolist())
-        if args.zupt and stationary(row) and use_msceqf:
-            if vio.zero_velocity_update(args.zupt_sigma):
-                zupt_fired[0] += 1
+        vio.process_imu(float(row[0]), row[1:4].tolist(), row[4:7].tolist())
 
+    # The initialiser buffers 100 samples, gravity-aligns, seeds the gyro bias if the
+    # window was stationary, rebuilds the backend at that pose and replays the buffer.
     for j in range(i0 - N_INIT, i0):
         push_imu(imu[j])
 
@@ -313,11 +290,7 @@ def main():
         fs, _ = tracker.process(gray)
         uvs = {int(f["id"]): [float(f["x"]), float(f["y"])] for f in fs}
         if not args.no_vision and (k - args.start) % args.vision_stride == 0:
-            if use_msceqf:
-                vio.process_vision(float(ts), {int(i): (float(u), float(v))
-                                               for i, (u, v) in uvs.items()})
-            else:
-                vio.process_vision(float(ts), uvs)
+            vio.process_vision(float(ts), uvs)
         if use_msceqf:
             p, _rm, _v = vio.nav_pose()
             p = np.asarray(p, float)
@@ -495,7 +468,7 @@ def main():
               f"{np.degrees(yt[:,0].mean()*tot):+.1f} deg of yaw if it integrates at unit "
               "gain")
     if args.zupt:
-        print(f"ZUPT accepted on {zupt_fired[0]} IMU samples")
+        print(f"ZUPT accepted on {vio.zupt_fired} IMU samples")
     print(f"run done in {time.perf_counter()-t0:.1f}s   path length "
           f"{np.sum(np.linalg.norm(np.diff(traj,axis=0),axis=1)):.1f} m")
 
