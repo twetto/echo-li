@@ -1,12 +1,12 @@
 use std::collections::{HashMap, VecDeque};
 use std::mem::ManuallyDrop;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use camera_geometry::CameraProjection;
 use echo_li_core::backend::VioBackendFull;
-use echo_li_core::backend::{EqvioBackend, MsceqfBackend};
+use echo_li_core::backend::{backend_from_config, EqvioBackend};
 use echo_li_core::config::MsceqfConfig;
 use echo_li_core::config::VIOConfig;
 use echo_li_core::core_types::CameraIntrinsics;
@@ -21,7 +21,7 @@ use echo_li_core::mathematical::imu_velocity::IMUVelocity;
 use echo_li_core::mathematical::vio_state::{VIOSensorState, VIOState};
 use echo_li_core::mathematical::vision_measurement::VisionMeasurement;
 use echo_li_core::{VIOFilter, VIOFilterSettings};
-use echo_li_ros2::{NSEC_PER_SEC, best_effort_qos, quat_to_se3, stamp_ns, to_stamp, xyzi_cloud};
+use echo_li_ros2::{best_effort_qos, quat_to_se3, stamp_ns, to_stamp, xyzi_cloud, NSEC_PER_SEC};
 use echo_lie::SE3;
 use futures::StreamExt;
 use nalgebra::{Matrix3, Matrix4, Vector2, Vector3, Vector6};
@@ -943,18 +943,16 @@ impl VioNode {
 
         if !self.initialized {
             if let Some(start) = self.init.push(imu) {
-                self.filter = match &self.msceqf_config {
-                    Some(cfg) => Box::new(MsceqfBackend::from_config(
-                        cfg,
-                        self.camera.clone(),
-                        self.fx,
-                        &start,
-                    )),
-                    None => Box::new(EqvioBackend::new(
-                        VIOFilter::new(self.filter_settings.clone(), start.state),
-                        self.camera.clone(),
-                    )),
-                };
+                // The one chooser all three wrappers share; the node only logs the result.
+                let (filter, kind) = backend_from_config(
+                    self.msceqf_config.as_ref(),
+                    &self.filter_settings,
+                    self.camera.clone(),
+                    self.fx,
+                    &start,
+                );
+                self.filter = filter;
+                log::info!("backend={} running after gravity alignment", kind.as_str());
                 for buffered in start.replay {
                     self.filter.process_imu(buffered);
                 }

@@ -153,9 +153,70 @@ pub trait CameraPoseCovariance {
 /// [`Self::pose_covariance`], which returns `None` for a backend that cannot supply it:
 /// collapsing that into a required method would force an implementor to invent a
 /// covariance, and "I cannot tell you" must not become "my uncertainty is zero".
-pub trait VioBackendFull: VioBackend + LandmarkMap {
+/// `Send + Sync` is part of the contract: the ROS 2 node drives a backend from its
+/// executor threads and the Python binding has to release the GIL around a frame step,
+/// so a backend that cannot cross a thread is not usable by two of the three wrappers.
+pub trait VioBackendFull: VioBackend + LandmarkMap + Send + Sync {
     fn pose_covariance(&self) -> Option<&dyn CameraPoseCovariance> {
         None
+    }
+
+    /// Downcast hook, so a caller that needs something one backend alone provides --
+    /// EqVIO's pose clones, its full covariance, its gramian -- can reach the concrete
+    /// type behind the trait object instead of the shared trait growing a method for
+    /// one caller. A caller that downcasts to the wrong backend gets `None`, which is
+    /// the honest answer: the capability is not there.
+    fn as_any(&self) -> &dyn std::any::Any;
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
+}
+
+/// Which backend [`backend_from_config`] built. Logged by every wrapper so a run's
+/// provenance says which filter produced it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendKind {
+    Eqvio,
+    Msceqf,
+}
+
+impl BackendKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BackendKind::Eqvio => "EqVIO",
+            BackendKind::Msceqf => "MSCEqF",
+        }
+    }
+}
+
+/// THE one place a backend is chosen and built from configuration.
+///
+/// An `MSCEqF:` section with `enabled: true` selects MSCEqF; anything else is EqVIO.
+/// The CLI, the ROS 2 node and the Python binding all call this, so there is exactly
+/// one reading of the config and one construction path -- the ROS 2 node used to carry
+/// this logic privately, which left the CLI unable to select MSCEqF at all and the
+/// Python binding re-typing twenty constructor arguments by hand.
+///
+/// `start` is the output of [`crate::initialization::StationaryInit`]: both backends
+/// seed from its gravity-aligned state. `fx` converts the MSCEqF section's PIXEL noise
+/// into the normalized units that backend works in.
+pub fn backend_from_config(
+    msceqf: Option<&crate::config::MsceqfConfig>,
+    eqvio: &crate::VIOFilterSettings,
+    cam: Arc<dyn CameraModel>,
+    fx: f64,
+    start: &crate::initialization::FilterStart,
+) -> (Box<dyn VioBackendFull>, BackendKind) {
+    match msceqf.filter(|c| c.enabled) {
+        Some(cfg) => (
+            Box::new(MsceqfBackend::from_config(cfg, cam, fx, start)),
+            BackendKind::Msceqf,
+        ),
+        None => (
+            Box::new(EqvioBackend::new(
+                crate::VIOFilter::new(eqvio.clone(), start.state.clone()),
+                cam,
+            )),
+            BackendKind::Eqvio,
+        ),
     }
 }
 
@@ -261,6 +322,12 @@ impl VioBackend for EqvioBackend {
 impl VioBackendFull for EqvioBackend {
     fn pose_covariance(&self) -> Option<&dyn CameraPoseCovariance> {
         Some(self)
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
     }
 }
 
@@ -1013,7 +1080,14 @@ impl VioBackend for MsceqfBackend {
 /// group algebra over its clone window, and projecting that onto a single camera pose
 /// is a derivation this backend does not do. Reporting `None` is the honest answer
 /// until it does.
-impl VioBackendFull for MsceqfBackend {}
+impl VioBackendFull for MsceqfBackend {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
 
 impl LandmarkMap for MsceqfBackend {
     fn landmarks_world(&self) -> HashMap<u64, Vector3<f64>> {
@@ -1042,6 +1116,84 @@ mod msceqf_backend_tests {
     /// gate silently refuses every birth -- which is how the first version of these
     /// tests passed while exercising nothing.
     const VX: f64 = 2.0;
+
+    /// `backend_from_config` is the only chooser, so it must agree with direct construction
+    /// on BOTH branches, and the branch must actually follow the section: an EqVIO config
+    /// yields an EqVIO fingerprint, an enabled `MSCEqF:` section yields MSCEqF's.
+    #[test]
+    fn backend_from_config_selects_by_section_and_matches_direct_construction() {
+        use crate::config::{MsceqfConfig, MsceqfInitialStd, MsceqfProcessNoise};
+        use crate::initialization::StationaryInit;
+        let samples: Vec<IMUVelocity> = (0..10)
+            .map(|i| {
+                IMUVelocity::new(
+                    i as f64 * 0.01,
+                    Vector3::zeros(),
+                    Vector3::new(0.0, 0.0, 9.81),
+                )
+            })
+            .collect();
+        let start = StationaryInit::from_samples(10, SE3::identity(), samples);
+        let eqvio = crate::VIOFilterSettings::default();
+        let fx = 400.0;
+
+        // No section: EqVIO, identical to building it by hand.
+        let (built, kind) = backend_from_config(None, &eqvio, test_cam(), fx, &start);
+        assert_eq!(kind, BackendKind::Eqvio);
+        let direct = EqvioBackend::new(
+            crate::VIOFilter::new(eqvio.clone(), start.state.clone()),
+            test_cam(),
+        );
+        assert_eq!(built.state_fingerprint(), direct.state_fingerprint());
+        assert!(built.as_any().downcast_ref::<EqvioBackend>().is_some());
+        assert!(built.as_any().downcast_ref::<MsceqfBackend>().is_none());
+
+        // Enabled section: MSCEqF, identical to from_config.
+        let cfg = MsceqfConfig {
+            enabled: true,
+            num_clones: 7,
+            pixel_std: 1.5,
+            chi2_mult: 1.3,
+            slam_chi2_mult: 0.0,
+            max_track: 123,
+            slam_min_len: 0,
+            max_slam: 4,
+            curvature: true,
+            update_span: 0,
+            max_promote_range: 0.0,
+            direct_product_bias: false,
+            civera_birth_depth: 0.0,
+            civera_birth_rel_std: 1.0,
+            gravity: [0.0, 0.0, -9.81],
+            initial_std: MsceqfInitialStd {
+                attitude: 2.0e-2,
+                velocity: 3.0e-1,
+                position: 4.0e-4,
+                bias: 5.0e-2,
+                extrinsics: 6.0e-4,
+            },
+            process_noise: MsceqfProcessNoise {
+                accel_density: 1.6798e-3,
+                gyro_density: 1.2724e-3,
+                accel_random_walk: 3.0e-3,
+                gyro_random_walk: 1.0e-4,
+                transition_order: 0,
+            },
+        };
+        let (built, kind) = backend_from_config(Some(&cfg), &eqvio, test_cam(), fx, &start);
+        assert_eq!(kind, BackendKind::Msceqf);
+        let direct = MsceqfBackend::from_config(&cfg, test_cam(), fx, &start);
+        assert_eq!(built.state_fingerprint(), direct.state_fingerprint());
+        assert!(built.as_any().downcast_ref::<MsceqfBackend>().is_some());
+
+        // A DISABLED section must not select MSCEqF.
+        let off = MsceqfConfig {
+            enabled: false,
+            ..cfg
+        };
+        let (_, kind) = backend_from_config(Some(&off), &eqvio, test_cam(), fx, &start);
+        assert_eq!(kind, BackendKind::Eqvio);
+    }
 
     /// The flag must actually move the clone, by the amount the lag implies. A flag
     /// that silently does nothing looks exactly like a mechanism that does not matter.

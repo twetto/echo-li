@@ -15,13 +15,11 @@ use echo_li_core::initialization::StationaryInit;
 /// Samples averaged for the gravity alignment at start-up. Matches the ROS 2 node's
 /// `initialization_imu_samples` default and the pyo3 binding's `n_init_samples`.
 const N_INIT_SAMPLES: usize = 100;
-use echo_li_core::backend::{
-    CameraPoseCovariance, EqvioBackend, LandmarkMap, NavEstimate, VioBackend,
-};
+use echo_li_core::backend::{backend_from_config, NavEstimate, VioBackendFull};
 use echo_li_core::mathematical::camera::CameraModel;
 use echo_li_core::mathematical::*;
 use echo_li_core::trajectory_metrics::TrajectoryMetrics;
-use echo_li_core::{LandmarkDepthPrior, VIOFilter, VIOFilterSettings};
+use echo_li_core::{LandmarkDepthPrior, VIOFilterSettings};
 use nalgebra::{Matrix3, Matrix4, Vector2};
 use rudolf_v::camera::CameraIntrinsics as RudolfCameraIntrinsics;
 use rudolf_v::camera::DistortionModel as RudolfDistortionModel;
@@ -1267,11 +1265,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         start.pitch_deg
     );
 
-    // The backend owns the camera, so the per-frame call no longer passes one.
-    let mut filter: Option<EqvioBackend> = Some(EqvioBackend::new(
-        VIOFilter::new(settings.clone(), start.state),
+    // The backend owns the camera, so the per-frame call no longer passes one. Which
+    // backend is decided in ONE place, shared with the ROS 2 node and the Python binding:
+    // an enabled `MSCEqF:` section selects MSCEqF, otherwise EqVIO.
+    let (backend, backend_kind) = backend_from_config(
+        vio_config.as_ref().and_then(|c| c.msceqf.as_ref()),
+        &settings,
         cam_model.clone(),
-    ));
+        k_matrix[(0, 0)],
+        &start,
+    );
+    println!("Backend: {}", backend_kind.as_str());
+    let mut filter: Option<Box<dyn VioBackendFull>> = Some(backend);
 
     // Eager-init: the filter is built once, and the buffered samples are spliced back
     // onto the FRONT of the event stream so they pass through at their original
@@ -1573,7 +1578,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     let state_hash = trace_determinism.then(|| f.state_fingerprint());
                     let t_wc = f.camera_pose().as_matrix();
-                    let sparse_pose_cov = f.camera_pose_covariances();
+                    // Through the seam: a backend that reports no camera-pose covariance
+                    // (MSCEqF today) hands the depth filter None rather than a wrong number.
+                    let sparse_pose_cov = f
+                        .pose_covariance()
+                        .and_then(|p| p.camera_pose_covariances());
                     prev_cam_pose = Some(t_wc);
                     if let Some(sparse) = &mut sparse_filter {
                         if sparse_pose_cov.is_some() {
