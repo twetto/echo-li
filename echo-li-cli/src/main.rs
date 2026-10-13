@@ -1270,6 +1270,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // an enabled `MSCEqF:` section selects MSCEqF, otherwise EqVIO.
     let (backend, backend_kind) = backend_from_config(
         vio_config.as_ref().and_then(|c| c.msceqf.as_ref()),
+        vio_config.as_ref().and_then(|c| c.zupt.as_ref()),
         &settings,
         cam_model.clone(),
         k_matrix[(0, 0)],

@@ -736,6 +736,40 @@ pub struct StereoConfig {
 /// Three values are NOT here, because they come from elsewhere and must not be
 /// duplicated: the initial attitude and position come from gravity alignment at
 /// start-up, and the camera extrinsic is the same `t_bs` the rest of the system uses.
+/// `ZUPT:` section. Thresholds are on the VARIABILITY of the IMU over the window, not
+/// on magnitude -- a magnitude test cannot tell rest from constant-velocity motion.
+/// Defaults are the values validated on the bikevid rig (window 25 samples at 122 Hz,
+/// gyro RMS 0.05 rad/s, |accel| std 0.15 m/s^2, sigma_v 1e-2 m/s), where they fired on
+/// the rest phases and never while riding (measured rest accel-std 0.015 vs 2.1
+/// riding, a 140x margin).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+#[serde(default)]
+pub struct ZuptConfig {
+    pub enabled: bool,
+    /// Detector window, IMU samples.
+    pub window: usize,
+    /// Gyro RMS about its window mean, rad/s.
+    pub gyro_std_threshold: f64,
+    /// Std of |accel| over the window, m/s^2.
+    pub acc_std_threshold: f64,
+    /// Assumed std of the zero-velocity measurement, m/s.
+    pub sigma_v: f64,
+}
+
+impl Default for ZuptConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            window: 25,
+            gyro_std_threshold: 0.05,
+            acc_std_threshold: 0.15,
+            sigma_v: 1.0e-2,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
@@ -876,6 +910,13 @@ pub struct VIOConfig {
     pub stereo: Option<StereoConfig>,
     #[serde(rename = "MSCEqF", default)]
     pub msceqf: Option<MsceqfConfig>,
+    /// Zero-velocity updates, applied by the BACKEND on every IMU sample the detector
+    /// calls stationary. Absent or `enabled: false` leaves the backend without one --
+    /// which, on a rig that starts at rest, is the single largest error source this
+    /// codebase has measured (764 m of dead-reckoned drift on bikevid before a ZUPT,
+    /// 0.0 m after; 81 m ATE on EuRoC V1_01 from a rest start without one).
+    #[serde(rename = "ZUPT", default)]
+    pub zupt: Option<ZuptConfig>,
     #[serde(rename = "Rerun", default)]
     pub rerun: RerunVisConfig,
     pub eqf: EqfConfig,

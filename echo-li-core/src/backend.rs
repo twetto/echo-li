@@ -168,6 +168,68 @@ pub trait VioBackendFull: VioBackend + LandmarkMap + Send + Sync {
     /// the honest answer: the capability is not there.
     fn as_any(&self) -> &dyn std::any::Any;
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
+
+    /// IMU samples on which an installed [`ZuptPolicy`] was accepted; 0 without one.
+    /// On the seam because every wrapper should be able to report it: a run whose ZUPT
+    /// never fired on a rest start is the single most expensive silent failure this
+    /// codebase has measured.
+    fn zupt_fired(&self) -> u64 {
+        0
+    }
+}
+
+/// Zero-velocity policy a backend runs INSIDE `process_imu`: the detector decides
+/// stationarity from IMU variability, the backend then asserts v = 0 through its own
+/// `zero_velocity_update`. Owned by the backend rather than the wrapper so the CLI, the
+/// ROS 2 node and the Python binding cannot each forget it -- before this, the only
+/// ZUPT in use anywhere was a Python reimplementation inside a diagnostic harness, and
+/// no production wrapper ran one.
+pub struct ZuptPolicy {
+    detector: crate::initialization::ZeroVelocityDetector,
+    sigma_v: f64,
+    /// Samples on which the update was offered and accepted. Exposed because a policy
+    /// that silently never fires is indistinguishable from one that works, until the
+    /// rest phase has drifted hundreds of metres.
+    fired: u64,
+}
+
+impl ZuptPolicy {
+    pub fn new(
+        window: usize,
+        gyro_std_threshold: f64,
+        acc_std_threshold: f64,
+        sigma_v: f64,
+    ) -> Self {
+        Self {
+            detector: crate::initialization::ZeroVelocityDetector::new(
+                window,
+                gyro_std_threshold,
+                acc_std_threshold,
+            ),
+            sigma_v,
+            fired: 0,
+        }
+    }
+
+    /// `None` when the section is absent or disabled.
+    pub fn from_config(cfg: Option<&crate::config::ZuptConfig>) -> Option<Self> {
+        let c = cfg.filter(|c| c.enabled)?;
+        Some(Self::new(
+            c.window,
+            c.gyro_std_threshold,
+            c.acc_std_threshold,
+            c.sigma_v,
+        ))
+    }
+
+    /// Feed one sample; `Some(sigma_v)` when the backend should assert zero velocity now.
+    fn observe(&mut self, imu: &IMUVelocity) -> Option<f64> {
+        self.detector.push(imu.clone()).then_some(self.sigma_v)
+    }
+
+    pub fn fired(&self) -> u64 {
+        self.fired
+    }
 }
 
 /// Which backend [`backend_from_config`] built. Logged by every wrapper so a run's
@@ -200,23 +262,26 @@ impl BackendKind {
 /// into the normalized units that backend works in.
 pub fn backend_from_config(
     msceqf: Option<&crate::config::MsceqfConfig>,
+    zupt: Option<&crate::config::ZuptConfig>,
     eqvio: &crate::VIOFilterSettings,
     cam: Arc<dyn CameraModel>,
     fx: f64,
     start: &crate::initialization::FilterStart,
 ) -> (Box<dyn VioBackendFull>, BackendKind) {
     match msceqf.filter(|c| c.enabled) {
-        Some(cfg) => (
-            Box::new(MsceqfBackend::from_config(cfg, cam, fx, start)),
-            BackendKind::Msceqf,
-        ),
-        None => (
-            Box::new(EqvioBackend::new(
+        Some(cfg) => {
+            let mut b = MsceqfBackend::from_config(cfg, cam, fx, start);
+            b.set_zupt(ZuptPolicy::from_config(zupt));
+            (Box::new(b), BackendKind::Msceqf)
+        }
+        None => {
+            let mut b = EqvioBackend::new(
                 crate::VIOFilter::new(eqvio.clone(), start.state.clone()),
                 cam,
-            )),
-            BackendKind::Eqvio,
-        ),
+            );
+            b.set_zupt(ZuptPolicy::from_config(zupt));
+            (Box::new(b), BackendKind::Eqvio)
+        }
     }
 }
 
@@ -229,11 +294,26 @@ pub fn backend_from_config(
 pub struct EqvioBackend {
     filter: crate::VIOFilter,
     cam: Arc<dyn CameraModel>,
+    zupt: Option<ZuptPolicy>,
 }
 
 impl EqvioBackend {
     pub fn new(filter: crate::VIOFilter, cam: Arc<dyn CameraModel>) -> Self {
-        Self { filter, cam }
+        Self {
+            filter,
+            cam,
+            zupt: None,
+        }
+    }
+
+    /// Install (or remove) the zero-velocity policy. See [`ZuptPolicy`].
+    pub fn set_zupt(&mut self, zupt: Option<ZuptPolicy>) {
+        self.zupt = zupt;
+    }
+
+    /// Samples on which a ZUPT was accepted; 0 when no policy is installed.
+    pub fn zupt_fired(&self) -> u64 {
+        self.zupt.as_ref().map_or(0, |z| z.fired())
     }
 
     /// Borrow the concrete filter. Composition, not encapsulation: a consumer that needs
@@ -254,7 +334,16 @@ impl EqvioBackend {
 
 impl VioBackend for EqvioBackend {
     fn process_imu(&mut self, imu: IMUVelocity) {
-        self.filter.process_imu(imu);
+        self.filter.process_imu(imu.clone());
+        // Propagate first, then assert rest: the detector reads the raw sample, the
+        // update acts on the state that sample produced.
+        if let Some(sigma) = self.zupt.as_mut().and_then(|z| z.observe(&imu)) {
+            if self.zero_velocity_update(sigma) {
+                if let Some(z) = self.zupt.as_mut() {
+                    z.fired += 1;
+                }
+            }
+        }
     }
 
     fn process_vision(
@@ -328,6 +417,9 @@ impl VioBackendFull for EqvioBackend {
     }
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
+    }
+    fn zupt_fired(&self) -> u64 {
+        EqvioBackend::zupt_fired(self)
     }
 }
 
@@ -495,6 +587,7 @@ pub struct MsceqfBackend {
     /// Propagate to the frame stamp before cloning instead of cloning whatever the
     /// last IMU sample left behind. See [`Self::propagate_to`].
     clone_at_frame_stamp: bool,
+    zupt: Option<ZuptPolicy>,
 }
 
 impl MsceqfBackend {
@@ -518,13 +611,20 @@ impl MsceqfBackend {
         use nalgebra::{SMatrix, Vector6};
 
         let sensor = &start.state.sensor;
+        // The origin bias is whatever StationaryInit seeded -- the gyro bias measured
+        // over a stationary start, zero otherwise. A first version passed zeros here,
+        // which silently discarded that seed on this path alone: the EqVIO backend takes
+        // it through `start.state`, and the bikevid harness seeded it by hand (762 m of
+        // IMU-only drift -> 37 m on that rig, whose gyro bias is 2.5 deg/s), so the
+        // ROS 2 node -- the one consumer of this constructor -- was the only caller
+        // running MSCEqF without it.
         let origin = SystemOrigin::new(
             echo_lie::SE23::new(
                 sensor.pose.rotation,
                 sensor.pose.translation,
                 sensor.velocity,
             ),
-            Vector6::zeros(),
+            sensor.input_bias,
             sensor.camera_offset.clone(),
             Vector3::new(cfg.gravity[0], cfg.gravity[1], cfg.gravity[2]),
         );
@@ -618,6 +718,7 @@ impl MsceqfBackend {
             last_stamp: None,
             last_imu: None,
             clone_at_frame_stamp: false,
+            zupt: None,
         }
     }
 
@@ -668,6 +769,16 @@ impl MsceqfBackend {
     /// Take the recorded per-track `chi2 / gate` ratios, emptying the buffer.
     pub fn take_msc_chi2_ratios(&mut self) -> Vec<f64> {
         std::mem::take(&mut self.filter.msc_chi2_ratio)
+    }
+
+    /// Install (or remove) the zero-velocity policy. See [`ZuptPolicy`].
+    pub fn set_zupt(&mut self, zupt: Option<ZuptPolicy>) {
+        self.zupt = zupt;
+    }
+
+    /// Samples on which a ZUPT was accepted; 0 when no policy is installed.
+    pub fn zupt_fired(&self) -> u64 {
+        self.zupt.as_ref().map_or(0, |z| z.fired())
     }
 
     /// Clone at the frame's own stamp rather than at the last IMU sample. Off by
@@ -757,6 +868,14 @@ impl VioBackend for MsceqfBackend {
             ang: imu.gyr,
             acc: imu.acc,
         });
+        // Propagate first, then assert rest (see EqvioBackend::process_imu).
+        if let Some(sigma) = self.zupt.as_mut().and_then(|z| z.observe(&imu)) {
+            if self.zero_velocity_update(sigma) {
+                if let Some(z) = self.zupt.as_mut() {
+                    z.fired += 1;
+                }
+            }
+        }
     }
 
     /// One frame, in the order the stages must run.
@@ -1087,6 +1206,9 @@ impl VioBackendFull for MsceqfBackend {
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
     }
+    fn zupt_fired(&self) -> u64 {
+        MsceqfBackend::zupt_fired(self)
+    }
 }
 
 impl LandmarkMap for MsceqfBackend {
@@ -1138,7 +1260,7 @@ mod msceqf_backend_tests {
         let fx = 400.0;
 
         // No section: EqVIO, identical to building it by hand.
-        let (built, kind) = backend_from_config(None, &eqvio, test_cam(), fx, &start);
+        let (built, kind) = backend_from_config(None, None, &eqvio, test_cam(), fx, &start);
         assert_eq!(kind, BackendKind::Eqvio);
         let direct = EqvioBackend::new(
             crate::VIOFilter::new(eqvio.clone(), start.state.clone()),
@@ -1180,7 +1302,7 @@ mod msceqf_backend_tests {
                 transition_order: 0,
             },
         };
-        let (built, kind) = backend_from_config(Some(&cfg), &eqvio, test_cam(), fx, &start);
+        let (built, kind) = backend_from_config(Some(&cfg), None, &eqvio, test_cam(), fx, &start);
         assert_eq!(kind, BackendKind::Msceqf);
         let direct = MsceqfBackend::from_config(&cfg, test_cam(), fx, &start);
         assert_eq!(built.state_fingerprint(), direct.state_fingerprint());
@@ -1191,8 +1313,90 @@ mod msceqf_backend_tests {
             enabled: false,
             ..cfg
         };
-        let (_, kind) = backend_from_config(Some(&off), &eqvio, test_cam(), fx, &start);
+        let (_, kind) = backend_from_config(Some(&off), None, &eqvio, test_cam(), fx, &start);
         assert_eq!(kind, BackendKind::Eqvio);
+    }
+
+    /// A backend at rest with no vision must HOLD velocity when the ZUPT policy is
+    /// installed, and the policy must actually fire. The control arm has to drift, or
+    /// the assertion is vacuous: a filter that never moves passes either way.
+    #[test]
+    fn zupt_policy_holds_velocity_at_rest_and_fires() {
+        use crate::config::ZuptConfig;
+        let cfg = ZuptConfig {
+            enabled: true,
+            ..ZuptConfig::default()
+        };
+        // A TRUE rest start (zero velocity) with an accel-magnitude error of 0.5 m/s^2
+        // -- the error that dead-reckons into velocity on a real rig -- and gyro at zero.
+        // The start must be at rest: a ZUPT is a chi2-gated update, so it holds rest, it
+        // does not rescue a large pre-existing velocity error (a first version of this
+        // test started at 2 m/s and the gate correctly refused every update).
+        let run = |with_zupt: bool| -> (f64, u64) {
+            let origin = SystemOrigin::new(
+                SE23::new(SO3::identity(), Vector3::zeros(), Vector3::zeros()),
+                Vector6::zeros(),
+                SE3::identity(),
+                Vector3::new(0.0, 0.0, -9.81),
+            );
+            // Everything at the RIG operating point, where the policy was validated
+            // (bikevid: 764 m of rest drift -> 0.0 m): initial stds attitude 1e-2,
+            // velocity 1e-1, position 1e-4, bias 1e-2; accel bias random walk 4.1e-3;
+            // and the rig's own 0.14 m/s^2 gravity-magnitude error. Two earlier
+            // versions of this test taught why the operating point matters. With
+            // velocity std 1e-2 the first ZUPT opportunity (sample 25) is already 6
+            // sigma and the gate refuses every update forever. With the bias random
+            // walk frozen at 1e-5 against a 0.5 m/s^2 error, the gate accepted 23
+            // updates then stalled: each accepted ZUPT shrinks P_vv, the gain falls, the
+            // unmodelled acceleration re-accumulates faster than the update removes it,
+            // and the innovation walks out of the gate. A ZUPT holds rest only while the
+            // bias state can absorb the acceleration it keeps seeing.
+            let d_std = [1e-2, 1e-2, 1e-2, 1e-1, 1e-1, 1e-1, 1e-4, 1e-4, 1e-4];
+            let filter = MSCEqFFilter::new(
+                origin,
+                &SMatrix::<f64, 9, 9>::from_fn(
+                    |i, j| if i == j { d_std[i] * d_std[i] } else { 0.0 },
+                ),
+                &(SMatrix::<f64, 6, 6>::identity() * 1e-4),
+                &(SMatrix::<f64, 6, 6>::identity() * 1e-6),
+                ProcessNoise {
+                    angular_velocity_std: 1.7e-4,
+                    acceleration_std: 4.2e-3,
+                    angular_velocity_bias_std: 1.2e-4,
+                    acceleration_bias_std: 4.1e-3,
+                    state_transition_order: 0,
+                },
+            );
+            let mut b = MsceqfBackend::new(filter, test_cam(), MsceqfSettings::default());
+            if with_zupt {
+                b.set_zupt(ZuptPolicy::from_config(Some(&cfg)));
+            }
+            for k in 0..1200u64 {
+                let t = k as f64 * (1.0 / 122.0);
+                b.process_imu(IMUVelocity::new(
+                    t,
+                    Vector3::zeros(),
+                    Vector3::new(0.0, 0.0, 9.81 + 0.14),
+                ));
+            }
+            (b.nav_estimate().velocity.norm(), b.zupt_fired())
+        };
+        let (v_off, fired_off) = run(false);
+        let (v_on, fired_on) = run(true);
+        assert_eq!(fired_off, 0);
+        assert!(
+            fired_on > 100,
+            "policy should fire on most rest samples, fired {fired_on}"
+        );
+        assert!(
+            v_on < 0.05,
+            "with ZUPT the velocity must be held near zero, got {v_on:.4} m/s"
+        );
+        // 0.14 m/s^2 over ~9.8 s dead-reckons to ~1.4 m/s without a ZUPT.
+        assert!(
+            v_off > 0.5,
+            "control arm must drift or the test proves nothing, got {v_off:.4} m/s"
+        );
     }
 
     /// The flag must actually move the clone, by the amount the lag implies. A flag

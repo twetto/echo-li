@@ -7,8 +7,8 @@ use std::time::Instant;
 use camera_geometry::CameraProjection;
 use echo_li_core::backend::VioBackendFull;
 use echo_li_core::backend::{backend_from_config, EqvioBackend};
-use echo_li_core::config::MsceqfConfig;
 use echo_li_core::config::VIOConfig;
+use echo_li_core::config::{MsceqfConfig, ZuptConfig};
 use echo_li_core::core_types::CameraIntrinsics;
 use echo_li_core::depth::occupancy::LocalOccupancyMap;
 use echo_li_core::depth::patch_depth::{
@@ -394,6 +394,8 @@ struct VioNode {
     /// Present when the config selected MSCEqF; the rebuild then constructs that
     /// backend instead of EqVIO.
     msceqf_config: Option<MsceqfConfig>,
+    /// `ZUPT:` section, installed on whichever backend the rebuild constructs.
+    zupt_config: Option<ZuptConfig>,
     /// Focal length in pixels, for converting the MSCEqF section's PIXEL noise into
     /// the normalized units that backend works in.
     fx: f64,
@@ -730,6 +732,7 @@ impl VioNode {
             frontend,
             filter_settings,
             msceqf_config: msceqf_cfg,
+            zupt_config: vio_config.zupt.clone(),
             fx: params.intrinsics[0] * params.image_scale,
             t_bc: params.t_bs,
             initialized: false,
@@ -946,13 +949,18 @@ impl VioNode {
                 // The one chooser all three wrappers share; the node only logs the result.
                 let (filter, kind) = backend_from_config(
                     self.msceqf_config.as_ref(),
+                    self.zupt_config.as_ref(),
                     &self.filter_settings,
                     self.camera.clone(),
                     self.fx,
                     &start,
                 );
                 self.filter = filter;
-                log::info!("backend={} running after gravity alignment", kind.as_str());
+                log::info!(
+                    "backend={} running after gravity alignment, zupt={}",
+                    kind.as_str(),
+                    self.zupt_config.as_ref().is_some_and(|z| z.enabled)
+                );
                 for buffered in start.replay {
                     self.filter.process_imu(buffered);
                 }

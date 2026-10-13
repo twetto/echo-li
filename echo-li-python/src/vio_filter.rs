@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use echo_li_core::backend::{backend_from_config, BackendKind, EqvioBackend, VioBackendFull};
-use echo_li_core::config::{MsceqfConfig, VIOConfig};
+use echo_li_core::config::{MsceqfConfig, VIOConfig, ZuptConfig};
 use echo_li_core::initialization::{FilterStart, StationaryInit};
 use echo_li_core::mathematical::camera::CameraModel;
 use echo_li_core::mathematical::imu_velocity::IMUVelocity;
@@ -36,6 +36,7 @@ pub struct PyVIOFilter {
     /// again from a caller-supplied state.
     settings: VIOFilterSettings,
     msceqf: Option<MsceqfConfig>,
+    zupt: Option<ZuptConfig>,
     /// Focal length in pixels, needed only by MSCEqF (its pixel noise is normalised at
     /// construction). The camera model does not expose it, so the caller supplies it.
     fx: Option<f64>,
@@ -94,6 +95,7 @@ impl PyVIOFilter {
         };
         let (backend, _) = backend_from_config(
             self.msceqf.as_ref(),
+            self.zupt.as_ref(),
             &self.settings,
             self.camera.clone(),
             fx,
@@ -145,6 +147,7 @@ impl PyVIOFilter {
         })?;
         let settings = vio_config.to_filter_settings();
         let msceqf = vio_config.msceqf.clone();
+        let zupt = vio_config.zupt.clone();
 
         let cam: Arc<dyn CameraModel> = if let Some(cam_obj) = camera {
             to_camera_arc(cam_obj)?
@@ -172,6 +175,7 @@ impl PyVIOFilter {
             kind: BackendKind::Eqvio,
             settings,
             msceqf,
+            zupt,
             fx,
             camera: cam,
             camera_extrinsics: None,
@@ -182,6 +186,7 @@ impl PyVIOFilter {
         };
         let (backend, kind) = backend_from_config(
             me.msceqf.as_ref(),
+            me.zupt.as_ref(),
             &me.settings,
             me.camera.clone(),
             me.fx.unwrap_or(0.0),
@@ -786,6 +791,12 @@ impl PyVIOFilter {
     #[getter]
     fn vision_count(&self) -> usize {
         self.vision_count
+    }
+
+    /// IMU samples on which the backend's ZUPT policy was accepted (0 if none installed).
+    #[getter]
+    fn zupt_fired(&self) -> u64 {
+        self.backend.zupt_fired()
     }
 
     fn __repr__(&self) -> String {
