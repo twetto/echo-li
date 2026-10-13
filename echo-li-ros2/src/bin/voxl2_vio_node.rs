@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use camera_geometry::CameraProjection;
 use echo_li_core::backend::VioBackendFull;
-use echo_li_core::backend::{backend_from_config, EqvioBackend};
+use echo_li_core::backend::{backend_from_config, CloneRelFeed, EqvioBackend};
 use echo_li_core::config::VIOConfig;
 use echo_li_core::config::{MsceqfConfig, ZuptConfig};
 use echo_li_core::core_types::CameraIntrinsics;
@@ -412,6 +412,8 @@ struct VioNode {
 
     // Sparse 3D
     sparse_3d: Option<Sparse3DFilter>,
+    /// Clone-relative pose-covariance feed for the depth filter (see core).
+    sparse_feed: CloneRelFeed,
 
     // Dense mapping
     depth_mapper: Option<PatchDepthMapper>,
@@ -649,12 +651,10 @@ impl VioNode {
                 c.curvature
             );
             if vio_config.sparse_vog.as_ref().is_some_and(|s| s.enabled) {
-                // Sparse3D consumes camera-pose covariance, which this backend cannot
-                // report yet; it would run on missing information rather than wrong
-                // information, but it would not be doing its job either.
-                log::warn!(
-                    "MSCEqF backend does not report camera-pose covariance yet; the \
-                     Sparse3D depth filter will receive None for P_vv/P_ww"
+                log::info!(
+                    "Sparse3D under MSCEqF runs CLONE-RELATIVE: each landmark is driven by \
+                     its anchor clone's gauge-cancelled relative covariance and re-anchored \
+                     on eviction (CloneRelFeed)"
                 );
             }
         } else {
@@ -742,6 +742,7 @@ impl VioNode {
                 SE3::from_matrix(&params.t_bs),
             ),
             sparse_3d,
+            sparse_feed: CloneRelFeed::default(),
             depth_mapper,
             depth_seed_coords,
             depth_pub,
@@ -1089,16 +1090,22 @@ impl VioNode {
                 .iter()
                 .map(|f| (f.id, Vector2::new(f.x, f.y)))
                 .collect();
-            // None means the backend cannot report pose uncertainty, which the depth
-            // filter must treat as missing information rather than as certainty.
-            let (p_vv, p_ww) = self
-                .filter
-                .pose_covariance()
-                .and_then(|c| c.camera_pose_covariances())
-                .map(|(v, w)| (Some(v), Some(w)))
-                .unwrap_or((None, None));
+            // Clone-relative when the backend manages its own window (MSCEqF), the
+            // legacy absolute pair otherwise; None stays None -- missing information,
+            // not certainty. One shared feed, so this node and the CLI cannot differ.
             let measurement = VisionMeasurement::new(stamp, feature_uvs);
-            sparse.update(&measurement, &t_wc, p_vv.as_ref(), p_ww.as_ref());
+            let rep =
+                self.sparse_feed
+                    .feed(self.filter.pose_covariance(), sparse, &measurement, &t_wc);
+            if self.images_processed % 300 == 0 {
+                log::debug!(
+                    "sparse3d feed: clone_relative={} n_rel={} reanchored={} absolute={}",
+                    rep.clone_relative,
+                    rep.n_rel,
+                    rep.reanchored,
+                    rep.had_absolute
+                );
+            }
         }
 
         // Dense mapping: patch depth → occupancy

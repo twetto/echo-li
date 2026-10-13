@@ -1748,6 +1748,18 @@ impl MSCEqFFilter {
         SE3::new(nav.t.rotation.clone(), nav.t.position).compose(&nav.s)
     }
 
+    /// WORLD camera pose of clone `pos`. A clone stores the group element `E_k`, not a
+    /// pose: the camera pose is `T S = (T0 D)_{SE3} C(D)^{-1} S0 E = SE3(T0) S0 E`, so
+    /// the origin never cancels out of an absolute pose the way it does out of a
+    /// clone-to-clone relative one. Handing a consumer the bare `E_k` as if it were
+    /// `T_wc` is off by `SE3(T0) S0`, which on a seeded start is the whole trajectory
+    /// so far.
+    pub fn clone_world_pose(&self, pos: usize) -> SE3 {
+        let t0 = SE3::new(self.origin.t0.rotation.clone(), self.origin.t0.position);
+        t0.compose(&self.origin.s0)
+            .compose(&self.x.clones[pos].pose)
+    }
+
     /// Anchor->current RELATIVE camera-pose covariance, between two CLONES.
     ///
     /// This is the quantity Sparse3D consumes (EqVIO sibling:

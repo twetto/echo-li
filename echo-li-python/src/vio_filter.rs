@@ -5,7 +5,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use echo_li_core::backend::{
-    backend_from_config, BackendKind, EqvioBackend, MsceqfBackend, VioBackendFull,
+    backend_from_config, BackendKind, CameraPoseCovariance, EqvioBackend, MsceqfBackend,
+    VioBackendFull,
 };
 use echo_li_core::config::{MsceqfConfig, VIOConfig, ZuptConfig};
 use echo_li_core::initialization::{FilterStart, StationaryInit};
@@ -573,7 +574,8 @@ impl PyVIOFilter {
     /// Current camera pose covariance (P_vv, P_ww) as two 3x3 arrays -- position and
     /// attitude covariance of the camera pose in the camera-fixed (local) frame. Feed
     /// these straight into Sparse3DFilter.update so the landmark depth covariance accounts
-    /// for pose uncertainty. None if the backend does not report one (MSCEqF today).
+    /// for pose uncertainty, under either backend (MSCEqF: the newest clone's marginal).
+    /// None if the backend does not report one.
     fn get_camera_pose_covariance<'py>(
         &self,
         py: Python<'py>,
@@ -709,6 +711,13 @@ impl PyVIOFilter {
         Ok(self.msceqf("msc_update_counts")?.msc_update_counts())
     }
 
+    /// Feature ids the MSCEqF backend currently holds (buffered tracks + in-state
+    /// landmarks), ascending -- what a front-end budget should prefer to keep.
+    /// MSCEqF-only.
+    fn msc_tracked_ids(&self) -> PyResult<Vec<u64>> {
+        Ok(self.msceqf("msc_tracked_ids")?.tracked_ids())
+    }
+
     /// Cumulative per-reason structureless drop counts
     /// `[too_few_obs, stale_clone, triangulation_failed, jacobian_failed, chi2_rejected]`.
     /// MSCEqF-only.
@@ -764,9 +773,77 @@ impl PyVIOFilter {
         Ok(d)
     }
 
-    /// Ids of the live pose clones (block order). EqVIO-only.
-    fn clone_ids(&self) -> PyResult<Vec<u64>> {
-        Ok(self.eqvio("clone_ids")?.clone_ids())
+    /// Ids of the live pose clones, oldest first, under either backend.
+    fn clone_ids(&self) -> Vec<u64> {
+        self.backend
+            .pose_covariance()
+            .map(|c| c.live_clone_ids())
+            .unwrap_or_default()
+    }
+
+    /// The clone that IS the current camera pose, when the backend manages its own
+    /// window (MSCEqF); None under EqVIO, whose clones are the caller's.
+    fn current_clone_id(&self) -> Option<u64> {
+        self.backend
+            .pose_covariance()
+            .and_then(|c| c.current_clone_id())
+    }
+
+    /// The clone the backend evicted in its last frame step, as
+    /// `(old_id, new_id, T_wc_new 4x4, P_vv, P_ww)` -- the evidence a depth filter needs
+    /// to re-anchor landmarks before their anchor is gone. None if nothing was evicted
+    /// or the backend does not manage clones.
+    fn last_clone_eviction<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> Option<(
+        u64,
+        u64,
+        Bound<'py, PyArray2<f64>>,
+        Bound<'py, PyArray2<f64>>,
+        Bound<'py, PyArray2<f64>>,
+    )> {
+        let ev = self
+            .backend
+            .pose_covariance()
+            .and_then(|c| c.last_clone_eviction())?;
+        let m4 = ev.t_wc_new.as_matrix();
+        let t: Vec<f64> = (0..4)
+            .flat_map(|r| (0..4).map(move |c| m4[(r, c)]))
+            .collect();
+        let mat3 = |m: &Matrix3<f64>| {
+            let d: Vec<f64> = (0..3)
+                .flat_map(|r| (0..3).map(move |c| m[(r, c)]))
+                .collect();
+            PyArray2::from_owned_array(py, Array2::from_shape_vec((3, 3), d).unwrap())
+        };
+        Some((
+            ev.old_clone_id,
+            ev.new_clone_id,
+            PyArray2::from_owned_array(py, Array2::from_shape_vec((4, 4), t).unwrap()),
+            mat3(&ev.p_vv),
+            mat3(&ev.p_ww),
+        ))
+    }
+
+    /// Full 6x6 anchor->current relative covariance, `[rot, trans]` order, under a
+    /// clone-managing backend (MSCEqF). None otherwise.
+    fn relative_pose_covariance_full<'py>(
+        &self,
+        py: Python<'py>,
+        clone_id: u64,
+    ) -> Option<Bound<'py, PyArray2<f64>>> {
+        let m = self
+            .backend
+            .pose_covariance()
+            .and_then(|c| c.relative_pose_covariance_full(clone_id))?;
+        let d: Vec<f64> = (0..6)
+            .flat_map(|r| (0..6).map(move |c| m[(r, c)]))
+            .collect();
+        Some(PyArray2::from_owned_array(
+            py,
+            Array2::from_shape_vec((6, 6), d).unwrap(),
+        ))
     }
 
     /// Honest, gauge-cancelled relative-pose covariance between clone `clone_id`
@@ -774,14 +851,14 @@ impl PyVIOFilter {
     /// the current camera pose: returns (P_vv_rel, P_ww_rel) as two 3x3 arrays, a
     /// drop-in replacement for get_camera_pose_covariance when feeding Sparse3DFilter's
     /// pose-range term for a landmark anchored at that clone. None if the clone is not
-    /// live or the covariance is non-finite. EqVIO-only.
+    /// live or the covariance is non-finite. Under MSCEqF the anchor is a live clone and
+    /// `t_wc_clone` is ignored; under EqVIO it is the stored anchor pose.
     fn get_relative_pose_covariance<'py>(
         &self,
         py: Python<'py>,
         clone_id: u64,
         t_wc_clone: PyReadonlyArray2<f64>,
     ) -> PyResult<Option<(Bound<'py, PyArray2<f64>>, Bound<'py, PyArray2<f64>>)>> {
-        let filter = self.eqvio("get_relative_pose_covariance")?;
         let arr = t_wc_clone.as_array();
         if arr.shape() != [4, 4] {
             return Ok(None);
@@ -799,8 +876,12 @@ impl PyVIOFilter {
                 .collect();
             PyArray2::from_owned_array(py, Array2::from_shape_vec((3, 3), data).unwrap())
         };
-        Ok(filter
-            .sparse_relative_pose_covariances(clone_id, &t_clone)
+        // Through the seam: EqVIO needs the stored anchor pose, MSCEqF's anchor is a
+        // live clone and it ignores the argument.
+        Ok(self
+            .backend
+            .pose_covariance()
+            .and_then(|c| c.relative_pose_covariances(clone_id, &t_clone))
             .map(|(p_vv, p_ww)| (mat3(&p_vv), mat3(&p_ww))))
     }
 

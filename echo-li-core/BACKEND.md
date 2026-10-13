@@ -128,10 +128,21 @@ Owed, in dependency order: `MSCEqFFilter` is a primitives API -- `stochastic_clo
    REAL camera model, where the Python harness used a bare inverse-K. Those agree on an
    undistorted pinhole (MidAir) and diverge on a distorted one, so MidAir is the right
    place to compare.
-2. **`MsceqfBackend::pose_covariance`.** It returns `None` today, so a node running
-   MSCEqF would starve the Sparse3D depth filter of pose uncertainty. MSCEqF carries
-   covariance on the group algebra over its clone window; projecting that onto a single
-   camera pose is the missing derivation.
+2. **`MsceqfBackend::pose_covariance`** -- DONE. The absolute pair is the newest
+   clone's own 6x6 marginal (in an MSCKF the current camera pose IS a clone, and
+   `phi()`'s camera pose is invariant to the navigation direction, so there is no
+   core-state Jacobian route). The pair that matters is the clone-to-clone
+   anchor->current RELATIVE covariance, reached through `CameraPoseCovariance`'s
+   `relative_pose_covariances` / `live_clone_ids` / `current_clone_id` /
+   `last_clone_eviction`, and consumed by `CloneRelFeed` -- the one shared feed the CLI
+   and the ROS 2 node run, which reproduces the depth NEES harness's construction
+   (clone-relative, PSD-clipped increments, re-anchor on eviction). Validated on Kite t0:
+   the harness's `--pose-source backend` (this seam) is byte-identical to its
+   `--pose-source msceqf` (the hand-built adapter) in three settings, and the eviction
+   re-anchor rule lands within the one-frame timing difference of the harness's rule.
+   One trap, pinned by `msceqf_eviction_is_recorded_before_the_clone_dies`: a clone
+   stores the group element `E_k`, not a pose; its world camera pose is
+   `SE3(T0) S0 E_k` (`clone_world_pose`), and the first version handed out `E_k`.
 
 ### Selecting MSCEqF
 

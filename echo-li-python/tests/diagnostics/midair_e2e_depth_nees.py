@@ -290,6 +290,96 @@ class MSCEqFAdapter:
         pass
 
 
+class BackendAdapter:
+    """Presents EqVIO's surface, backed by the SHIPPING path: `echo_li.VIOFilter` with an
+    `MSCEqF:` config section, i.e. `backend_from_config` plus the `CameraPoseCovariance`
+    seam that the CLI and the ROS 2 node consume. Built to the same construction as
+    MSCEqFAdapter (initial stds, IMU noise, window, update span, curvature off, gravity),
+    so a difference between `--pose-source msceqf` and `--pose-source backend` is a
+    difference in the shipped wiring, not in the filter.
+
+    Two surface differences are real and deliberate:
+      * the backend owns clone timing (clone-before-update inside process_vision), so
+        `clone_pose()` / `marginalize_clone()` are no-ops exactly as in MSCEqFAdapter;
+      * `get_landmarks()` returns the backend's buffered track ids, which is what
+        MSCEqFAdapter returned, so the front-end budget prefers the same features.
+    """
+
+    def __init__(self, cfg, cam, f, num_clones, pixel_std_px, max_slam,
+                 acc_d, gyr_d, acc_rw, gyr_rw, update_span=11, max_track=200):
+        import echo_li
+        import tempfile
+        full = _deep_copy(cfg)
+        full["MSCEqF"] = {
+            "enabled": True,
+            "numClones": int(num_clones),
+            "pixelStd": float(pixel_std_px),          # pixels; /fx inside
+            "chi2Mult": 1.0,
+            "maxTrack": int(max_track),
+            "maxSlam": int(max_slam),
+            "curvature": False,                       # MSCEqFAdapter passes False
+            "updateSpan": int(update_span),
+            "cloneAtFrameStamp": False,
+            # NWU harness: z is UP, gravity ACCELERATION is -z (see MSCEqFAdapter).
+            "gravity": [0.0, 0.0, -9.81],
+            "initialStd": {"attitude": 1e-2, "velocity": 1e-1, "position": 1e-4,
+                           "bias": 1e-2, "extrinsics": 1e-4},
+            "processNoise": {"accelDensity": float(acc_d), "gyroDensity": float(gyr_d),
+                             "accelRandomWalk": float(acc_rw),
+                             "gyroRandomWalk": float(gyr_rw), "transitionOrder": 0},
+        }
+        full.pop("ZUPT", None)                        # the adapter has no ZUPT
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as tf:
+            yaml.safe_dump(full, tf, sort_keys=False)
+            self.config_path = tf.name
+        self.f = echo_li.VIOFilter(self.config_path, cam, fx=float(f))
+        assert self.f.backend_kind == "MSCEqF", self.f.backend_kind
+
+    def process_imu(self, stamp, gyr, acc):
+        self.f.process_imu(stamp, list(gyr), list(acc))
+
+    def process_vision(self, stamp, uvs):
+        self.f.process_vision(stamp, uvs)
+
+    def get_landmarks(self):
+        return {int(t): None for t in self.f.msc_tracked_ids()}
+
+    def get_pose(self):
+        return self.f.get_pose()
+
+    def get_camera_pose_covariance(self):
+        return self.f.get_camera_pose_covariance()
+
+    def clone_pose(self, k, stamp):
+        pass                   # the backend clones inside process_vision
+
+    def marginalize_clone(self, cid):
+        return False           # window is managed internally
+
+    def clone_ids(self):
+        return [int(c) for c in self.f.clone_ids()]
+
+    def n_clones(self):
+        return int(self.f.n_clones())
+
+    def get_relative_pose_covariance(self, cid, t_wc_clone):
+        return self.f.get_relative_pose_covariance(int(cid), np.ascontiguousarray(t_wc_clone))
+
+    def relative_pose_covariance_full(self, cid, _cur_id):
+        return self.f.relative_pose_covariance_full(int(cid))
+
+    def last_clone_eviction(self):
+        """(old_id, new_id, T_wc_new, P_vv, P_ww) captured BEFORE the backend dropped
+        the clone this frame, or None. The CLI/ROS 2 feed re-anchors from this."""
+        return self.f.last_clone_eviction()
+
+    def set_camera_extrinsics(self, ext):
+        self.f.set_camera_extrinsics(np.ascontiguousarray(ext))
+
+    def set_initial_state(self, p, R, v_body):
+        self.f.set_initial_state(p, np.ascontiguousarray(R), v_body)
+
+
 def vio_body_pose(vio):
     """SE(3) pose of the VIO body frame in the world frame."""
     pos, quat = vio.get_pose()
@@ -357,12 +447,21 @@ def main():
                          "structureless only, which is this filter's WEAKEST mode "
                          "(landmarks roughly halve ATE). The 7 no-output trajectories "
                          "all diverge in pose, so this is the first thing to try.")
-    ap.add_argument("--pose-source", choices=("eqvio", "msceqf"), default="eqvio",
+    ap.add_argument("--pose-source", choices=("eqvio", "msceqf", "backend"), default="eqvio",
                     help="which filter supplies poses AND the clone-relative covariance. "
                          "'msceqf' routes through the fork-b native filter via "
                          "MSCEqFAdapter; its relative cov is clone-to-clone (no "
-                         "core-state Jacobian exists there). The scoring path is "
-                         "identical either way, so the two are directly comparable.")
+                         "core-state Jacobian exists there). 'backend' is the SHIPPING "
+                         "wiring: VIOFilter with an MSCEqF: section, covariances through "
+                         "the CameraPoseCovariance seam (BackendAdapter). The scoring "
+                         "path is identical either way, so the three are directly "
+                         "comparable; msceqf vs backend is the match test for the seam.")
+    ap.add_argument("--reanchor-eviction", action="store_true",
+                    help="with --pose-source backend --reanchor: re-anchor from the "
+                         "backend's last_clone_eviction() record (old->newest, cov "
+                         "captured before the eviction), which is what CloneRelFeed "
+                         "does in the CLI/ROS 2 node, instead of the harness's "
+                         "oldest-live->newest-registered rule one frame earlier")
     ap.add_argument("--clone-relative", action="store_true",
                     help="feed Sparse3D's §V-D pose-range term the HONEST, "
                          "gauge-cancelled anchor→current relative-pose covariance "
@@ -517,8 +616,23 @@ def main():
             acc_rw=_vn.get("accBias", 4.462e-3), gyr_rw=_vn.get("gyrBias", 1.337e-4))
         print("pose source: fork-b native MSCEqF (clone-to-clone relative cov); "
               f"seed |v0_world|={np.linalg.norm(v0_w):.2f} m/s")
+    elif args.pose_source == "backend":
+        print(f"  IMU noise from config: acc={_vn.get('acc')} gyr={_vn.get('gyr')} "
+              f"accBias={_vn.get('accBias')} gyrBias={_vn.get('gyrBias')}")
+        vio = BackendAdapter(
+            cfg, cam, f,
+            num_clones=max(args.clone_window, 11), max_slam=args.msceqf_max_slam,
+            pixel_std_px=(args.sigma_pixel or 1.0),
+            acc_d=_vn.get("acc", 3.28e-3), gyr_d=_vn.get("gyr", 3.94e-3),
+            acc_rw=_vn.get("accBias", 4.462e-3), gyr_rw=_vn.get("gyrBias", 1.337e-4))
+        print("pose source: shipping backend (VIOFilter + MSCEqF: section, "
+              f"CameraPoseCovariance seam); config {vio.config_path}; "
+              f"seed |v0_world|={np.linalg.norm(v0_w):.2f} m/s; "
+              f"reanchor rule={'eviction' if args.reanchor_eviction else 'harness'}")
     else:
         vio = echo_li.VIOFilter(merged_config_path, cam)
+    if args.reanchor_eviction and args.pose_source != "backend":
+        sys.exit("--reanchor-eviction needs --pose-source backend")
     vio.set_camera_extrinsics(np.ascontiguousarray(ext))
     vio.set_initial_state(p0_w.tolist(), np.ascontiguousarray(R0), v0_body.tolist())
 
@@ -631,7 +745,31 @@ def main():
             # relative_pose_covariance returns None and the landmark is re-anchored as
             # if the two anchors were perfectly known relative to each other. Move the
             # oldest clone's landmarks onto the newest LIVE clone while both still exist.
-            if args.reanchor:
+            if args.reanchor and args.reanchor_eviction:
+                # The shipping rule (CloneRelFeed): the backend evicted a clone inside
+                # this frame's process_vision and recorded, BEFORE dropping it, the
+                # old->newest relative covariance and the newest pose.
+                _ev = vio.last_clone_eviction()
+                if _ev is not None:
+                    _old, _new, _T, _pv, _pw = _ev
+                    if os.environ.get("DBG_EV"):
+                        _dT = np.abs(np.asarray(_T, float) - T_wc).max()
+                        _na = sum(1 for fd in sparse.get_features().values()
+                                  if fd["anchor_clone_id"] == _old)
+                        print(f"  DBG_EV k={k} old={_old} new={_new} |T_ev-T_wc|max={_dT:.2e} "
+                              f"live={vio.clone_ids()[0]}..{vio.clone_ids()[-1]} "
+                              f"n_on_old={_na}", file=sys.stderr)
+                    _cov = (np.asarray(_pv, float).tolist(), np.asarray(_pw, float).tolist())
+                    if args.reanchor_cov_scale != 1.0:
+                        _cov = ((np.asarray(_cov[0]) * args.reanchor_cov_scale).tolist(),
+                                (np.asarray(_cov[1]) * args.reanchor_cov_scale).tolist())
+                    if args.reanchor_nocov:
+                        _cov = None
+                    _dbg_reanchor[0 if _cov is None else 1] += 1
+                    n_reanchored[0] += sparse.reanchor_clone(
+                        int(_old), np.asarray(_T, float).tolist(), int(_new), _cov)
+                    clone_rel_prev.pop(int(_old), None)
+            elif args.reanchor:
                 # The filter's clone list and the harness's pose book can disagree
                 # (the filter may hold clones the harness never registered), so only
                 # use ids present in BOTH -- we need the pose to re-anchor onto.
@@ -782,8 +920,13 @@ def main():
                      if fd["anchor_clone_id"] is not None]
             _d = sorted(set(int(a) for a in _anch))
             if _d:
+                # Orphans: landmarks whose anchor clone the pose source no longer holds.
+                # They get NO relative covariance this frame and fall back to the
+                # absolute pair -- the "bigger error bars flatter NEES" trap.
+                _livec = {int(c) for c in vio.clone_ids()} if args.clone_relative else set()
+                _orph = sum(1 for a in _anch if int(a) not in _livec)
                 anchor_census.append((k, vio.n_clones() if args.clone_relative else 0,
-                                      len(_sf), len(_d), k - min(_d)))
+                                      len(_sf), len(_d), k - min(_d), _orph))
 
         if args.clone_relative and n_frames % 40 == 0:
             sf = sparse.get_features()
@@ -983,6 +1126,9 @@ def main():
         print(f"    oldest anchor age: median {np.median(_c[:, 4]):.0f}  "
               f"p90 {np.percentile(_c[:, 4], 90):.0f}  max {_c[:, 4].max():.0f} frames")
         print(f"    live features    : median {np.median(_c[:, 2]):.0f}")
+        print(f"    orphan anchors   : median {np.median(_c[:, 5]):.0f}  "
+              f"p90 {np.percentile(_c[:, 5], 90):.0f}  max {_c[:, 5].max():.0f}  "
+              f"(landmarks whose anchor clone is not live)")
         print(f"    clones ALLOCATED : {_c[:, 1].max():.0f}")
 
     print(f"\n{'=' * 72}")

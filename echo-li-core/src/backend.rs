@@ -142,6 +142,71 @@ pub trait CameraPoseCovariance {
     /// camera-fixed frame. `None` means unavailable, which a consumer must treat as
     /// missing information, NOT as certainty.
     fn camera_pose_covariances(&self) -> Option<(Matrix3<f64>, Matrix3<f64>)>;
+
+    /// Gauge-cancelled anchor->current relative-pose covariance `(P_vv, P_ww)` between
+    /// the clone `clone_id` and the current camera pose. This, not the absolute pair,
+    /// is what the Sparse3D depth NEES was calibrated on: the cross term between the two
+    /// clones cancels the gauge they share, which neither marginal can. `t_wc_clone` is
+    /// the anchor's pose as the consumer stored it; an MSCKF backend, whose anchor IS a
+    /// live clone, may ignore it. `None` when the clone is not live.
+    fn relative_pose_covariances(
+        &self,
+        _clone_id: u64,
+        _t_wc_clone: &SE3,
+    ) -> Option<(Matrix3<f64>, Matrix3<f64>)> {
+        None
+    }
+
+    /// The FULL 6x6 anchor->current relative covariance, tangent order
+    /// `[rot(0:3), trans(3:6)]`, for consumers that need the rotation-translation
+    /// cross block. `None` when unsupported or the clone is not live.
+    fn relative_pose_covariance_full(&self, _clone_id: u64) -> Option<nalgebra::Matrix6<f64>> {
+        None
+    }
+
+    /// Ids of the clones a consumer may anchor on right now, oldest first.
+    fn live_clone_ids(&self) -> Vec<u64> {
+        Vec::new()
+    }
+
+    /// The clone that IS the current camera pose, if the backend manages its own
+    /// window (an MSCKF does; EqVIO's clones are the caller's).
+    fn current_clone_id(&self) -> Option<u64> {
+        None
+    }
+
+    /// The clone the backend evicted during its last frame step, with the evidence a
+    /// depth filter needs to move landmarks anchored on it: captured BEFORE the
+    /// marginalization, while the old->new relative pose was still computable.
+    fn last_clone_eviction(&self) -> Option<&CloneEviction> {
+        None
+    }
+}
+
+/// Evidence of a clone eviction, for re-anchoring landmarks before their anchor dies.
+#[derive(Debug, Clone)]
+pub struct CloneEviction {
+    pub old_clone_id: u64,
+    pub new_clone_id: u64,
+    /// The new anchor's camera pose (world <- camera).
+    pub t_wc_new: SE3,
+    /// Old->new relative-pose covariance `(P_vv, P_ww)`, gauge-cancelled.
+    pub p_vv: Matrix3<f64>,
+    pub p_ww: Matrix3<f64>,
+}
+
+/// Nearest positive-semidefinite matrix: clip negative eigenvalues of the symmetrized
+/// input to zero. The per-frame INCREMENT of a relative-pose covariance,
+/// `Cov_rel(k -> t) - Cov_rel(k -> t-1)`, can be momentarily non-PSD after a measurement
+/// update; the accumulating range injection must only ever add variance.
+pub fn psd_clip(m: &Matrix3<f64>) -> Matrix3<f64> {
+    let sym = (m + m.transpose()) * 0.5;
+    let eig = nalgebra::SymmetricEigen::new(sym);
+    let mut d = Matrix3::zeros();
+    for i in 0..3 {
+        d[(i, i)] = eig.eigenvalues[i].max(0.0);
+    }
+    eig.eigenvectors * d * eig.eigenvectors.transpose()
 }
 
 /// What a full wrapper needs behind a trait object.
@@ -229,6 +294,94 @@ impl ZuptPolicy {
 
     pub fn fired(&self) -> u64 {
         self.fired
+    }
+}
+
+/// Feeds a Sparse3D depth filter from a backend's pose covariance the way the depth
+/// NEES harness did when it calibrated the filter: clone-RELATIVE, with re-anchoring.
+///
+/// Owned by the consumer (node, CLI) and called once per frame. If the backend manages
+/// its own clone window (`current_clone_id()` is `Some`), each landmark is driven by
+/// the gauge-cancelled anchor->current covariance of its own anchor clone, the
+/// per-frame INCREMENT of that covariance is PSD-clipped for the accumulating range
+/// injection, and landmarks whose anchor the backend just evicted are moved onto the
+/// newest clone with the covariance captured before the eviction. If the backend does
+/// not manage clones (EqVIO), this is exactly the legacy absolute `update`. Shared
+/// because the first version of this logic lived in a Python harness and nowhere else.
+#[derive(Default)]
+pub struct CloneRelFeed {
+    prev: HashMap<u64, (Matrix3<f64>, Matrix3<f64>)>,
+}
+
+/// What one [`CloneRelFeed::feed`] did, so a wrapper can log it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FeedReport {
+    /// `true` when the clone-relative path ran; `false` for the legacy absolute path.
+    pub clone_relative: bool,
+    /// Landmarks moved to a new anchor this frame.
+    pub reanchored: usize,
+    /// Clones for which a relative covariance was supplied.
+    pub n_rel: usize,
+    /// Whether an absolute pair was available at all.
+    pub had_absolute: bool,
+}
+
+impl CloneRelFeed {
+    pub fn feed(
+        &mut self,
+        cov: Option<&dyn CameraPoseCovariance>,
+        sparse: &mut crate::depth::sparse_3d::Sparse3DFilter,
+        measurement: &VisionMeasurement,
+        t_wc: &nalgebra::Matrix4<f64>,
+    ) -> FeedReport {
+        let mut report = FeedReport::default();
+        let absolute = cov.and_then(|c| c.camera_pose_covariances());
+        report.had_absolute = absolute.is_some();
+        let (p_vv, p_ww) = match absolute.as_ref() {
+            Some((v, w)) => (Some(v), Some(w)),
+            None => (None, None),
+        };
+        let Some(c) = cov.filter(|c| c.current_clone_id().is_some()) else {
+            sparse.update(measurement, t_wc, p_vv, p_ww);
+            return report;
+        };
+        report.clone_relative = true;
+
+        // Re-anchor BEFORE the update, with the evidence captured before the eviction.
+        if let Some(ev) = c.last_clone_eviction() {
+            report.reanchored = sparse.reanchor_clone(
+                ev.old_clone_id,
+                &ev.t_wc_new.as_matrix(),
+                Some(ev.new_clone_id),
+                Some((&ev.p_vv, &ev.p_ww)),
+            );
+            self.prev.remove(&ev.old_clone_id);
+        }
+
+        let live = c.live_clone_ids();
+        self.prev.retain(|id, _| live.contains(id));
+        let mut rel: crate::depth::sparse_3d::CloneRelCov = HashMap::new();
+        for id in live {
+            let Some((rv, rw)) = c.relative_pose_covariances(id, &SE3::identity()) else {
+                continue;
+            };
+            let (dv, dw) = match self.prev.get(&id) {
+                None => (Matrix3::zeros(), Matrix3::zeros()),
+                Some((pv, pw)) => (psd_clip(&(rv - pv)), psd_clip(&(rw - pw))),
+            };
+            self.prev.insert(id, (rv, rw));
+            rel.insert(id, (rv, rw, dv, dw));
+        }
+        report.n_rel = rel.len();
+        sparse.update_with_clones(
+            measurement,
+            t_wc,
+            p_vv,
+            p_ww,
+            c.current_clone_id(),
+            Some(&rel),
+        );
+        report
     }
 }
 
@@ -434,6 +587,17 @@ impl CameraPoseCovariance for EqvioBackend {
     fn camera_pose_covariances(&self) -> Option<(Matrix3<f64>, Matrix3<f64>)> {
         self.filter.sparse_camera_pose_covariances()
     }
+    fn relative_pose_covariances(
+        &self,
+        clone_id: u64,
+        t_wc_clone: &SE3,
+    ) -> Option<(Matrix3<f64>, Matrix3<f64>)> {
+        self.filter
+            .sparse_relative_pose_covariances(clone_id, t_wc_clone)
+    }
+    fn live_clone_ids(&self) -> Vec<u64> {
+        self.filter.clone_ids()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -588,6 +752,8 @@ pub struct MsceqfBackend {
     /// last IMU sample left behind. See [`Self::propagate_to`].
     clone_at_frame_stamp: bool,
     zupt: Option<ZuptPolicy>,
+    /// See [`CameraPoseCovariance::last_clone_eviction`]. Reset every frame step.
+    last_eviction: Option<CloneEviction>,
 }
 
 impl MsceqfBackend {
@@ -608,7 +774,7 @@ impl MsceqfBackend {
         start: &crate::initialization::FilterStart,
     ) -> Self {
         use crate::mathematical::msceqf_filter::{MSCEqFFilter, ProcessNoise, SystemOrigin};
-        use nalgebra::{SMatrix, Vector6};
+        use nalgebra::SMatrix;
 
         let sensor = &start.state.sensor;
         // The origin bias is whatever StationaryInit seeded -- the gyro bias measured
@@ -618,12 +784,13 @@ impl MsceqfBackend {
         // IMU-only drift -> 37 m on that rig, whose gyro bias is 2.5 deg/s), so the
         // ROS 2 node -- the one consumer of this constructor -- was the only caller
         // running MSCEqF without it.
+        // `VIOSensorState.velocity` is the SE(3) BODY velocity; `SE23` carries WORLD
+        // velocity. A first version passed it through unrotated, which was invisible at
+        // the rest starts every wrapper uses (v = 0) and wrong for any seeded moving
+        // start, e.g. the depth-NEES harness's GT seed.
+        let v_world = sensor.pose.rotation.act(&sensor.velocity);
         let origin = SystemOrigin::new(
-            echo_lie::SE23::new(
-                sensor.pose.rotation,
-                sensor.pose.translation,
-                sensor.velocity,
-            ),
+            echo_lie::SE23::new(sensor.pose.rotation, sensor.pose.translation, v_world),
             sensor.input_bias,
             sensor.camera_offset.clone(),
             Vector3::new(cfg.gravity[0], cfg.gravity[1], cfg.gravity[2]),
@@ -721,6 +888,7 @@ impl MsceqfBackend {
             last_imu: None,
             clone_at_frame_stamp: false,
             zupt: None,
+            last_eviction: None,
         }
     }
 
@@ -748,6 +916,14 @@ impl MsceqfBackend {
     /// `(tracks offered, tracks accepted)` by the structureless update so far.
     pub fn msc_update_counts(&self) -> (u64, u64) {
         (self.msc_offered, self.msc_accepted)
+    }
+
+    /// Feature ids the backend currently holds: buffered structureless tracks plus
+    /// in-state landmarks, ascending. What a front-end budget should prefer to keep,
+    /// the way EqVIO's `landmarks_world()` keys are -- `landmarks_world()` here lists
+    /// only the in-state ones, which is empty in structureless mode.
+    pub fn tracked_ids(&self) -> Vec<u64> {
+        self.buf.keys().chain(self.slam.iter()).copied().collect()
     }
 
     /// Cumulative per-reason drop counts from the structureless update:
@@ -907,6 +1083,7 @@ impl VioBackend for MsceqfBackend {
     ) {
         let k = self.k;
         self.k += 1;
+        self.last_eviction = None;
 
         // (0) Bring the state to THIS FRAME'S stamp before cloning. Without it the
         // clone holds wherever the last IMU sample left the state, which on a
@@ -1135,6 +1312,21 @@ impl VioBackend for MsceqfBackend {
         // clones that went.
         while self.clone_ids.len() > self.settings.num_clones {
             let old = self.clone_ids[0];
+            // Evidence for re-anchoring, taken while the old->new relative covariance
+            // still exists: a depth filter anchored on this clone has to be moved onto
+            // the newest one, and it can only do that honestly with this covariance.
+            let newest_pos = self.clone_ids.len() - 1;
+            if newest_pos > 0 {
+                if let Some((p_vv, p_ww)) = self.filter.relative_pose_covariance(0, newest_pos) {
+                    self.last_eviction = Some(CloneEviction {
+                        old_clone_id: old,
+                        new_clone_id: self.clone_ids[newest_pos],
+                        t_wc_new: self.filter.clone_world_pose(newest_pos),
+                        p_vv,
+                        p_ww,
+                    });
+                }
+            }
             self.filter.marginalize_clone(0);
             self.clone_ids.remove(0);
             self.buf.retain(|_, obs| {
@@ -1201,7 +1393,57 @@ impl VioBackend for MsceqfBackend {
 /// group algebra over its clone window, and projecting that onto a single camera pose
 /// is a derivation this backend does not do. Reporting `None` is the honest answer
 /// until it does.
+impl CameraPoseCovariance for MsceqfBackend {
+    /// The newest clone's own 6x6 marginal. In an MSCKF the current camera pose IS a
+    /// clone -- `phi()`'s camera pose is invariant to the navigation direction, so there
+    /// is no core-state Jacobian route -- and this is exactly what the Sparse3D depth
+    /// NEES harness fed in place of EqVIO's absolute pair when it calibrated 10/30
+    /// Kite trajectories. Chart: the clone's left (global) SE(3) tangent,
+    /// `[rot(0:3), trans(3:6)]`, returned as `(P_vv, P_ww)`.
+    fn camera_pose_covariances(&self) -> Option<(Matrix3<f64>, Matrix3<f64>)> {
+        let pos = self.clone_ids.len().checked_sub(1)?;
+        let ci = self.filter.clone_idx(pos);
+        if ci + 6 > self.filter.dim() {
+            return None;
+        }
+        let blk = |r0: usize| {
+            self.filter
+                .cov
+                .fixed_view::<3, 3>(ci + r0, ci + r0)
+                .into_owned()
+        };
+        let (p_ww, p_vv) = (blk(0), blk(3));
+        (p_vv.iter().chain(p_ww.iter()).all(|v| v.is_finite())).then_some((p_vv, p_ww))
+    }
+    fn relative_pose_covariances(
+        &self,
+        clone_id: u64,
+        _t_wc_clone: &SE3,
+    ) -> Option<(Matrix3<f64>, Matrix3<f64>)> {
+        let apos = self.clone_ids.iter().position(|&c| c == clone_id)?;
+        let cpos = self.clone_ids.len().checked_sub(1)?;
+        self.filter.relative_pose_covariance(apos, cpos)
+    }
+    fn relative_pose_covariance_full(&self, clone_id: u64) -> Option<nalgebra::Matrix6<f64>> {
+        let apos = self.clone_ids.iter().position(|&c| c == clone_id)?;
+        let cpos = self.clone_ids.len().checked_sub(1)?;
+        self.filter.relative_pose_covariance_full(apos, cpos)
+    }
+    fn live_clone_ids(&self) -> Vec<u64> {
+        self.clone_ids.clone()
+    }
+    fn current_clone_id(&self) -> Option<u64> {
+        self.clone_ids.last().copied()
+    }
+    fn last_clone_eviction(&self) -> Option<&CloneEviction> {
+        self.last_eviction.as_ref()
+    }
+}
+
 impl VioBackendFull for MsceqfBackend {
+    fn pose_covariance(&self) -> Option<&dyn CameraPoseCovariance> {
+        Some(self)
+    }
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -1402,6 +1644,163 @@ mod msceqf_backend_tests {
         );
     }
 
+    /// The absolute camera-pose covariance IS the newest clone's block, the relative
+    /// covariance of the current clone to itself is zero, and an older anchor's is not
+    /// -- the last being the non-vacuity control.
+    #[test]
+    fn msceqf_pose_covariances_are_the_clone_window_relations() {
+        let mut b = make_backend(MsceqfSettings {
+            num_clones: 6,
+            ..Default::default()
+        });
+        let ids: Vec<u64> = (0..20).collect();
+        for k in 0..12u64 {
+            let t = k as f64 * 0.05;
+            b.process_imu(imu(t));
+            b.process_vision(frame_at(t, &ids), &HashMap::new());
+        }
+        let (p_vv, p_ww) = b.camera_pose_covariances().expect("a clone exists");
+        let cur = b.current_clone_id().expect("current clone");
+        let ci = b.filter.clone_idx(b.clone_ids.len() - 1);
+        assert_eq!(p_ww, b.filter.cov.fixed_view::<3, 3>(ci, ci).into_owned());
+        assert_eq!(
+            p_vv,
+            b.filter.cov.fixed_view::<3, 3>(ci + 3, ci + 3).into_owned()
+        );
+        assert!(
+            p_vv.trace() > 0.0 && p_ww.trace() > 0.0,
+            "block must carry variance"
+        );
+        let (rv, rw) = b.relative_pose_covariances(cur, &SE3::identity()).unwrap();
+        assert!(
+            rv.amax() < 1e-12 && rw.amax() < 1e-12,
+            "self-relative must vanish"
+        );
+        let oldest = b.live_clone_ids()[0];
+        let (ov, ow) = b
+            .relative_pose_covariances(oldest, &SE3::identity())
+            .unwrap();
+        assert!(
+            ov.trace() > 1e-12 || ow.trace() > 1e-12,
+            "anchor-relative must not vanish"
+        );
+        assert_eq!(b.live_clone_ids().len(), 6);
+    }
+
+    /// The eviction evidence is captured BEFORE the clone dies: the old id is gone from
+    /// the live set afterwards, the new id is the current clone, and the covariance is
+    /// finite. Without it a depth filter re-anchors blind.
+    #[test]
+    fn msceqf_eviction_is_recorded_before_the_clone_dies() {
+        // A NON-TRIVIAL origin, or the world-pose check below is vacuous: with T0 = I
+        // and S0 = I the clone's group element and its world pose coincide, which is
+        // exactly the special case under which the bug this guards was invisible.
+        let mut b = make_backend_with_origin(
+            MsceqfSettings {
+                num_clones: 4,
+                ..Default::default()
+            },
+            Vector3::new(3.0, -2.0, 1.0),
+            SE3::new(
+                SO3::exp(&Vector3::new(0.0, 0.0, 0.3)),
+                Vector3::new(0.1, 0.0, 0.0),
+            ),
+        );
+        let ids: Vec<u64> = (0..20).collect();
+        for k in 0..3u64 {
+            let t = k as f64 * 0.05;
+            b.process_imu(imu(t));
+            b.process_vision(frame_at(t, &ids), &HashMap::new());
+            assert!(b.last_clone_eviction().is_none(), "window not full yet");
+        }
+        for k in 3..8u64 {
+            let t = k as f64 * 0.05;
+            b.process_imu(imu(t));
+            b.process_vision(frame_at(t, &ids), &HashMap::new());
+            if b.clone_ids.len() == 4 && k >= 4 {
+                let ev = b
+                    .last_clone_eviction()
+                    .expect("an eviction every full frame");
+                assert!(!b.live_clone_ids().contains(&ev.old_clone_id));
+                assert_eq!(Some(ev.new_clone_id), b.current_clone_id());
+                assert!(ev.p_vv.iter().chain(ev.p_ww.iter()).all(|v| v.is_finite()));
+                // The newest clone IS the current camera pose, in the WORLD frame. The
+                // first version handed out the clone's group element `E_k` instead,
+                // which drifted from the camera pose by the whole trajectory (28 m by
+                // frame 39 on Kite t0) and sent every re-anchored landmark somewhere
+                // else; nothing here caught it because nothing compared the two.
+                let cam = b.camera_pose().as_matrix();
+                let err = (ev.t_wc_new.as_matrix() - cam).abs().max();
+                assert!(
+                    err < 1e-9,
+                    "eviction pose is not the world camera pose: {err:.3e}"
+                );
+            }
+        }
+    }
+
+    /// `from_config` must hand MSCEqF a WORLD velocity: seed a BODY velocity under a
+    /// 90-degree yaw and read the body velocity back through the seam.
+    #[test]
+    fn from_config_keeps_the_body_velocity_through_a_rotated_seed() {
+        use crate::config::{MsceqfConfig, MsceqfInitialStd, MsceqfProcessNoise};
+        use crate::initialization::FilterStart;
+        use crate::mathematical::vio_state::{VIOSensorState, VIOState};
+        let yaw = SO3::exp(&Vector3::new(0.0, 0.0, std::f64::consts::FRAC_PI_2));
+        let sensor = VIOSensorState {
+            input_bias: Vector6::zeros(),
+            pose: SE3::new(yaw, Vector3::zeros()),
+            velocity: Vector3::new(1.0, 0.0, 0.0), // BODY
+            camera_offset: SE3::identity(),
+        };
+        let start = FilterStart {
+            state: VIOState::new(sensor, vec![]),
+            replay: Vec::new(),
+            stationary: false,
+            roll_deg: 0.0,
+            pitch_deg: 0.0,
+            gyro_bias: Vector3::zeros(),
+        };
+        let cfg = MsceqfConfig {
+            enabled: true,
+            num_clones: 7,
+            pixel_std: 1.0,
+            chi2_mult: 1.0,
+            slam_chi2_mult: 0.0,
+            max_track: 100,
+            slam_min_len: 0,
+            max_slam: 0,
+            curvature: true,
+            update_span: 0,
+            max_promote_range: 0.0,
+            direct_product_bias: false,
+            clone_at_frame_stamp: false,
+            civera_birth_depth: 0.0,
+            civera_birth_rel_std: 1.0,
+            gravity: [0.0, 0.0, -9.81],
+            initial_std: MsceqfInitialStd {
+                attitude: 1e-2,
+                velocity: 1e-1,
+                position: 1e-4,
+                bias: 1e-2,
+                extrinsics: 1e-4,
+            },
+            process_noise: MsceqfProcessNoise {
+                accel_density: 1e-3,
+                gyro_density: 1e-4,
+                accel_random_walk: 1e-5,
+                gyro_random_walk: 1e-6,
+                transition_order: 0,
+            },
+        };
+        let b = MsceqfBackend::from_config(&cfg, test_cam(), 400.0, &start);
+        let v_body = b.nav_estimate().velocity;
+        assert!(
+            (v_body - Vector3::new(1.0, 0.0, 0.0)).norm() < 1e-9,
+            "body velocity must round-trip, got {v_body:?}"
+        );
+    }
+
     /// The flag must actually move the clone, by the amount the lag implies. A flag
     /// that silently does nothing looks exactly like a mechanism that does not matter.
     #[test]
@@ -1437,15 +1836,131 @@ mod msceqf_backend_tests {
         );
     }
 
+    /// The shared feed must do under MSCEqF what the depth NEES harness did when it
+    /// calibrated: clone-relative covariances for every live clone, and landmarks moved
+    /// off an evicted anchor before it dies. Under EqVIO it must be the legacy absolute
+    /// update, untouched. Each assertion is one thing the feed can silently stop doing.
+    #[test]
+    fn clone_rel_feed_is_clone_relative_under_msceqf_and_legacy_under_eqvio() {
+        use crate::depth::sparse_3d::{Sparse3DChart, Sparse3DFilter};
+        use crate::depth::sparse_gb::SparseVogSettings;
+        let k = Matrix3::new(400.0, 0.0, 320.0, 0.0, 400.0, 240.0, 0.0, 0.0, 1.0);
+        let mut sparse = Sparse3DFilter::new(
+            k,
+            Sparse3DChart::BearingInvDepthAdditive,
+            SparseVogSettings {
+                min_track_length: 1,
+                birth_min_flow_px: 0.0,
+                ..Default::default()
+            },
+        )
+        .with_camera(test_cam());
+        let mut b = make_backend(MsceqfSettings {
+            num_clones: 4,
+            ..Default::default()
+        });
+        let mut feed = CloneRelFeed::default();
+        let ids: Vec<u64> = (0..20).collect();
+        let (mut saw_rel, mut reanchored) = (false, 0usize);
+        for k in 0..10u64 {
+            let t = k as f64 * 0.05;
+            b.process_imu(imu(t));
+            let frame = frame_at(t, &ids);
+            b.process_vision(frame.clone(), &HashMap::new());
+            let t_wc = b.nav_estimate().pose.as_matrix();
+            let r = feed.feed(b.pose_covariance(), &mut sparse, &frame, &t_wc);
+            assert!(
+                r.clone_relative,
+                "MSCEqF manages clones: clone-relative path"
+            );
+            assert!(r.had_absolute, "newest clone marginal is always available");
+            assert_eq!(
+                r.n_rel,
+                b.live_clone_ids().len(),
+                "one relative covariance per live clone"
+            );
+            saw_rel |= r.n_rel > 1;
+            reanchored += r.reanchored;
+            // No landmark may point at a clone the backend no longer holds.
+            let live = b.live_clone_ids();
+            for f in sparse.features_iter() {
+                if let Some(a) = f.anchor_clone_id {
+                    assert!(
+                        live.contains(&a),
+                        "feature {} anchored on dead clone {a}",
+                        f.feat_id
+                    );
+                }
+            }
+        }
+        assert!(
+            saw_rel,
+            "relative covariances for more than the current clone"
+        );
+        assert!(
+            sparse.feature_count() > 0,
+            "the depth filter actually holds features"
+        );
+        assert!(
+            reanchored > 0,
+            "window overflow (10 frames, 4 clones) must re-anchor"
+        );
+
+        // EqVIO: no clone management -> the legacy absolute update, no re-anchoring.
+        let settings = crate::VIOFilterSettings::default();
+        let state = crate::mathematical::vio_state::VIOState::new(
+            crate::mathematical::vio_state::VIOSensorState {
+                input_bias: Vector6::zeros(),
+                pose: SE3::identity(),
+                velocity: Vector3::new(VX, 0.0, 0.0),
+                camera_offset: SE3::identity(),
+            },
+            vec![],
+        );
+        let mut e = EqvioBackend::new(crate::VIOFilter::new(settings, state), test_cam());
+        let mut sparse_e = Sparse3DFilter::new(
+            k,
+            Sparse3DChart::BearingInvDepthAdditive,
+            SparseVogSettings {
+                min_track_length: 1,
+                birth_min_flow_px: 0.0,
+                ..Default::default()
+            },
+        )
+        .with_camera(test_cam());
+        let mut feed_e = CloneRelFeed::default();
+        for k in 0..6u64 {
+            let t = k as f64 * 0.05;
+            e.process_imu(imu(t));
+            let frame = frame_at(t, &ids);
+            e.process_vision(frame.clone(), &HashMap::new());
+            let t_wc = e.nav_estimate().pose.as_matrix();
+            let r = feed_e.feed(e.pose_covariance(), &mut sparse_e, &frame, &t_wc);
+            assert!(
+                !r.clone_relative,
+                "EqVIO does not manage clones: legacy path"
+            );
+            assert_eq!(r.n_rel, 0);
+            assert_eq!(r.reanchored, 0);
+        }
+        assert!(sparse_e
+            .features_iter()
+            .all(|f| f.anchor_clone_id.is_none()));
+    }
+
     fn make_backend(settings: MsceqfSettings) -> MsceqfBackend {
+        make_backend_with_origin(settings, Vector3::zeros(), SE3::identity())
+    }
+
+    fn make_backend_with_origin(
+        settings: MsceqfSettings,
+        p0: Vector3<f64>,
+        s0: SE3,
+    ) -> MsceqfBackend {
         let origin = SystemOrigin::new(
-            SE23::new(
-                SO3::identity(),
-                Vector3::zeros(),
-                Vector3::new(VX, 0.0, 0.0),
-            ),
+            SE23::new(SO3::identity(), p0, Vector3::new(VX, 0.0, 0.0)),
             Vector6::zeros(),
-            SE3::identity(),
+            s0,
             Vector3::new(0.0, 0.0, -9.81),
         );
         let d_init = SMatrix::<f64, 9, 9>::identity() * 1e-4;

@@ -1309,6 +1309,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             patch_depth_cov_vis_max
         );
     }
+    let mut sparse_feed = echo_li_core::backend::CloneRelFeed::default();
     let mut sparse_filter = build_sparse_filter(
         &args,
         vio_config.as_ref(),
@@ -1580,7 +1581,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let state_hash = trace_determinism.then(|| f.state_fingerprint());
                     let t_wc = f.camera_pose().as_matrix();
                     // Through the seam: a backend that reports no camera-pose covariance
-                    // (MSCEqF today) hands the depth filter None rather than a wrong number.
+                    // hands the depth filter None rather than a wrong number. Both shipped
+                    // backends report one today; the `None` arm is the contract, not a case.
                     let sparse_pose_cov = f
                         .pose_covariance()
                         .and_then(|p| p.camera_pose_covariances());
@@ -1604,7 +1606,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             } else {
                                 &sparse_measurement
                             };
-                        sparse.update(sparse_meas, &t_wc, p_vv, p_ww);
+                        // Clone-relative under a clone-managing backend (MSCEqF), the
+                        // legacy absolute pair under EqVIO -- one shared feed with the
+                        // ROS 2 node. `p_vv`/`p_ww` above only count availability now.
+                        let _ = (p_vv, p_ww);
+                        sparse_feed.feed(f.pose_covariance(), sparse, sparse_meas, &t_wc);
                         if let Some(mapper) = &mut patch_depth_mapper {
                             if !patch_gray_data.is_empty() {
                                 let frame = FrameProducts {
