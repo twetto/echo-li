@@ -21,6 +21,15 @@ Pixels come from frames320.bin, built with IMREAD_REDUCED_GRAYSCALE_4 "the same
 decode as the live rig", so the front-end sees what the rig saw. Intrinsics are the
 authoritative calib_final values scaled by 0.25; distortion is normalised and does
 not scale.
+
+Any rig bag works through `--bag-cache DIR` (frames320.bin + frames320_index.npy from
+the same decode, sensors.npz from the extractor with HEADER image stamps). With
+`--sparse3d` the frame's tracks also go through the shipped `VIOFilter.sparse_feed`
+seam (CloneRelFeed: clone-relative covariances, re-anchoring) into a Sparse3D filter
+built from the config's `SparseVog` section; its CONVERGED landmarks are drawn as
+hollow circles next to the in-state dots. The estimate is SE(3)-aligned (Umeyama, no
+scale) to the recorded odometry over matched stamps, and the right panel colours it by
+the residual against that control -- which is an on-rig EqVIO run, not ground truth.
 """
 import argparse
 import os
@@ -31,10 +40,13 @@ from pathlib import Path
 import cv2
 import numpy as np
 import yaml
+from scipy.spatial.transform import Rotation as Rot
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import echo_li  # noqa: E402
+from euroc_msceqf_native_ate import align_umeyama  # noqa: E402
+from midair_e2e_depth_nees import SPARSE_KEYS  # noqa: E402
 
 BIKE = "/mnt/18TB/chen_fu_yeh/bikevid"
 W, H = 320, 200
@@ -160,6 +172,16 @@ def main():
                          "(semi-direct, direct-product, anything) can be its mechanism.")
     ap.add_argument("--zupt-sigma", type=float, default=1e-2,
                     help="assumed stddev of the zero-velocity measurement, m/s")
+    ap.add_argument("--bag-cache", default=BIKE,
+                    help="directory holding frames320.bin + frames320_index.npy for the "
+                         "bag named by --sensors (default: the bikevid directory)")
+    ap.add_argument("--sparse3d", action="store_true",
+                    help="run Sparse3D on every frame's tracks through VIOFilter.sparse_feed "
+                         "(the shipped CloneRelFeed path) and draw its converged landmarks "
+                         "as hollow circles")
+    ap.add_argument("--sparse-config", default="",
+                    help="YAML whose SparseVog section configures Sparse3D (default: the "
+                         "run config)")
     args = ap.parse_args()
 
     global TIMESHIFT
@@ -168,10 +190,17 @@ def main():
         print(f'camera-IMU timeshift overridden -> {TIMESHIFT*1e3:.2f} ms')
     z = np.load(args.sensors)
     imu, img_t, odom = z["imu"], z["img_t"], z["odom"]
-    idx = np.load(f"{BIKE}/frames320_index.npy")
-    cache = np.memmap(f"{BIKE}/frames320.bin", dtype=np.uint8, mode="r").reshape(-1, H, W)
-    n_all = min(len(idx), len(cache))
-    n = n_all if args.nframes <= 0 else min(args.nframes, n_all - args.start)
+    idx = np.load(f"{args.bag_cache}/frames320_index.npy")
+    cache = np.memmap(f"{args.bag_cache}/frames320.bin", dtype=np.uint8, mode="r").reshape(-1, H, W)
+    n_all = min(len(idx), len(cache), len(img_t))
+    # Some bags start the camera before the IMU; the filter cannot see a frame that
+    # precedes its 100-sample init window, so start at the first one that follows it.
+    if img_t[args.start] + TIMESHIFT < imu[100, 0]:
+        k0 = int(np.searchsorted(img_t + TIMESHIFT, imu[100, 0]))
+        print(f"first {k0} frames precede the IMU init window (camera starts "
+              f"{imu[0, 0] - img_t[0]:.2f} s before the IMU): starting at frame {k0}")
+        args.start = k0
+    n = n_all - args.start if args.nframes <= 0 else min(args.nframes, n_all - args.start)
     print(f"frames {n} of {n_all}   imu {imu.shape}   recorded odom {odom.shape}")
 
     cfg_path = args.config
@@ -255,6 +284,10 @@ def main():
                              "accelRandomWalk": acc_rw, "gyroRandomWalk": gyr_rw,
                              "transitionOrder": 0},
         }
+    elif "MSCEqF" in full_cfg:
+        # --backend eqvio must win over a config that carries an enabled MSCEqF section,
+        # otherwise the "EqVIO arm" silently runs MSCEqF (it did, 2026-10-15).
+        full_cfg["MSCEqF"] = dict(full_cfg["MSCEqF"], enabled=False)
     if args.zupt:
         full_cfg["ZUPT"] = {"enabled": True, "window": 25, "gyroStdThreshold": 0.05,
                             "accStdThreshold": 0.15, "sigmaV": args.zupt_sigma}
@@ -265,6 +298,25 @@ def main():
     vio.set_camera_extrinsics(np.ascontiguousarray(T_BS))
     print(f"backend={vio.backend_kind}  zupt={bool(args.zupt)}  config={run_cfg}")
 
+    sparse = None
+    if args.sparse3d:
+        with open(args.sparse_config or cfg_path) as fh:
+            scfg = yaml.safe_load(fh).get("SparseVog") or {}
+        settings = {k: scfg[k] for k in SPARSE_KEYS if k in scfg}
+        settings["parametrization"] = "bearing_invdepth_additive3d"
+        # sigma_s(E) from the IMU excitation over the run, the same operational rule
+        # the Kite harness applies (`--scale-sigma-auto`): E = std(w_z) * std(a_y) on
+        # the raw IMU, body axes as recorded.
+        _seg = imu[(imu[:, 0] >= img_t[args.start]) & (imu[:, 0] <= img_t[args.start + n - 1])]
+        _E = float(np.std(_seg[:, 3]) * np.std(_seg[:, 5])) if len(_seg) > 10 else 0.0
+        settings["scale_sigma"] = max(0.02, 0.0072 * _E ** (-0.710)) if _E > 0 else 0.02
+        sparse = echo_li.Sparse3DFilter.bearing_invdepth_additive3d(cam, **settings)
+        print(f"Sparse3D via VIOFilter.sparse_feed: direct={settings.get('pose_range_direct', False)} "
+              f"consider={settings.get('consider_relpose', False)} "
+              f"bias_walk_var={settings.get('bias_walk_var', 0.0)} "
+              f"E={_E:.4f} -> scale_sigma={settings['scale_sigma']:.4f}  "
+              f"min_track_length={settings.get('min_track_length', '?')}")
+
     def push_imu(row):
         vio.process_imu(float(row[0]), row[1:4].tolist(), row[4:7].tolist())
 
@@ -274,6 +326,7 @@ def main():
         push_imu(imu[j])
 
     traj, stamps, feats_per_frame, lm_rng = [], [], {}, {}
+    sp_rng, sp_stats = {}, [0, 0, 0]       # per-frame Sparse3D landmarks; reanchored, n_rel, clone-relative frames
     diag = []
     grav_audit = []
     bias_trace = []
@@ -291,6 +344,24 @@ def main():
         uvs = {int(f["id"]): [float(f["x"]), float(f["y"])] for f in fs}
         if not args.no_vision and (k - args.start) % args.vision_stride == 0:
             vio.process_vision(float(ts), uvs)
+            if sparse is not None:
+                # World camera pose for Sparse3D: body pose from the backend, camera
+                # offset from the SAME extrinsics the filter was given.
+                _pp, _qq = vio.get_pose()
+                _T = np.eye(4)
+                _T[:3, :3] = Rot.from_quat(np.asarray(_qq, float)).as_matrix()
+                _T[:3, 3] = np.asarray(_pp, float)
+                _rep = vio.sparse_feed(sparse, float(ts), uvs, (_T @ T_BS).tolist())
+                sp_stats[0] += int(_rep[1]); sp_stats[1] += int(_rep[2]); sp_stats[2] += int(_rep[0])
+                _d = {}
+                for _fid, _fd in sparse.get_features().items():
+                    _r = float(np.linalg.norm(np.asarray(_fd["position"], float)))
+                    if not (np.isfinite(_r) and _r > 1e-6):
+                        continue
+                    _rv = float(_fd["range_var_reported"])
+                    _conv = sparse.query_range(int(_fid))[0] > 0.0
+                    _d[int(_fid)] = (_r, float(np.sqrt(max(_rv, 0.0))), bool(_conv))
+                sp_rng[k] = _d
         if use_msceqf:
             p, _rm, _v = vio.nav_pose()
             p = np.asarray(p, float)
@@ -496,15 +567,75 @@ def main():
         np.savez(args.depth_trace,
                  **{str(k): np.array(v) for k, v in list(long_lived.items())[:400]})
 
+    if sparse is not None:
+        n_conv = [sum(1 for v in d.values() if v[2]) for d in sp_rng.values()]
+        n_all_sp = [len(d) for d in sp_rng.values()]
+        cr = np.array([v[0] for d in sp_rng.values() for v in d.values() if v[2]])
+        cs = np.array([v[1] for d in sp_rng.values() for v in d.values() if v[2]])
+        print(f"Sparse3D: clone-relative on {sp_stats[2]} frames, {sp_stats[1]} relative "
+              f"covariances, {sp_stats[0]} re-anchors; per frame live median "
+              f"{np.median(n_all_sp) if n_all_sp else 0:.0f}, converged median "
+              f"{np.median(n_conv) if n_conv else 0:.0f}")
+        if len(cr):
+            print("  converged landmark range (m) pct 5/25/50/75/95: "
+                  + "/".join(f"{v:.2f}" for v in np.percentile(cr, [5, 25, 50, 75, 95]))
+                  + f"   reported sigma_r median {np.median(cs):.2f} m, "
+                  f"sigma_r/r median {np.median(cs / cr):.3f}")
+
     # --- control: the trajectory the bag already carries -------------------
+    # Matched by stamp (the on-rig odometry carries the frame stamps), then SE(3)-aligned
+    # with no scale so the residual still shows a scale error. Both runs start at rest
+    # with gravity aligned, so the alignment is in principle a yaw + translation; the
+    # full SE(3) is used anyway and its tilt is reported as a wiring check.
     ctrl = None
+    aligned = None
+    err = None
     if len(odom):
-        m = (odom[:, 0] >= stamps[0]) & (odom[:, 0] <= stamps[-1])
-        if m.sum() > 10:
-            ctrl = odom[m, 1:4]
-            ctrl = ctrl - ctrl[0]
+        j = np.searchsorted(odom[:, 0], stamps)
+        j = np.clip(j, 1, len(odom) - 1)
+        j = np.where(np.abs(odom[j - 1, 0] - stamps) < np.abs(odom[j, 0] - stamps), j - 1, j)
+        ok = np.abs(odom[j, 0] - stamps) < 0.02
+        if ok.sum() > 10:
+            ctrl_all = odom[j, 1:4]
+            ctrl_all = ctrl_all - ctrl_all[ok][0]
+            aligned_ok = align_umeyama(traj[ok], ctrl_all[ok])
+            # Apply the same transform to every pose for drawing.
+            mu_e, mu_a = traj[ok].mean(0), aligned_ok.mean(0)
+            Hm = (traj[ok] - mu_e).T @ (aligned_ok - mu_a)
+            U, _, Vt = np.linalg.svd(Hm)
+            Ra = Vt.T @ np.diag([1, 1, np.sign(np.linalg.det(Vt.T @ U.T))]) @ U.T
+            aligned = (Ra @ (traj - mu_e).T).T + mu_a
+            ctrl = np.where(ok[:, None], ctrl_all, np.nan)
+            err = np.linalg.norm(aligned - ctrl, axis=1)
+            e = err[ok]
+            pl = lambda p: float(np.sum(np.linalg.norm(np.diff(p, axis=0), axis=1)))
+            sm = lambda p, w: np.array([p[max(0, i - w):i + w + 1].mean(0) for i in range(len(p))])
+            w = max(1, int(round(0.25 / np.median(np.diff(stamps)))))
+            tilt = np.degrees(np.arccos(np.clip(Ra[2, 2], -1, 1)))
+            # Scale as the Umeyama similarity would report it, from the same matches.
+            ec, gc = traj[ok] - mu_e, ctrl_all[ok] - ctrl_all[ok].mean(0)
+            s_sim = float(np.trace(np.diag(np.linalg.svd(ec.T @ gc)[1]) @ np.diag([1, 1, np.sign(np.linalg.det(Vt.T @ U.T))])) / np.sum(ec ** 2))
+            print(f"control (/echo_li/odometry): {ok.sum()} of {len(stamps)} frames matched "
+                  f"within 20 ms; SE(3) alignment tilt {tilt:.2f} deg")
+            print(f"  residual |est - ctrl| (m): rmse {np.sqrt(np.mean(e**2)):.2f}  median "
+                  f"{np.median(e):.2f}  p95 {np.percentile(e, 95):.2f}  max {e.max():.2f}")
+            print(f"  path length est/ctrl raw {pl(traj[ok]):.1f}/{pl(ctrl_all[ok]):.1f} m "
+                  f"= {pl(traj[ok]) / max(pl(ctrl_all[ok]), 1e-9):.3f}x; smoothed 0.5 s "
+                  f"{pl(sm(traj[ok], w)):.1f}/{pl(sm(ctrl_all[ok], w)):.1f} m = "
+                  f"{pl(sm(traj[ok], w)) / max(pl(sm(ctrl_all[ok], w)), 1e-9):.3f}x; "
+                  f"similarity scale est->ctrl {s_sim:.3f}")
+            print(f"  start->end displacement est {np.linalg.norm(traj[-1] - traj[0]):.2f} m, "
+                  f"ctrl {np.linalg.norm(ctrl_all[ok][-1] - ctrl_all[ok][0]):.2f} m")
+            for q0, q1 in ((0.0, 0.25), (0.25, 0.5), (0.5, 0.75), (0.75, 1.0)):
+                i0b, i1b = int(q0 * ok.sum()), max(int(q1 * ok.sum()), int(q0 * ok.sum()) + 1)
+                print(f"    quarter {q0:.2f}-{q1:.2f}: residual median {np.median(e[i0b:i1b]):.2f}  "
+                      f"p95 {np.percentile(e[i0b:i1b], 95):.2f} m")
+        else:
+            print("control: fewer than 10 odometry stamps match the frames -- not aligned")
     np.savez(args.out.replace(".mp4", "_traj.npz"), traj=traj, stamps=stamps,
-             ctrl=(ctrl if ctrl is not None else np.zeros((0, 3))))
+             ctrl=(ctrl if ctrl is not None else np.zeros((0, 3))),
+             aligned=(aligned if aligned is not None else np.zeros((0, 3))),
+             err=(err if err is not None else np.zeros(0)))
 
     if args.no_render:
         print("--no-render: stopping after the filter pass")
@@ -512,12 +643,17 @@ def main():
 
     # --- render ------------------------------------------------------------
     jetr = cv2.applyColorMap(np.arange(256, dtype=np.uint8)[:, None], cv2.COLORMAP_JET)[::-1, 0]
-    allr = np.array([r for d in lm_rng.values() for r in d.values()])
+    # One colour scale for both populations (in-state dots and Sparse3D circles).
+    allr = np.array([r for d in lm_rng.values() for r in d.values()]
+                    + [v[0] for d in sp_rng.values() for v in d.values() if v[2]])
     vlo, vhi = (np.percentile(allr, 5), np.percentile(allr, 95)) if len(allr) else (0.5, 10.0)
     print(f"range colour scale: {vlo:.2f}-{vhi:.2f} m over {len(allr)} landmark-frames")
 
     RW, SC = 420, 3
-    pts = traj[:, :2]
+    draw = aligned if aligned is not None else traj
+    pts = draw[:, :2]
+    if ctrl is not None:
+        pts = np.vstack([pts, ctrl[np.isfinite(ctrl[:, 0]), :2]])
     lo, hi = pts.min(axis=0), pts.max(axis=0)
     span = max((hi - lo).max(), 1e-3) * 1.15
     mid = (hi + lo) / 2
@@ -529,35 +665,57 @@ def main():
                          (W * SC + RW, H * SC))
     base = np.full((H * SC, RW, 3), 28, np.uint8)
     if ctrl is not None and len(ctrl) > 1:
-        cp = [P(c[:2]) for c in ctrl]
+        cp = [P(c[:2]) for c in ctrl if np.isfinite(c[0])]
         cv2.polylines(base, [np.array(cp, np.int32)], False, (105, 105, 105), 1, cv2.LINE_AA)
+    # Residual colour scale for the estimate: green at 0, red at the p95 residual.
+    e95 = float(np.nanpercentile(err, 95)) if err is not None and np.isfinite(err).any() else 1.0
+    def ecol(ev):
+        if ev is None or not np.isfinite(ev):
+            return (90, 200, 255)
+        t = float(np.clip(ev / max(e95, 1e-6), 0, 1))
+        return (0, int(255 * (1 - t)), int(255 * t))
     rendered = 0
     for k in range(args.start, args.start + n, args.stride):
         left = cv2.cvtColor(cv2.resize(np.asarray(cache[k]), (W * SC, H * SC),
                                        interpolation=cv2.INTER_NEAREST), cv2.COLOR_GRAY2BGR)
         rr = lm_rng.get(k, {})
-        nn = ns = 0
+        sp = sp_rng.get(k, {})
+        nn = ns = nc = 0
         for fid, (u, v) in feats_per_frame.get(k, {}).items():
             x, y = int(u * SC), int(v * SC)
+            if fid in sp and sp[fid][2]:
+                # Sparse3D converged landmark: hollow circle coloured by its range.
+                col = clut(jetr, (sp[fid][0] - vlo) / (vhi - vlo + 1e-9))
+                cv2.circle(left, (x, y), 9, col, 2, cv2.LINE_AA)
+                nc += 1
             if fid in rr:
                 col = clut(jetr, (rr[fid] - vlo) / (vhi - vlo + 1e-9))
                 cv2.circle(left, (x, y), 5, col, -1, cv2.LINE_AA)
                 cv2.circle(left, (x, y), 5, (0, 0, 0), 1, cv2.LINE_AA)
                 ns += 1
-            else:
-                cv2.circle(left, (x, y), 4, (150, 150, 150), 1, cv2.LINE_AA)
+            elif fid not in sp or not sp[fid][2]:
+                cv2.circle(left, (x, y), 2, (150, 150, 150), -1, cv2.LINE_AA)
                 nn += 1
         j = k - args.start
-        txt(left, f"t {stamps[j]-stamps[0]:6.1f}s   tracked(o) {nn}   in-state(*) {ns}", (8, 20))
+        line = f"t {stamps[j]-stamps[0]:6.1f}s   tracked(.) {nn}   in-state(*) {ns}"
+        if sparse is not None:
+            line += f"   sparse3d converged(o) {nc}"
+        txt(left, line, (8, 20))
         txt(left, f"range {vlo:.1f}-{vhi:.1f} m (jet_r: near=red)", (8, 38))
         right = base.copy()
-        cv2.polylines(right, [np.array([P(p[:2]) for p in traj[:j + 1]], np.int32)],
-                      False, (90, 200, 255), 2, cv2.LINE_AA)
-        cv2.circle(right, P(traj[j][:2]), 4, (0, 255, 255), -1, cv2.LINE_AA)
-        txt(right, "estimate (this run)", (10, 20), (90, 200, 255))
+        seg = draw[:j + 1]
+        for i in range(1, len(seg)):
+            cv2.line(right, P(seg[i - 1][:2]), P(seg[i][:2]),
+                     ecol(err[i] if err is not None else None), 2, cv2.LINE_AA)
+        cv2.circle(right, P(draw[j][:2]), 4, (0, 255, 255), -1, cv2.LINE_AA)
+        txt(right, f"estimate ({vio.backend_kind}), SE3-aligned, green->red = 0..{e95:.1f} m off control",
+            (10, 20), (90, 200, 255))
         if ctrl is not None:
-            txt(right, "bag /echo_li/odometry (control)", (10, 38), (160, 160, 160))
-        txt(right, f"path {np.sum(np.linalg.norm(np.diff(traj[:j+1],axis=0),axis=1)):.1f} m", (10, 56))
+            txt(right, "bag /echo_li/odometry (on-rig EqVIO control, not GT)", (10, 38), (160, 160, 160))
+        line = f"path {np.sum(np.linalg.norm(np.diff(traj[:j+1],axis=0),axis=1)):.1f} m"
+        if err is not None and np.isfinite(err[j]):
+            line += f"   |est-ctrl| {err[j]:.2f} m"
+        txt(right, line, (10, 56))
         vw.write(np.hstack([left, right]))
         rendered += 1
     vw.release()
