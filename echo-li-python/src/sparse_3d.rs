@@ -10,7 +10,7 @@ use nalgebra::{Matrix3, Matrix4, Vector2};
 
 #[pyclass(name = "Sparse3DFilter")]
 pub struct PySparse3DFilter {
-    inner: Sparse3DFilter,
+    pub(crate) inner: Sparse3DFilter,
 }
 
 #[pymethods]
@@ -380,6 +380,7 @@ fn parse_settings(kwargs: Option<&Bound<'_, pyo3::types::PyDict>>) -> PyResult<S
     set!("max_depth", max_depth);
     set!("birth_min_flow_px", birth_min_flow_px);
     set!("pose_range_direct", pose_range_direct);
+    set!("consider_relpose", consider_relpose);
     set!("scale_sigma", scale_sigma);
     set!("conv_range_sigma_frac", conv_range_sigma_frac);
     set!("civera_birth_depth", civera_birth_depth);

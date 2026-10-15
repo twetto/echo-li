@@ -653,8 +653,8 @@ impl VioNode {
             if vio_config.sparse_vog.as_ref().is_some_and(|s| s.enabled) {
                 log::info!(
                     "Sparse3D under MSCEqF runs CLONE-RELATIVE: each landmark is driven by \
-                     its anchor clone's gauge-cancelled relative covariance and re-anchored \
-                     on eviction (CloneRelFeed)"
+                     its anchor clone's gauge-cancelled relative covariance and moved off \
+                     the oldest clone every frame (CloneRelFeed, the depth NEES harness rule)"
                 );
             }
         } else {

@@ -61,7 +61,7 @@ SPARSE_KEYS = [
     "bias_walk_var", "uniform_z_max", "uniform_rho_max", "uniform_d_min", "uniform_d_max",
     "a_init", "b_init", "ab_min", "ab_max", "min_inlier_ratio",
     "mahalanobis_reset_chi2", "process_depth_var", "range_walk_var", "pose_range_scale",
-    "pose_range_coherent", "pose_range_direct", "scale_sigma", "conv_range_sigma_frac",
+    "pose_range_coherent", "pose_range_direct", "consider_relpose", "scale_sigma", "conv_range_sigma_frac",
     "min_parallax", "min_cos_sim", "min_depth", "max_depth", "birth_min_flow_px",
     "use_equivariant_output", "iekf_iterations", "rotation_unscented",
 ]
@@ -368,6 +368,24 @@ class BackendAdapter:
     def relative_pose_covariance_full(self, cid, _cur_id):
         return self.f.relative_pose_covariance_full(int(cid))
 
+    def sparse_feed(self, sparse, stamp, uvs, t_wc):
+        return self.f.sparse_feed(sparse, stamp, uvs, t_wc)
+
+    def set_sparse_reanchor_age(self, age):
+        self.f.set_sparse_reanchor_age(int(age))
+
+    def set_sparse_reanchor_transport_cov(self, on):
+        self.f.set_sparse_reanchor_transport_cov(bool(on))
+
+    def set_sparse_consider(self, on):
+        self.f.set_sparse_consider(bool(on))
+
+    def set_sparse_consider_m_mode(self, mode):
+        self.f.set_sparse_consider_m_mode(int(mode))
+
+    def set_sparse_consider_sigma_mode(self, mode):
+        self.f.set_sparse_consider_sigma_mode(int(mode))
+
     def last_clone_eviction(self):
         """(old_id, new_id, T_wc_new, P_vv, P_ww) captured BEFORE the backend dropped
         the clone this frame, or None. The CLI/ROS 2 feed re-anchors from this."""
@@ -456,6 +474,27 @@ def main():
                          "the CameraPoseCovariance seam (BackendAdapter). The scoring "
                          "path is identical either way, so the three are directly "
                          "comparable; msceqf vs backend is the match test for the seam.")
+    ap.add_argument("--feed", choices=("python", "rust"), default="python",
+                    help="with --pose-source backend: 'rust' replaces this harness's whole "
+                         "clone-relative block (re-anchor, relative covariances, PSD-clipped "
+                         "increments, the Sparse3D update) with VIOFilter.sparse_feed, i.e. "
+                         "the CloneRelFeed the CLI and ROS 2 node run. Byte-identity with "
+                         "--feed python is the proof that the shipped path IS the harness")
+    ap.add_argument("--consider", action="store_true",
+                    help="with --feed rust: consider (Schmidt) treatment of the anchor->current "
+                         "relative pose, filter_formulation §V-F (settings.consider_relpose + "
+                         "CloneRelFeed.consider). Replaces the measurement-side pose term, the "
+                         "range injection and the independence assumption at re-anchor")
+    ap.add_argument("--consider-m", choices=("vio", "identity", "zero"), default="vio",
+                    help="diagnostic: the cross-term transport operator M_k in consider mode")
+    ap.add_argument("--consider-sigma", choices=("full", "iso-t", "iso", "trans"), default="full",
+                    help="diagnostic: the anchor->current covariance handed to consider mode: "
+                         "full 6x6; translation block tr/3*I with cross blocks zeroed (iso-t); "
+                         "both blocks isotropised (iso); translation block only (trans). Tests the tr/3-smear hypothesis")
+    ap.add_argument("--reanchor-age", type=int, default=0,
+                    help="with --feed rust: diagnostic re-anchor PERIOD sweep -- move every "
+                         "landmark whose anchor is >= this many frames old onto the previous "
+                         "clone (0 = the production harness rule)")
     ap.add_argument("--reanchor-eviction", action="store_true",
                     help="with --pose-source backend --reanchor: re-anchor from the "
                          "backend's last_clone_eviction() record (old->newest, cov "
@@ -481,9 +520,11 @@ def main():
                          "sigma_s(E)=max(0.02, 0.0072*E^-0.710); Kite t0 -> 0.0395.")
     ap.add_argument("--reanchor-cov-scale", type=float, default=1.0,
                     help="scale the re-anchor covariance (sanity: does this path matter?)")
-    ap.add_argument("--reanchor-nocov", action="store_true",
-                    help="omit the relative-pose covariance at re-anchor (test for "
-                         "double-counting against pose_range_direct)")
+    ap.add_argument("--reanchor-cov", action="store_true",
+                    help="ADD the old->new relative-pose covariance at re-anchor (the "
+                         "pre-2026-10-15 default; dropped: its transverse remainder is an "
+                         "independence artefact and the next update removes it; "
+                         "CloneRelFeed::reanchor_transport_cov)")
     ap.add_argument("--xcov-audit", action="store_true",
                     help="measure the discarded rotation-translation cross-block and "
                          "its effect on the combined range variance")
@@ -562,6 +603,8 @@ def main():
         settings["range_walk_var"] = args.range_walk_var
     if args.sigma_pixel is not None:
         settings["sigma_pixel"] = args.sigma_pixel
+    if args.consider:
+        settings["consider_relpose"] = True
 
     # Print effective range-critical settings for provenance.
     eff_prs = settings.get("pose_range_scale", 0.0)
@@ -569,7 +612,7 @@ def main():
     eff_rwv = settings.get("range_walk_var", 0.0)
     eff_pdv = settings.get("process_depth_var", 0.0)
     print(f"Config: {args.config}")
-    print(f"Sparse3D range knobs: direct={settings.get('pose_range_direct', False)}, pose_range_scale={eff_prs}, "
+    print(f"Sparse3D range knobs: direct={settings.get('pose_range_direct', False)}, consider={settings.get('consider_relpose', False)}, pose_range_scale={eff_prs}, "
           f"pose_range_coherent={eff_prc}, range_walk_var={eff_rwv}, "
           f"process_depth_var={eff_pdv}")
     print(f"PVV scale (γ²): {args.pvv_scale}")
@@ -633,8 +676,27 @@ def main():
         vio = echo_li.VIOFilter(merged_config_path, cam)
     if args.reanchor_eviction and args.pose_source != "backend":
         sys.exit("--reanchor-eviction needs --pose-source backend")
+    if args.feed == "rust" and not (args.pose_source == "backend" and args.clone_relative):
+        sys.exit("--feed rust needs --pose-source backend --clone-relative")
     vio.set_camera_extrinsics(np.ascontiguousarray(ext))
     vio.set_initial_state(p0_w.tolist(), np.ascontiguousarray(R0), v0_body.tolist())
+    if args.reanchor_age:
+        if args.feed != "rust":
+            sys.exit("--reanchor-age needs --feed rust")
+        vio.set_sparse_reanchor_age(args.reanchor_age)   # AFTER the seed: reseed resets the feed
+        print(f"re-anchor age sweep: age >= {args.reanchor_age} frames")
+    if args.consider:
+        if args.feed != "rust":
+            sys.exit("--consider needs --feed rust")
+        vio.set_sparse_consider(True)
+        vio.set_sparse_consider_m_mode({"vio": 0, "identity": 1, "zero": 2}[args.consider_m])
+        vio.set_sparse_consider_sigma_mode({"full": 0, "iso-t": 1, "iso": 2, "trans": 3}[args.consider_sigma])
+        print("CONSIDER mode: landmark–pose cross-covariance tracked (§V-F); "
+              f"no range injection, no measurement-side pose term; M = {args.consider_m}; "
+              f"Sigma = {args.consider_sigma}")
+    if args.feed == "rust" and args.reanchor_cov:
+        vio.set_sparse_reanchor_transport_cov(True)       # same meaning as in the Python block
+        print("re-anchor WITH the transport covariance (rust feed)")
 
     # --- Sparse3D ---
     if args.scale_sigma_auto:
@@ -736,183 +798,190 @@ def main():
         # Clone THIS frame's pose (= anchor for any landmark born now), roll the
         # window, then feed Sparse3D the honest per-clone INCREMENTAL relative-pose
         # covariance so each landmark's §V-D term uses its own anchor→current cov.
-        clone_id_arg = None
-        rel_cov_arg = None
-        if args.clone_relative:
-            # Re-anchor BEFORE cloning this frame. The MSCEqF filter keeps its own
-            # fixed-size clone window and evicts the oldest clone inside clone_pose(),
-            # so a clone read AFTER that call may already be gone -- in which case
-            # relative_pose_covariance returns None and the landmark is re-anchored as
-            # if the two anchors were perfectly known relative to each other. Move the
-            # oldest clone's landmarks onto the newest LIVE clone while both still exist.
-            if args.reanchor and args.reanchor_eviction:
-                # The shipping rule (CloneRelFeed): the backend evicted a clone inside
-                # this frame's process_vision and recorded, BEFORE dropping it, the
-                # old->newest relative covariance and the newest pose.
-                _ev = vio.last_clone_eviction()
-                if _ev is not None:
-                    _old, _new, _T, _pv, _pw = _ev
-                    if os.environ.get("DBG_EV"):
-                        _dT = np.abs(np.asarray(_T, float) - T_wc).max()
-                        _na = sum(1 for fd in sparse.get_features().values()
-                                  if fd["anchor_clone_id"] == _old)
-                        print(f"  DBG_EV k={k} old={_old} new={_new} |T_ev-T_wc|max={_dT:.2e} "
-                              f"live={vio.clone_ids()[0]}..{vio.clone_ids()[-1]} "
-                              f"n_on_old={_na}", file=sys.stderr)
-                    _cov = (np.asarray(_pv, float).tolist(), np.asarray(_pw, float).tolist())
-                    if args.reanchor_cov_scale != 1.0:
-                        _cov = ((np.asarray(_cov[0]) * args.reanchor_cov_scale).tolist(),
-                                (np.asarray(_cov[1]) * args.reanchor_cov_scale).tolist())
-                    if args.reanchor_nocov:
+        if args.feed == "rust":
+            # The shipped path, end to end: CloneRelFeed does the re-anchor, the
+            # relative covariances, the increments and the update.
+            _rep = vio.sparse_feed(sparse, stamp, all_uvs, T_wc.tolist())
+            n_reanchored[0] += int(_rep[1])
+            _dbg_reanchor[1] += 1
+        else:
+            clone_id_arg = None
+            rel_cov_arg = None
+            if args.clone_relative:
+                # Re-anchor BEFORE cloning this frame. The MSCEqF filter keeps its own
+                # fixed-size clone window and evicts the oldest clone inside clone_pose(),
+                # so a clone read AFTER that call may already be gone -- in which case
+                # relative_pose_covariance returns None and the landmark is re-anchored as
+                # if the two anchors were perfectly known relative to each other. Move the
+                # oldest clone's landmarks onto the newest LIVE clone while both still exist.
+                if args.reanchor and args.reanchor_eviction:
+                    # The shipping rule (CloneRelFeed): the backend evicted a clone inside
+                    # this frame's process_vision and recorded, BEFORE dropping it, the
+                    # old->newest relative covariance and the newest pose.
+                    _ev = vio.last_clone_eviction()
+                    if _ev is not None:
+                        _old, _new, _T, _pv, _pw = _ev
+                        if os.environ.get("DBG_EV"):
+                            _dT = np.abs(np.asarray(_T, float) - T_wc).max()
+                            _na = sum(1 for fd in sparse.get_features().values()
+                                      if fd["anchor_clone_id"] == _old)
+                            print(f"  DBG_EV k={k} old={_old} new={_new} |T_ev-T_wc|max={_dT:.2e} "
+                                  f"live={vio.clone_ids()[0]}..{vio.clone_ids()[-1]} "
+                                  f"n_on_old={_na}", file=sys.stderr)
+                        _cov = (np.asarray(_pv, float).tolist(), np.asarray(_pw, float).tolist())
+                        if args.reanchor_cov_scale != 1.0:
+                            _cov = ((np.asarray(_cov[0]) * args.reanchor_cov_scale).tolist(),
+                                    (np.asarray(_cov[1]) * args.reanchor_cov_scale).tolist())
+                        if not args.reanchor_cov:
+                            _cov = None
+                        _dbg_reanchor[0 if _cov is None else 1] += 1
+                        n_reanchored[0] += sparse.reanchor_clone(
+                            int(_old), np.asarray(_T, float).tolist(), int(_new), _cov)
+                        clone_rel_prev.pop(int(_old), None)
+                elif args.reanchor:
+                    # The filter's clone list and the harness's pose book can disagree
+                    # (the filter may hold clones the harness never registered), so only
+                    # use ids present in BOTH -- we need the pose to re-anchor onto.
+                    _live = [int(x) for x in vio.clone_ids() if int(x) in clone_pose]
+                    if len(_live) >= 2 and len(vio.clone_ids()) >= vio.n_clones():
+                        _old, _new = _live[0], _live[-1]
+                        _rc = vio.get_relative_pose_covariance(
+                            _old, np.ascontiguousarray(clone_pose[_new]))
                         _cov = None
-                    _dbg_reanchor[0 if _cov is None else 1] += 1
-                    n_reanchored[0] += sparse.reanchor_clone(
-                        int(_old), np.asarray(_T, float).tolist(), int(_new), _cov)
-                    clone_rel_prev.pop(int(_old), None)
-            elif args.reanchor:
-                # The filter's clone list and the harness's pose book can disagree
-                # (the filter may hold clones the harness never registered), so only
-                # use ids present in BOTH -- we need the pose to re-anchor onto.
-                _live = [int(x) for x in vio.clone_ids() if int(x) in clone_pose]
-                if len(_live) >= 2 and len(vio.clone_ids()) >= vio.n_clones():
-                    _old, _new = _live[0], _live[-1]
-                    _rc = vio.get_relative_pose_covariance(
-                        _old, np.ascontiguousarray(clone_pose[_new]))
-                    _cov = None
-                    if _rc is not None:
-                        _cov = (np.asarray(_rc[0], float).tolist(),
-                                np.asarray(_rc[1], float).tolist())
-                    if _cov is not None and args.reanchor_cov_scale != 1.0:
-                        _cov = ((np.asarray(_cov[0]) * args.reanchor_cov_scale).tolist(),
-                                (np.asarray(_cov[1]) * args.reanchor_cov_scale).tolist())
-                    if args.reanchor_nocov:
-                        _cov = None
-                    _dbg_reanchor[0 if _cov is None else 1] += 1
-                    n_reanchored[0] += sparse.reanchor_clone(
-                        _old, clone_pose[_new].tolist(), _new, _cov)
+                        if _rc is not None:
+                            _cov = (np.asarray(_rc[0], float).tolist(),
+                                    np.asarray(_rc[1], float).tolist())
+                        if _cov is not None and args.reanchor_cov_scale != 1.0:
+                            _cov = ((np.asarray(_cov[0]) * args.reanchor_cov_scale).tolist(),
+                                    (np.asarray(_cov[1]) * args.reanchor_cov_scale).tolist())
+                        if not args.reanchor_cov:
+                            _cov = None
+                        _dbg_reanchor[0 if _cov is None else 1] += 1
+                        n_reanchored[0] += sparse.reanchor_clone(
+                            _old, clone_pose[_new].tolist(), _new, _cov)
 
-            vio.clone_pose(int(k), stamp)
-            clone_pose[int(k)] = T_wc.copy()
+                vio.clone_pose(int(k), stamp)
+                clone_pose[int(k)] = T_wc.copy()
 
-            for cid in list(clone_pose):
-                if cid < k - args.clone_window:
-                    # Re-anchoring already happened above, while the clone was still
-                    # live in the filter's own window.
-                    vio.marginalize_clone(int(cid))
-                    clone_pose.pop(cid, None)
-                    clone_rel_prev.pop(cid, None)
-            rel_cov_arg = {}
-            for cid in vio.clone_ids():
-                cid = int(cid)
-                Tc = clone_pose.get(cid)
-                if Tc is None:
-                    continue
-                rc = vio.get_relative_pose_covariance(cid, np.ascontiguousarray(Tc))
-                if rc is None:
-                    continue
-                if args.xcov_audit:
-                    # Eq (11) adds the rotation and baseline range-contributions IN
-                    # QUADRATURE, i.e. assumes Sigma_{phi,t} = 0. That block is computed
-                    # and then dropped by relative_pose_covariance. Measure (a) its
-                    # correlation strength and (b) what it does to the combined range
-                    # variance along the directions that actually matter:
-                    #   s_t = (r/b) * t_hat     (baseline-length error scales r)
-                    #   s_phi = (r^2/b) * n_hat (parallax-angle error, n perp to the
-                    #                            anchor-current epipolar plane)
-                    _C = vio.relative_pose_covariance_full(int(cid), int(k))
-                    if _C is not None:
-                        _C = np.asarray(_C, float)
-                        _W = _C[:3, :3]; _T = _C[3:, 3:]; _X = _C[:3, 3:]
-                        _dw = np.sqrt(np.trace(_W) / 3.0)
-                        _dt = np.sqrt(np.trace(_T) / 3.0)
-                        _rho = (np.abs(_X).max() / max(_dw * _dt, 1e-18))
-                        _tb = (np.linalg.inv(Tc) @ T_wc)[:3, 3]
-                        _b = np.linalg.norm(_tb)
-                        if _b > 1e-6:
-                            _that = _tb / _b
-                            _r = 20.0          # representative scene range, scale-free below
-                            _st = (_r / _b) * _that
-                            # rotation axis that most changes parallax: perpendicular to
-                            # the baseline, pick the dominant eigenvector of W restricted
-                            # to that plane -- approximate with any unit vector perp to t.
-                            _tmp = np.array([0.0, 0.0, 1.0])
-                            if abs(_that @ _tmp) > 0.9:
-                                _tmp = np.array([1.0, 0.0, 0.0])
-                            _n = np.cross(_that, _tmp); _n /= np.linalg.norm(_n)
-                            _sp = (_r * _r / _b) * _n
-                            _s = np.concatenate([_sp, _st])
-                            _v_full = float(_s @ _C @ _s)
-                            _v_quad = float(_sp @ _W @ _sp + _st @ _T @ _st)
-                            if _v_quad > 0 and np.isfinite(_v_full):
-                                xcov_audit.append((_rho, _v_full / _v_quad, _b))
+                for cid in list(clone_pose):
+                    if cid < k - args.clone_window:
+                        # Re-anchoring already happened above, while the clone was still
+                        # live in the filter's own window.
+                        vio.marginalize_clone(int(cid))
+                        clone_pose.pop(cid, None)
+                        clone_rel_prev.pop(cid, None)
+                rel_cov_arg = {}
+                for cid in vio.clone_ids():
+                    cid = int(cid)
+                    Tc = clone_pose.get(cid)
+                    if Tc is None:
+                        continue
+                    rc = vio.get_relative_pose_covariance(cid, np.ascontiguousarray(Tc))
+                    if rc is None:
+                        continue
+                    if args.xcov_audit:
+                        # Eq (11) adds the rotation and baseline range-contributions IN
+                        # QUADRATURE, i.e. assumes Sigma_{phi,t} = 0. That block is computed
+                        # and then dropped by relative_pose_covariance. Measure (a) its
+                        # correlation strength and (b) what it does to the combined range
+                        # variance along the directions that actually matter:
+                        #   s_t = (r/b) * t_hat     (baseline-length error scales r)
+                        #   s_phi = (r^2/b) * n_hat (parallax-angle error, n perp to the
+                        #                            anchor-current epipolar plane)
+                        _C = vio.relative_pose_covariance_full(int(cid), int(k))
+                        if _C is not None:
+                            _C = np.asarray(_C, float)
+                            _W = _C[:3, :3]; _T = _C[3:, 3:]; _X = _C[:3, 3:]
+                            _dw = np.sqrt(np.trace(_W) / 3.0)
+                            _dt = np.sqrt(np.trace(_T) / 3.0)
+                            _rho = (np.abs(_X).max() / max(_dw * _dt, 1e-18))
+                            _tb = (np.linalg.inv(Tc) @ T_wc)[:3, 3]
+                            _b = np.linalg.norm(_tb)
+                            if _b > 1e-6:
+                                _that = _tb / _b
+                                _r = 20.0          # representative scene range, scale-free below
+                                _st = (_r / _b) * _that
+                                # rotation axis that most changes parallax: perpendicular to
+                                # the baseline, pick the dominant eigenvector of W restricted
+                                # to that plane -- approximate with any unit vector perp to t.
+                                _tmp = np.array([0.0, 0.0, 1.0])
+                                if abs(_that @ _tmp) > 0.9:
+                                    _tmp = np.array([1.0, 0.0, 0.0])
+                                _n = np.cross(_that, _tmp); _n /= np.linalg.norm(_n)
+                                _sp = (_r * _r / _b) * _n
+                                _s = np.concatenate([_sp, _st])
+                                _v_full = float(_s @ _C @ _s)
+                                _v_quad = float(_sp @ _W @ _sp + _st @ _T @ _st)
+                                if _v_quad > 0 and np.isfinite(_v_full):
+                                    xcov_audit.append((_rho, _v_full / _v_quad, _b))
 
-                if args.pose_cov_audit:
-                    # Does the REPORTED anchor->current translation covariance match the
-                    # ACTUAL error against GT? This is upstream of Sparse3D entirely: if
-                    # P_vv is N x too small here, the depth filter is being fed a wrong
-                    # number and no amount of work inside Sparse3D can fix it.
-                    _tf = np.linalg.inv(Tc) @ T_wc               # filter anchor->cur
-                    _gc = ds.pose(cid) @ ext
-                    _tg = np.linalg.inv(_gc) @ (ds.pose(k) @ ext)  # GT anchor->cur
-                    _e = (np.linalg.inv(_tg) @ _tf)[:3, 3]       # translation discrepancy
-                    _P = np.asarray(rc[0], float)
-                    try:
-                        _n = float(_e @ np.linalg.solve(_P, _e))
-                        # DIRECTIONAL split. The recorded fork-b defect is a SCALE-channel
-                        # over-confidence ALONG the velocity/baseline direction, shared
-                        # with the reference MSCEqF C++ (i.e. intrinsic to SE_2(3), not a
-                        # windowing problem). If the relative-pose over-confidence is
-                        # along-baseline it is that same defect; if it is isotropic it is
-                        # something else.
-                        _bv = _tf[:3, 3]
-                        _bn = float(np.linalg.norm(_bv))
-                        _na = _np_ = np.nan
-                        if _bn > 1e-6:
-                            _u = _bv / _bn
-                            _ea = float(_u @ _e)
-                            _va = float(_u @ _P @ _u)
-                            if _va > 0:
-                                _na = _ea * _ea / _va
-                            # one perpendicular direction
-                            _tmp = np.array([0.0, 0.0, 1.0])
-                            if abs(_u @ _tmp) > 0.9:
-                                _tmp = np.array([1.0, 0.0, 0.0])
-                            _w = np.cross(_u, _tmp); _w /= np.linalg.norm(_w)
-                            _ep = float(_w @ _e); _vp = float(_w @ _P @ _w)
-                            if _vp > 0:
-                                _np_ = _ep * _ep / _vp
-                        if np.isfinite(_n):
-                            pose_audit.append((k - cid, _n, float(np.linalg.norm(_e)),
-                                               float(np.sqrt(np.trace(_P) / 3.0)),
-                                               _na, _np_))
-                    except np.linalg.LinAlgError:
-                        pass
-                pvv_rel = np.asarray(rc[0], float) * args.pvv_scale
-                pww_rel = np.asarray(rc[1], float)
-                prev = clone_rel_prev.get(cid)
-                if prev is None:
-                    dv = np.zeros((3, 3))
-                    dw = np.zeros((3, 3))
-                else:
-                    dv = psd_clip(pvv_rel - prev[0])
-                    dw = psd_clip(pww_rel - prev[1])
-                clone_rel_prev[cid] = (pvv_rel, pww_rel)
-                # (full_v, full_w, inc_v, inc_w): full → §V-D measurement term,
-                # increment → accumulating range injection.
-                rel_cov_arg[cid] = (pvv_rel.tolist(), pww_rel.tolist(),
-                                    dv.tolist(), dw.tolist())
-            clone_id_arg = int(k)
+                    if args.pose_cov_audit:
+                        # Does the REPORTED anchor->current translation covariance match the
+                        # ACTUAL error against GT? This is upstream of Sparse3D entirely: if
+                        # P_vv is N x too small here, the depth filter is being fed a wrong
+                        # number and no amount of work inside Sparse3D can fix it.
+                        _tf = np.linalg.inv(Tc) @ T_wc               # filter anchor->cur
+                        _gc = ds.pose(cid) @ ext
+                        _tg = np.linalg.inv(_gc) @ (ds.pose(k) @ ext)  # GT anchor->cur
+                        _e = (np.linalg.inv(_tg) @ _tf)[:3, 3]       # translation discrepancy
+                        _P = np.asarray(rc[0], float)
+                        try:
+                            _n = float(_e @ np.linalg.solve(_P, _e))
+                            # DIRECTIONAL split. The recorded fork-b defect is a SCALE-channel
+                            # over-confidence ALONG the velocity/baseline direction, shared
+                            # with the reference MSCEqF C++ (i.e. intrinsic to SE_2(3), not a
+                            # windowing problem). If the relative-pose over-confidence is
+                            # along-baseline it is that same defect; if it is isotropic it is
+                            # something else.
+                            _bv = _tf[:3, 3]
+                            _bn = float(np.linalg.norm(_bv))
+                            _na = _np_ = np.nan
+                            if _bn > 1e-6:
+                                _u = _bv / _bn
+                                _ea = float(_u @ _e)
+                                _va = float(_u @ _P @ _u)
+                                if _va > 0:
+                                    _na = _ea * _ea / _va
+                                # one perpendicular direction
+                                _tmp = np.array([0.0, 0.0, 1.0])
+                                if abs(_u @ _tmp) > 0.9:
+                                    _tmp = np.array([1.0, 0.0, 0.0])
+                                _w = np.cross(_u, _tmp); _w /= np.linalg.norm(_w)
+                                _ep = float(_w @ _e); _vp = float(_w @ _P @ _w)
+                                if _vp > 0:
+                                    _np_ = _ep * _ep / _vp
+                            if np.isfinite(_n):
+                                pose_audit.append((k - cid, _n, float(np.linalg.norm(_e)),
+                                                   float(np.sqrt(np.trace(_P) / 3.0)),
+                                                   _na, _np_))
+                        except np.linalg.LinAlgError:
+                            pass
+                    pvv_rel = np.asarray(rc[0], float) * args.pvv_scale
+                    pww_rel = np.asarray(rc[1], float)
+                    prev = clone_rel_prev.get(cid)
+                    if prev is None:
+                        dv = np.zeros((3, 3))
+                        dw = np.zeros((3, 3))
+                    else:
+                        dv = psd_clip(pvv_rel - prev[0])
+                        dw = psd_clip(pww_rel - prev[1])
+                    clone_rel_prev[cid] = (pvv_rel, pww_rel)
+                    # (full_v, full_w, inc_v, inc_w): full → §V-D measurement term,
+                    # increment → accumulating range injection.
+                    rel_cov_arg[cid] = (pvv_rel.tolist(), pww_rel.tolist(),
+                                        dv.tolist(), dw.tolist())
+                clone_id_arg = int(k)
 
-        if os.environ.get("DBG_COV") and n_frames % 40 == 0:
-            tv = np.trace(np.asarray(pvv_arg)) if pvv_arg is not None else float("nan")
-            tw = np.trace(np.asarray(pww_arg)) if pww_arg is not None else float("nan")
-            nrel = len(rel_cov_arg) if rel_cov_arg else 0
-            rv = (np.trace(np.asarray(list(rel_cov_arg.values())[0][0]))
-                  if nrel else float("nan"))
-            print(f"  DBG k={k} n_uvs={len(all_uvs)} tr(pvv)={tv:.3e} tr(pww)={tw:.3e} "
-                  f"n_rel={nrel} tr(rel_vv[0])={rv:.3e}", file=sys.stderr)
-        sparse.update(stamp, all_uvs, T_wc.tolist(), pvv_arg, pww_arg,
-                      clone_id_arg, rel_cov_arg)
+            if os.environ.get("DBG_COV") and n_frames % 40 == 0:
+                tv = np.trace(np.asarray(pvv_arg)) if pvv_arg is not None else float("nan")
+                tw = np.trace(np.asarray(pww_arg)) if pww_arg is not None else float("nan")
+                nrel = len(rel_cov_arg) if rel_cov_arg else 0
+                rv = (np.trace(np.asarray(list(rel_cov_arg.values())[0][0]))
+                      if nrel else float("nan"))
+                print(f"  DBG k={k} n_uvs={len(all_uvs)} tr(pvv)={tv:.3e} tr(pww)={tw:.3e} "
+                      f"n_rel={nrel} tr(rel_vv[0])={rv:.3e}", file=sys.stderr)
+            sparse.update(stamp, all_uvs, T_wc.tolist(), pvv_arg, pww_arg,
+                          clone_id_arg, rel_cov_arg)
 
         if args.anchor_census and n_frames % 25 == 0:
             _sf = sparse.get_features()
@@ -1108,6 +1177,20 @@ def main():
         print(f"    |err| median {np.median(_pa[:, 2]):.4f} m   "
               f"reported sigma median {np.median(_pa[:, 3]):.4f} m   "
               f"ratio {np.median(_pa[:, 2]) / max(np.median(_pa[:, 3]), 1e-9):.1f}")
+        # By anchor->current SEPARATION (frames): the recorded long-separation
+        # over-confidence lives here, so a wide clone window must be read against it.
+        _age = _pa[:, 0]
+        for _lo, _hi in ((1, 5), (5, 10), (10, 20), (20, 40), (40, 80), (80, 10**9)):
+            _m = (_age >= _lo) & (_age < _hi)
+            if _m.sum() < 20:
+                continue
+            _a = _pa[_m, 4]; _a = _a[np.isfinite(_a)]
+            _q = _pa[_m, 5]; _q = _q[np.isfinite(_q)]
+            print(f"    sep {_lo:3d}–{_hi if _hi < 10**9 else '∞':>3}: n={int(_m.sum()):6d}  "
+                  f"3dof med {np.median(_pa[_m, 1]):6.2f} mean {np.mean(_pa[_m, 1]):8.1f}  "
+                  f"along med {np.median(_a) if len(_a) else float('nan'):6.2f}  "
+                  f"perp med {np.median(_q) if len(_q) else float('nan'):6.2f}  "
+                  f"|err| {np.median(_pa[_m, 2]):.3f} m  sigma {np.median(_pa[_m, 3]):.3f} m")
     if srr:
         _sr = np.array(srr)
         print(f"\n  sigma_rho/rho (delta-method validity; <<1 required to score in RANGE):")

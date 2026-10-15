@@ -164,6 +164,17 @@ pub trait CameraPoseCovariance {
         None
     }
 
+    /// Joint 12x12 covariance of the two relative poses `anchor->prev` (block 0) and
+    /// `anchor->current` (block 1), both live clones. What the depth filter's consider
+    /// recursion needs to regress this frame's relative-pose error on last frame's.
+    /// `None` when unsupported or a clone is not live.
+    fn relative_pose_joint_covariance(
+        &self,
+        _clone_id: u64,
+        _prev_clone_id: u64,
+    ) -> Option<nalgebra::SMatrix<f64, 12, 12>> {
+        None
+    }
     /// Ids of the clones a consumer may anchor on right now, oldest first.
     fn live_clone_ids(&self) -> Vec<u64> {
         Vec::new()
@@ -304,13 +315,110 @@ impl ZuptPolicy {
 /// its own clone window (`current_clone_id()` is `Some`), each landmark is driven by
 /// the gauge-cancelled anchor->current covariance of its own anchor clone, the
 /// per-frame INCREMENT of that covariance is PSD-clipped for the accumulating range
-/// injection, and landmarks whose anchor the backend just evicted are moved onto the
-/// newest clone with the covariance captured before the eviction. If the backend does
-/// not manage clones (EqVIO), this is exactly the legacy absolute `update`. Shared
-/// because the first version of this logic lived in a Python harness and nowhere else.
-#[derive(Default)]
+/// injection, and every frame the landmarks sitting on the OLDEST live clone are moved
+/// onto the PREVIOUS frame's clone -- the pose this feed registered for it a frame ago
+/// -- with the oldest->current relative covariance. If the backend does not manage
+/// clones (EqVIO), this is exactly the legacy absolute `update`. Shared because the
+/// first version of this logic lived in a Python harness and nowhere else.
+///
+/// The re-anchor rule is the harness's, reproduced to the frame, and not the obvious
+/// alternative (move landmarks when the backend evicts their clone, onto the newest
+/// clone, with the pose the filter holds for it). The two were measured on all 30
+/// Kite_training trajectories with the same backend: the harness rule is honest
+/// (tail <= the Student-t reference) on 26/30, the eviction rule on 22/30, with the
+/// >chi2_99 tail systematically heavier under eviction. Why one frame and one clone of
+/// difference does that is NOT established; what is established is which rule the
+/// filter formulation was validated with, so that is the one that ships.
 pub struct CloneRelFeed {
     prev: HashMap<u64, (Matrix3<f64>, Matrix3<f64>)>,
+    /// Camera pose this feed passed to the depth filter for each live clone -- the
+    /// anchor pose Sparse3D holds for it, which is what a landmark must be moved
+    /// ONTO (not the filter's later-corrected clone pose).
+    poses: HashMap<u64, nalgebra::Matrix4<f64>>,
+    /// DIAGNOSTIC sweep knob, `None` in production. `Some(a)`: instead of the harness
+    /// rule, move every landmark whose anchor clone is at least `a` frames old onto
+    /// the previous frame's clone (same target, same covariance convention). Varies
+    /// the re-anchor PERIOD, which the harness rule fixes at window-1, so the two
+    /// measured rules' 26/30-vs-22/30 gap can be attributed or not to how often a
+    /// landmark is re-anchored.
+    pub reanchor_age: Option<u64>,
+    /// `false` in production (since 2026-10-15). `true` re-anchors WITH the
+    /// old->current relative-pose covariance added to the landmark; under
+    /// `pose_range_direct` the depth filter projects the radial direction out of it,
+    /// so what is added is the TRANSVERSE remainder of the independence form
+    /// `R P_a R' + J Sigma J'`. Dropped because (i) under the error channel the
+    /// pose-covariance audit measures -- a baseline-scale error common to landmark and
+    /// translation, p_n = (1+s)(R p_a + t) -- the exact moved covariance is
+    /// sigma_s^2 p_n p_n', purely radial, so the transverse block is an artefact of
+    /// assuming the landmark and pose errors independent, not a second copy of
+    /// anything; and (ii) the next bearing update is taken from the new anchor, where
+    /// the chart's transverse coordinates are observed directly at pixel level, so the
+    /// block is contracted away by that one update whatever the channel, leaving only
+    /// leakage into the range chart through the chart Jacobian and the gate. Measured
+    /// on 30 Kite_training trajectories at the shipped re-anchor rule: adding it costs
+    /// range accuracy (6.6 vs 5.7 %), one honest trajectory (26 vs 27/30) and inflates
+    /// reported sigma_r (5.15 vs 4.40 m).
+    pub reanchor_transport_cov: bool,
+    /// Consider (Schmidt) mode, filter_formulation §V-F: per live anchor the feed also
+    /// hands the depth filter the FULL anchor->current relative covariance and the
+    /// one-step regression operator `M_k` of that relative-pose error, and re-anchors
+    /// onto the CURRENT clone with the full covariance, so the landmark's tracked
+    /// landmark–pose cross-covariance is exactly the term the transfer needs. Must
+    /// match `SparseVogSettings::consider_relpose` on the filter being fed.
+    pub consider: bool,
+    /// DIAGNOSTIC for consider mode: 0 = the VIO's regression operator (production),
+    /// 1 = identity (pure persistence of the cross term), 2 = zero (no persistence).
+    /// Brackets how much of the consider result depends on `M_k` being right.
+    pub consider_m_mode: u8,
+    /// DIAGNOSTIC for consider mode: 0 = the VIO's full 6x6 anchor->current
+    /// covariance (production); 1 = its translation block replaced by `tr/3 * I` and
+    /// the rotation–translation cross blocks zeroed; 2 = both diagonal blocks
+    /// isotropised, cross blocks zeroed; 3 = translation block only (rotation and cross
+    /// blocks zeroed). Tests whether the legacy path's honesty on
+    /// long tracks comes from `tr(Sigma_v)/3` smearing an over-conservative
+    /// perpendicular channel into the range term: if the consider recursion fed the
+    /// isotropised covariance recovers legacy's long-track coverage, the remaining
+    /// deficit is the VIO's along-baseline covariance, not the depth filter.
+    pub consider_sigma_mode: u8,
+}
+
+/// Apply [`CloneRelFeed::consider_sigma_mode`] to a `[rot(0:3), trans(3:6)]` 6x6.
+fn isotropise_rel_cov(sigma: &nalgebra::Matrix6<f64>, mode: u8) -> nalgebra::Matrix6<f64> {
+    if mode == 0 {
+        return *sigma;
+    }
+    let mut out = nalgebra::Matrix6::<f64>::zeros();
+    let ww = sigma.fixed_view::<3, 3>(0, 0).into_owned();
+    let vv = sigma.fixed_view::<3, 3>(3, 3).into_owned();
+    let iso = |b: &Matrix3<f64>| Matrix3::<f64>::identity() * (b.trace() / 3.0);
+    match mode {
+        1 => {
+            out.fixed_view_mut::<3, 3>(0, 0).copy_from(&ww);
+            out.fixed_view_mut::<3, 3>(3, 3).copy_from(&iso(&vv));
+        }
+        2 => {
+            out.fixed_view_mut::<3, 3>(0, 0).copy_from(&iso(&ww));
+            out.fixed_view_mut::<3, 3>(3, 3).copy_from(&iso(&vv));
+        }
+        _ => {
+            out.fixed_view_mut::<3, 3>(3, 3).copy_from(&vv);
+        }
+    }
+    out
+}
+
+impl Default for CloneRelFeed {
+    fn default() -> Self {
+        Self {
+            prev: HashMap::new(),
+            poses: HashMap::new(),
+            reanchor_age: None,
+            reanchor_transport_cov: false,
+            consider: false,
+            consider_m_mode: 0,
+            consider_sigma_mode: 0,
+        }
+    }
 }
 
 /// What one [`CloneRelFeed::feed`] did, so a wrapper can log it.
@@ -324,6 +432,8 @@ pub struct FeedReport {
     pub n_rel: usize,
     /// Whether an absolute pair was available at all.
     pub had_absolute: bool,
+    /// Anchors given a consider (full covariance + regression operator) entry.
+    pub n_consider: usize,
 }
 
 impl CloneRelFeed {
@@ -347,18 +457,100 @@ impl CloneRelFeed {
         };
         report.clone_relative = true;
 
-        // Re-anchor BEFORE the update, with the evidence captured before the eviction.
-        if let Some(ev) = c.last_clone_eviction() {
-            report.reanchored = sparse.reanchor_clone(
-                ev.old_clone_id,
-                &ev.t_wc_new.as_matrix(),
-                Some(ev.new_clone_id),
-                Some((&ev.p_vv, &ev.p_ww)),
-            );
-            self.prev.remove(&ev.old_clone_id);
+        let live = c.live_clone_ids();
+        self.poses.retain(|id, _| live.contains(id));
+        // Re-anchor BEFORE the update: landmarks on the oldest live clone move onto
+        // the newest clone this feed has REGISTERED (the previous frame's), with the
+        // oldest->current relative covariance. Both clones are live, so the covariance
+        // exists; the current clone is not registered yet, so it is never the target.
+        let registered: Vec<u64> = live
+            .iter()
+            .copied()
+            .filter(|id| self.poses.contains_key(id))
+            .collect();
+        if registered.len() >= 2 {
+            // Consider mode moves onto the CURRENT clone (its pose is this frame's
+            // `t_wc`), the harness rule onto the previous frame's registered clone.
+            let (new, t_new) = match (self.consider, c.current_clone_id()) {
+                (true, Some(cur)) => (cur, *t_wc),
+                _ => {
+                    let n = registered[registered.len() - 1];
+                    (n, self.poses[&n])
+                }
+            };
+            let olds: Vec<u64> = match (self.reanchor_age, c.current_clone_id()) {
+                (Some(age), Some(cur)) => registered[..registered.len() - 1]
+                    .iter()
+                    .copied()
+                    .filter(|id| cur.saturating_sub(*id) >= age)
+                    .collect(),
+                _ => vec![registered[0]],
+            };
+            for old in olds {
+                if old == new {
+                    continue;
+                }
+                let cov = if self.reanchor_transport_cov {
+                    c.relative_pose_covariances(old, &SE3::identity())
+                } else {
+                    None
+                };
+                let full = if self.consider {
+                    c.relative_pose_covariance_full(old)
+                        .map(|s| isotropise_rel_cov(&s, self.consider_sigma_mode))
+                } else {
+                    None
+                };
+                report.reanchored += sparse.reanchor_clone_full(
+                    old,
+                    &t_new,
+                    Some(new),
+                    cov.as_ref().map(|(v, w)| (v, w)),
+                    full.as_ref(),
+                );
+            }
+        }
+        let prev_frame_clone = c
+            .current_clone_id()
+            .and_then(|cur| live.iter().rev().find(|&&id| id != cur).copied());
+        if let Some(cur) = c.current_clone_id() {
+            self.poses.insert(cur, *t_wc);
+        }
+        if self.consider {
+            // Per live anchor: the full anchor->current covariance and the regression
+            // operator M = Cov(a->cur, a->prev) Cov(a->prev)^-1 (zero when the previous
+            // relative covariance is singular, i.e. the anchor IS the previous clone;
+            // a landmark there carries no cross term yet, so M is never used).
+            let mut map: crate::depth::sparse_3d::ConsiderRelMap = HashMap::new();
+            for &id in &c.live_clone_ids() {
+                let sigma = if Some(id) == c.current_clone_id() {
+                    Some(nalgebra::Matrix6::<f64>::zeros())
+                } else {
+                    c.relative_pose_covariance_full(id)
+                };
+                let Some(sigma) = sigma else { continue };
+                let sigma = isotropise_rel_cov(&sigma, self.consider_sigma_mode);
+                let m = prev_frame_clone
+                    .filter(|&p| p != id)
+                    .and_then(|p| c.relative_pose_joint_covariance(id, p))
+                    .and_then(|j| {
+                        let s_prev = j.fixed_view::<6, 6>(0, 0).into_owned();
+                        let cross = j.fixed_view::<6, 6>(6, 0).into_owned();
+                        s_prev.try_inverse().map(|inv| cross * inv)
+                    })
+                    .filter(|m| m.iter().all(|v| v.is_finite()))
+                    .unwrap_or_else(nalgebra::Matrix6::<f64>::zeros);
+                let m = match self.consider_m_mode {
+                    1 => nalgebra::Matrix6::<f64>::identity(),
+                    2 => nalgebra::Matrix6::<f64>::zeros(),
+                    _ => m,
+                };
+                map.insert(id, crate::depth::sparse_3d::ConsiderRel { sigma, m });
+            }
+            report.n_consider = map.len();
+            sparse.set_consider_relpose(map);
         }
 
-        let live = c.live_clone_ids();
         self.prev.retain(|id, _| live.contains(id));
         let mut rel: crate::depth::sparse_3d::CloneRelCov = HashMap::new();
         for id in live {
@@ -1429,6 +1621,16 @@ impl CameraPoseCovariance for MsceqfBackend {
         let cpos = self.clone_ids.len().checked_sub(1)?;
         self.filter.relative_pose_covariance_full(apos, cpos)
     }
+    fn relative_pose_joint_covariance(
+        &self,
+        clone_id: u64,
+        prev_clone_id: u64,
+    ) -> Option<nalgebra::SMatrix<f64, 12, 12>> {
+        let apos = self.clone_ids.iter().position(|&c| c == clone_id)?;
+        let ppos = self.clone_ids.iter().position(|&c| c == prev_clone_id)?;
+        let cpos = self.clone_ids.len().checked_sub(1)?;
+        self.filter.relative_pose_joint_covariance(apos, ppos, cpos)
+    }
     fn live_clone_ids(&self) -> Vec<u64> {
         self.clone_ids.clone()
     }
@@ -1739,6 +1941,99 @@ mod msceqf_backend_tests {
         }
     }
 
+    /// The joint 12x12 of two relative poses must agree block-wise with the two 6x6
+    /// relative covariances it generalizes, and its cross block must be the diagonal
+    /// block when prev == current (Cov(x, x) = Var(x)).
+    #[test]
+    fn relative_pose_joint_covariance_is_consistent_with_the_pairwise_one() {
+        let mut b = make_backend(MsceqfSettings {
+            num_clones: 6,
+            ..Default::default()
+        });
+        let ids: Vec<u64> = (0..20).collect();
+        for k in 0..6u64 {
+            let t = k as f64 * 0.05;
+            b.process_imu(imu(t));
+            b.process_vision(frame_at(t, &ids), &HashMap::new());
+        }
+        let live = b.live_clone_ids();
+        assert!(live.len() >= 3);
+        let (a, p, c) = (live[0], live[live.len() - 2], live[live.len() - 1]);
+        let j = b.relative_pose_joint_covariance(a, p).expect("joint");
+        let ap = b
+            .filter
+            .relative_pose_covariance_full(0, live.len() - 2)
+            .expect("a->p");
+        let ac = b.relative_pose_covariance_full(a).expect("a->c");
+        let err_pp = (j.fixed_view::<6, 6>(0, 0) - ap).abs().max();
+        let err_cc = (j.fixed_view::<6, 6>(6, 6) - ac).abs().max();
+        assert!(
+            err_pp < 1e-12 && err_cc < 1e-12,
+            "diagonal blocks differ: {err_pp:.2e} {err_cc:.2e}"
+        );
+        let jcc = b
+            .relative_pose_joint_covariance(a, c)
+            .expect("joint with prev == cur");
+        let err_x = (jcc.fixed_view::<6, 6>(6, 0) - ac).abs().max();
+        assert!(
+            err_x < 1e-12,
+            "cross block with prev == cur must be the variance: {err_x:.2e}"
+        );
+        // Non-trivial cross block for a genuinely previous clone.
+        assert!(j.fixed_view::<6, 6>(6, 0).abs().max() > 0.0);
+    }
+
+    /// Consider mode of the feed: every live anchor gets a full covariance and a finite
+    /// regression operator; the current clone's covariance is zero.
+    #[test]
+    fn clone_rel_feed_consider_mode_serves_every_live_anchor() {
+        use crate::depth::sparse_3d::{Sparse3DChart, Sparse3DFilter};
+        use crate::depth::sparse_gb::SparseVogSettings;
+        let k = Matrix3::new(400.0, 0.0, 320.0, 0.0, 400.0, 240.0, 0.0, 0.0, 1.0);
+        let mut sparse = Sparse3DFilter::new(
+            k,
+            Sparse3DChart::BearingInvDepthAdditive,
+            SparseVogSettings {
+                min_track_length: 1,
+                birth_min_flow_px: 0.0,
+                consider_relpose: true,
+                ..Default::default()
+            },
+        )
+        .with_camera(test_cam());
+        let mut b = make_backend(MsceqfSettings {
+            num_clones: 5,
+            ..Default::default()
+        });
+        let mut feed = CloneRelFeed {
+            consider: true,
+            ..Default::default()
+        };
+        let ids: Vec<u64> = (0..20).collect();
+        let mut any_cross = false;
+        for k in 0..10u64 {
+            let t = k as f64 * 0.05;
+            b.process_imu(imu(t));
+            let frame = frame_at(t, &ids);
+            b.process_vision(frame.clone(), &HashMap::new());
+            let t_wc = b.nav_estimate().pose.as_matrix();
+            let r = feed.feed(b.pose_covariance(), &mut sparse, &frame, &t_wc);
+            assert!(r.clone_relative);
+            assert_eq!(
+                r.n_consider,
+                b.live_clone_ids().len(),
+                "one consider entry per live clone"
+            );
+            for f in sparse.features_iter() {
+                any_cross |= f.p_stheta.iter().any(|v| v.abs() > 0.0);
+                assert!(f.p_stheta.iter().all(|v| v.is_finite()));
+                assert!(f.covariance.iter().all(|v| v.is_finite()));
+            }
+        }
+        assert!(sparse.feature_count() > 0);
+        assert!(any_cross, "no landmark ever acquired a cross term");
+    }
+
     /// `from_config` must hand MSCEqF a WORLD velocity: seed a BODY velocity under a
     /// 90-degree yaw and read the body velocity back through the seam.
     #[test]
@@ -1881,13 +2176,23 @@ mod msceqf_backend_tests {
             );
             saw_rel |= r.n_rel > 1;
             reanchored += r.reanchored;
-            // No landmark may point at a clone the backend no longer holds.
             let live = b.live_clone_ids();
             for f in sparse.features_iter() {
-                if let Some(a) = f.anchor_clone_id {
-                    assert!(
-                        live.contains(&a),
-                        "feature {} anchored on dead clone {a}",
+                let Some(a) = f.anchor_clone_id else { continue };
+                // No landmark may point at a clone the backend no longer holds ...
+                assert!(
+                    live.contains(&a),
+                    "feature {} anchored on dead clone {a}",
+                    f.feat_id
+                );
+                // ... and, the harness rule: once two registered clones exist, nothing
+                // is left on the oldest live clone after the feed (it was moved onto
+                // the previous frame's clone before the update; births anchor on the
+                // current one).
+                if k >= 2 {
+                    assert_ne!(
+                        a, live[0],
+                        "feature {} still on the oldest clone",
                         f.feat_id
                     );
                 }
@@ -1903,7 +2208,7 @@ mod msceqf_backend_tests {
         );
         assert!(
             reanchored > 0,
-            "window overflow (10 frames, 4 clones) must re-anchor"
+            "the harness rule re-anchors every frame from frame 2 on"
         );
 
         // EqVIO: no clone management -> the legacy absolute update, no re-anchoring.

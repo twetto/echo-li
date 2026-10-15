@@ -1852,6 +1852,60 @@ impl MSCEqFFilter {
         Some(cov)
     }
 
+    /// JOINT covariance of two anchor-relative poses, `(theta^{a->p}, theta^{a->c})`,
+    /// 12x12 with the `a->p` block first. Same construction as
+    /// [`Self::relative_pose_covariance_full`] applied to the 18x18 clone block over
+    /// `(a, p, c)`: with `A_x = Ad((T_a^-1 T_x)^-1)`,
+    /// `delta^{a->x} = delta_x - A_x delta_a`, so the cross block is
+    /// `Cov(delta^{a->c}, delta^{a->p}) = Sig_cp - Sig_ca A_p' - A_c Sig_ap + A_c Sig_aa A_p'`.
+    /// This is what a consumer needs to regress this frame's relative-pose error on the
+    /// previous frame's (the consider recursion of the depth filter): the regression
+    /// operator `M = Cov(a->c, a->p) Cov(a->p)^-1` is NOT the transport adjoint alone,
+    /// it also carries this frame's correction of the pose and the correlation of the
+    /// new increment with the accumulated error.
+    pub fn relative_pose_joint_covariance(
+        &self,
+        anchor_pos: usize,
+        prev_pos: usize,
+        current_pos: usize,
+    ) -> Option<SMatrix<f64, 12, 12>> {
+        let n = self.x.clones.len();
+        if anchor_pos >= n || prev_pos >= n || current_pos >= n {
+            return None;
+        }
+        let ai = self.clone_idx(anchor_pos);
+        let pi = self.clone_idx(prev_pos);
+        let ci = self.clone_idx(current_pos);
+        let blk = |r: usize, c: usize| self.cov.fixed_view::<6, 6>(r, c).into_owned();
+        let (sig_aa, sig_pp, sig_cc) = (blk(ai, ai), blk(pi, pi), blk(ci, ci));
+        let (sig_ap, sig_ac, sig_pc) = (blk(ai, pi), blk(ai, ci), blk(pi, ci));
+        let t_a = &self.x.clones[anchor_pos].pose;
+        let adj = |pos: usize| {
+            t_a.inverse()
+                .compose(&self.x.clones[pos].pose)
+                .inverse()
+                .adjoint()
+        };
+        let (a_p, a_c) = (adj(prev_pos), adj(current_pos));
+        let pp = a_p * sig_aa * a_p.transpose() + sig_pp
+            - sig_ap.transpose() * a_p.transpose()
+            - a_p * sig_ap;
+        let cc = a_c * sig_aa * a_c.transpose() + sig_cc
+            - sig_ac.transpose() * a_c.transpose()
+            - a_c * sig_ac;
+        // Cov(delta^{a->c}, delta^{a->p}) = Sig_cp - Sig_ca A_p' - A_c Sig_ap + A_c Sig_aa A_p'
+        let cp = sig_pc.transpose() - sig_ac.transpose() * a_p.transpose() - a_c * sig_ap
+            + a_c * sig_aa * a_p.transpose();
+        let mut j = SMatrix::<f64, 12, 12>::zeros();
+        j.fixed_view_mut::<6, 6>(0, 0)
+            .copy_from(&(0.5 * (pp + pp.transpose())));
+        j.fixed_view_mut::<6, 6>(6, 6)
+            .copy_from(&(0.5 * (cc + cc.transpose())));
+        j.fixed_view_mut::<6, 6>(6, 0).copy_from(&cp);
+        j.fixed_view_mut::<6, 6>(0, 6).copy_from(&cp.transpose());
+        j.iter().all(|v| v.is_finite()).then_some(j)
+    }
+
     /// In-state (SLAM) landmark measurement update — the equivariant analog of
     /// OpenVINS `UpdaterSLAM::update`. Unlike the structureless [`Self::msc_update`],
     /// the landmark is a state, so its feature column is KEPT (no nullspace

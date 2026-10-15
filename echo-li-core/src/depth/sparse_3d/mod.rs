@@ -5,7 +5,8 @@ use std::sync::Arc;
 
 use echo_lie::SOT3;
 use nalgebra::{
-    Matrix2, Matrix2x3, Matrix2x5, Matrix3, Matrix3x2, Matrix4, Matrix5, Vector2, Vector3, Vector4,
+    Matrix2, Matrix2x3, Matrix2x5, Matrix2x6, Matrix3, Matrix3x2, Matrix3x6, Matrix4, Matrix5,
+    Matrix6, Vector2, Vector3, Vector4,
 };
 
 use crate::coordinate_suite::base_skew;
@@ -97,6 +98,13 @@ pub struct FeatureState3D {
     /// than a sum of increments. Reset to 0 on re-anchor (a fresh anchor has zero
     /// relative covariance to itself).
     pose_q_prev: f64,
+    /// Consider cross-covariance `Cov(delta s, delta theta^{a->k})` between the chart
+    /// state and the anchor->current relative-pose error, `[phi; t]` order, in the same
+    /// convention as the measurement-side pose Jacobian (`delta q_c = [q_c]_x phi + t`).
+    /// Zero at birth (the anchor IS the birth frame, so the relative pose is identity
+    /// with zero covariance) and after a re-anchor. Only maintained under
+    /// `settings.consider_relpose`.
+    pub p_stheta: Matrix3x6<f64>,
 
     // --- Per-track correspondence-bias state (BearingInvDepthAdditive only,
     // enabled by settings.bias_walk_var > 0). Augments the 3-DOF landmark to a
@@ -173,7 +181,11 @@ impl FeatureState3D {
 
     pub fn inlier_ratio(&self) -> f64 {
         let ab = self.a + self.b;
-        if ab <= 0.0 { 0.0 } else { self.a / ab }
+        if ab <= 0.0 {
+            0.0
+        } else {
+            self.a / ab
+        }
     }
 }
 
@@ -190,6 +202,8 @@ pub struct Sparse3DFilter {
     pending: HashMap<u64, PendingFeature>,
     prev_uvs: HashMap<u64, Vector2<f64>>,
     prev_t_wc: Option<Matrix4<f64>>,
+    /// Per-anchor consider data for THIS frame, set by the feed before `update_with_clones`.
+    consider_rel: ConsiderRelMap,
     prev_stamp: f64,
 }
 
@@ -207,6 +221,7 @@ impl Sparse3DFilter {
             pending: HashMap::new(),
             prev_uvs: HashMap::new(),
             prev_t_wc: None,
+            consider_rel: HashMap::new(),
             prev_stamp: -1.0,
         }
     }
@@ -299,6 +314,7 @@ impl Sparse3DFilter {
             let settings = self.settings.clone();
             let k = self.k;
             let cam = self.camera.as_deref();
+            let consider_rel = &self.consider_rel;
             self.features
                 .par_iter_mut()
                 .filter_map(|feat| {
@@ -309,9 +325,10 @@ impl Sparse3DFilter {
                     let uv_curr = curr_uvs.get(&fid)?;
                     let (pvv_m, pww_m, pvv_i, pww_i) =
                         resolve_pose_cov(rel_cov_by_clone, feat.anchor_clone_id, p_vv, p_ww);
+                    let cr = feat.anchor_clone_id.and_then(|cid| consider_rel.get(&cid));
                     (!update_feature_3d(
                         chart, &k, cam, &settings, feat, uv_curr, &t_cw_curr, pvv_m, pww_m, pvv_i,
-                        pww_i, dt,
+                        pww_i, dt, cr,
                     ))
                     .then_some(fid)
                 })
@@ -334,6 +351,9 @@ impl Sparse3DFilter {
 
                 let (pvv_m, pww_m, pvv_i, pww_i) =
                     resolve_pose_cov(rel_cov_by_clone, feat.anchor_clone_id, p_vv, p_ww);
+                let cr = feat
+                    .anchor_clone_id
+                    .and_then(|cid| self.consider_rel.get(&cid));
                 if !update_feature_3d(
                     self.chart,
                     &self.k,
@@ -347,6 +367,7 @@ impl Sparse3DFilter {
                     pvv_i,
                     pww_i,
                     dt,
+                    cr,
                 ) {
                     reset_features.push(fid);
                 }
@@ -468,6 +489,7 @@ impl Sparse3DFilter {
                     p_sb: Matrix3x2::zeros(),
                     p_bb: Matrix2::zeros(),
                     pose_q_prev: 0.0,
+                    p_stheta: Matrix3x6::zeros(),
                     // Bearing chart anchors at the CURRENT frame (anchor_t_wc =
                     // *t_wc), so the anchor clone is this frame's clone.
                     anchor_clone_id: current_clone_id,
@@ -557,6 +579,7 @@ impl Sparse3DFilter {
                 p_sb: Matrix3x2::zeros(),
                 p_bb: Matrix2::zeros(),
                 pose_q_prev: 0.0,
+                p_stheta: Matrix3x6::zeros(),
                 // Non-bearing charts also anchor at the current frame here.
                 anchor_clone_id: current_clone_id,
             };
@@ -610,6 +633,24 @@ impl Sparse3DFilter {
         new_clone_id: Option<u64>,
         rel_pose_cov: Option<(&Matrix3<f64>, &Matrix3<f64>)>,
     ) -> bool {
+        self.reanchor_feature_full(fid, t_wc_new, new_clone_id, rel_pose_cov, None)
+    }
+
+    /// [`Self::reanchor_feature`] plus the consider-mode transfer (§V-F eq. 17): with
+    /// `consider_relpose` on and `rel_full` given, the old->new pose covariance enters
+    /// TOGETHER with the landmark's tracked cross-covariance,
+    /// `J_s P_s J_s' + J_th S J_th' + J_s P_sth J_th' + (.)'`, instead of under the
+    /// independence assumption `P_sth = 0`; the cross term is then reset for the new
+    /// epoch. The radial projection used under `pose_range_direct` does not apply (no
+    /// range injection runs in consider mode).
+    pub fn reanchor_feature_full(
+        &mut self,
+        fid: u64,
+        t_wc_new: &Matrix4<f64>,
+        new_clone_id: Option<u64>,
+        rel_pose_cov: Option<(&Matrix3<f64>, &Matrix3<f64>)>,
+        rel_full: Option<&Matrix6<f64>>,
+    ) -> bool {
         if self.chart != Sparse3DChart::BearingInvDepthAdditive {
             return false;
         }
@@ -652,6 +693,38 @@ impl Sparse3DFilter {
 
         let j = j_from_p * r_rel * j_old;
         let mut inv_p_new = j * feat.inv_p * j.transpose();
+        if let (true, Some(sig)) = (self.settings.consider_relpose, rel_full) {
+            // (17): point-in-new-frame perturbation d p_new = J_s ds + J_th dth with
+            // J_th = [[p_new]_x  I] -- the SAME convention as the update's pose Jacobian
+            // (`dq_c = [q_c]_x phi + t`, lever arm the point in the current frame), which
+            // the sign- and lever-sensitive cross term requires; the legacy branch below
+            // uses `[R p_old]_x`, which only its quadratic form is indifferent to. The
+            // sum can be numerically indefinite; clip to PSD.
+            let mut j_th = Matrix3x6::<f64>::zeros();
+            j_th.fixed_view_mut::<3, 3>(0, 0)
+                .copy_from(&base_skew(&p_new));
+            j_th.fixed_view_mut::<3, 3>(0, 3)
+                .copy_from(&Matrix3::identity());
+            let js = r_rel * j_old; // d p_new / d s_old
+            let cross = js * feat.p_stheta * j_th.transpose();
+            let cov_p = j_th * sig * j_th.transpose() + cross + cross.transpose();
+            let add = j_from_p * cov_p * j_from_p.transpose();
+            inv_p_new += add;
+            inv_p_new = 0.5 * (inv_p_new + inv_p_new.transpose());
+            let eig = inv_p_new.symmetric_eigen();
+            let clipped = Matrix3::from_diagonal(&eig.eigenvalues.map(|v| v.max(1e-18)));
+            inv_p_new = eig.eigenvectors * clipped * eig.eigenvectors.transpose();
+            feat.p_sb = j * feat.p_sb;
+            feat.inv_s = Vector3::new(0.0, 0.0, rho_new);
+            feat.inv_p = 0.5 * (inv_p_new + inv_p_new.transpose());
+            feat.anchor_ray = b_new;
+            feat.tangent_basis = u_new;
+            feat.anchor_t_wc = *t_wc_new;
+            feat.anchor_clone_id = new_clone_id;
+            feat.pose_q_prev = 0.0;
+            feat.p_stheta = Matrix3x6::zeros();
+            return true;
+        }
         if let Some((pvv, pww)) = rel_pose_cov {
             let sk = skew3(&(r_rel * p_old));
             let mut cov_p = sk * pww * sk.transpose() + pvv;
@@ -693,6 +766,20 @@ impl Sparse3DFilter {
         new_clone_id: Option<u64>,
         rel_pose_cov: Option<(&Matrix3<f64>, &Matrix3<f64>)>,
     ) -> usize {
+        self.reanchor_clone_full(old_clone_id, t_wc_new, new_clone_id, rel_pose_cov, None)
+    }
+
+    /// [`Self::reanchor_clone`] with, under `consider_relpose`, the FULL old->new
+    /// relative covariance so the transfer can use the landmark's tracked cross term
+    /// (§V-F eq. 17). `rel_full` is ignored when consider mode is off.
+    pub fn reanchor_clone_full(
+        &mut self,
+        old_clone_id: u64,
+        t_wc_new: &Matrix4<f64>,
+        new_clone_id: Option<u64>,
+        rel_pose_cov: Option<(&Matrix3<f64>, &Matrix3<f64>)>,
+        rel_full: Option<&Matrix6<f64>>,
+    ) -> usize {
         let ids: Vec<u64> = self
             .features
             .iter()
@@ -701,11 +788,18 @@ impl Sparse3DFilter {
             .collect();
         let mut n = 0;
         for fid in ids {
-            if self.reanchor_feature(fid, t_wc_new, new_clone_id, rel_pose_cov) {
+            if self.reanchor_feature_full(fid, t_wc_new, new_clone_id, rel_pose_cov, rel_full) {
                 n += 1;
             }
         }
         n
+    }
+
+    /// Install this frame's per-anchor consider data (see [`ConsiderRel`]). Call before
+    /// `update_with_clones`; the map is consumed by that call's updates and replaced
+    /// wholesale next frame.
+    pub fn set_consider_relpose(&mut self, map: ConsiderRelMap) {
+        self.consider_rel = map;
     }
 
     pub fn query(&self, fid: u64) -> (f64, f64) {
@@ -1015,6 +1109,17 @@ fn apply_chart_delta(chart: Sparse3DChart, q: &Vector3<f64>, delta: &Vector3<f64
 /// (`inc_v`, `inc_w`). The two are consumed differently (see [`resolve_pose_cov`]).
 pub type CloneRelCov = HashMap<u64, (Matrix3<f64>, Matrix3<f64>, Matrix3<f64>, Matrix3<f64>)>;
 
+/// Consider-mode input for one anchor (filter_formulation §V-F): the FULL 6x6
+/// anchor->current relative-pose covariance `[phi; t]` and the one-step regression
+/// operator `M_k = Cov(theta_k, theta_{k-1}) Cov(theta_{k-1})^-1` that transports the
+/// landmark–pose cross-covariance between frames.
+#[derive(Debug, Clone, Copy)]
+pub struct ConsiderRel {
+    pub sigma: Matrix6<f64>,
+    pub m: Matrix6<f64>,
+}
+pub type ConsiderRelMap = HashMap<u64, ConsiderRel>;
+
 /// Route a landmark to the pose covariances its §V-D update should use, splitting
 /// the two distinct consumers of pose uncertainty:
 ///   - **measurement term** `r_meas += proj·P·projᵀ` — rebuilt fresh every frame, so
@@ -1063,12 +1168,24 @@ fn update_feature_3d(
     p_vv_inc: Option<&Matrix3<f64>>,
     p_ww_inc: Option<&Matrix3<f64>>,
     dt: f64,
+    consider: Option<&ConsiderRel>,
 ) -> bool {
     match chart {
         Sparse3DChart::InvDepthAdditive => invdepth_additive_update_3d(
             k, settings, feat, uv_obs, t_cw_curr, p_vv, p_ww, p_vv_inc, p_ww_inc, dt,
         ),
         Sparse3DChart::BearingInvDepthAdditive => match cam {
+            Some(cam) if settings.consider_relpose && settings.bias_walk_var <= 0.0 => {
+                match consider {
+                    Some(cr) => bearing_consider_update_3d(
+                        cam, k, settings, feat, uv_obs, t_cw_curr, cr, dt,
+                    ),
+                    // No consider entry for this anchor (feed not in consider mode, or the
+                    // anchor is not a live clone): the landmark cannot be updated honestly.
+                    // Skip the frame rather than silently run the other model.
+                    None => true,
+                }
+            }
             Some(cam) => bearing_invdepth_additive_update_3d(
                 cam, k, settings, feat, uv_obs, t_cw_curr, p_vv, p_ww, p_vv_inc, p_ww_inc, dt,
             ),
@@ -1340,7 +1457,7 @@ fn bearing_invdepth_additive_update_3d(
         return false;
     }
     let proj = cam.projection_jacobian(&q_c); // dpixel/dP_cam (2x3)
-    // Measurement-side pose uncertainty (see invdepth_additive_update_3d).
+                                              // Measurement-side pose uncertainty (see invdepth_additive_update_3d).
     if dt > 0.0 {
         if let Some(pvv) = p_vv {
             r_meas += proj * pvv * proj.transpose();
@@ -1408,6 +1525,158 @@ fn bearing_invdepth_additive_update_3d(
     let j_g = r_ca * jpa_new; // dP_cur/ds
     feat.position = r_ca * pa_new + t_ca_t;
     let cov_euc = j_g * feat.inv_p * j_g.transpose();
+    feat.covariance = 0.5 * (cov_euc + cov_euc.transpose());
+    true
+}
+
+/// Consider (Schmidt) bearing-invdepth update, filter_formulation §V-F eqs (18)-(21).
+///
+/// The anchor->current relative-pose error `theta` (`[phi; t]`, perturbing the point in
+/// the current frame as `dq_c = [q_c]_x phi + t`, the same convention as the
+/// measurement-side pose term it replaces) is a CONSIDERED variable: never estimated
+/// here, but carried in the joint covariance with the landmark through
+/// `feat.p_stheta`. Per frame: (21) transport `P_sth <- P_sth M'`; (19) joint innovation
+/// covariance and consider gain; (20) joint-Joseph posterior and the cross-term update
+/// `P_sth+ = (I - K C) P_sth - K J Sigma`, which is where a RADIAL component is born
+/// (the gain's rho-row is non-zero under parallax) -- the thing the radial-blind
+/// measurement term (9) cannot do and the range injection (10)-(11) imitated by hand.
+/// No range injection and no measurement-side pose term run in this path. The cached
+/// current-frame covariance includes the transported pose covariance and the cross term,
+/// since that is the covariance of the point the consumer is handed.
+#[allow(clippy::too_many_arguments)]
+fn bearing_consider_update_3d(
+    cam: &dyn CameraModel,
+    k: &Matrix3<f64>,
+    settings: &SparseVogSettings,
+    feat: &mut FeatureState3D,
+    uv_obs: &Vector2<f64>,
+    t_cw_curr: &Matrix4<f64>,
+    cr: &ConsiderRel,
+    dt: f64,
+) -> bool {
+    let fx = k[(0, 0)];
+    let fy = k[(1, 1)];
+    let t_ca = t_cw_curr * feat.anchor_t_wc;
+    let r_ca = t_ca.fixed_view::<3, 3>(0, 0).into_owned();
+    let t_ca_t = t_ca.fixed_view::<3, 1>(0, 3).into_owned();
+    let b0 = feat.anchor_ray;
+    let u = feat.tangent_basis;
+    let pj_of = |s: &Vector3<f64>| {
+        let eta = Vector2::new(s[0], s[1]);
+        bearing_chart::point_and_jacobian(&b0, &u, &eta, s[2])
+    };
+    let sigma = cr.sigma;
+
+    // (21) transport of the cross term to this frame's relative pose.
+    if dt > 0.0 {
+        feat.p_stheta *= cr.m.transpose();
+    }
+
+    let (pa, jpa) = pj_of(&feat.inv_s);
+    let q_c = r_ca * pa + t_ca_t;
+    if q_c[2] < settings.min_depth {
+        return false;
+    }
+    let proj = cam.projection_jacobian(&q_c); // 2x3
+    let mut j_pose = Matrix2x6::<f64>::zeros(); // d pixel / d theta
+    j_pose
+        .fixed_view_mut::<2, 3>(0, 0)
+        .copy_from(&(proj * base_skew(&q_c)));
+    j_pose.fixed_view_mut::<2, 3>(0, 3).copy_from(&proj);
+    let c = proj * r_ca * jpa; // 2x3
+    let r_core = Matrix2::identity() * measurement_variance_px2(settings, feat);
+
+    // (19)
+    let p = feat.inv_p;
+    let pst = feat.p_stheta;
+    let cross_s = c * pst * j_pose.transpose(); // 2x2
+    let s_mat = c * p * c.transpose()
+        + cross_s
+        + cross_s.transpose()
+        + j_pose * sigma * j_pose.transpose()
+        + r_core;
+    let Some(s_inv) = (s_mat + Matrix2::identity() * 1e-8).try_inverse() else {
+        return true;
+    };
+    let det_s = s_mat.determinant();
+    if det_s < 1e-30 {
+        return true;
+    }
+    let gain = (p * c.transpose() + pst * j_pose.transpose()) * s_inv; // 3x2
+
+    let y_pred = cam.project(&q_c);
+    let residual = uv_obs - y_pred;
+    let maha_sq = (residual.transpose() * s_inv * residual)[(0, 0)];
+    feat.last_nis = maha_sq;
+    if settings.mahalanobis_reset_chi2 > 0.0 && maha_sq > settings.mahalanobis_reset_chi2 {
+        return false;
+    }
+    let full_delta = gain * residual;
+
+    // (20), joint Joseph form: the posterior error is L [ds; dth] + K eps with
+    // L = [I - K C, -K J].
+    let i_kc = Matrix3::identity() - gain * c;
+    let kj = gain * j_pose; // 3x6
+    let cross_post = i_kc * pst * kj.transpose();
+    let p_post = i_kc * p * i_kc.transpose() - cross_post - cross_post.transpose()
+        + kj * sigma * kj.transpose()
+        + gain * r_core * gain.transpose();
+    let pst_post = i_kc * pst - kj * sigma;
+
+    let gauss_pdf = (-0.5 * maha_sq).exp() / ((2.0 * std::f64::consts::PI).powi(2) * det_s).sqrt();
+    let uniform_prior = 1.0 / (fx * fy * 4.0);
+    let ab = feat.a + feat.b;
+    if ab <= 0.0 {
+        return true;
+    }
+    let c1 = (feat.a / ab) * gauss_pdf;
+    let c2 = (feat.b / ab) * uniform_prior;
+    let z_norm = c1 + c2;
+    if z_norm < 1e-30 {
+        feat.b = (feat.b + 1.0).min(settings.ab_max);
+        return true;
+    }
+    let w1 = c1 / z_norm;
+    let w2 = c2 / z_norm;
+    let gamma = w1 * full_delta;
+    let p_new = w1 * p_post + w2 * p + w1 * w2 * (full_delta * full_delta.transpose());
+    if p_new
+        .symmetric_eigen()
+        .eigenvalues
+        .iter()
+        .any(|v| *v <= 0.0 || !v.is_finite())
+    {
+        return true;
+    }
+    // The outlier hypothesis leaves the cross term as it was; theta has zero mean
+    // under both, so the mixture adds no spread to it.
+    let pst_new = w1 * pst_post + w2 * pst;
+    if !pst_new.iter().all(|v| v.is_finite()) {
+        return true;
+    }
+
+    feat.inv_s += gamma;
+    feat.inv_s[2] = clamp_rho(settings, feat.inv_s[2]);
+    feat.inv_p = 0.5 * (p_new + p_new.transpose());
+    feat.p_stheta = pst_new;
+    feat.track_length += 1;
+    update_beta(settings, feat, w1, w2);
+
+    // Current-frame report: the point handed to a consumer is q_c = T^{ca} P(s), whose
+    // error is J_s ds + J_th dth -- landmark, transported pose, and their cross term.
+    let (pa_new, jpa_new) = pj_of(&feat.inv_s);
+    let j_g = r_ca * jpa_new; // 3x3
+    feat.position = r_ca * pa_new + t_ca_t;
+    let mut j_th = Matrix3x6::<f64>::zeros();
+    j_th.fixed_view_mut::<3, 3>(0, 0)
+        .copy_from(&base_skew(&feat.position));
+    j_th.fixed_view_mut::<3, 3>(0, 3)
+        .copy_from(&Matrix3::identity());
+    let cross_e = j_g * feat.p_stheta * j_th.transpose();
+    let cov_euc = j_g * feat.inv_p * j_g.transpose()
+        + j_th * sigma * j_th.transpose()
+        + cross_e
+        + cross_e.transpose();
     feat.covariance = 0.5 * (cov_euc + cov_euc.transpose());
     true
 }
@@ -2314,6 +2583,307 @@ mod tests {
 
     /// Re-anchoring is a change of PARAMETRIZATION: the world point must not move, and
     /// the uncertainty must be conserved (not silently dropped when eta is reset to 0).
+    /// §V-F in miniature. One landmark, a camera translating along +x, the anchor->
+    /// current relative-pose covariance growing with the baseline (and a translation
+    /// block only, so the measurement-side term alone would be radial-blind by (9)).
+    /// Checks the three things the consider recursion must do that the legacy path
+    /// cannot: (i) a non-zero cross term with a RADIAL (rho) row after one update,
+    /// (ii) a reported current-frame range variance that GROWS with the pose covariance
+    /// while the legacy filter's stays pinned, and (iii) a re-anchor whose covariance
+    /// with the tracked cross term is no larger than the independence version.
+    /// Cross-epoch probe for the consider recursion (filter_formulation §V-F): the
+    /// VIO's error is a COMMON-MODE scale factor on every baseline, and the covariance it
+    /// hands over is honest for it (sigma_s = s). One filter keeps its birth anchor for
+    /// the whole track (one epoch); the other is moved onto the current clone every
+    /// `period` frames the way `CloneRelFeed` does in consider mode, which transports
+    /// the old->new covariance into the landmark and RESETS the cross term. Both are
+    /// scored against the TRUE range from the true camera at the last frame. Prints the
+    /// two reported variances and NEES; the assertions pin only what is structural.
+    #[test]
+    fn consider_reanchor_epochs_are_independent_under_a_common_scale_error() {
+        use crate::mathematical::camera::PinholeModel;
+        let cam: Arc<dyn CameraModel> = Arc::new(PinholeModel {
+            fx: 400.0,
+            fy: 400.0,
+            cx: 320.0,
+            cy: 240.0,
+        });
+        let kmat = k();
+        let point_w = Vector3::new(0.3, -0.2, 6.0);
+        let (s_true, s_sig, step) = (0.05, 0.05, 0.3);
+        let sigma_for = |sep: usize| {
+            let mut s = Matrix6::<f64>::zeros();
+            s[(3, 3)] = (s_sig * step * sep as f64).powi(2);
+            s[(4, 4)] = 1e-10;
+            s[(5, 5)] = 1e-10;
+            s
+        };
+        // True camera at x = step*i; the VIO reports x = step*i*(1+s): every baseline is
+        // scaled by the same factor. Pixels come from the TRUE geometry.
+        let frame = |i: usize| {
+            let t_true = pose(step * i as f64);
+            let t_rep = pose(step * i as f64 * (1.0 + s_true));
+            let q_c = t_true.try_inverse().unwrap()
+                * Vector4::new(point_w[0], point_w[1], point_w[2], 1.0);
+            let uv = cam.project(&Vector3::new(q_c[0], q_c[1], q_c[2]));
+            let mut coords = HashMap::new();
+            coords.insert(7u64, Vector2::new(uv[0] as f32, uv[1] as f32));
+            (
+                t_rep,
+                t_true,
+                VisionMeasurement::new(i as f64 * 0.04, coords),
+            )
+        };
+        let n = 42usize;
+        let run = |period: Option<usize>| -> (f64, f64) {
+            let mut st = settings();
+            st.min_track_length = 1;
+            st.birth_min_flow_px = 0.0;
+            st.pose_range_direct = false;
+            st.pose_range_scale = 0.0;
+            st.consider_relpose = true;
+            let mut f = Sparse3DFilter::bearing_invdepth3d(kmat, cam.clone(), st);
+            for i in 0..2 {
+                let (t, _, m) = frame(i);
+                f.update_with_clones(&m, &t, None, None, Some(i as u64), None);
+            }
+            assert_eq!(f.feature_count(), 1, "landmark born");
+            let mut anchor = f.feature(7).unwrap().anchor_clone_id.unwrap() as usize;
+            let mut true_range = 0.0;
+            for i in 2..n {
+                let (t, t_true, m) = frame(i);
+                if let Some(p) = period {
+                    if i - anchor >= p {
+                        let sig = sigma_for(i - anchor);
+                        assert!(f.reanchor_feature_full(7, &t, Some(i as u64), None, Some(&sig)));
+                        anchor = i;
+                    }
+                }
+                let mut cmap: ConsiderRelMap = HashMap::new();
+                cmap.insert(
+                    anchor as u64,
+                    ConsiderRel {
+                        sigma: sigma_for(i - anchor),
+                        m: Matrix6::identity(),
+                    },
+                );
+                f.set_consider_relpose(cmap);
+                f.update_with_clones(&m, &t, None, None, Some(i as u64), None);
+                let q = t_true.try_inverse().unwrap()
+                    * Vector4::new(point_w[0], point_w[1], point_w[2], 1.0);
+                true_range = Vector3::new(q[0], q[1], q[2]).norm();
+            }
+            let feat = f.feature(7).unwrap();
+            let err = feat.position.norm() - true_range;
+            let var = feat.range_variance_for_chart(f.chart());
+            (err, var)
+        };
+        let (e1, v1) = run(None);
+        let (e5, v5) = run(Some(5));
+        let (e2, v2) = run(Some(2));
+        eprintln!(
+            "common scale error {s_true}: one epoch err {e1:.3} m sigma {:.3} m NEES {:.2}; \
+             period 5 err {e5:.3} m sigma {:.3} m NEES {:.2}; \
+             period 2 err {e2:.3} m sigma {:.3} m NEES {:.2}",
+            v1.sqrt(),
+            e1 * e1 / v1,
+            v5.sqrt(),
+            e5 * e5 / v5,
+            v2.sqrt(),
+            e2 * e2 / v2
+        );
+        // The estimate is the scaled reconstruction either way: the error is the same
+        // scale error of the range, and no re-anchor rule can change it.
+        assert!(
+            (e1 - e5).abs() < 0.2 * e1.abs(),
+            "errors differ: {e1} vs {e5}"
+        );
+        assert!(e1.abs() > 0.5 * s_true * true_range_of(&point_w, step, n - 1));
+        // Structural claim under test: the one-epoch recursion carries the honest scale
+        // covariance (NEES of order one); re-anchoring resets the cross term, so later
+        // epochs re-measure the SAME scale error as if it were fresh, and the reported
+        // variance shrinks with the number of epochs.
+        assert!(
+            e1 * e1 / v1 < 4.0,
+            "one epoch is not honest: NEES {}",
+            e1 * e1 / v1
+        );
+        assert!(
+            v5 < 0.5 * v1,
+            "period 5 did not shrink the report: {v5} vs {v1}"
+        );
+        assert!(v2 < v5, "period 2 should shrink it further: {v2} vs {v5}");
+    }
+
+    fn true_range_of(point_w: &Vector3<f64>, step: f64, i: usize) -> f64 {
+        let q = pose(step * i as f64).try_inverse().unwrap()
+            * Vector4::new(point_w[0], point_w[1], point_w[2], 1.0);
+        Vector3::new(q[0], q[1], q[2]).norm()
+    }
+
+    #[test]
+    fn consider_recursion_carries_pose_uncertainty_into_the_range_channel() {
+        use crate::mathematical::camera::PinholeModel;
+        let cam: Arc<dyn CameraModel> = Arc::new(PinholeModel {
+            fx: 400.0,
+            fy: 400.0,
+            cx: 320.0,
+            cy: 240.0,
+        });
+        let kmat = k();
+        let point_w = Vector3::new(0.3, -0.2, 6.0);
+        let build = |consider: bool| {
+            let mut st = settings();
+            st.min_track_length = 1;
+            st.birth_min_flow_px = 0.0;
+            st.pose_range_direct = false;
+            st.pose_range_scale = 0.0;
+            st.consider_relpose = consider;
+            Sparse3DFilter::bearing_invdepth3d(kmat, cam.clone(), st)
+        };
+        let mut legacy = build(false);
+        let mut consider = build(true);
+        // Frames: camera at x = 0.3*i (enough parallax at 6 m for the birth gate),
+        // identity attitude; landmark id 7.
+        let frame = |i: usize| {
+            let t = pose(0.3 * i as f64);
+            let q_c =
+                t.try_inverse().unwrap() * Vector4::new(point_w[0], point_w[1], point_w[2], 1.0);
+            let uv = cam.project(&Vector3::new(q_c[0], q_c[1], q_c[2]));
+            let mut coords = HashMap::new();
+            coords.insert(7u64, Vector2::new(uv[0] as f32, uv[1] as f32));
+            (t, VisionMeasurement::new(i as f64 * 0.04, coords))
+        };
+        // Birth needs two frames (pending -> triangulated); the anchor is frame 1.
+        for i in 0..2 {
+            let (t, m) = frame(i);
+            legacy.update_with_clones(&m, &t, None, None, Some(i as u64), None);
+            consider.update_with_clones(&m, &t, None, None, Some(i as u64), None);
+        }
+        assert_eq!(consider.feature_count(), 1, "landmark born");
+        let anchor = consider.feature(7).unwrap().anchor_clone_id.unwrap();
+        let mut ranges_legacy = Vec::new();
+        let mut ranges_consider = Vec::new();
+        for i in 2..12usize {
+            let (t, m) = frame(i);
+            // Translation-only relative covariance growing with the baseline.
+            let base = 0.3 * (i as f64 - anchor as f64);
+            let sig_t = (0.05 * base).powi(2);
+            let mut sigma = Matrix6::<f64>::zeros();
+            for d in 3..6 {
+                sigma[(d, d)] = sig_t;
+            }
+            let mut rel: CloneRelCov = HashMap::new();
+            rel.insert(
+                anchor,
+                (
+                    Matrix3::identity() * sig_t,
+                    Matrix3::zeros(),
+                    Matrix3::zeros(),
+                    Matrix3::zeros(),
+                ),
+            );
+            legacy.update_with_clones(&m, &t, None, None, Some(i as u64), Some(&rel));
+            let mut cmap: ConsiderRelMap = HashMap::new();
+            cmap.insert(
+                anchor,
+                ConsiderRel {
+                    sigma,
+                    m: Matrix6::identity(),
+                },
+            );
+            consider.set_consider_relpose(cmap);
+            consider.update_with_clones(&m, &t, None, None, Some(i as u64), Some(&rel));
+            ranges_legacy.push(
+                legacy
+                    .feature(7)
+                    .unwrap()
+                    .range_variance_for_chart(legacy.chart()),
+            );
+            ranges_consider.push(
+                consider
+                    .feature(7)
+                    .unwrap()
+                    .range_variance_for_chart(consider.chart()),
+            );
+        }
+        let f = consider.feature(7).unwrap();
+        // (i) cross term exists and has a radial row.
+        assert!(
+            f.p_stheta.iter().any(|v| v.abs() > 0.0),
+            "cross term never born"
+        );
+        let rho_row = f.p_stheta.row(2);
+        assert!(
+            rho_row.iter().any(|v| v.abs() > 0.0),
+            "no radial component in the cross term"
+        );
+        // (ii) the consider range variance grows with the pose covariance; the legacy one
+        // (measurement-side term only, injection off) contracts.
+        let (c0, c1) = (ranges_consider[1], *ranges_consider.last().unwrap());
+        let (l0, l1) = (ranges_legacy[1], *ranges_legacy.last().unwrap());
+        assert!(
+            l1 <= l0,
+            "legacy range variance should only contract: {l0} -> {l1}"
+        );
+        assert!(
+            c1 > l1,
+            "consider range variance must exceed the radial-blind one: {c1} vs {l1}"
+        );
+        assert!(
+            c1 > 0.5 * c0,
+            "consider range variance collapsed: {c0} -> {c1}"
+        );
+        // (iii) re-anchor onto the current clone is a pure re-parametrization of the
+        // REPORTED current-frame covariance (landmark + transported pose + cross term):
+        // the new anchor-chart covariance, mapped back to the current frame, must equal
+        // what the last update cached. The sign of the cross term is NOT asserted -- it
+        // is geometry-dependent (a first-version assertion that it lowers rho was wrong).
+        let (t_new, _) = frame(11);
+        let sigma_now = {
+            let base = 0.3 * (11.0 - anchor as f64);
+            let mut s = Matrix6::<f64>::zeros();
+            for d in 3..6 {
+                s[(d, d)] = (0.05 * base).powi(2);
+            }
+            s
+        };
+        let reported = consider.feature(7).unwrap().covariance;
+        let mut indep = build(true);
+        let mut ff = consider.feature(7).unwrap().clone();
+        ff.p_stheta = Matrix3x6::zeros();
+        indep.insert_feature(ff);
+        assert!(consider.reanchor_feature_full(7, &t_new, Some(11), None, Some(&sigma_now)));
+        assert!(indep.reanchor_feature_full(7, &t_new, Some(11), None, Some(&sigma_now)));
+        let f = consider.feature(7).unwrap();
+        let (_, j_new) = bearing_chart::point_and_jacobian(
+            &f.anchor_ray,
+            &f.tangent_basis,
+            &Vector2::new(f.inv_s[0], f.inv_s[1]),
+            f.inv_s[2],
+        );
+        let back = j_new * f.inv_p * j_new.transpose();
+        let rel = (back - reported).abs().max() / reported.abs().max();
+        assert!(
+            rel < 1e-6,
+            "consider re-anchor is not a re-parametrization of the report: {rel:.2e}"
+        );
+        let pi = indep.feature(7).unwrap().inv_p;
+        assert!(
+            (pi[(2, 2)] - f.inv_p[(2, 2)]).abs() > 1e-12 * pi[(2, 2)],
+            "cross term made no difference"
+        );
+        assert!(
+            consider
+                .feature(7)
+                .unwrap()
+                .p_stheta
+                .iter()
+                .all(|v| *v == 0.0),
+            "cross term reset for the new epoch"
+        );
+    }
+
     #[test]
     fn reanchor_preserves_the_world_point_and_conserves_uncertainty() {
         use crate::mathematical::camera::{CameraModel, PinholeModel};
@@ -2393,7 +2963,7 @@ mod tests {
     #[test]
     fn pose_range_direct_accumulates_to_the_current_relative_covariance() {
         let r2 = 400.0; // r = 20 m
-        // Relative covariance grows BALLISTICALLY (~k^2), as measured for real VIO.
+                        // Relative covariance grows BALLISTICALLY (~k^2), as measured for real VIO.
         let sig = |k: f64| Matrix3::identity() * (1e-4 * k * k);
         // Baseline grows with the window, so the inverse-parallax gain CHANGES.
         let b2 = |k: f64| (0.3 * k).powi(2).max(1e-4 * r2);
@@ -2677,6 +3247,7 @@ mod tests {
             p_sb: Matrix3x2::zeros(),
             p_bb: Matrix2::zeros(),
             pose_q_prev: 0.0,
+            p_stheta: Matrix3x6::zeros(),
             anchor_clone_id: None,
         }
     }

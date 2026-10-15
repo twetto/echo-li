@@ -103,6 +103,17 @@ pub struct SparseVogSettings {
     /// scalar. Requires a kept-pose window supplying the true anchor->current covariance
     /// (MSCEqF clones); with the absolute-marginal surrogate it is not meaningful.
     pub pose_range_direct: bool,
+    /// Consider (Schmidt) treatment of the anchor->current relative pose,
+    /// filter_formulation §V-F: each landmark carries its 3x6 cross-covariance with
+    /// that pose error; the update uses the joint innovation covariance and the
+    /// consider gain; the current-frame report adds the transported pose covariance
+    /// and the cross term; re-anchoring onto the current clone uses the tracked cross
+    /// term. Replaces the measurement-side pose term, the range injection
+    /// (`pose_range_direct` / `pose_range_scale`) and the independence assumption at
+    /// re-anchor. Needs a feed that supplies `ConsiderRel` per anchor
+    /// (`CloneRelFeed::consider`). BearingInvDepthAdditive chart, bias state off.
+    /// Default false. UNVALIDATED: built 2026-10-14 to test §V-F's predictions.
+    pub consider_relpose: bool,
     /// Exogenous multiplicative SCALE uncertainty, as a 1-sigma fraction of range.
     /// Adds `(scale_sigma * r)^2` to the REPORTED range variance (and `(scale_sigma * d)^2`
     /// to reported depth variance). Default 0 = off.
@@ -243,6 +254,7 @@ impl Default for SparseVogSettings {
             max_depth: 100.0,
             birth_min_flow_px: 3.0,
             pose_range_direct: false,
+            consider_relpose: false,
             scale_sigma: 0.0,
             conv_range_sigma_frac: 0.0,
             civera_birth_depth: 0.0,
@@ -272,7 +284,11 @@ pub struct FeatureState {
 impl FeatureState {
     pub fn inlier_ratio(&self) -> f64 {
         let ab = self.a + self.b;
-        if ab <= 0.0 { 0.0 } else { self.a / ab }
+        if ab <= 0.0 {
+            0.0
+        } else {
+            self.a / ab
+        }
     }
 }
 

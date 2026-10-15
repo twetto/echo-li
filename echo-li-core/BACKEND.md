@@ -136,10 +136,20 @@ Owed, in dependency order: `MSCEqFFilter` is a primitives API -- `stochastic_clo
    `relative_pose_covariances` / `live_clone_ids` / `current_clone_id` /
    `last_clone_eviction`, and consumed by `CloneRelFeed` -- the one shared feed the CLI
    and the ROS 2 node run, which reproduces the depth NEES harness's construction
-   (clone-relative, PSD-clipped increments, re-anchor on eviction). Validated on Kite t0:
-   the harness's `--pose-source backend` (this seam) is byte-identical to its
-   `--pose-source msceqf` (the hand-built adapter) in three settings, and the eviction
-   re-anchor rule lands within the one-frame timing difference of the harness's rule.
+   (clone-relative, PSD-clipped increments, and the harness's re-anchor rule: every
+   frame, landmarks on the oldest live clone move onto the previous frame's clone,
+   WITHOUT adding the oldest->new relative covariance -- `reanchor_transport_cov`,
+   off since 2026-10-15: under the measured error channel that block is an
+   independence artefact, not covariance, and the next update removes it; keeping it
+   cost 6.6 vs 5.7 % range error, 26 vs 27/30 honest, sigma_r 5.15 vs 4.40 m, see the
+   field's comment). Validated on all 30 Kite_training
+   trajectories: the harness's `--pose-source backend --feed rust`, which routes the
+   whole clone-relative block through `VIOFilter.sparse_feed` = this `CloneRelFeed`, is
+   byte-identical to the harness's own Python block, and the harness's hand-built
+   adapter (`--pose-source msceqf`) reproduces its 2026-10-09 ledger exactly. The
+   eviction-based alternative (`--reanchor-eviction`, via `last_clone_eviction`) was
+   measured and is NOT shipped: honest on 22/30 vs 26/30 for the harness rule, with a
+   systematically heavier >chi2_99 tail; why is not established.
    One trap, pinned by `msceqf_eviction_is_recorded_before_the_clone_dies`: a clone
    stores the group element `E_k`, not a pose; its world camera pose is
    `SE3(T0) S0 E_k` (`clone_world_pose`), and the first version handed out `E_k`.

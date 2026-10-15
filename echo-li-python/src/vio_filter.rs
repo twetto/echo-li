@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use echo_li_core::backend::{
-    backend_from_config, BackendKind, CameraPoseCovariance, EqvioBackend, MsceqfBackend,
-    VioBackendFull,
+    backend_from_config, BackendKind, CameraPoseCovariance, CloneRelFeed, EqvioBackend,
+    MsceqfBackend, VioBackendFull,
 };
 use echo_li_core::config::{MsceqfConfig, VIOConfig, ZuptConfig};
 use echo_li_core::initialization::{FilterStart, StationaryInit};
@@ -53,6 +53,8 @@ pub struct PyVIOFilter {
     // Remembered so it survives set_initial_state, which REPLACES the backend
     // and would otherwise silently discard the setting.
     gram_window: usize,
+    /// The shared Sparse3D feed (see `CloneRelFeed`), reset with every reseed.
+    sparse_feed: CloneRelFeed,
     /// Frames handed to `process_vision`. Counted here rather than read from EqVIO so
     /// it means the same thing under either backend.
     vision_count: usize,
@@ -143,6 +145,7 @@ impl PyVIOFilter {
             gyro_bias,
         };
         self.backend = self.build(&start)?;
+        self.sparse_feed = CloneRelFeed::default();
         let window = self.gram_window;
         if window > 0 {
             if let Ok(f) = self.eqvio_mut("enable_gramian") {
@@ -210,6 +213,7 @@ impl PyVIOFilter {
             init: StationaryInit::new(n_init_samples, SE3::identity()),
             initialized: false,
             gram_window: 0,
+            sparse_feed: CloneRelFeed::default(),
             vision_count: 0,
         };
         let (backend, kind) = backend_from_config(
@@ -709,6 +713,68 @@ impl PyVIOFilter {
     /// (offered, accepted) structureless tracks. MSCEqF-only.
     fn msc_update_counts(&self) -> PyResult<(u64, u64)> {
         Ok(self.msceqf("msc_update_counts")?.msc_update_counts())
+    }
+
+    /// Drive a Sparse3DFilter from this backend's pose covariance through the SHARED
+    /// `CloneRelFeed` -- the exact code the CLI and the ROS 2 node run -- instead of
+    /// re-implementing the clone-relative bookkeeping in Python. Call once per frame,
+    /// after `process_vision`, with the full tracked-feature set and the current camera
+    /// pose `t_wc` (4x4). Returns `(clone_relative, reanchored, n_rel, had_absolute)`.
+    fn sparse_feed(
+        &mut self,
+        sparse: &mut crate::sparse_3d::PySparse3DFilter,
+        stamp: f64,
+        feature_uvs: HashMap<u64, [f32; 2]>,
+        t_wc: [[f64; 4]; 4],
+    ) -> (bool, usize, usize, bool) {
+        let cam_coords: HashMap<u64, Vector2<f32>> = feature_uvs
+            .into_iter()
+            .map(|(id, uv)| (id, Vector2::new(uv[0], uv[1])))
+            .collect();
+        let measurement = VisionMeasurement::new(stamp, cam_coords);
+        let mut t = nalgebra::Matrix4::<f64>::zeros();
+        for r in 0..4 {
+            for c in 0..4 {
+                t[(r, c)] = t_wc[r][c];
+            }
+        }
+        let r = self.sparse_feed.feed(
+            self.backend.pose_covariance(),
+            &mut sparse.inner,
+            &measurement,
+            &t,
+        );
+        (r.clone_relative, r.reanchored, r.n_rel, r.had_absolute)
+    }
+
+    /// Diagnostic: set the feed's re-anchor age (see `CloneRelFeed::reanchor_age`);
+    /// 0 restores the production (harness) rule.
+    fn set_sparse_reanchor_age(&mut self, age: u64) {
+        self.sparse_feed.reanchor_age = (age > 0).then_some(age);
+    }
+
+    /// Diagnostic: whether the feed adds the old->current relative-pose covariance to
+    /// a landmark when re-anchoring it (see `CloneRelFeed::reanchor_transport_cov`).
+    fn set_sparse_reanchor_transport_cov(&mut self, on: bool) {
+        self.sparse_feed.reanchor_transport_cov = on;
+    }
+
+    /// Consider mode of the feed (see `CloneRelFeed::consider`); pair it with a
+    /// Sparse3DFilter built with `consider_relpose=True`.
+    fn set_sparse_consider(&mut self, on: bool) {
+        self.sparse_feed.consider = on;
+    }
+
+    /// Diagnostic: 0 = VIO regression operator, 1 = identity, 2 = zero (see
+    /// `CloneRelFeed::consider_m_mode`).
+    fn set_sparse_consider_m_mode(&mut self, mode: u8) {
+        self.sparse_feed.consider_m_mode = mode;
+    }
+
+    /// Diagnostic: 0 = full relative covariance, 1 = translation block isotropised,
+    /// 2 = both blocks isotropised (see `CloneRelFeed::consider_sigma_mode`).
+    fn set_sparse_consider_sigma_mode(&mut self, mode: u8) {
+        self.sparse_feed.consider_sigma_mode = mode;
     }
 
     /// Feature ids the MSCEqF backend currently holds (buffered tracks + in-state

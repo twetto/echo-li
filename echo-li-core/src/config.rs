@@ -257,6 +257,8 @@ pub struct SparseVogConfig {
     #[serde(default)]
     pub pose_range_direct: Option<bool>,
     #[serde(default)]
+    pub consider_relpose: Option<bool>,
+    #[serde(default)]
     pub scale_sigma: Option<f64>,
     #[serde(default)]
     pub conv_range_sigma_frac: Option<f64>,
@@ -366,6 +368,9 @@ impl SparseVogConfig {
         }
         if let Some(v) = self.pose_range_direct {
             settings.pose_range_direct = v;
+        }
+        if let Some(v) = self.consider_relpose {
+            settings.consider_relpose = v;
         }
         if let Some(v) = self.scale_sigma {
             settings.scale_sigma = v;
