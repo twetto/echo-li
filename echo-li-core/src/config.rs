@@ -219,6 +219,8 @@ pub struct SparseVogConfig {
     #[serde(default)]
     pub bias_walk_var: Option<f64>,
     #[serde(default)]
+    pub bias_init_var: Option<f64>,
+    #[serde(default)]
     pub pose_range_scale: Option<f64>,
     #[serde(default)]
     pub pose_range_coherent: Option<f64>,
@@ -314,6 +316,9 @@ impl SparseVogConfig {
         }
         if let Some(v) = self.bias_walk_var {
             settings.bias_walk_var = v;
+        }
+        if let Some(v) = self.bias_init_var {
+            settings.bias_init_var = v;
         }
         if let Some(v) = self.pose_range_scale {
             settings.pose_range_scale = v;

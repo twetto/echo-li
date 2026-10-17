@@ -47,6 +47,7 @@ from scipy.spatial.transform import Rotation as Rot
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import midair_drift as md
+import fdf_densify_study as dz  # noqa: E402
 import echo_li
 
 # Keys forwarded from the YAML SparseVog section to the Sparse3D constructor.
@@ -58,7 +59,7 @@ SPARSE_KEYS = [
     "max_pool_size", "min_track_length", "conv_variance_threshold",
     "civera_birth_depth", "civera_rho_sigma_frac",
     "init_depth_var", "init_invdepth_var", "sigma_pixel", "flow_age_rate_px_per_frame",
-    "bias_walk_var", "uniform_z_max", "uniform_rho_max", "uniform_d_min", "uniform_d_max",
+    "bias_walk_var", "bias_init_var", "uniform_z_max", "uniform_rho_max", "uniform_d_min", "uniform_d_max",
     "a_init", "b_init", "ab_min", "ab_max", "min_inlier_ratio",
     "mahalanobis_reset_chi2", "process_depth_var", "range_walk_var", "pose_range_scale",
     "pose_range_coherent", "pose_range_direct", "consider_relpose", "scale_sigma", "conv_range_sigma_frac",
@@ -306,12 +307,16 @@ class BackendAdapter:
     """
 
     def __init__(self, cfg, cam, f, num_clones, pixel_std_px, max_slam,
-                 acc_d, gyr_d, acc_rw, gyr_rw, update_span=11, max_track=200):
+                 acc_d, gyr_d, acc_rw, gyr_rw, update_span=0, max_track=200,
+                 direct_product_bias=False, bias_std=1e-2):
         import echo_li
         import tempfile
         full = _deep_copy(cfg)
         full["MSCEqF"] = {
             "enabled": True,
+            # Static (direct-product) bias chart instead of the semi-direct one; the
+            # only chart-level switch the backend exposes. Diagnostic arm only.
+            "directProductBias": bool(direct_product_bias),
             "numClones": int(num_clones),
             "pixelStd": float(pixel_std_px),          # pixels; /fx inside
             "chi2Mult": 1.0,
@@ -323,7 +328,7 @@ class BackendAdapter:
             # NWU harness: z is UP, gravity ACCELERATION is -z (see MSCEqFAdapter).
             "gravity": [0.0, 0.0, -9.81],
             "initialStd": {"attitude": 1e-2, "velocity": 1e-1, "position": 1e-4,
-                           "bias": 1e-2, "extrinsics": 1e-4},
+                           "bias": float(bias_std), "extrinsics": 1e-4},
             "processNoise": {"accelDensity": float(acc_d), "gyroDensity": float(gyr_d),
                              "accelRandomWalk": float(acc_rw),
                              "gyroRandomWalk": float(gyr_rw), "transitionOrder": 0},
@@ -337,6 +342,23 @@ class BackendAdapter:
 
     def process_imu(self, stamp, gyr, acc):
         self.f.process_imu(stamp, list(gyr), list(acc))
+
+    def imu_bias(self):
+        return np.asarray(self.f.imu_bias())
+
+    def n_slam(self):
+        return int(self.f.n_slam())
+
+    def att_cov(self):
+        # MSCEqF core order [att, vel, pos | bias | extr | clones]; DIAGONAL of the attitude
+        # block only (nav_cov_diag is the accessor the backend exposes), as a 3x3.
+        return np.diag(np.asarray(self.f.nav_cov_diag())[:3])
+
+    def msc_reject_counts(self):
+        return list(self.f.msc_reject_counts())
+
+    def msc_update_counts(self):
+        return tuple(self.f.msc_update_counts())
 
     def process_vision(self, stamp, uvs):
         self.f.process_vision(stamp, uvs)
@@ -398,6 +420,195 @@ class BackendAdapter:
         self.f.set_initial_state(p, np.ascontiguousarray(R), v_body)
 
 
+class OpenVINSAdapter:
+    """Presents the same surface as BackendAdapter, backed by a RECORDED OpenVINS run:
+    the env-gated clone-covariance dump (`OV_CLONECOV`, see
+    artifacts/openvins_ws/ov_ws/src/.../ROSVisualizerHelper.cpp) written by
+    `ros1_serial_msckf` on the same Kite bag. This is the pose-source ablation for the
+    Sparse3D depth NEES: everything downstream (tracks, the Python clone-relative block,
+    Sparse3D, scoring) is byte-identical to `--pose-source backend --feed python`; only
+    the poses and the anchor->current covariance come from OpenVINS instead of MSCEqF.
+
+    Dump record: ts t_ItoC Nc [clone_time]*Nc [qx qy qz qw px py pz]*Nc [cov (6Nc)^2],
+    JPL quat q_GtoI, p_IinG, error state per clone [dtheta(3, IMU-local), dp(3, global)]
+    with R_GtoI_true = Exp(-dtheta) R_GtoI_est, p_true = p_est + dp (ov_core PoseJPL).
+    Clone times are image stamps on the bag clock (1.0 + k/25).
+
+    The relative covariance handed out is the one the MSCEqF backend hands out
+    (msceqf_filter.rs `relative_pose_covariance`): the LEFT perturbation of the
+    current<-anchor CAMERA pose expressed in the current camera frame, i.e. the chart
+    Sparse3D section V-B linearises in (q_true = (I + [phi]x) q + dt). It is built from
+    the dumped 12x12 joint clone block by a finite-difference Jacobian of that exact
+    map, so no hand-derived convention can be silently wrong.
+    """
+
+    BAG_T0 = 1.0
+    FPS = 25.0
+
+    def __init__(self, dump_path, ext, max_clones=11):
+        self.ext = np.asarray(ext, float)
+        self.max_clones = int(max_clones)
+        self.rec = {}            # frame k -> (clone_frames, R_ItoG list, p list, cov)
+        self.k = None
+        self.cur = None
+        n_rec = 0
+        with open(dump_path) as fh:
+            for ln in fh:
+                if ln.startswith("#") or not ln.strip():
+                    continue
+                v = np.fromstring(ln, sep=" ")
+                nc = int(v[2])
+                ct = v[3:3 + nc]
+                po = v[3 + nc:3 + nc + 7 * nc].reshape(nc, 7)
+                cov = v[3 + nc + 7 * nc:].reshape(6 * nc, 6 * nc)
+                kf = np.round((ct - self.BAG_T0) * self.FPS)
+                ok = np.abs(ct - (self.BAG_T0 + kf / self.FPS)) < 0.5 / self.FPS
+                if not ok[-1]:
+                    continue
+                kcur = int(kf[-1])
+                Rs = [self._quat2rot_jpl(po[i, :4]).T for i in range(nc)]   # R_ItoG
+                ps = [po[i, 4:7].copy() for i in range(nc)]
+                frames = [int(kf[i]) if ok[i] else None for i in range(nc)]
+                self.rec[kcur] = (frames, Rs, ps, cov)
+                n_rec += 1
+        ks = sorted(self.rec)
+        self.first_frame = ks[0] if ks else None
+        print(f"OpenVINS dump: {n_rec} records, frames {ks[0] if ks else '-'}..{ks[-1] if ks else '-'}, "
+              f"clones/record median {np.median([len(r[0]) for r in self.rec.values()]) if ks else 0:.0f}")
+
+    @staticmethod
+    def _skew(v):
+        return np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+
+    @staticmethod
+    def _quat2rot_jpl(q):
+        """OpenVINS JPL quat (xyzw) -> R_GtoI."""
+        qv = q[:3]; qw = q[3]
+        return ((2 * qw * qw - 1) * np.eye(3) - 2 * qw * OpenVINSAdapter._skew(qv)
+                + 2 * np.outer(qv, qv))
+
+    def _T_wc(self, R_ItoG, p, dth, dp):
+        """Camera pose in G under the OV error-state perturbation (exact exp)."""
+        R = R_ItoG @ Rot.from_rotvec(dth).as_matrix()      # R_ItoG_true = R_ItoG Exp(dth)
+        T = np.eye(4)
+        T[:3, :3] = R
+        T[:3, 3] = p + dp
+        return T @ self.ext
+
+    @staticmethod
+    def _left_delta(T_true, T_nom):
+        """Left-perturbation coordinates [phi, dt] with T_true ~= (I+[phi]x | dt) T_nom."""
+        D = T_true @ np.linalg.inv(T_nom)
+        return np.concatenate([Rot.from_matrix(D[:3, :3]).as_rotvec(), D[:3, 3]])
+
+    # --- IMU / vision --------------------------------------------------------
+    def process_imu(self, stamp, gyr, acc):
+        pass
+
+    def process_vision(self, stamp, uvs):
+        self.k = int(round(stamp * self.FPS))
+        self.cur = self.rec.get(self.k)
+
+    @property
+    def ready(self):
+        return self.cur is not None
+
+    # --- EqVIO-shaped accessors ----------------------------------------------
+    def get_landmarks(self):
+        return {}
+
+    def get_pose(self):
+        frames, Rs, ps, _ = self.cur
+        i = len(frames) - 1
+        return ps[i].copy(), Rot.from_matrix(Rs[i]).as_quat()
+
+    def _idx(self, cid):
+        frames = self.cur[0]
+        for i, fr in enumerate(frames):
+            if fr == int(cid):
+                return i
+        return None
+
+    def get_camera_pose_covariance(self):
+        """(P_vv, P_ww) of the newest clone's camera pose, RIGHT perturbation in the
+        camera frame (the trait doc's 'camera-fixed frame'); fallback path only."""
+        frames, Rs, ps, cov = self.cur
+        i = len(frames) - 1
+        Tn = self._T_wc(Rs[i], ps[i], np.zeros(3), np.zeros(3))
+        J = np.zeros((6, 6))
+        eps = 1e-6
+        for j in range(6):
+            x = np.zeros(6); x[j] = eps
+            Tt = self._T_wc(Rs[i], ps[i], x[:3], x[3:])
+            D = np.linalg.inv(Tn) @ Tt
+            J[:, j] = np.concatenate([Rot.from_matrix(D[:3, :3]).as_rotvec(), D[:3, 3]]) / eps
+        P = cov[6 * i:6 * i + 6, 6 * i:6 * i + 6]
+        S = J @ P @ J.T
+        S = 0.5 * (S + S.T)
+        return S[3:, 3:].copy(), S[:3, :3].copy()
+
+    def clone_pose(self, k, stamp):
+        pass
+
+    def marginalize_clone(self, cid):
+        return False
+
+    def clone_ids(self):
+        if self.cur is None:
+            return []
+        return [fr for fr in self.cur[0] if fr is not None]
+
+    def n_clones(self):
+        return self.max_clones
+
+    def relative_pose_covariance_full(self, cid, _cur_id):
+        if self.cur is None:
+            return None
+        a = self._idx(cid)
+        frames, Rs, ps, cov = self.cur
+        c = len(frames) - 1
+        if a is None or a == c:
+            return None
+        Ta = self._T_wc(Rs[a], ps[a], np.zeros(3), np.zeros(3))
+        Tc = self._T_wc(Rs[c], ps[c], np.zeros(3), np.zeros(3))
+        Tn = np.linalg.inv(Tc) @ Ta                       # current <- anchor
+        J = np.zeros((6, 12))
+        eps = 1e-6
+        for j in range(12):
+            x = np.zeros(12); x[j] = eps
+            Ta_t = self._T_wc(Rs[a], ps[a], x[0:3], x[3:6])
+            Tc_t = self._T_wc(Rs[c], ps[c], x[6:9], x[9:12])
+            J[:, j] = self._left_delta(np.linalg.inv(Tc_t) @ Ta_t, Tn) / eps
+        ia = slice(6 * a, 6 * a + 6); ic = slice(6 * c, 6 * c + 6)
+        P = np.block([[cov[ia, ia], cov[ia, ic]], [cov[ic, ia], cov[ic, ic]]])
+        S = J @ P @ J.T
+        S = 0.5 * (S + S.T)
+        if not np.isfinite(S).all():
+            return None
+        return S
+
+    def get_relative_pose_covariance(self, cid, _t_wc_clone):
+        S = self.relative_pose_covariance_full(cid, None)
+        if S is None:
+            return None
+        return S[3:, 3:].copy(), S[:3, :3].copy()
+
+    def set_camera_extrinsics(self, ext):
+        self.ext = np.asarray(ext, float)
+
+    def set_initial_state(self, *a, **kw):
+        pass
+
+
+def _nslam_str(vio):
+    """In-state landmark count for the clone-window print; '-' for a filter without it
+    (EqVIO raises RuntimeError on the MSCEqF-only accessor, hasattr is true)."""
+    try:
+        return str(vio.n_slam())
+    except (AttributeError, RuntimeError):
+        return "-"
+
+
 def vio_body_pose(vio):
     """SE(3) pose of the VIO body frame in the world frame."""
     pos, quat = vio.get_pose()
@@ -441,6 +652,18 @@ def main():
                     help="override eqf.initialVariance.biasAcc")
     ap.add_argument("--bias-gyr", type=float, default=None,
                     help="override eqf.initialVariance.biasGyr")
+    ap.add_argument("--msceqf-bias-std", type=float, default=1e-2,
+                    help="backend pose source: initial IMU-bias std (rad/s, m/s^2); default 1e-2")
+    ap.add_argument("--gt-gyro", action="store_true",
+                    help="DIAGNOSTIC: feed the GT body angular rate instead of the measured gyro")
+    ap.add_argument("--msceqf-update-span", type=int, default=0,
+                    help="backend: flush structureless tracks after this many obs (0 = only at loss/"
+                         "marginalization, the backend default). Every Kite run before 2026-10-16 "
+                         "used 11 == the clone window, which flushes every track one frame before "
+                         "it can be promoted, so no in-state landmark ever existed; pass 11 to "
+                         "reproduce those traces.")
+    ap.add_argument("--msceqf-dp-bias", action="store_true",
+                    help="backend pose source: direct-product (static) bias chart instead of semi-direct")
     ap.add_argument("--vel-acc", type=float, default=None,
                     help="override eqf.velocityNoise.acc")
     ap.add_argument("--vel-gyr", type=float, default=None,
@@ -465,7 +688,15 @@ def main():
                          "structureless only, which is this filter's WEAKEST mode "
                          "(landmarks roughly halve ATE). The 7 no-output trajectories "
                          "all diverge in pose, so this is the first thing to try.")
-    ap.add_argument("--pose-source", choices=("eqvio", "msceqf", "backend"), default="eqvio",
+    ap.add_argument("--ov-dump", default="",
+                    help="with --pose-source openvins: the OV_CLONECOV dump of the OpenVINS "
+                         "run on this trajectory's bag (poses + joint clone covariance)")
+    ap.add_argument("--score-from-frame", type=int, default=0,
+                    help="drop scored observations with frame index below this (both arms "
+                         "of a pose-source comparison must use the same value; a "
+                         "self-initialising source has no output before it initialises)")
+    ap.add_argument("--pose-source", choices=("eqvio", "msceqf", "backend", "openvins", "gt"),
+                    default="eqvio",
                     help="which filter supplies poses AND the clone-relative covariance. "
                          "'msceqf' routes through the fork-b native filter via "
                          "MSCEqFAdapter; its relative cov is clone-to-clone (no "
@@ -551,6 +782,35 @@ def main():
     ap.add_argument("--gt-anchored", action="store_true",
                     help="score against the reprojected GT BIRTH landmark instead of "
                          "GT depth at the current (drifted) tracked pixel")
+    ap.add_argument("--track-source", choices=("rudolf", "fdf"), default="rudolf",
+                    help="tracks fed to Sparse3D. rudolf: the FAST+KLT front end; fdf: FlowDep-F "
+                         "anchor-referenced epipolar patch tracker driven by the --pose-source pose "
+                         "(GT with --pose-source gt). The pose source itself always runs on Rudolf-V.")
+    ap.add_argument("--fdf", action="append", default=[], metavar="KEY=VAL", help="FlowDepF setting override")
+    ap.add_argument("--fdf-posterior", action="store_true",
+                    help="feed every Sparse3D feature's range posterior back as the FlowDep-F search bound")
+    ap.add_argument("--fdf-aniso-r", type=float, default=0.0, metavar="SIGMA_ACROSS_PX",
+                    help="per-observation 2x2 R for FlowDep-F tracks: along the epipolar line the "
+                         "tracker's Gauss-Newton sigma floored by --fdf-along-floor, across it this "
+                         "value (px). 0 = the isotropic sigma_pixel (default)")
+    ap.add_argument("--fdf-along-floor", type=float, default=0.2,
+                    help="floor (px) on the along-line sigma used with --fdf-aniso-r")
+    ap.add_argument("--bias-epoch-var", type=float, default=0.0,
+                    help="with --track-source fdf and the bias state on: when FlowDep-F re-anchors a "
+                         "patch (its anchor frame changes), reset that landmark's bias block to this "
+                         "prior variance (px^2) before the frame's update -- the piecewise-constant "
+                         "bias model (one offset per reference). 0 = off")
+    ap.add_argument("--densify", action="store_true",
+                    help="with --track-source fdf: fuse the converged landmarks into a dense range frame every "
+                         "frame (design note row 5b rule: nearest patch + disagreement + footprint term + the "
+                         "scale term fully correlated) and score every 2nd pixel against GT; also scores the "
+                         "same rule with the shared (reported - state) term dropped, to isolate eq. 35")
+    ap.add_argument("--slant-deg", type=float, default=35.0)
+    ap.add_argument("--fdf-dump", default="",
+                    help="write every FlowDep-F observation (frame, id, u, v, level, eta, eta_sigma, "
+                         "sigma_px, dir, residual, anchor) to this .npz")
+    ap.add_argument("--sparse", action="append", default=[], metavar="KEY=VAL",
+                    help="SparseVog setting override, e.g. --sparse max_pool_size=4000")
     ap.add_argument("--converged-only", action="store_true",
                     help="score only features passing query_range's convergence gates")
     ap.add_argument("--no-progress", action="store_true")
@@ -667,11 +927,20 @@ def main():
             num_clones=max(args.clone_window, 11), max_slam=args.msceqf_max_slam,
             pixel_std_px=(args.sigma_pixel or 1.0),
             acc_d=_vn.get("acc", 3.28e-3), gyr_d=_vn.get("gyr", 3.94e-3),
-            acc_rw=_vn.get("accBias", 4.462e-3), gyr_rw=_vn.get("gyrBias", 1.337e-4))
+            acc_rw=_vn.get("accBias", 4.462e-3), gyr_rw=_vn.get("gyrBias", 1.337e-4),
+            direct_product_bias=args.msceqf_dp_bias, bias_std=args.msceqf_bias_std,
+            update_span=args.msceqf_update_span)
+        print(f"  MSCEqF chart: {'direct-product' if args.msceqf_dp_bias else 'semi-direct'} bias; max_slam={args.msceqf_max_slam}")
         print("pose source: shipping backend (VIOFilter + MSCEqF: section, "
               f"CameraPoseCovariance seam); config {vio.config_path}; "
               f"seed |v0_world|={np.linalg.norm(v0_w):.2f} m/s; "
               f"reanchor rule={'eviction' if args.reanchor_eviction else 'harness'}")
+    elif args.pose_source == "openvins":
+        if not args.ov_dump:
+            sys.exit("--pose-source openvins needs --ov-dump")
+        vio = OpenVINSAdapter(args.ov_dump, ext, max_clones=max(args.clone_window, 11))
+        print(f"pose source: RECORDED OpenVINS run ({args.ov_dump}); self-initialised, "
+              f"first frame with a clone window: {vio.first_frame}")
     else:
         vio = echo_li.VIOFilter(merged_config_path, cam)
     if args.reanchor_eviction and args.pose_source != "backend":
@@ -711,7 +980,33 @@ def main():
         settings["scale_sigma"] = _ss
         print(f"scale_sigma AUTO: E = {_E:.5f}  ->  sigma_s = {_ss:.4f}")
 
+    for kv in args.sparse:
+        _k, _v = kv.split("=", 1)
+        if _k not in SPARSE_KEYS:
+            sys.exit(f"--sparse: unknown key {_k}")
+        _cur = settings.get(_k, sparse_cfg.get(_k))
+        settings[_k] = (_v.lower() == "true") if isinstance(_cur, bool) else type(_cur)(_v) if isinstance(_cur, (int, float)) else float(_v)
+        print(f"SparseVog override {_k} = {settings[_k]!r}")
     sparse = echo_li.Sparse3DFilter.bearing_invdepth_additive3d(cam, **settings)
+    fdf = None
+    fdf_acc = {}
+    fdf_dump_rows = []
+    fdf_anchor = {}; n_epoch = [0]
+    import functools
+    ds.depth = functools.lru_cache(maxsize=2)(ds.depth)   # read each frame's depth PNG once (scorer + densify)
+    dense_samples = {"corr": [], "noshared": []}; dense_cov = {"corr": [], "noshared": []}; dense_n = []
+    dz.SLANT_G[0] = np.tan(np.radians(args.slant_deg)) / f
+    if args.track_source == "fdf":
+        _fs = {k: float(v) for k, v in (cfg.get("FlowDepF", {}) or {}).items()}
+        for kv in args.fdf:
+            _k, _v = kv.split("=", 1)
+            _fs[_k] = float(_v)
+        fdf = echo_li.FlowDepF(f, f, cx, cy, W, H, _fs or None)
+        print(f"track source: FlowDep-F  settings {_fs}  posterior feedback {args.fdf_posterior}")
+    T_nwu4 = np.eye(4)
+    T_nwu4[:3, :3] = t_ned_to_nwu
+    if args.pose_source == "gt":
+        print("pose source: dataset GT camera pose, pose covariance 0 (known-pose arm)")
 
     # --- Build interleaved event list (IMU @ 100Hz, camera @ 25Hz) ---
     nimg = min(args.frames, ds.n - args.start)
@@ -732,12 +1027,18 @@ def main():
     t0 = time.time()
     n_frames = 0
     traj_est, traj_gt, traj_k = [], [], []
+    traj_r_est, traj_r_gt = [], []   # body attitude (NWU world), est and GT, per frame
+    traj_bias = []                   # [gyro(3); accel(3)] estimate per frame, NaN if the source has none
+    traj_att_cov = []                # 3x3 attitude covariance block per frame (filter chart), NaN if none
+    traj_upd = []                    # cumulative (tracks offered, accepted) by the structureless update
+    traj_nslam = []                  # in-state landmarks per frame
     # Clone-window bookkeeping (clone-relative pose covariance for Sparse3D §V-D).
     _dbg_reanchor = [0, 0, 0]   # [cov=None, cov set, dbg prints]
     n_reanchored = [0]    # landmarks moved to a new anchor (--reanchor)
     anchor_census = []    # (k, n_clones, n_feats, n_distinct_anchors, oldest_anchor_age)
     xcov_audit = []       # (|corr|, v_full/v_quadrature, baseline m)
-    pose_audit = []       # (age, 3dof NEES, |err| m, sigma m, NEES_along, NEES_perp)
+    pose_audit = []
+    rot_audit = []   # (lag, 3-dof NEES, |phi| rad, sigma_rot rad) anchor->cur rotation       # (age, 3dof NEES, |err| m, sigma m, NEES_along, NEES_perp)
     srr = []              # sigma_rho / rho -- delta-method validity at the operating point
     gt_anchor = {}        # fid -> GT world point of the BIRTH landmark (--gt-anchored)
     clone_pose = {}       # clone_id (= frame k) -> T_wc (4x4) anchor pose
@@ -754,6 +1055,16 @@ def main():
             q = ds.att[gi]
             R_gt = Rot.from_quat([q[1], q[2], q[3], q[0]]).as_matrix()
             gyr_body = (R_gt.T @ np.asarray(gyr)).tolist()
+            if args.gt_gyro:
+                # DIAGNOSTIC: noise-free, bias-free gyro. NOT the HDF5 angular_velocity field:
+                # that disagrees with the attitude derivative by ~26 mrad/s median on Kite
+                # and made the filter WORSE. Use the GT attitude increment over the sample's
+                # own interval, which is what the backend integrates (sample i covers
+                # (t_{i-1}, t_i]). Filter noise parameters untouched.
+                if gi >= 1:
+                    q0 = ds.att[gi - 1]
+                    R_prev = Rot.from_quat([q0[1], q0[2], q0[3], q0[0]]).as_matrix()
+                    gyr_body = (Rot.from_matrix(R_prev.T @ R_gt).as_rotvec() / 0.01).tolist()
             vio.process_imu(stamp, gyr_body, acc)
             continue
 
@@ -761,24 +1072,54 @@ def main():
         k = data
         gray = ds.image(k)
 
-        # Track features with Rudolf-V.
+        # Track features with Rudolf-V: always the pose source's own front end, so the
+        # pose and its covariance are the same ones the KLT arm is scored against.
         feats, _stats = tracker.process(gray)
-        all_uvs = {int(fd["id"]): (float(fd["x"]), float(fd["y"])) for fd in feats}
+        klt_uvs = {int(fd["id"]): (float(fd["x"]), float(fd["y"])) for fd in feats}
+        if fdf is not None:
+            # FlowDep-F feeds Sparse3D only. Its pose is the one Sparse3D will get: for a
+            # filter source that is the IMU-propagated pose before this frame's update.
+            _T_track = (T_nwu4 @ ds.pose(k) @ ext) if args.pose_source == "gt" else (vio_body_pose(vio) @ ext)
+            all_uvs = fdf.process(np.ascontiguousarray(gray), _T_track.tolist())
+            if args.fdf_aniso_r > 0:
+                sparse.set_observation_noise({o[0]: (max(o[6], args.fdf_along_floor), o[7], o[8], args.fdf_aniso_r)
+                                              for o in fdf.last_observations()})
+            if args.fdf_dump:
+                for o in fdf.last_observations():
+                    fdf_dump_rows.append((k,) + tuple(o[:10]) + tuple(o[10]))
+            if args.bias_epoch_var > 0:
+                _changed = []
+                for o in fdf.last_observations():
+                    _af = o[10][2]
+                    if fdf_anchor.get(o[0]) not in (None, _af):
+                        _changed.append(int(o[0]))
+                    fdf_anchor[o[0]] = _af
+                if _changed:
+                    n_epoch[0] += sparse.reset_bias(_changed, args.bias_epoch_var)
+            for _kk, _vv in fdf.stats().items():
+                fdf_acc[_kk] = fdf_acc.get(_kk, 0.0) + _vv
+        else:
+            all_uvs = klt_uvs
 
         # Cap observations for EqF with spatial distribution.
         # Grid-based selection: divide frame into cells, pick at most
         # ceil(budget/n_cells) per cell, preferring existing landmarks.
         existing = {int(x) for x in vio.get_landmarks().keys()}
-        obs_ids = sorted(all_uvs.keys())
+        obs_ids = sorted(klt_uvs.keys())
         if args.eqf_max_obs > 0 and len(obs_ids) > args.eqf_max_obs:
             if args.eqf_selection == "grid":
-                obs_ids = _grid_select(all_uvs, existing, args.eqf_max_obs, W, H)
+                obs_ids = _grid_select(klt_uvs, existing, args.eqf_max_obs, W, H)
             else:
                 keep_exist = [fid for fid in obs_ids if fid in existing]
                 keep_new = [fid for fid in obs_ids if fid not in existing]
                 obs_ids = (keep_exist + keep_new)[:args.eqf_max_obs]
-        vio_uvs = {fid: all_uvs[fid] for fid in obs_ids}
+        vio_uvs = {fid: klt_uvs[fid] for fid in obs_ids}
         vio.process_vision(stamp, vio_uvs)
+        if not getattr(vio, "ready", True):
+            # A recorded, self-initialising pose source has nothing for this frame.
+            # The tracker ran, so tracks stay continuous; Sparse3D is simply not fed.
+            n_frames += 1
+            continue
 
         # Sparse3D update with ALL tracked features.
         T_wc = vio_body_pose(vio) @ ext
@@ -786,12 +1127,28 @@ def main():
             traj_k.append(k)
             traj_est.append(vio_body_pose(vio)[:3, 3].copy())
             traj_gt.append((t_ned_to_nwu @ ds.pose(k)[:3, 3]).copy())
+            traj_r_est.append(vio_body_pose(vio)[:3, :3].copy())
+            traj_r_gt.append((t_ned_to_nwu @ ds.pose(k)[:3, :3]).copy())
+            # The GT-pose arm's bystander filter is EqVIO, whose VIOFilter raises on the
+            # MSCEqF-only accessors (hasattr is true for all of them).
+            def _opt(fn, fill):
+                try:
+                    return np.asarray(fn(), float).copy()
+                except (AttributeError, RuntimeError):
+                    return fill
+            traj_bias.append(_opt(vio.imu_bias, np.full(6, np.nan)) if hasattr(vio, "imu_bias") else np.full(6, np.nan))
+            traj_att_cov.append(_opt(vio.att_cov, np.full((3, 3), np.nan)) if hasattr(vio, "att_cov") else np.full((3, 3), np.nan))
+            traj_upd.append(_opt(vio.msc_update_counts, np.full(2, np.nan)) if hasattr(vio, "msc_update_counts") else np.full(2, np.nan))
+            traj_nslam.append(float(_opt(vio.n_slam, np.nan)) if hasattr(vio, "n_slam") else np.nan)
         pcov = vio.get_camera_pose_covariance()
         if pcov is not None:
             pvv = np.asarray(pcov[0], float) * args.pvv_scale
             pww = np.asarray(pcov[1], float)
             pvv_arg, pww_arg = pvv.tolist(), pww.tolist()
         else:
+            pvv_arg = pww_arg = None
+        if args.pose_source == "gt":
+            T_wc = T_nwu4 @ ds.pose(k) @ ext
             pvv_arg = pww_arg = None
 
         # --- Clone-relative pose covariance ---
@@ -876,6 +1233,11 @@ def main():
                     Tc = clone_pose.get(cid)
                     if Tc is None:
                         continue
+                    if args.pose_source == "gt":
+                        # Known-pose arm: clones and re-anchoring as on the filter arm, but
+                        # NO relative covariance (the bystander EqVIO's would be injected
+                        # into the range channel otherwise: reported sigma_r 9 m on Kite).
+                        continue
                     rc = vio.get_relative_pose_covariance(cid, np.ascontiguousarray(Tc))
                     if rc is None:
                         continue
@@ -954,6 +1316,16 @@ def main():
                                 pose_audit.append((k - cid, _n, float(np.linalg.norm(_e)),
                                                    float(np.sqrt(np.trace(_P) / 3.0)),
                                                    _na, _np_))
+                            # ROTATION block: the same question for the anchor->current
+                            # rotation. Chart differences (left vs right perturbation) are a
+                            # similarity by the ~1 deg relative rotation itself, negligible at
+                            # the lags that matter here.
+                            _W = np.asarray(rc[1], float)
+                            _phi = Rot.from_matrix(_tg[:3, :3] @ _tf[:3, :3].T).as_rotvec()
+                            _nr = float(_phi @ np.linalg.solve(_W, _phi))
+                            if np.isfinite(_nr):
+                                rot_audit.append((k - cid, _nr, float(np.linalg.norm(_phi)),
+                                                  float(np.sqrt(np.trace(_W) / 3.0))))
                         except np.linalg.LinAlgError:
                             pass
                     pvv_rel = np.asarray(rc[0], float) * args.pvv_scale
@@ -982,6 +1354,41 @@ def main():
                       f"n_rel={nrel} tr(rel_vv[0])={rv:.3e}", file=sys.stderr)
             sparse.update(stamp, all_uvs, T_wc.tolist(), pvv_arg, pww_arg,
                           clone_id_arg, rel_cov_arg)
+        if fdf is not None and args.fdf_posterior:
+            # Flat per-feature summary (one binding call): every feature's range posterior.
+            _ids, _r, _vc, _vr, _cvg, _tl = sparse.range_summary()
+            _ok = _vc > 0
+            _post = {int(i): (float(r), float(np.sqrt(v) * r)) for i, r, v in zip(_ids[_ok], _r[_ok], _vc[_ok])}
+            if _post:
+                fdf.set_posterior(_post)
+            if args.densify and k >= args.score_from_frame:
+                _lev = {o[0]: o[3] for o in fdf.last_observations()}
+                _items = []
+                for _fid, _rr, _vc1, _vr1, _cv1 in zip(_ids, _r, _vc, _vr, _cvg):
+                    _fid = int(_fid)
+                    if not _cv1 or _vc1 <= 0 or _fid not in all_uvs:
+                        continue
+                    _items.append((all_uvs[_fid][0], all_uvs[_fid][1], _lev.get(_fid, 0), float(np.log(_rr)), float(_vc1), float(np.sqrt(max(_vr1 - _vc1, 0.0)))))
+                dense_n.append(len(_items))
+                if _items:
+                    _gt = ds.depth(k)
+                    _vg = np.isfinite(_gt) & (_gt > 0.5) & (_gt < md.SKY)
+                    _lg = np.log(np.where(_vg, _gt, 1.0))
+                    _g = np.where(_vg, _gt, np.nan)
+                    _mn = cv2.erode(np.nan_to_num(_g, nan=np.inf).astype(np.float32), np.ones((5, 5), np.uint8))
+                    _mx = cv2.dilate(np.nan_to_num(_g, nan=-np.inf).astype(np.float32), np.ones((5, 5), np.uint8))
+                    _spread = np.where(_vg & np.isfinite(_mn) & np.isfinite(_mx), (_mx - _mn) / np.maximum(_g, 1e-6), 9.0)
+                    _sl = slice(None, None, 2)
+                    _fused = dz.fuse(_items, H, W)
+                    for _name, _key in (("corr", "nearest_disagree_slant"), ("noshared", "nearest_disagree_slant_noshared")):
+                        _eta, _var, _covm = _fused[_key]
+                        _m = (_covm & _vg)[_sl, _sl]
+                        dense_cov[_name].append(float(_covm.mean()))
+                        _e = _eta[_sl, _sl][_m] - _lg[_sl, _sl][_m]; _v = np.maximum(_var[_sl, _sl][_m], 1e-12)
+                        dense_samples[_name].append(np.stack([np.exp(_e) - 1.0, _e * _e / _v, np.sqrt(_v), _spread[_sl, _sl][_m]], axis=1).astype(np.float32))
+                else:
+                    for _name in ("corr", "noshared"):
+                        dense_cov[_name].append(0.0)
 
         if args.anchor_census and n_frames % 25 == 0:
             _sf = sparse.get_features()
@@ -1010,7 +1417,8 @@ def main():
             nav_err = float(np.linalg.norm(p_est - p_gt))
             print(f"  [clone k={k}] n_clones={vio.n_clones()} feats={len(sf)} "
                   f"maxtl={maxtl} n(tl>={args.min_track})={n_ge} "
-                  f"navErr={nav_err:.3f}m", file=sys.stderr)
+                  f"navErr={nav_err:.3f}m slam={_nslam_str(vio)}",
+                  file=sys.stderr)
 
         # Score Sparse3D features against GT depth.
         depth_map = ds.depth(k)
@@ -1060,6 +1468,11 @@ def main():
             gt_range = float(depth_map[gy, gx])
             if not (0.5 < gt_range < md.SKY):
                 continue
+            # GT ambiguity at the scored pixel: relative spread of GT range over the 5x5
+            # neighbourhood (a leaf/sky boundary has no single truth).
+            _win = depth_map[gy - 2:gy + 3, gx - 2:gx + 3]
+            _win = _win[np.isfinite(_win) & (_win > 0.5) & (_win < md.SKY)]
+            gt_spread = float((_win.max() - _win.min()) / np.median(_win)) if _win.size else 9.0
 
             # --gt-anchored: score against the BIRTH landmark, not the current pixel.
             # The default reads GT depth wherever the tracked pixel now sits, so as
@@ -1125,10 +1538,10 @@ def main():
                 if not np.isfinite(nees_rho):
                     continue
                 rows.append((k, tl, _rho_e - rho_gt, rho_gt, nees_rho,
-                             np.sqrt(_vrho), _rho_e, nees_r))
+                             np.sqrt(_vrho), _rho_e, nees_r, gt_spread, int(fid)))
             else:
                 rows.append((k, tl, re - gt_range, gt_range, nees_r,
-                             np.sqrt(var_r), re, nees_rho))
+                             np.sqrt(var_r), re, nees_rho, gt_spread, int(fid)))
 
         n_frames += 1
         if not args.no_progress and n_frames % 100 == 0:
@@ -1140,13 +1553,34 @@ def main():
     os.unlink(merged_config_path)
 
     # --- Report ---
-    A = np.array(rows, float) if rows else np.empty((0, 7))
+    if args.score_from_frame > 0:
+        _n0 = len(rows)
+        rows = [r for r in rows if r[0] >= args.score_from_frame]
+        print(f"  score-from-frame {args.score_from_frame}: kept {len(rows)} of {_n0} obs")
+    A = np.array(rows, float) if rows else np.empty((0, 10))
     if len(A) == 0:
         print("No scored observations!")
         return
 
-    _k, tl, derr, rng, nees, sig, r_est, nees_alt = A.T
+    _k, tl, derr, rng, nees, sig, r_est, nees_alt = A.T[:8]
+    gt_spread = A[:, 8]
     relerr = derr / rng
+    if fdf is not None and args.fdf_dump:
+        _D = np.array(fdf_dump_rows, float)
+        np.savez(args.fdf_dump, data=_D, cols=np.array(["frame", "id", "u", "v", "level", "eta", "eta_sigma",
+                                                         "sigma_px", "dir_x", "dir_y", "residual",
+                                                         "anchor_u", "anchor_v", "anchor_frame"]))
+        print(f"FlowDep-F observations written: {args.fdf_dump} ({len(_D)} rows)")
+    if args.densify and dense_samples["corr"]:
+        print(f"\nDENSIFIED FRAME (rule nearest+disagreement+footprint {args.slant_deg:.0f} deg; every 2nd pixel vs GT, frames >= {args.score_from_frame}); converged patches per frame median {np.median(dense_n):.0f}")
+        for _name, _lab in (("corr", "shared scale term fully correlated (eq. 35)"), ("noshared", "shared term DROPPED")):
+            _A = np.concatenate(dense_samples[_name]); _err, _nees, _sig, _sp = _A.T; _ua = _sp <= 0.2
+            print(f"  {_lab}: coverage {100 * np.mean(dense_cov[_name]):.1f}%  n {len(_A)}  err med {100 * np.median(np.abs(_err)):.1f}% p90 {100 * np.percentile(np.abs(_err), 90):.1f}% gross {100 * np.mean(np.abs(_err) > 0.2):.1f}%  "
+                  f"NEES med {np.median(_nees):.3f} mean {np.mean(_nees):.1f} >3.84 {100 * np.mean(_nees > 3.84):.1f}% >6.63 {100 * np.mean(_nees > 6.63):.1f}%  sigma med {100 * np.median(_sig):.1f}%  | unamb n {_ua.sum()} err {100 * np.median(np.abs(_err[_ua])):.1f}% NEES {np.median(_nees[_ua]):.3f} >3.84 {100 * np.mean(_nees[_ua] > 3.84):.1f}% >6.63 {100 * np.mean(_nees[_ua] > 6.63):.1f}%")
+    if args.bias_epoch_var > 0:
+        print(f"bias epochs reset on FlowDep-F re-anchor: {n_epoch[0]} (prior {args.bias_epoch_var} px^2)")
+    if fdf is not None and n_frames:
+        print("FlowDep-F per-frame means: " + "  ".join(f"{_kk} {_vv / n_frames:.1f}" for _kk, _vv in sorted(fdf_acc.items())))
 
     if xcov_audit:
         _x = np.array(xcov_audit, dtype=float)
@@ -1162,6 +1596,17 @@ def main():
     if pose_audit:
         _pa = np.array(pose_audit, dtype=float)
         _n = _pa[:, 1]
+        if rot_audit:
+            _ra = np.array(rot_audit, dtype=float)
+            print(f"\n  POSE-COV AUDIT (ROTATION): reported anchor->cur rotation cov vs GT error")
+            for _lo, _hi in ((1, 2), (2, 3), (3, 5), (5, 10), (10, 20), (20, 10**9)):
+                _m = (_ra[:, 0] >= _lo) & (_ra[:, 0] < _hi)
+                if _m.sum() < 20:
+                    continue
+                _q = _ra[_m, 1]
+                print(f"    lag [{_lo},{_hi}): n {int(_m.sum()):6d}  NEES3 median {np.median(_q):7.2f} mean {np.mean(_q):8.1f} "
+                      f">7.81 {100*np.mean(_q > 7.81):4.1f}%  |phi| med {np.degrees(np.median(_ra[_m, 2])):.4f} deg  "
+                      f"sigma med {np.degrees(np.median(_ra[_m, 3])):.4f} deg  ratio {np.median(_ra[_m, 2])/max(np.median(_ra[_m, 3]),1e-12):.2f}")
         print(f"\n  POSE-COV AUDIT: reported anchor->cur translation cov vs GT error")
         print(f"    3-dof NEES median {np.median(_n):.2f}  mean {np.mean(_n):.1f}   "
               f"(ideal median 2.366, mean 3.0)")
@@ -1226,6 +1671,12 @@ def main():
               f"{np.mean(_alt):.1f}   %>3.84 {100 * (_alt > 3.84).mean():.1f}%")
     print(f"  range NEES-1D  median / mean: {np.median(nees):.3f} / {np.mean(nees):.1f}"
           f"   (ideal median 0.455, mean 1)")
+    _amb = gt_spread > 0.2
+    for _name, _m in (("GT unambiguous (5x5 spread <= 20%)", ~_amb), ("GT ambiguous", _amb)):
+        if _m.sum():
+            print(f"  {_name}: n {_m.sum()} ({100 * _m.mean():.0f}%)  abs err median {100 * np.median(np.abs(relerr[_m])):.1f}%  "
+                  f"p90 {100 * np.percentile(np.abs(relerr[_m]), 90):.1f}%  NEES median {np.median(nees[_m]):.3f}  "
+                  f">3.84 {100 * np.mean(nees[_m] > 3.84):.1f}%  >6.63 {100 * np.mean(nees[_m] > 6.63):.1f}%")
     print(f"  %>3.84 / %>6.63:  {100 * np.mean(nees > 3.84):.1f}% / "
           f"{100 * np.mean(nees > 6.63):.1f}%   (ideal 5% / 1%)")
     print(f"  signed range err:  median {100 * np.median(relerr):+.1f}%  "
@@ -1252,8 +1703,15 @@ def main():
 
     if args.dump_traj and traj_est:
         np.savez(args.dump_traj, k=np.array(traj_k), est=np.array(traj_est),
-                 gt=np.array(traj_gt))
+                 r_est=np.array(traj_r_est), r_gt=np.array(traj_r_gt),
+                 gt=np.array(traj_gt), bias=np.array(traj_bias), att_cov=np.array(traj_att_cov),
+                 upd=np.array(traj_upd), nslam=np.array(traj_nslam))
         print(f"trajectory -> {args.dump_traj}  ({len(traj_est)} frames)")
+    if hasattr(vio, "msc_reject_counts"):
+        try:
+            print(f"MSC update rejections (filter counters): {vio.msc_reject_counts()}")
+        except RuntimeError:
+            pass  # EqVIO / GT pose source: no MSCEqF counters
     if args.save_npz:
         provenance = {
             "config_file": str(Path(args.config).resolve()),
@@ -1264,7 +1722,7 @@ def main():
         }
         np.savez(args.save_npz,
                  cols=np.array(["k", "tl", "derr", "rng", "nees", "sig", "r_est",
-                                "nees_alt"]),
+                                "nees_alt", "gt_spread", "fid"]),
                  data=A,
                  provenance=json.dumps(provenance))
         print(f"\nSaved → {args.save_npz}")

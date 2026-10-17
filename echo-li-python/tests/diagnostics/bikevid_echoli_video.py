@@ -23,7 +23,12 @@ authoritative calib_final values scaled by 0.25; distortion is normalised and do
 not scale.
 
 Any rig bag works through `--bag-cache DIR` (frames320.bin + frames320_index.npy from
-the same decode, sensors.npz from the extractor with HEADER image stamps). With
+the same decode, sensors.npz from the extractor with HEADER image stamps), or simply by
+name with `--bag vio_live_20260925-055046`: the cache is looked up under `--bag-root`
+and, when it is not there yet, extracted from the rosbag2 under `--bag-src` by running
+extract_rigbag.py inside the ROS 2 distrobox (`--distrobox`). `--bag bikevid` is the
+bike recording. With `--bag`, `--out` defaults to <bag>.mp4 in the working directory
+and `--config` to the rig MSCEqF + Sparse3D config kept next to the caches. With
 `--sparse3d` the frame's tracks also go through the shipped `VIOFilter.sparse_feed`
 seam (CloneRelFeed: clone-relative covariances, re-anchoring) into a Sparse3D filter
 built from the config's `SparseVog` section; its CONVERGED landmarks are drawn as
@@ -45,14 +50,20 @@ from scipy.spatial.transform import Rotation as Rot
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import echo_li  # noqa: E402
+import fdf_densify_study as dz  # noqa: E402
 from euroc_msceqf_native_ate import align_umeyama  # noqa: E402
 from midair_e2e_depth_nees import SPARSE_KEYS  # noqa: E402
 
 BIKE = "/mnt/18TB/chen_fu_yeh/bikevid"
+# Rig recordings: raw rosbag2 directories, and the extracted caches the harness reads.
+RIG_BAG_SRC = "/mnt/18TB/chen_fu_yeh/bagmkv/bags"
+RIG_BAG_ROOT = "/mnt/18TB/chen_fu_yeh/bagmkv/rig_offline/bags"
+RIG_CONFIG = "/mnt/18TB/chen_fu_yeh/bagmkv/rig_offline/rig_sparse.yaml"
 W, H = 320, 200
 # calib_final-camchain-imucam.yaml, scaled by 0.25 for the raw_scale_denom=4 stream.
 FX, FY, CX, CY = 226.7062860357, 226.1687971677, 150.0624337420, 99.3898662352
 DIST = (0.046897611239, -0.062989153081, -0.001026069440, -0.001348024507)
+CAM_MODEL = "radtan"              # or "equidistant" (Kannala-Brandt k1..k4), from --calib camera_model
 TIMESHIFT = 0.012583408676        # camera trigger -> exposure, measured
 GRAVITY = 9.7893                  # Hsinchu local g, NOT 9.81 (calib README)
 # T_imu_cam from myrig_calib_320.yaml: camera-to-IMU rotation, camera position in IMU.
@@ -72,11 +83,52 @@ def txt(img, s, org, col=(235, 235, 235)):
     cv2.putText(img, s, org, cv2.FONT_HERSHEY_SIMPLEX, 0.38, col, 1, cv2.LINE_AA)
 
 
+def ensure_bag_cache(name, root, src, distrobox):
+    """Return the cache directory for rig bag `name`, extracting it first if needed.
+
+    Extraction decodes the rosbag2 with rclpy, which only exists inside the ROS 2
+    distrobox, so it is run there; the harness itself stays in the venv.
+    """
+    cache = os.path.join(root, name)
+    need = ["sensors.npz", "frames320.bin", "frames320_index.npy"]
+    if all(os.path.exists(os.path.join(cache, f)) for f in need):
+        return cache
+    bagdir = os.path.join(src, name)
+    if not os.path.isdir(bagdir):
+        sys.exit(f"bag '{name}': no cache under {root} and no rosbag2 directory {bagdir}")
+    extractor = str(Path(__file__).resolve().parent / "extract_rigbag.py")
+    cmd = ["distrobox", "enter", distrobox, "--", "bash", "-c",
+           f". /opt/ros/humble/setup.bash && python3 {extractor} {bagdir} {cache}"]
+    print(f"extracting {name} -> {cache}\n  " + " ".join(cmd), flush=True)
+    import subprocess
+    rc = subprocess.call(cmd)
+    if rc != 0 or not all(os.path.exists(os.path.join(cache, f)) for f in need):
+        sys.exit(f"extraction of '{name}' failed (exit {rc})")
+    return cache
+
+
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--sensors", required=True, help="bike_sensors.npz from the extractor")
-    ap.add_argument("--config", required=True, help="eqvio_myrig_rt_320.yaml")
-    ap.add_argument("--out", required=True)
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--bag", default="",
+                    help="rig bag by name (directory name under --bag-src, e.g. "
+                         "vio_live_20260925-055046), or 'bikevid'. Replaces --sensors/--bag-cache.")
+    ap.add_argument("--bag-root", default=RIG_BAG_ROOT,
+                    help="where extracted caches live: <bag-root>/<bag>/{sensors.npz,frames320.bin,"
+                         "frames320_index.npy}")
+    ap.add_argument("--bag-src", default=RIG_BAG_SRC,
+                    help="where the raw rosbag2 directories live (extracted on first use)")
+    ap.add_argument("--distrobox", default="ubuntu-22-04",
+                    help="distrobox with ROS 2 humble + rclpy, used only to extract a missing cache")
+    ap.add_argument("--calib", default="",
+                    help="rig calibration in the ROS 2 node's format (echo-li-ros2/config/myrig_calib.yaml: "
+                         "intrinsics, distortion_coefficients, t_bs, camera_time_offset_sec at the "
+                         "source image_width; camera_model radtan or equidistant). Intrinsics are "
+                         "scaled to the 320-wide cache. Default: "
+                         "the first rig's constants baked into this file. Needed for any other rig.")
+    ap.add_argument("--sensors", default="", help="bike_sensors.npz from the extractor (or use --bag)")
+    ap.add_argument("--config", default="",
+                    help=f"run config; with --bag defaults to {RIG_CONFIG}")
+    ap.add_argument("--out", default="", help="output mp4; with --bag defaults to <bag>.mp4")
     ap.add_argument("--nframes", type=int, default=0, help="0 = all")
     ap.add_argument("--start", type=int, default=0)
     ap.add_argument("--stride", type=int, default=2, help="render every Nth frame")
@@ -179,12 +231,70 @@ def main():
                     help="run Sparse3D on every frame's tracks through VIOFilter.sparse_feed "
                          "(the shipped CloneRelFeed path) and draw its converged landmarks "
                          "as hollow circles")
+    ap.add_argument("--patch-mapper", action="store_true",
+                    help="run the shipped PatchDepthMapper offline on each frame, seeded exactly as "
+                         "the ROS2 node seeds it (Sparse3D converged landmarks with eta_var = var/r^2, "
+                         "then in-state landmarks not covered by Sparse3D at eta_var 0.25), in THREE "
+                         "instances: both sources / Sparse3D only / in-state only. Status map and "
+                         "seed sources are overlaid on the left panel; per-frame pixel counts by "
+                         "status, SeedOnly disc components and the pixels only the in-state seeds "
+                         "produce go to <out>_mapper.npz. Needs --sparse3d.")
+    ap.add_argument("--track-source", default="rudolf", choices=["rudolf", "fdf"],
+                    help="fdf: ALSO run FlowDep-F (anchor-referenced epipolar patch tracker) on the "
+                         "fisheye-undistorted frame, driven by the backend's pose, feeding a second "
+                         "Sparse3D (pinhole camera) through the same sparse_feed; the rendered video "
+                         "gains a second row with the densified range (rule of the design note row "
+                         "5b: nearest patch + disagreement + footprint term) and its per-pixel sigma. "
+                         "The pose source still runs on Rudolf-V. Needs --sparse3d. Dense frames are "
+                         "kept in memory for rendered frames only (~130 kB each).")
+    ap.add_argument("--fdf", action="append", default=[], metavar="KEY=VAL", help="FlowDepF setting override")
+    ap.add_argument("--slant-deg", type=float, default=35.0, help="footprint slant prior of the densify rule")
+    ap.add_argument("--fill", action="store_true",
+                    help="add the FILLED class to the dense row (design note rows 5k/5l): normalised-convolution "
+                         "interpolation between measured patches, kept only where evidence surrounds the pixel "
+                         "(balance gate), drawn at lower opacity; sigma = nearest measured + (2 g0 d)^2")
+    ap.add_argument("--fdf-sparse", action="append", default=[], metavar="KEY=VAL",
+                    help="Sparse3D override for the FlowDep-F arm only (e.g. bias_walk_var=0.3, design note row 5h)")
+    ap.add_argument("--fdf-clahe", action="store_true", help="same as --fdf-input clahe")
+    ap.add_argument("--fdf-input", default="raw", choices=["raw", "clahe", "global", "gain"],
+                    help="intensity map applied to the undistorted frame FlowDep-F sees. raw: none (on the rig's "
+                         "dim frames the per-cell curvature median is 4-6 against a birth gate of 25); clahe: the "
+                         "front-end config's CLAHE (local, frame-dependent map); global: cv2.equalizeHist (one "
+                         "monotone curve per frame); gain: linear stretch of the 1st..99th percentile to 0..255 "
+                         "(one affine map per frame, the most photometrically consistent)")
     ap.add_argument("--sparse-config", default="",
                     help="YAML whose SparseVog section configures Sparse3D (default: the "
                          "run config)")
     args = ap.parse_args()
 
-    global TIMESHIFT
+    if args.bag:
+        if args.bag == "bikevid":
+            args.bag_cache = BIKE
+            args.sensors = os.path.join(BIKE, "bike_sensors_hdr.npz")
+        else:
+            args.bag_cache = ensure_bag_cache(args.bag, args.bag_root, args.bag_src, args.distrobox)
+            args.sensors = os.path.join(args.bag_cache, "sensors.npz")
+        args.out = args.out or f"{args.bag}.mp4"
+        args.config = args.config or RIG_CONFIG
+        print(f"bag {args.bag}: cache {args.bag_cache}  config {args.config}  out {args.out}")
+    if not (args.sensors and args.config and args.out):
+        ap.error("either --bag NAME, or all of --sensors, --config and --out")
+
+    global TIMESHIFT, FX, FY, CX, CY, DIST, T_BS, CAM_MODEL
+    if args.calib:
+        with open(args.calib) as fh:
+            cal = next(iter(yaml.safe_load(fh).values()))["ros__parameters"]
+        sc = W / float(cal["image_width"])
+        FX, FY, CX, CY = (float(v) * sc for v in cal["intrinsics"])
+        DIST = tuple(float(v) for v in cal["distortion_coefficients"])
+        CAM_MODEL = cal.get("camera_model", "radtan").lower()
+        if CAM_MODEL not in ("radtan", "equidistant"):
+            sys.exit(f"--calib camera_model '{CAM_MODEL}': this harness handles radtan or equidistant")
+        T_BS = np.array(cal["t_bs"], float).reshape(4, 4)
+        TIMESHIFT = float(cal.get("camera_time_offset_sec", TIMESHIFT))
+        print(f"calibration {args.calib}: source {cal['image_width']}x{cal['image_height']} -> x{sc:.3g}  "
+              f"{CAM_MODEL}  fx {FX:.3f} fy {FY:.3f} cx {CX:.3f} cy {CY:.3f}  dist {DIST}  timeshift {TIMESHIFT*1e3:.3f} ms\n"
+              f"  T_BS\n{np.array2string(T_BS, precision=6, suppress_small=True)}")
     if args.timeshift is not None:
         TIMESHIFT = args.timeshift
         print(f'camera-IMU timeshift overridden -> {TIMESHIFT*1e3:.2f} ms')
@@ -218,9 +328,10 @@ def main():
               f"{cfg['eqf']['initialValue']['sceneDepth']}  "
               f"featureOutlierAbs={cfg['eqf']['measurementNoise']['featureOutlierAbs']}")
 
-    cam = echo_li.RadTanCamera(FX, FY, CX, CY, *DIST)
+    cam_cls = echo_li.EquidistantCamera if CAM_MODEL == "equidistant" else echo_li.RadTanCamera
+    cam = cam_cls(FX, FY, CX, CY, *DIST)
     fcfg = echo_li.FrontendConfig.from_yaml(cfg_path)
-    fcfg.set_camera(FX, FY, CX, CY, W, H, list(DIST))
+    fcfg.set_camera(FX, FY, CX, CY, W, H, list(DIST), CAM_MODEL)
     if args.no_lbp:
         fcfg.lbp_verification = False
         print("frontend LBP verification DISABLED")
@@ -299,6 +410,12 @@ def main():
     print(f"backend={vio.backend_kind}  zupt={bool(args.zupt)}  config={run_cfg}")
 
     sparse = None
+    fdf = None; sparse_fdf = None; undist_maps = None
+    dense_frames = {}      # k -> (undistorted gray, eta_p f16, sigma f16, covered) for rendered frames
+    fdf_rng = {}           # k -> {fid: (u, v, range, converged)} on the pinhole frame
+    fdf_stat = [0, 0]      # converged landmark-frames: fdf, klt (for the summary)
+    if args.sparse3d and args.track_source == "fdf":
+        pass
     if args.sparse3d:
         with open(args.sparse_config or cfg_path) as fh:
             scfg = yaml.safe_load(fh).get("SparseVog") or {}
@@ -311,11 +428,86 @@ def main():
         _E = float(np.std(_seg[:, 3]) * np.std(_seg[:, 5])) if len(_seg) > 10 else 0.0
         settings["scale_sigma"] = max(0.02, 0.0072 * _E ** (-0.710)) if _E > 0 else 0.02
         sparse = echo_li.Sparse3DFilter.bearing_invdepth_additive3d(cam, **settings)
+        if args.track_source == "fdf":
+            # FlowDep-F is pinhole-only: undistort every frame to a pinhole with the SAME
+            # fx fy cx cy (pixels outside the fisheye's valid region stay black and are
+            # never born: no gradient). The second Sparse3D sees those pinhole pixels.
+            _K = np.array([[FX, 0, CX], [0, FY, CY], [0, 0, 1]], float)
+            if CAM_MODEL == "equidistant":
+                _m1, _m2 = cv2.fisheye.initUndistortRectifyMap(_K, np.array(DIST, float), np.eye(3), _K, (W, H), cv2.CV_32FC1)
+            else:
+                _m1, _m2 = cv2.initUndistortRectifyMap(_K, np.array(DIST, float), np.eye(3), _K, (W, H), cv2.CV_32FC1)
+            undist_maps = (_m1, _m2)
+            _fs = {k: float(v) for k, v in (kv.split("=", 1) for kv in args.fdf)}
+            fdf = echo_li.FlowDepF(FX, FY, CX, CY, W, H, _fs or None)
+            _ps = dict(settings); _ps["max_pool_size"] = max(int(_ps.get("max_pool_size", 300)), 4000)
+            for _kv in args.fdf_sparse:
+                _k, _v = _kv.split("=", 1)
+                _cur = _ps.get(_k, scfg.get(_k, 0.0))
+                _ps[_k] = (_v.lower() == "true") if isinstance(_cur, bool) else type(_cur)(_v) if isinstance(_cur, (int, float)) else float(_v)
+                print(f"FlowDep-F Sparse3D override {_k} = {_ps[_k]!r}")
+            sparse_fdf = echo_li.Sparse3DFilter.bearing_invdepth_additive3d(echo_li.PinholeCamera(FX, FY, CX, CY), **_ps)
+            dz.SLANT_G[0] = np.tan(np.radians(args.slant_deg)) / FX
+            if args.fdf_clahe:
+                args.fdf_input = "clahe"
+            fdf_map = None
+            if args.fdf_input == "clahe":
+                with open(cfg_path) as fh:
+                    _rv = (yaml.safe_load(fh) or {}).get("RudolfV", {}) or {}
+                _tile = int(_rv.get("claheTileSize", 64)); _clip = float(_rv.get("claheClipLimit", 4.0))
+                _cl = cv2.createCLAHE(clipLimit=_clip, tileGridSize=(max(1, W // _tile), max(1, H // _tile)))
+                fdf_map = _cl.apply
+                print(f"FlowDep-F input: CLAHE tile {_tile} px (grid {max(1, W // _tile)}x{max(1, H // _tile)}) clip {_clip}")
+            elif args.fdf_input == "global":
+                fdf_map = cv2.equalizeHist
+                print("FlowDep-F input: global histogram equalisation")
+            elif args.fdf_input == "gain":
+                def fdf_map(im):
+                    lo_, hi_ = np.percentile(im, (1, 99))
+                    return np.clip((im.astype(np.float32) - lo_) * (255.0 / max(hi_ - lo_, 1.0)), 0, 255).astype(np.uint8)
+                print("FlowDep-F input: global 1..99 percentile stretch")
+            print(f"FlowDep-F on the undistorted pinhole frame, settings {_fs}; second Sparse3D (pinhole, pool {_ps['max_pool_size']}); densify slant {args.slant_deg:.0f} deg")
         print(f"Sparse3D via VIOFilter.sparse_feed: direct={settings.get('pose_range_direct', False)} "
               f"consider={settings.get('consider_relpose', False)} "
               f"bias_walk_var={settings.get('bias_walk_var', 0.0)} "
               f"E={_E:.4f} -> scale_sigma={settings['scale_sigma']:.4f}  "
               f"min_track_length={settings.get('min_track_length', '?')}")
+
+    mappers = {}
+    mp_rows = []              # per frame: see MP_COLS
+    mp_status = {}            # k -> (status_both, status_s3d) uint8 maps on render frames
+    mp_seeds = {}             # k -> (set of Sparse3D seed ids, set of in-state seed ids)
+    MP_COLS = ("k", "n_s3d_seeds", "n_lm_seeds",
+               "both_seedonly", "both_photo", "both_rej", "both_cc", "both_cc_med",
+               "s3d_seedonly", "s3d_photo", "s3d_rej", "lm_seedonly", "lm_photo", "lm_rej",
+               "only_from_lm", "only_from_s3d",
+               # no GT on the rig, so two proxies for false depth: FLICKER = covered pixels
+               # whose log-range jumps > 0.3 (35 %) from the previous mapper frame, split by
+               # whether the in-state seeds alone produce them; and seeds with a neighbour
+               # inside the seed radius whose range differs > 2x (a disc straddling a
+               # discontinuity), per seed source.
+               "flicker_px", "flicker_px_only_lm", "covered_prev_and_now",
+               "s3d_seeds_straddle", "lm_seeds_straddle")
+    mp_prev = {"eta": None, "only_lm": None}
+    if args.patch_mapper:
+        if sparse is None:
+            sys.exit("--patch-mapper needs --sparse3d")
+        with open(run_cfg) as fh:
+            _mcfg = yaml.safe_load(fh)
+        _pd = dict(_mcfg.get("PatchDepth") or {})
+        # The rig config is written for the 1280x800 stream and downscales by `scale`;
+        # the cache already holds the quarter-resolution frames, so run at scale 1 and
+        # shrink the seed radius by the same factor (the mapper multiplies it by scale).
+        _native_scale = float(_pd.get("scale", 1.0))
+        _pd["scale"] = 1.0
+        _pd["seed_radius_px"] = float(_pd.get("seed_radius_px", 32.0)) * _native_scale
+        _mcfg["PatchDepth"] = _pd
+        _mcfg_path = args.out.replace(".mp4", "_mapper_cfg.yaml")
+        with open(_mcfg_path, "w") as fh:
+            yaml.safe_dump(_mcfg, fh, sort_keys=False)
+        for _name in ("both", "s3d", "lm"):
+            mappers[_name] = echo_li.PatchDepthMapper(cam, FX, FY, CX, CY, W, H, config=_mcfg_path)
+        print(f"PatchDepthMapper x3 (both / s3d / lm): {_pd}  seed coords={mappers['both'].seed_coordinates}")
 
     def push_imu(row):
         vio.process_imu(float(row[0]), row[1:4].tolist(), row[4:7].tolist())
@@ -362,6 +554,54 @@ def main():
                     _conv = sparse.query_range(int(_fid))[0] > 0.0
                     _d[int(_fid)] = (_r, float(np.sqrt(max(_rv, 0.0))), bool(_conv))
                 sp_rng[k] = _d
+            if fdf is not None:
+                # FlowDep-F on the undistorted frame with the backend's pose of this frame
+                # (the same body pose @ T_BS the KLT Sparse3D just got).
+                _ug = cv2.remap(gray, undist_maps[0], undist_maps[1], cv2.INTER_LINEAR)
+                if fdf_map is not None:
+                    _ug = fdf_map(_ug)
+                _T = np.eye(4)
+                _pp, _qq = vio.get_pose()
+                _T[:3, :3] = Rot.from_quat(np.asarray(_qq, float)).as_matrix(); _T[:3, 3] = np.asarray(_pp, float)
+                _Twc = _T @ T_BS
+                _uvf = fdf.process(np.ascontiguousarray(_ug), _Twc.tolist())
+                vio.sparse_feed(sparse_fdf, float(ts), _uvf, _Twc.tolist())
+                _post = {}; _items = []; _dd = {}
+                _lev = {o[0]: o[3] for o in fdf.last_observations()}
+                for _fid, _fd in sparse_fdf.get_features().items():
+                    _est = np.asarray(_fd["position"], float); _cov = np.asarray(_fd["covariance_euclidean"], float)
+                    _r = float(np.linalg.norm(_est))
+                    if not (np.isfinite(_r) and _r > 1e-6 and np.isfinite(_cov).all()):
+                        continue
+                    _rh = _est / _r; _vr = float(_rh @ _cov @ _rh)
+                    if _vr > 0:
+                        _post[int(_fid)] = (_r, float(np.sqrt(_vr)))
+                    _conv = sparse_fdf.query_range(int(_fid))[0] > 0.0
+                    if _fid in _uvf:
+                        _dd[int(_fid)] = (_uvf[_fid][0], _uvf[_fid][1], _r, bool(_conv))
+                        if _conv and _vr > 0:
+                            _vrep = float(_fd["range_var_reported"]) / (_r * _r)
+                            _vc = _vr / (_r * _r)
+                            _items.append((_uvf[_fid][0], _uvf[_fid][1], _lev.get(_fid, 0), np.log(_r), _vc, float(np.sqrt(max(_vrep - _vc, 0.0)))))
+                if _post:
+                    fdf.set_posterior(_post)
+                fdf_rng[k] = _dd
+                if os.environ.get("DBG_FDF") and (k - args.start) % 100 == 0:
+                    _rf = [v[2] for v in _dd.values() if v[3]]; _rk = [v[0] for v in sp_rng.get(k, {}).values() if v[2]]
+                    _ra = [v[2] for v in _dd.values()]
+                    print(f"  DBG_FDF k={k} fdf conv {len(_rf)} med range {np.median(_rf) if _rf else 0:.2f} (all tracked {len(_ra)} med {np.median(_ra) if _ra else 0:.2f})  klt conv {len(_rk)} med {np.median(_rk) if _rk else 0:.2f}  stats {fdf.stats()}", file=sys.stderr)
+                fdf_stat[0] += sum(1 for v in _dd.values() if v[3]); fdf_stat[1] += sum(1 for v in sp_rng.get(k, {}).values() if v[2])
+                if (k - args.start) % args.stride == 0 and not args.no_render:
+                    if _items:
+                        _eta, _var, _cov_m = dz.fuse(_items, H, W)["nearest_disagree_slant"]
+                    else:
+                        _eta = np.zeros((H, W)); _var = np.ones((H, W)); _cov_m = np.zeros((H, W), bool)
+                    _cls = _cov_m.astype(np.uint8)                       # 1 = Measured, 2 = Filled, 0 = Unknown
+                    if args.fill and _cov_m.any():
+                        _ef, _vf, _filled, _ = dz.fill(_eta, _var, _cov_m)
+                        _eta = np.where(_filled, _ef, _eta); _var = np.where(_filled, _vf, _var)
+                        _cls[_filled] = 2
+                    dense_frames[k] = (_ug.copy(), _eta.astype(np.float16), np.sqrt(np.maximum(_var, 1e-12)).astype(np.float16), _cls)
         if use_msceqf:
             p, _rm, _v = vio.nav_pose()
             p = np.asarray(p, float)
@@ -416,6 +656,78 @@ def main():
         if args.depth_trace and rr_all is not None and lm_rng.get(k):
             for lid, dd in lm_rng[k].items():
                 rr_all.setdefault(lid, []).append((float(ts), dd))
+        if mappers and not args.no_vision and (k - args.start) % args.vision_stride == 0:
+            # Seeds exactly as voxl2_vio_node.rs builds its priors (raw pixels of this
+            # frame's features): Sparse3D converged landmarks first, eta_var = var/r^2;
+            # then in-state landmarks not already covered, eta_var 0.25, r >= 0.1.
+            _sp = sp_rng.get(k, {})
+            _lm = lm_rng.get(k, {})
+            pri_s3d, pri_lm, ids_s3d, ids_lm = [], [], set(), set()
+            for _fid, (_u, _v) in uvs.items():
+                if _fid in _sp and _sp[_fid][2]:
+                    _r, _sig, _ = _sp[_fid]
+                    pri_s3d.append((_u, _v, float(np.log(_r)), float(_sig * _sig / (_r * _r)) if _r > 0.01 else 1.0))
+                    ids_s3d.add(_fid)
+            for _fid, (_u, _v) in uvs.items():
+                if _fid in ids_s3d or _fid not in _lm or not (_lm[_fid] >= 0.1):
+                    continue
+                pri_lm.append((_u, _v, float(np.log(_lm[_fid])), 0.25))
+                ids_lm.add(_fid)
+            _pp, _qq = vio.get_pose()
+            _Twb = np.eye(4)
+            _Twb[:3, :3] = Rot.from_quat(np.asarray(_qq, float)).as_matrix()
+            _Twb[:3, 3] = np.asarray(_pp, float)
+            _Twc = (_Twb @ T_BS).tolist()
+            outs = {}
+            for _name, _pri in (("both", pri_s3d + pri_lm), ("s3d", pri_s3d), ("lm", pri_lm)):
+                outs[_name] = mappers[_name].update(float(ts), int(k), gray, _Twc, _pri)
+            def _cnt(o):
+                if o is None:
+                    return (0, 0, 0), None
+                st = o["status"]
+                return (int((st == 1).sum()), int((st == 2).sum()), int((st == 3).sum())), st
+            (b1, b2, b3), st_b = _cnt(outs["both"])
+            (s1, s2, s3), st_s = _cnt(outs["s3d"])
+            (l1, l2, l3), st_l = _cnt(outs["lm"])
+            n_cc, cc_med = 0, 0.0
+            if st_b is not None and b1 > 0:
+                _n, _, _stats, _ = cv2.connectedComponentsWithStats((st_b == 1).astype(np.uint8), connectivity=8)
+                n_cc = int(_n - 1)
+                cc_med = float(np.median(_stats[1:, cv2.CC_STAT_AREA])) if _n > 1 else 0.0
+            only_lm = only_s3d = 0
+            if st_b is not None:
+                _cov_b = st_b > 0
+                _cov_s = (st_s > 0) if st_s is not None else np.zeros_like(_cov_b)
+                _cov_l = (st_l > 0) if st_l is not None else np.zeros_like(_cov_b)
+                only_lm = int((_cov_b & ~_cov_s).sum())    # pixels the in-state seeds alone bring
+                only_s3d = int((_cov_b & ~_cov_l).sum())   # pixels the Sparse3D seeds alone bring
+            flick = flick_lm = both_cov = 0
+            if st_b is not None:
+                _eta = outs["both"]["eta"]
+                _only = (st_b > 0) & ~((st_s > 0) if st_s is not None else np.zeros_like(st_b, bool))
+                if mp_prev["eta"] is not None:
+                    _c = np.isfinite(_eta) & np.isfinite(mp_prev["eta"])
+                    _j = _c & (np.abs(_eta - mp_prev["eta"]) > 0.3)
+                    both_cov = int(_c.sum()); flick = int(_j.sum()); flick_lm = int((_j & _only).sum())
+                mp_prev["eta"] = _eta.copy(); mp_prev["only_lm"] = _only
+            _rad = float(_pd["seed_radius_px"])
+            def _straddle(pri):
+                if len(pri) < 2:
+                    return 0
+                _a = np.array([(u, v, e) for u, v, e, _ in pri]); n_ = 0
+                for i in range(len(_a)):
+                    d = np.hypot(_a[:, 0] - _a[i, 0], _a[:, 1] - _a[i, 1])
+                    nb = (d < _rad) & (d > 0)
+                    if nb.any() and np.abs(_a[nb, 2] - _a[i, 2]).max() > np.log(2.0):
+                        n_ += 1
+                return n_
+            mp_rows.append((k, len(pri_s3d), len(pri_lm), b1, b2, b3, n_cc, cc_med,
+                            s1, s2, s3, l1, l2, l3, only_lm, only_s3d,
+                            flick, flick_lm, both_cov, _straddle(pri_s3d + pri_lm) - _straddle(pri_lm) if False else _straddle(pri_s3d), _straddle(pri_lm)))
+            if (k - args.start) % args.stride == 0:
+                mp_status[k] = (st_b.copy() if st_b is not None else None,
+                                st_s.copy() if st_s is not None else None)
+                mp_seeds[k] = (ids_s3d, ids_lm)
         if (k - args.start) % 2000 == 0:
             print(f"  [{k - args.start}/{n}] feats {len(uvs)} in-state {len(lm_rng.get(k, {}))} "
                   f"|p| {np.linalg.norm(p):.2f} m")
@@ -430,6 +742,28 @@ def main():
         off, acc = vio.msc_update_counts()
         print(f"structureless tracks: offered {off}, accepted {acc} "
               f"({100.0*acc/max(off,1):.1f}%)")
+    if mp_rows:
+        _M = np.array(mp_rows, dtype=float)
+        np.savez(args.out.replace(".mp4", "_mapper.npz"), rows=_M, cols=np.array(MP_COLS))
+        _med = {c: float(np.median(_M[:, i])) for i, c in enumerate(MP_COLS)}
+        _tot = {c: float(np.sum(_M[:, i])) for i, c in enumerate(MP_COLS)}
+        _npx = float(W * H)
+        print("PATCH MAPPER (per-frame medians; pixel counts as % of the 320x200 frame):")
+        print(f"  seeds/frame: Sparse3D converged {_med['n_s3d_seeds']:.0f}, in-state fallback {_med['n_lm_seeds']:.0f}")
+        for _nm in ("both", "s3d", "lm"):
+            print(f"  {_nm:4s}: SeedOnly {100*_med[_nm+'_seedonly']/_npx:5.1f}%  PhotoRefined {100*_med[_nm+'_photo']/_npx:5.1f}%  "
+                  f"Rejected {100*_med[_nm+'_rej']/_npx:5.1f}%"
+                  + (f"  SeedOnly discs/frame {_med['both_cc']:.0f}, median disc {_med['both_cc_med']:.0f} px" if _nm == "both" else ""))
+        print(f"  covered pixels that only the in-state seeds bring: {100*_med['only_from_lm']/_npx:5.1f}% of frame "
+              f"(sum over run {100*_tot['only_from_lm']/max(_tot['both_seedonly']+_tot['both_photo'],1):.1f}% of all covered pixel-frames); "
+              f"only Sparse3D brings: {100*_med['only_from_s3d']/_npx:5.1f}%")
+        _fl = 100 * _tot['flicker_px'] / max(_tot['covered_prev_and_now'], 1)
+        _fl_lm = 100 * _tot['flicker_px_only_lm'] / max(_tot['flicker_px'], 1)
+        print(f"  FLICKER (|d eta| > 0.3 frame-to-frame): {_fl:.1f}% of covered pixel-frames; "
+              f"{_fl_lm:.1f}% of the flickering pixels exist only because of in-state seeds "
+              f"(they are {100*_tot['only_from_lm']/max(_tot['both_seedonly']+_tot['both_photo'],1):.1f}% of coverage)")
+        print(f"  seeds with a >2x-range neighbour inside the seed radius: Sparse3D {100*_tot['s3d_seeds_straddle']/max(_tot['n_s3d_seeds'],1):.1f}%, "
+              f"in-state {100*_tot['lm_seeds_straddle']/max(_tot['n_lm_seeds'],1):.1f}%")
         rj = vio.msc_reject_counts()
         names = ["too_few_obs", "stale_clone", "triangulation", "jacobian", "chi2"]
         print("  dropped by: " + "  ".join(
@@ -641,6 +975,14 @@ def main():
         print("--no-render: stopping after the filter pass")
         return
 
+    if fdf is not None:
+        _cv = [float((v[3] > 0).mean()) for v in dense_frames.values()]
+        _cvm = [float((v[3] == 1).mean()) for v in dense_frames.values()]
+        _st = fdf.stats()
+        print(f"FlowDep-F: converged landmark-frames {fdf_stat[0]} vs KLT {fdf_stat[1]} over {n} frames "
+              f"({fdf_stat[0] / max(n, 1):.1f} vs {fdf_stat[1] / max(n, 1):.1f} per frame); live {fdf.n_live()}; "
+              f"densified coverage per rendered frame median {100 * np.median(_cv) if _cv else 0:.1f}% p10 {100 * np.percentile(_cv, 10) if _cv else 0:.1f}% p90 {100 * np.percentile(_cv, 90) if _cv else 0:.1f}% (measured {100 * np.median(_cvm) if _cvm else 0:.1f}%)")
+
     # --- render ------------------------------------------------------------
     jetr = cv2.applyColorMap(np.arange(256, dtype=np.uint8)[:, None], cv2.COLORMAP_JET)[::-1, 0]
     # One colour scale for both populations (in-state dots and Sparse3D circles).
@@ -661,8 +1003,13 @@ def main():
         u = (xy - mid) / span + 0.5
         return int(u[0] * (RW - 20)) + 10, int((1 - u[1]) * (H * SC - 20)) + 10
 
+    rows = 2 if fdf is not None else 1
     vw = cv2.VideoWriter(args.out, cv2.VideoWriter_fourcc(*"mp4v"), args.fps,
-                         (W * SC + RW, H * SC))
+                         (W * SC + RW, H * SC * rows))
+    if fdf is not None:
+        _lr = np.array([v[2] for d in fdf_rng.values() for v in d.values() if v[3]])
+        if len(_lr):
+            vlo, vhi = min(vlo, np.percentile(_lr, 5)), max(vhi, np.percentile(_lr, 95))
     base = np.full((H * SC, RW, 3), 28, np.uint8)
     if ctrl is not None and len(ctrl) > 1:
         cp = [P(c[:2]) for c in ctrl if np.isfinite(c[0])]
@@ -681,6 +1028,27 @@ def main():
         rr = lm_rng.get(k, {})
         sp = sp_rng.get(k, {})
         nn = ns = nc = 0
+        if k in mp_status and mp_status[k][0] is not None:
+            # Status overlay: yellow = SeedOnly (seed disc, no photometric refinement),
+            # green = PhotoRefined, red = Rejected; magenta = covered ONLY because of the
+            # in-state fallback seeds (absent from the Sparse3D-only instance).
+            st_b, st_s = mp_status[k]
+            ov = np.zeros((H, W, 3), np.uint8)
+            ov[st_b == 1] = (0, 255, 255)
+            ov[st_b == 2] = (0, 200, 0)
+            ov[st_b == 3] = (0, 0, 255)
+            if st_s is not None:
+                ov[(st_b > 0) & ~(st_s > 0)] = (255, 0, 255)
+            ov = cv2.resize(ov, (W * SC, H * SC), interpolation=cv2.INTER_NEAREST)
+            m = ov.any(axis=2)
+            left[m] = (0.55 * left[m] + 0.45 * ov[m]).astype(np.uint8)
+            ids_s3d, ids_lm = mp_seeds.get(k, (set(), set()))
+            for fid, (u, v) in feats_per_frame.get(k, {}).items():
+                if fid in ids_lm:
+                    x, y = int(u * SC), int(v * SC)
+                    cv2.rectangle(left, (x - 6, y - 6), (x + 6, y + 6), (255, 0, 255), 2)
+            txt(left, f"mapper: yellow SeedOnly  green PhotoRefined  red Rejected  magenta only-from-in-state-seed (square)",
+                (8, H * SC - 10), (255, 255, 255))
         for fid, (u, v) in feats_per_frame.get(k, {}).items():
             x, y = int(u * SC), int(v * SC)
             if fid in sp and sp[fid][2]:
@@ -716,7 +1084,42 @@ def main():
         if err is not None and np.isfinite(err[j]):
             line += f"   |est-ctrl| {err[j]:.2f} m"
         txt(right, line, (10, 56))
-        vw.write(np.hstack([left, right]))
+        frame_out = np.hstack([left, right])
+        if fdf is not None:
+            # Second row: FlowDep-F converged landmarks on the undistorted frame + the
+            # densified range (nearest patch + disagreement + footprint sigma) | per-pixel sigma.
+            _ug, _eta, _sig, _cls = dense_frames.get(k, (None, None, None, None))
+            if _ug is None:
+                _ug = cv2.remap(np.asarray(cache[k]), undist_maps[0], undist_maps[1], cv2.INTER_LINEAR)
+                _eta = np.zeros((H, W), np.float16); _sig = np.ones((H, W), np.float16); _cls = np.zeros((H, W), np.uint8)
+            _cov_m = _cls > 0
+            dl = cv2.cvtColor(cv2.resize(_ug, (W * SC, H * SC), interpolation=cv2.INTER_NEAREST), cv2.COLOR_GRAY2BGR)
+            t_d = np.clip((np.exp(_eta.astype(np.float64)) - vlo) / (vhi - vlo + 1e-9), 0, 1)
+            col = jetr[(t_d * 255).astype(np.uint8)]          # same lookup as clut(jetr, t) above
+            col = cv2.resize(col, (W * SC, H * SC), interpolation=cv2.INTER_NEAREST)
+            cls_big = cv2.resize(_cls, (W * SC, H * SC), interpolation=cv2.INTER_NEAREST)
+            m_meas = cls_big == 1; m_fill = cls_big == 2
+            dl[m_meas] = (0.3 * dl[m_meas] + 0.7 * col[m_meas]).astype(np.uint8)
+            dl[m_fill] = (0.6 * dl[m_fill] + 0.4 * col[m_fill]).astype(np.uint8)   # Filled: paler, same colour scale
+            nf = 0
+            for fid, (u, v, r, conv) in fdf_rng.get(k, {}).items():
+                if conv:
+                    cv2.circle(dl, (int(u * SC), int(v * SC)), 3, (255, 255, 255), 1, cv2.LINE_AA); nf += 1
+            txt(dl, f"FlowDep-F converged {nf}   dense range: measured {100 * (_cls == 1).mean():.0f}%" + (f" + filled {100 * (_cls == 2).mean():.0f}% (paler)" if args.fill else "") + f"   unknown {100 * (_cls == 0).mean():.0f}%", (8, 20))
+            txt(dl, "undistorted pinhole frame; same colour scale as above; filled = interpolated between measured patches only", (8, 38))
+            sg = np.full((H * SC, RW, 3), 28, np.uint8)
+            sw = RW; sh = int(H * sw / W)
+            t_s = np.clip((np.log(np.maximum(_sig.astype(np.float64), 1e-4)) - np.log(0.01)) / (np.log(0.30) - np.log(0.01)), 0, 1)
+            scol = jetr[(t_s * 255).astype(np.uint8)]          # 1 % red .. 30 % blue
+            scol[~_cov_m] = (28, 28, 28)
+            sg[:sh] = cv2.resize(scol, (sw, sh), interpolation=cv2.INTER_NEAREST)
+            txt(sg, "per-pixel sigma: red 1% .. blue 30%", (10, sh + 20), (200, 200, 200))
+            if _cov_m.any():
+                txt(sg, f"median sigma {100 * np.median(_sig[_cov_m].astype(np.float64)):.1f}%  (log-range)", (10, sh + 38), (200, 200, 200))
+            txt(sg, "no GT on the rig: sigma is the", (10, sh + 64), (160, 160, 160))
+            txt(sg, "rule validated on TartanAir/MidAir", (10, sh + 80), (160, 160, 160))
+            frame_out = np.vstack([frame_out, np.hstack([dl, sg])])
+        vw.write(frame_out)
         rendered += 1
     vw.release()
     print(f"wrote {args.out}  ({rendered} frames @ {args.fps} fps)")

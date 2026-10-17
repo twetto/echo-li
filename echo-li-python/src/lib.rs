@@ -7,6 +7,7 @@ mod msceqf_native;
 mod occupancy;
 mod patch_depth;
 mod sparse_3d;
+mod flowdep_f;
 mod stereo;
 mod vio_filter;
 
@@ -18,6 +19,7 @@ fn _echo_li(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<frontend::FrontendConfig>()?;
     m.add_class::<frontend::PyFrontend>()?;
     m.add_class::<vio_filter::PyVIOFilter>()?;
+    m.add_class::<flowdep_f::PyFlowDepF>()?;
     m.add_class::<msceqf_native::PyMSCEqFNativeFilter>()?;
     m.add_class::<msceqf_backend::PyMsceqfBackend>()?;
     m.add_class::<sparse_3d::PySparse3DFilter>()?;

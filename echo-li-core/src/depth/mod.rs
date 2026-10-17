@@ -1,4 +1,5 @@
 pub mod flowdep;
+pub mod flowdep_f;
 pub mod flowdep_kernels;
 pub mod keyframe_pool;
 pub mod occupancy;

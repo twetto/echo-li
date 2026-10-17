@@ -86,6 +86,12 @@ pub struct FeatureState3D {
     pub a: f64,
     pub b: f64,
     pub track_length: usize,
+    /// Per-observation measurement covariance (px²) for THIS frame's update, set by the
+    /// caller through `Sparse3DFilter::set_observation_noise` (e.g. FlowDep-F's along-line
+    /// variance from its Gauss–Newton Hessian and a floor across the epipolar line).
+    /// `None` → the isotropic `sigma_pixel` model with the flow-age term. Cleared after
+    /// every update.
+    pub obs_cov: Option<Matrix2<f64>>,
     pub ref_uv: Vector2<f64>,
     pub ref_stamp: f64,
     /// Last update normalized innovation squared (NIS = gating Mahalanobis
@@ -107,7 +113,7 @@ pub struct FeatureState3D {
     pub p_stheta: Matrix3x6<f64>,
 
     // --- Per-track correspondence-bias state (BearingInvDepthAdditive only,
-    // enabled by settings.bias_walk_var > 0). Augments the 3-DOF landmark to a
+    // enabled by settings.bias_walk_var > 0 or bias_init_var > 0). Augments the 3-DOF landmark to a
     // 5-DOF state s5 = (inv_s, bias). All zero / unused when disabled. ---
     pub bias: Vector2<f64>,   // estimated 2D pixel bias b
     pub p_sb: Matrix3x2<f64>, // cross-covariance cov(inv_s, bias)
@@ -204,6 +210,9 @@ pub struct Sparse3DFilter {
     prev_t_wc: Option<Matrix4<f64>>,
     /// Per-anchor consider data for THIS frame, set by the feed before `update_with_clones`.
     consider_rel: ConsiderRelMap,
+    /// Per-observation measurement covariances for the next update (see
+    /// `set_observation_noise`); applied to `FeatureState3D::obs_cov` and cleared.
+    pending_obs_cov: HashMap<u64, Matrix2<f64>>,
     prev_stamp: f64,
 }
 
@@ -222,6 +231,7 @@ impl Sparse3DFilter {
             prev_uvs: HashMap::new(),
             prev_t_wc: None,
             consider_rel: HashMap::new(),
+            pending_obs_cov: HashMap::new(),
             prev_stamp: -1.0,
         }
     }
@@ -280,6 +290,13 @@ impl Sparse3DFilter {
     /// landmark is then driven by its own honest gauge-cancelled relative cov
     /// instead of the shared absolute `p_vv`/`p_ww`. Passing `None` for the map is
     /// exactly [`update`] (legacy absolute path — both consumers use `p_vv`/`p_ww`).
+    /// Per-observation measurement covariances (px²) for the NEXT update, by feature id.
+    /// Features absent from the map use the isotropic model. Consumed and cleared by
+    /// the update.
+    pub fn set_observation_noise(&mut self, cov_by_id: HashMap<u64, Matrix2<f64>>) {
+        self.pending_obs_cov = cov_by_id;
+    }
+
     pub fn update_with_clones(
         &mut self,
         measurement: &VisionMeasurement,
@@ -305,6 +322,10 @@ impl Sparse3DFilter {
 
         let dt = (stamp - self.prev_stamp).max(0.0);
         let t_cw_curr = t_wc.try_inverse().unwrap_or_else(Matrix4::identity);
+        for feat in &mut self.features {
+            feat.obs_cov = self.pending_obs_cov.get(&feat.feat_id).copied();
+        }
+        self.pending_obs_cov.clear();
 
         #[cfg(feature = "parallel")]
         let reset_features: Vec<_> = {
@@ -480,6 +501,7 @@ impl Sparse3DFilter {
                     tangent_basis: u,
                     anchor_t_wc: *t_wc,
                     a: self.settings.a_init,
+                    obs_cov: None,
                     b: self.settings.b_init,
                     track_length: 1,
                     ref_uv: uv_curr,
@@ -487,7 +509,7 @@ impl Sparse3DFilter {
                     last_nis: f64::NAN,
                     bias: Vector2::zeros(),
                     p_sb: Matrix3x2::zeros(),
-                    p_bb: Matrix2::zeros(),
+                    p_bb: Matrix2::identity() * self.settings.bias_init_var,
                     pose_q_prev: 0.0,
                     p_stheta: Matrix3x6::zeros(),
                     // Bearing chart anchors at the CURRENT frame (anchor_t_wc =
@@ -570,6 +592,7 @@ impl Sparse3DFilter {
                 tangent_basis: Matrix3x2::zeros(),
                 anchor_t_wc: *t_wc,
                 a: self.settings.a_init,
+                obs_cov: None,
                 b: self.settings.b_init,
                 track_length: 1,
                 ref_uv: uv_curr,
@@ -577,7 +600,7 @@ impl Sparse3DFilter {
                 last_nis: f64::NAN,
                 bias: Vector2::zeros(),
                 p_sb: Matrix3x2::zeros(),
-                p_bb: Matrix2::zeros(),
+                p_bb: Matrix2::identity() * self.settings.bias_init_var,
                 pose_q_prev: 0.0,
                 p_stheta: Matrix3x6::zeros(),
                 // Non-bearing charts also anchor at the current frame here.
@@ -821,6 +844,25 @@ impl Sparse3DFilter {
         // behaviour -- only the honesty of the number handed to a consumer.
         let depth_var = depth_var + (self.settings.scale_sigma * depth).powi(2);
         (depth, depth_var)
+    }
+
+    /// Start a new bias epoch for `fid`: the per-track pixel bias is re-drawn (zeroed, with
+    /// prior variance `var` per axis and no cross-covariance with the landmark). Meant to be
+    /// called when the track source re-cuts the reference the feature is matched against
+    /// (FlowDep-F re-anchor), after which the along-line error of its matches is a new,
+    /// unrelated offset. No-op for an unknown id or when the bias state is off.
+    pub fn reset_bias(&mut self, fid: u64, var: f64) -> bool {
+        if !self.settings.bias_enabled() {
+            return false;
+        }
+        let Some(&slot) = self.feature_slots.get(&fid) else {
+            return false;
+        };
+        let feat = &mut self.features[slot];
+        feat.bias = Vector2::zeros();
+        feat.p_sb = Matrix3x2::zeros();
+        feat.p_bb = Matrix2::identity() * var;
+        true
     }
 
     pub fn query_range(&self, fid: u64) -> (f64, f64) {
@@ -1175,7 +1217,7 @@ fn update_feature_3d(
             k, settings, feat, uv_obs, t_cw_curr, p_vv, p_ww, p_vv_inc, p_ww_inc, dt,
         ),
         Sparse3DChart::BearingInvDepthAdditive => match cam {
-            Some(cam) if settings.consider_relpose && settings.bias_walk_var <= 0.0 => {
+            Some(cam) if settings.consider_relpose && !settings.bias_enabled() => {
                 match consider {
                     Some(cr) => bearing_consider_update_3d(
                         cam, k, settings, feat, uv_obs, t_cw_curr, cr, dt,
@@ -1201,6 +1243,17 @@ fn update_feature_3d(
 fn measurement_variance_px2(settings: &SparseVogSettings, feat: &FeatureState3D) -> f64 {
     let age = feat.track_length.saturating_sub(1) as f64;
     settings.sigma_pixel.powi(2) + (settings.flow_age_rate_px_per_frame * age).powi(2)
+}
+
+/// Measurement covariance (px²) of this frame's pixel observation: the per-observation
+/// matrix the caller supplied for this feature, else the isotropic `sigma_pixel` model
+/// (with the flow-age term, which models frame-to-frame template drift and therefore
+/// does not apply to an anchor-referenced observation that carries its own R).
+fn measurement_cov_px2(settings: &SparseVogSettings, feat: &FeatureState3D) -> Matrix2<f64> {
+    match feat.obs_cov {
+        Some(r) => r,
+        None => Matrix2::identity() * measurement_variance_px2(settings, feat),
+    }
 }
 
 /// Rho-first additive inverse-depth EKF update for one landmark.
@@ -1286,7 +1339,7 @@ fn invdepth_additive_update_3d(
         }
     }
 
-    let mut r_meas = Matrix2::identity() * measurement_variance_px2(settings, feat);
+    let mut r_meas = measurement_cov_px2(settings, feat);
 
     let q_c = r_ca * pa_of(&feat.inv_s) + t_ca_t;
     if q_c[2] < settings.min_depth {
@@ -1397,7 +1450,7 @@ fn bearing_invdepth_additive_update_3d(
     p_ww_inc: Option<&Matrix3<f64>>,
     dt: f64,
 ) -> bool {
-    if settings.bias_walk_var > 0.0 {
+    if settings.bias_enabled() {
         return bearing_bias_update_3d(
             cam, k, settings, feat, uv_obs, t_cw_curr, p_vv, p_ww, p_vv_inc, p_ww_inc, dt,
         );
@@ -1449,7 +1502,7 @@ fn bearing_invdepth_additive_update_3d(
         }
     }
 
-    let mut r_meas = Matrix2::identity() * measurement_variance_px2(settings, feat);
+    let mut r_meas = measurement_cov_px2(settings, feat);
 
     let (pa, jpa) = pj_of(&feat.inv_s);
     let q_c = r_ca * pa + t_ca_t;
@@ -1584,7 +1637,7 @@ fn bearing_consider_update_3d(
         .copy_from(&(proj * base_skew(&q_c)));
     j_pose.fixed_view_mut::<2, 3>(0, 3).copy_from(&proj);
     let c = proj * r_ca * jpa; // 2x3
-    let r_core = Matrix2::identity() * measurement_variance_px2(settings, feat);
+    let r_core = measurement_cov_px2(settings, feat);
 
     // (19)
     let p = feat.inv_p;
@@ -1755,7 +1808,7 @@ fn bearing_bias_update_3d(
     // Random walk on the bias: b_k = b_{k-1} + w_k, w_k ~ N(0, bias_walk_var I).
     feat.p_bb += Matrix2::identity() * settings.bias_walk_var;
 
-    let mut r_meas = Matrix2::identity() * measurement_variance_px2(settings, feat);
+    let mut r_meas = measurement_cov_px2(settings, feat);
 
     let (pa, jpa) = pj_of(&feat.inv_s);
     let q_c = r_ca * pa + t_ca_t;
@@ -1931,7 +1984,7 @@ fn iekf_update_3d(
         }
     }
 
-    let r_meas = Matrix2::identity() * measurement_variance_px2(settings, feat);
+    let r_meas = measurement_cov_px2(settings, feat);
 
     // Each branch produces the inlier-conditioned update terms shared by the
     // Gaussian-Beta tail below: the gating Mahalanobis^2 and det(S), the full
@@ -2240,7 +2293,7 @@ fn bearing_update_3d(
         h_euc * chart_to_euc_jac(chart, &q)
     };
     let y_pred = Vector2::new(fx * q[0] / q[2] + cx, fy * q[1] / q[2] + cy);
-    let r = Matrix2::identity() * measurement_variance_px2(settings, feat);
+    let r = measurement_cov_px2(settings, feat);
     let s = h * feat.covariance * h.transpose() + r;
     let Some(s_inv) = (s + Matrix2::identity() * 1e-8).try_inverse() else {
         return true;
@@ -3240,6 +3293,7 @@ mod tests {
             a: 1.0,
             b: 1.0,
             track_length: 3,
+            obs_cov: None,
             ref_uv: Vector2::new(0.0, 0.0),
             ref_stamp: 0.0,
             last_nis: f64::NAN,

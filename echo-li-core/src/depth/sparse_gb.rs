@@ -221,6 +221,13 @@ pub struct SparseVogSettings {
     /// Absorbs slow correspondence drift (the tracked pixel sliding off its
     /// landmark) as a random-walk pixel bias, so it is not misread as parallax.
     pub bias_walk_var: f64,
+    /// Prior variance (px^2, per axis) of the per-track pixel bias at birth. With a
+    /// walk of 0 this is a PERSISTENT bias model: the filter can never shrink a
+    /// landmark's uncertainty below what a constant offset of this size implies,
+    /// which is what a patch re-matched against one reference needs (its along-line
+    /// error repeats; FlowDep-F on Kite at GT pose: NEES by track length 4.8/12.7/37
+    /// with no bias state, 0.62/0.75/1.32 with a 0.3 px^2/frame walk). Default 0.
+    pub bias_init_var: f64,
     /// Experimental sigma-point rotation propagation for the additive chart.
     pub rotation_unscented: bool,
 }
@@ -266,6 +273,7 @@ impl Default for SparseVogSettings {
             pose_range_scale: 0.0,
             pose_range_coherent: 0.0,
             bias_walk_var: 0.0,
+            bias_init_var: 0.0,
             rotation_unscented: false,
         }
     }
@@ -666,5 +674,12 @@ fn depth_var_to_canonical_var(settings: &SparseVogSettings, z: f64, var_z: f64) 
         DepthParametrization::Euclidean => var_z,
         DepthParametrization::InvDepth => var_z / z.powi(4),
         DepthParametrization::Polar => var_z / z.powi(2),
+    }
+}
+
+impl SparseVogSettings {
+    /// The per-track bias state is carried when either its walk or its prior is set.
+    pub fn bias_enabled(&self) -> bool {
+        self.bias_walk_var > 0.0 || self.bias_init_var > 0.0
     }
 }

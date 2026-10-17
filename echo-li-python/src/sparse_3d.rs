@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use echo_li_core::depth::sparse_3d::Sparse3DFilter;
 use echo_li_core::depth::sparse_gb::{SecondOrderMode, SparseVogSettings};
 use echo_li_core::mathematical::vision_measurement::VisionMeasurement;
-use nalgebra::{Matrix3, Matrix4, Vector2};
+use nalgebra::{Matrix2, Matrix3, Matrix4, Vector2};
 
 #[pyclass(name = "Sparse3DFilter")]
 pub struct PySparse3DFilter {
@@ -141,6 +141,24 @@ impl PySparse3DFilter {
         );
     }
 
+    /// Per-observation measurement noise for the NEXT update: `{id: (sigma_along_px,
+    /// dir_x, dir_y, sigma_across_px)}` → R = σa² d dᵀ + σx² n nᵀ (px²), n ⊥ d.
+    fn set_observation_noise(&mut self, noise: HashMap<u64, (f64, f64, f64, f64)>) {
+        let m: HashMap<u64, Matrix2<f64>> = noise
+            .into_iter()
+            .map(|(id, (sa, dx, dy, sx))| {
+                let n = (dx * dx + dy * dy).sqrt().max(1e-12);
+                let d = Vector2::new(dx / n, dy / n);
+                let p = Vector2::new(-d[1], d[0]);
+                (
+                    id,
+                    sa * sa * (d * d.transpose()) + sx * sx * (p * p.transpose()),
+                )
+            })
+            .collect();
+        self.inner.set_observation_noise(m);
+    }
+
     fn query(&self, feature_id: u64) -> (f64, f64) {
         self.inner.query(feature_id)
     }
@@ -174,6 +192,66 @@ impl PySparse3DFilter {
             new_clone_id,
             cov.as_ref().map(|(v, w)| (v, w)),
         )
+    }
+
+    /// Flat per-feature range summary for hot loops (one call instead of `get_features`
+    /// plus Python per-feature algebra): `(ids, range, var_cond_eta, var_reported_eta,
+    /// converged, track_length)` where `var_cond_eta` is the filter's own state
+    /// covariance projected on the ray in log-range units (rhat^T C rhat / r^2),
+    /// `var_reported_eta` the reported range variance (state + scale term) / r^2, and
+    /// `converged` is `query_range(id).0 > 0`. Features with a non-finite covariance or
+    /// r <= 1e-6 are skipped.
+    fn range_summary<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> (
+        Bound<'py, PyArray1<u64>>,
+        Bound<'py, PyArray1<f64>>,
+        Bound<'py, PyArray1<f64>>,
+        Bound<'py, PyArray1<f64>>,
+        Bound<'py, PyArray1<bool>>,
+        Bound<'py, PyArray1<u32>>,
+    ) {
+        let chart = self.inner.chart();
+        let mut ids = Vec::new();
+        let mut rs = Vec::new();
+        let mut vc = Vec::new();
+        let mut vr = Vec::new();
+        let mut cv = Vec::new();
+        let mut tl = Vec::new();
+        for feat in self.inner.features_iter() {
+            let r = feat.position.norm();
+            if !(r.is_finite() && r > 1e-6) {
+                continue;
+            }
+            let c = feat.covariance_euclidean(chart);
+            if !c.iter().all(|v| v.is_finite()) {
+                continue;
+            }
+            let rh = feat.position / r;
+            let v = (rh.transpose() * c * rh)[(0, 0)] / (r * r);
+            ids.push(feat.feat_id);
+            rs.push(r);
+            vc.push(v);
+            vr.push(self.inner.reported_range_variance(feat) / (r * r));
+            cv.push(self.inner.query_range(feat.feat_id).0 > 0.0);
+            tl.push(feat.track_length as u32);
+        }
+        (
+            PyArray1::from_vec(py, ids),
+            PyArray1::from_vec(py, rs),
+            PyArray1::from_vec(py, vc),
+            PyArray1::from_vec(py, vr),
+            PyArray1::from_vec(py, cv),
+            PyArray1::from_vec(py, tl),
+        )
+    }
+
+    /// New bias epoch for each id (see `Sparse3DFilter::reset_bias`); returns how many were reset.
+    fn reset_bias(&mut self, ids: Vec<u64>, var: f64) -> usize {
+        ids.into_iter()
+            .filter(|&fid| self.inner.reset_bias(fid, var))
+            .count()
     }
 
     fn query_range(&self, fid: u64) -> (f64, f64) {
@@ -363,6 +441,7 @@ fn parse_settings(kwargs: Option<&Bound<'_, pyo3::types::PyDict>>) -> PyResult<S
     set!("sigma_pixel", sigma_pixel);
     set!("flow_age_rate_px_per_frame", flow_age_rate_px_per_frame);
     set!("bias_walk_var", bias_walk_var);
+    set!("bias_init_var", bias_init_var);
     set!("uniform_z_max", uniform_z_max);
     set!("uniform_rho_max", uniform_rho_max);
     set!("uniform_d_min", uniform_d_min);
