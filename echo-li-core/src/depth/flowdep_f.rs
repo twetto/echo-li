@@ -375,6 +375,10 @@ pub struct FlowDepF {
     frames_since_anchor: u32,
     last_t_wc: Option<Matrix4<f64>>,
     pub stats: FrameStats,
+    /// Level-0 pixels no patch may be born on this frame (the corner tracker's live
+    /// features: those already feed the depth filter, so a patch there is repeated work).
+    /// Consumed by the next `process` call and cleared.
+    birth_exclusions: Vec<(f64, f64)>,
 }
 
 impl FlowDepF {
@@ -399,7 +403,14 @@ impl FlowDepF {
             frames_since_anchor: 0,
             last_t_wc: None,
             stats: FrameStats::default(),
+            birth_exclusions: Vec::new(),
         }
+    }
+
+    /// Pixels (level 0) that the next frame's births must keep `min_birth_dist_px` away
+    /// from, on top of the live patches: the corner tracker's current features.
+    pub fn set_birth_exclusions(&mut self, pixels: Vec<(f64, f64)>) {
+        self.birth_exclusions = pixels;
     }
 
     pub fn n_live(&self) -> usize {
@@ -602,6 +613,7 @@ impl FlowDepF {
         // Forget anchors without live patches (the newest is always kept).
         self.gc_anchors();
 
+        self.birth_exclusions.clear();
         self.last_t_wc = Some(*t_wc);
         self.frame += 1;
         stats.live = self.patches.len();
@@ -682,6 +694,7 @@ impl FlowDepF {
                 occupied.push(((uv[0] + 0.5) * sc - 0.5, (uv[1] + 0.5) * sc - 0.5));
             }
         }
+        occupied.extend(self.birth_exclusions.iter().copied());
         let min_d2 = s.min_birth_dist_px * s.min_birth_dist_px;
         let is_free = |u0: f64, v0: f64, occ: &[(f64, f64)]| {
             occ.iter()

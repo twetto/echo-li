@@ -223,7 +223,9 @@ def main():
 
         # ---- render ----
         base = cv2.cvtColor(cv2.resize(und, (PW, PH), interpolation=cv2.INTER_LINEAR), cv2.COLOR_GRAY2BGR)
-        p1 = base.copy()
+        # The tracker runs on the RAW (distorted) frame, so its features are drawn on that frame,
+        # not on the undistorted base the other panels use; the scale raw->panel is s*SC either way.
+        p1 = cv2.cvtColor(cv2.resize(raw, (PW, PH), interpolation=cv2.INTER_LINEAR), cv2.COLOR_GRAY2BGR)
         for fid, (u, v) in uvs.items():
             cv2.circle(p1, (int(u * s * SC), int(v * s * SC)), 3, (0, 255, 255), 1, cv2.LINE_AA)
         txt(p1, f"EuRoC {root.name}  frame {k}  t+{ts - cam_t[k0]:.1f}s   MSCEqF (ZUPT, {args.max_slam} in-state) + Rudolf-V {len(uvs)} tracks", (8, 22))

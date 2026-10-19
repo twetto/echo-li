@@ -10,6 +10,7 @@ use echo_li_core::backend::{backend_from_config, CloneRelFeed, EqvioBackend};
 use echo_li_core::config::VIOConfig;
 use echo_li_core::config::{MsceqfConfig, ZuptConfig};
 use echo_li_core::core_types::CameraIntrinsics;
+use echo_li_core::depth::dense_mapper::DenseDepthMapper;
 use echo_li_core::depth::occupancy::LocalOccupancyMap;
 use echo_li_core::depth::patch_depth::{
     FrameProducts, PatchDepthMapper, PatchDepthOutput, PatchDepthSeedCoordinates, PatchStatus,
@@ -417,6 +418,9 @@ struct VioNode {
 
     // Dense mapping
     depth_mapper: Option<PatchDepthMapper>,
+    /// The FlowDep-F dense mapper (config `FlowDepDense`); when present it replaces the
+    /// patch mapper as the source of the dense frame and the occupancy map's input.
+    dense_mapper: Option<DenseDepthMapper>,
     depth_seed_coords: PatchDepthSeedCoordinates,
     depth_pub: Option<r2r::Publisher<r2r::sensor_msgs::msg::Image>>,
     depth_status_pub: Option<r2r::Publisher<r2r::sensor_msgs::msg::Image>>,
@@ -691,6 +695,30 @@ impl VioNode {
             Some(filter)
         });
 
+        // FlowDep-F dense mapper (design note §7 item 2). Runs instead of the patch mapper
+        // when its config section is present and enabled; needs the occupancy map too.
+        let dense_mapper = vio_config
+            .flowdep_dense
+            .as_ref()
+            .filter(|c| c.enabled)
+            .map(|c| {
+                let base = vio_config
+                    .sparse_vog
+                    .as_ref()
+                    .map(|sv| sv.to_sparse_settings())
+                    .unwrap_or_default();
+                let s = c.to_settings(&base);
+                log::info!(
+                    "FlowDepDense: enabled (scale {}, residual gate {}, birth/track curvature {}/{}, walk {}, fill {})",
+                    s.scale,
+                    s.tracker.max_mean_abs_residual,
+                    s.tracker.min_birth_curvature,
+                    s.tracker.min_track_curvature,
+                    s.sparse.bias_walk_var,
+                    s.fill.is_some()
+                );
+                DenseDepthMapper::new(camera.clone(), CameraIntrinsics { fx, fy, cx, cy }, w, h, s)
+            });
         // Patch depth mapper (Rust backend only — DIS depth dropped)
         let mut depth_mapper = None;
         let mut depth_seed_coords = PatchDepthSeedCoordinates::RawDistorted;
@@ -725,6 +753,20 @@ impl VioNode {
                 Err(e) => log::error!("Failed to create PatchDepthMapper: {e}"),
             }
         }
+        if occupancy_map.is_none() && dense_mapper.is_some() && params.occupancy_enabled {
+            let occ_settings = vio_config
+                .local_occupancy
+                .as_ref()
+                .map(|c| c.to_local_occupancy_settings())
+                .unwrap_or_default();
+            match LocalOccupancyMap::new(occ_settings) {
+                Ok(occ) => {
+                    log::info!("LocalOccupancyMap: enabled (fed by FlowDepDense)");
+                    occupancy_map = Some(occ);
+                }
+                Err(e) => log::error!("Failed to create LocalOccupancyMap: {e}"),
+            }
+        }
 
         Self {
             filter,
@@ -744,6 +786,7 @@ impl VioNode {
             sparse_3d,
             sparse_feed: CloneRelFeed::default(),
             depth_mapper,
+            dense_mapper,
             depth_seed_coords,
             depth_pub,
             depth_status_pub,
@@ -1109,8 +1152,14 @@ impl VioNode {
         }
 
         // Dense mapping: patch depth → occupancy
-        if self.depth_mapper.is_some() && self.images_processed % self.mapping_stride as u64 == 0 {
-            self.run_mapping(stamp_ns, &gray, &t_wc, &features);
+        if (self.depth_mapper.is_some() || self.dense_mapper.is_some())
+            && self.images_processed % self.mapping_stride as u64 == 0
+        {
+            if self.dense_mapper.is_some() {
+                self.run_dense_mapping(stamp_ns, &gray, &t_wc, &features);
+            } else {
+                self.run_mapping(stamp_ns, &gray, &t_wc, &features);
+            }
         }
 
         // Track estimated trajectory
@@ -1122,6 +1171,63 @@ impl VioNode {
         self.estimated_positions.push_back(position);
         self.estimated_quaternions.push_back(quaternion);
         self.estimated_stamps.push_back(stamp);
+    }
+
+    /// The FlowDep-F dense path: patch tracker on the equalised pinhole frame, its own
+    /// clone-relative Sparse3D, fusion + fill, then the class-aware occupancy update. The
+    /// corner tracker's live features are handed over so no patch is born on them.
+    fn run_dense_mapping(
+        &mut self,
+        stamp_ns: i64,
+        gray: &[u8],
+        t_wc: &Matrix4<f64>,
+        features: &[Feature],
+    ) {
+        let stamp = stamp_ns as f64 / NSEC_PER_SEC as f64;
+        let corners: Vec<(f64, f64)> = features.iter().map(|f| (f.x as f64, f.y as f64)).collect();
+        self.patch_depth_frame_count += 1;
+        let pd_start = Instant::now();
+        let output = {
+            let pose_cov = self.filter.pose_covariance();
+            self.dense_mapper
+                .as_mut()
+                .unwrap()
+                .process(gray, stamp, t_wc, pose_cov, &corners)
+        };
+        push_capped(
+            &mut self.patch_depth_times_ms,
+            pd_start.elapsed().as_secs_f64() * 1000.0,
+            300,
+        );
+        if self.patch_depth_frame_count % 300 == 0 {
+            let st = output.stats;
+            log::info!(
+                "FlowDepDense: live {} observed {} converged {} fused {} | measured {:.1}% filled {:.1}% | ms eq+remap {:.1} track {:.1} filter {:.1} fuse+fill {:.1}",
+                st.patches_live,
+                st.patches_observed,
+                st.landmarks_converged,
+                st.items_fused,
+                100.0 * st.measured_frac,
+                100.0 * st.filled_frac,
+                st.ms_equalise_remap,
+                st.ms_track,
+                st.ms_filter,
+                st.ms_fuse_fill
+            );
+        }
+        let pdo = output.to_patch_depth_output();
+        self.publish_depth_maps(stamp_ns, &pdo);
+        if let Some(occ) = &mut self.occupancy_map {
+            let occ_start = Instant::now();
+            let intr = self.dense_mapper.as_ref().unwrap().intrinsics();
+            occ.update_from_dense(&output, intr, t_wc);
+            push_capped(
+                &mut self.occupancy_times_ms,
+                occ_start.elapsed().as_secs_f64() * 1000.0,
+                300,
+            );
+            // The occupancy cloud is published by the node's timer, as for the patch mapper.
+        }
     }
 
     fn run_mapping(

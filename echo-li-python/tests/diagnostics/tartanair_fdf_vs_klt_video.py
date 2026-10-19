@@ -61,6 +61,7 @@ def main():
     ap.add_argument("--png-every", type=int, default=0, help="also write a PNG every N frames")
     ap.add_argument("--slant-deg", type=float, default=35.0, help="footprint slant prior of the densify rule")
     ap.add_argument("--dense-rule", default="nearest_disagree_slant", help="fusion rule name from fdf_densify_study")
+    ap.add_argument("--fill", action="store_true", help="add the honest fill (normalised convolution, balance-gated) between measured patches; Filled pixels drawn paler")
     ap.add_argument("--sparse", action="append", default=[], metavar="KEY=VAL", help="SparseVog override")
     ap.add_argument("--fdf", action="append", default=[], metavar="KEY=VAL", help="FlowDepF override")
     args = ap.parse_args()
@@ -264,12 +265,20 @@ def main():
             eta_p, var_p, covered = dz.fuse(items, H, W)[args.dense_rule]
         else:
             eta_p = np.zeros((H, W)); var_p = np.ones((H, W)); covered = np.zeros((H, W), bool)
+        filled = np.zeros((H, W), bool)
+        if args.fill and covered.any():
+            ef, vf, filled, _ = dz.fill(eta_p, var_p, covered)
+            eta_p = np.where(filled, ef, eta_p); var_p = np.where(filled, vf, var_p)
+            covered = covered | filled
         dense_r = np.where(covered, np.exp(eta_p), 0.0)
         okgt = covered & np.isfinite(gt_s) & (gt_s > 0.5) & (gt_s < sky)
         e_d = (dense_r[okgt] - gt_s[okgt]) / gt_s[okgt]
         n_d = (eta_p[okgt] - np.log(gt_s[okgt])) ** 2 / np.maximum(var_p[okgt], 1e-12)
         dense_err.append(e_d); dense_cov.append(covered.mean()); dense_nees.append(n_d)
         dense_panel = dense_panel_of(dense_r, covered, e_d, base, "densified range")
+        if filled.any():
+            dense_panel[filled] = (0.55 * dense_panel[filled] + 0.45 * 255).astype(np.uint8)
+            txt(dense_panel, f"measured {100*np.mean(covered & ~filled):.0f}% + filled {100*np.mean(filled):.0f}% (paler)", (6, 34))
         # Signed error panel of the dense frame.
         derr_panel = (base * 0.35).astype(np.uint8)
         e_full = np.zeros((H, W)); e_full[okgt] = (dense_r[okgt] - gt_s[okgt]) / gt_s[okgt]

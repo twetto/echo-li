@@ -57,3 +57,4 @@ mpv-shot*.jpg
 
 # aarch64 cross-build tree (CARGO_TARGET_DIR=target-orin)
 target-orin/
+target-distrobox/

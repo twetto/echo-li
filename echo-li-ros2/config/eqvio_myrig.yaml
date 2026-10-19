@@ -109,7 +109,9 @@ SparseVog:
   ab_max: 200.0
   min_inlier_ratio: 0.5
   mahalanobis_reset_chi2: 0.2
-  bias_walk_var: 0.0
+  # 0.04 px^2/frame: the corner-track value measured at known pose on 12 Kite flights
+  # (design note row 5p); 0 ran the corner landmark sigma over-confident on long tracks.
+  bias_walk_var: 0.04
   process_depth_var: 0.01
   pose_range_scale: 1.0
   pose_range_coherent: 0.0
@@ -119,6 +121,8 @@ SparseVog:
   max_depth: 12.0
 
 PatchDepth:
+  # Replaced by FlowDepDense below (design note §7 item 2); kept for comparison runs.
+  enabled: false
   # per_patch_bearing: target-anchored per-patch tangent rectification for the
   # equidistant fisheye.  Seamless and wide-FoV-correct.
   camera_mode: per_patch_bearing
@@ -137,6 +141,31 @@ PatchDepth:
   min_structure_eigen: 0.0
   vis_min_depth: 0.3
   vis_max_depth: 8.0
+
+# The FlowDep-F dense mapper (design note §7 item 2, rows 5m/5q): patch tracker on the
+# equalised pinhole frame at half size, its own clone-relative Sparse3D with the patch-track
+# walk variance, nearest+disagreement+footprint fusion and the balance-gated fill. The
+# occupancy map reads the per-pixel class: Measured integrates, Filled only carves free space.
+# Values are the rig-2 walkway arm (row 5m).
+FlowDepDense:
+  enabled: true
+  scale: 0.5
+  histeq: clahe
+  clahe_tile_size: 64
+  clahe_clip_limit: 4.0
+  max_mean_abs_residual: 30.0
+  min_birth_curvature: 10.0
+  min_track_curvature: 160.0
+  bias_walk_var: 0.3
+  max_pool_size: 4000
+  min_track_length: 5
+  slant_deg: 35.0
+  fill: true
+  fill_sigma: 12.0
+  fill_gate: 0.15
+  fill_balance: 12.0
+  fill_max_d: 48.0
+  exclude_corners: true
 
 DISDepth:
   # DIS optical flow preset: ultrafast / fast / medium.

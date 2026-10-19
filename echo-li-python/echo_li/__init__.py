@@ -13,6 +13,9 @@ from echo_li._echo_li import (
     LocalOccupancyMap,
     Stereo,
     static_initialize,
+    dense_fuse,
+    dense_fill,
+    DenseDepthMapper,
 )
 
 __all__ = [
@@ -30,4 +33,7 @@ __all__ = [
     "LocalOccupancyMap",
     "Stereo",
     "static_initialize",
+    "dense_fuse",
+    "dense_fill",
+    "DenseDepthMapper",
 ]

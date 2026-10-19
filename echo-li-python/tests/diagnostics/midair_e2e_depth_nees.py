@@ -766,6 +766,9 @@ def main():
                     help="score the filter's OWN reported range variance "
                          "(range_var_reported = estimate var + (scale_sigma*r)^2) "
                          "instead of reconstructing it from covariance_euclidean")
+    ap.add_argument("--xblock-dump", default=None, metavar="NPZ",
+                    help="with --pose-cov-audit: dump per (anchor, frame) the filter and GT anchor->current poses "
+                         "and the FULL 6x6 relative covariance [rot, trans], for the trans-rot cross-block audit")
     ap.add_argument("--pose-cov-audit", action="store_true",
                     help="score the REPORTED anchor->current translation covariance "
                          "against the ACTUAL error vs GT (3-dof NEES)")
@@ -1038,7 +1041,8 @@ def main():
     anchor_census = []    # (k, n_clones, n_feats, n_distinct_anchors, oldest_anchor_age)
     xcov_audit = []       # (|corr|, v_full/v_quadrature, baseline m)
     pose_audit = []
-    rot_audit = []   # (lag, 3-dof NEES, |phi| rad, sigma_rot rad) anchor->cur rotation       # (age, 3dof NEES, |err| m, sigma m, NEES_along, NEES_perp)
+    rot_audit = []   # (lag, 3-dof NEES, |phi| rad, sigma_rot rad) anchor->cur rotation
+    xblock_rows = []  # (lag, T_filter 16, T_gt 16, Sigma6x6 36) for --xblock-dump       # (age, 3dof NEES, |err| m, sigma m, NEES_along, NEES_perp)
     srr = []              # sigma_rho / rho -- delta-method validity at the operating point
     gt_anchor = {}        # fid -> GT world point of the BIRTH landmark (--gt-anchored)
     clone_pose = {}       # clone_id (= frame k) -> T_wc (4x4) anchor pose
@@ -1286,6 +1290,11 @@ def main():
                         _gc = ds.pose(cid) @ ext
                         _tg = np.linalg.inv(_gc) @ (ds.pose(k) @ ext)  # GT anchor->cur
                         _e = (np.linalg.inv(_tg) @ _tf)[:3, 3]       # translation discrepancy
+                        if args.xblock_dump is not None and hasattr(vio, "relative_pose_covariance_full"):
+                            _S6 = vio.relative_pose_covariance_full(cid, int(k))
+                            if _S6 is not None:
+                                xblock_rows.append(np.concatenate([[k - cid], np.asarray(_tf, float).ravel(),
+                                                                   np.asarray(_tg, float).ravel(), np.asarray(_S6, float).ravel()]))
                         _P = np.asarray(rc[0], float)
                         try:
                             _n = float(_e @ np.linalg.solve(_P, _e))
@@ -1712,6 +1721,9 @@ def main():
             print(f"MSC update rejections (filter counters): {vio.msc_reject_counts()}")
         except RuntimeError:
             pass  # EqVIO / GT pose source: no MSCEqF counters
+    if args.xblock_dump is not None and xblock_rows:
+        np.savez(args.xblock_dump, rows=np.array(xblock_rows, dtype=float))
+        print(f"\nxblock dump: {len(xblock_rows)} (anchor, frame) pairs -> {args.xblock_dump}")
     if args.save_npz:
         provenance = {
             "config_file": str(Path(args.config).resolve()),

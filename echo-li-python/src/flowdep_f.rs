@@ -12,7 +12,7 @@ pub struct PyFlowDepF {
     last: Vec<Observation>,
 }
 
-fn settings_from(map: Option<HashMap<String, f64>>) -> PyResult<FlowDepFSettings> {
+pub(crate) fn settings_from(map: Option<HashMap<String, f64>>) -> PyResult<FlowDepFSettings> {
     let mut s = FlowDepFSettings::default();
     if let Some(m) = map {
         for (k, v) in m {

@@ -68,6 +68,11 @@ fn eqvio_only(method: &str, kind: BackendKind) -> PyErr {
 }
 
 impl PyVIOFilter {
+    /// The backend, for sibling bindings that need its pose covariance.
+    pub(crate) fn backend_ref(&self) -> &dyn VioBackendFull {
+        self.backend.as_ref()
+    }
+
     fn eqvio(&self, method: &str) -> PyResult<&VIOFilter> {
         self.backend
             .as_any()

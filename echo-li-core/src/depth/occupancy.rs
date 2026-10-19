@@ -307,6 +307,159 @@ impl LocalOccupancyMap {
         stats
     }
 
+    /// Integrate a dense frame from the FlowDep-F mapper (`DenseDepthMapper`), which comes
+    /// in an undistorted pinhole frame with `intrinsics` at its own resolution and carries a
+    /// per-pixel CLASS. `Measured` pixels are integrated like a patch-depth return (hit band
+    /// around the endpoint, free space before it). `Filled` pixels are interpolations between
+    /// measured patches: they may only CARVE free space, up to `range - band_k * sigma_m`, and
+    /// never assert an obstacle; `Unknown` pixels do nothing. This is the one rule that makes
+    /// the fill honest at the map: a guess can say "nothing is closer than this", not "there is
+    /// something here".
+    pub fn update_from_dense(
+        &mut self,
+        output: &crate::depth::dense_mapper::DenseOutput,
+        intrinsics: CameraIntrinsics,
+        t_wc: &Matrix4<f64>,
+    ) -> OccupancyUpdateStats {
+        use crate::depth::dense_mapper::DenseClass;
+        self.recenter(t_wc[(0, 3)], t_wc[(1, 3)], t_wc[(2, 3)]);
+        let mut stats = OccupancyUpdateStats::default();
+        let (w, h) = (output.width, output.height);
+        if w == 0 || h == 0 {
+            return stats;
+        }
+        let cam_origin = Vector3::new(t_wc[(0, 3)], t_wc[(1, 3)], t_wc[(2, 3)]);
+        let res = self.settings.resolution;
+        let sigma_floor = res * self.settings.sigma_floor_factor;
+        for y in (0..h).step_by(self.settings.sample_stride) {
+            for x in (0..w).step_by(self.settings.sample_stride) {
+                stats.rays_considered += 1;
+                let idx = y * w + x;
+                let class = output.class[idx];
+                if class == DenseClass::Unknown {
+                    continue;
+                }
+                let eta = output.eta[idx];
+                let eta_var = output.eta_var[idx];
+                if !eta.is_finite() || !eta_var.is_finite() || eta_var < 0.0 {
+                    continue;
+                }
+                let rel_std = (eta_var as f64).sqrt();
+                if rel_std > self.settings.max_eta_std {
+                    continue;
+                }
+                let range = (eta as f64).exp();
+                if range < self.settings.min_range || range > self.settings.max_range {
+                    continue;
+                }
+                let uv = Vector2::new(x as f64, y as f64);
+                let bearing_c = intrinsics.normalize_pixel(&uv).normalize();
+                let p_c = bearing_c * range;
+                let p_w_h = t_wc * Vector4::new(p_c[0], p_c[1], p_c[2], 1.0);
+                let endpoint = Vector3::new(p_w_h[0], p_w_h[1], p_w_h[2]);
+                stats.rays_integrated += 1;
+                match class {
+                    DenseClass::Measured => match self.settings.update_mode {
+                        OccupancyUpdateMode::FixedIncrement => {
+                            self.integrate_ray(cam_origin, endpoint, &mut stats);
+                        }
+                        OccupancyUpdateMode::UncertaintyAware => {
+                            self.integrate_ray_sigma(cam_origin, endpoint, rel_std, &mut stats);
+                        }
+                    },
+                    DenseClass::Filled => {
+                        let sigma_m = (range * rel_std).max(sigma_floor);
+                        let free_len = range - self.settings.band_k * sigma_m;
+                        if free_len > 0.0 {
+                            let unit = (endpoint - cam_origin) / range;
+                            let weight = (sigma_floor / sigma_m)
+                                .clamp(self.settings.min_confidence_weight, 1.0)
+                                as f32;
+                            self.carve_free(
+                                cam_origin,
+                                cam_origin + unit * free_len,
+                                weight,
+                                &mut stats,
+                            );
+                        }
+                    }
+                    DenseClass::Unknown => {}
+                }
+            }
+        }
+        stats
+    }
+
+    /// Free-space-only traversal from `origin` to `endpoint` (both inclusive of the cells
+    /// they fall in): every in-grid cell gets `log_odds_miss * weight`; nothing is marked
+    /// occupied. Used for the `Filled` class.
+    fn carve_free(
+        &mut self,
+        origin: Vector3<f64>,
+        endpoint: Vector3<f64>,
+        weight: f32,
+        stats: &mut OccupancyUpdateStats,
+    ) {
+        let res = self.settings.resolution;
+        let p0 = [
+            (origin.x - self.origin_x) / res,
+            (origin.y - self.origin_y) / res,
+            (origin.z - self.origin_z) / res,
+        ];
+        let p1 = [
+            (endpoint.x - self.origin_x) / res,
+            (endpoint.y - self.origin_y) / res,
+            (endpoint.z - self.origin_z) / res,
+        ];
+        let dir = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
+        let mut cell = [
+            p0[0].floor() as i64,
+            p0[1].floor() as i64,
+            p0[2].floor() as i64,
+        ];
+        let end = [
+            p1[0].floor() as i64,
+            p1[1].floor() as i64,
+            p1[2].floor() as i64,
+        ];
+        let setup = |d: f64, i: i64, p: f64| -> (i64, f64, f64) {
+            if d > 0.0 {
+                (1, ((i + 1) as f64 - p) / d, 1.0 / d)
+            } else if d < 0.0 {
+                (-1, (i as f64 - p) / d, -1.0 / d)
+            } else {
+                (0, f64::INFINITY, f64::INFINITY)
+            }
+        };
+        let (step_x, mut tmax_x, tdelta_x) = setup(dir[0], cell[0], p0[0]);
+        let (step_y, mut tmax_y, tdelta_y) = setup(dir[1], cell[1], p0[1]);
+        let (step_z, mut tmax_z, tdelta_z) = setup(dir[2], cell[2], p0[2]);
+        let miss = self.settings.log_odds_miss * weight;
+        let mut entered = false;
+        loop {
+            if self.cell_in_bounds(cell[0], cell[1], cell[2]) {
+                self.add_log_odds(cell[0], cell[1], cell[2], miss);
+                stats.free_updates += 1;
+                entered = true;
+            } else if entered {
+                break;
+            }
+            if cell == end || tmax_x.min(tmax_y).min(tmax_z) > 1.0 {
+                break;
+            }
+            if tmax_x <= tmax_y && tmax_x <= tmax_z {
+                cell[0] += step_x;
+                tmax_x += tdelta_x;
+            } else if tmax_y <= tmax_z {
+                cell[1] += step_y;
+                tmax_y += tdelta_y;
+            } else {
+                cell[2] += step_z;
+                tmax_z += tdelta_z;
+            }
+        }
+    }
+
     fn recenter(&mut self, center_x: f64, center_y: f64, center_z: f64) {
         let res = self.settings.resolution;
         let new_center_ix = (center_x / res).floor() as i64;

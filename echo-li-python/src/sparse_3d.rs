@@ -416,7 +416,9 @@ fn array_to_matrix3(a: &[[f64; 3]; 3]) -> Matrix3<f64> {
     )
 }
 
-fn parse_settings(kwargs: Option<&Bound<'_, pyo3::types::PyDict>>) -> PyResult<SparseVogSettings> {
+pub(crate) fn parse_settings(
+    kwargs: Option<&Bound<'_, pyo3::types::PyDict>>,
+) -> PyResult<SparseVogSettings> {
     let mut s = SparseVogSettings::default();
     let Some(kw) = kwargs else { return Ok(s) };
 

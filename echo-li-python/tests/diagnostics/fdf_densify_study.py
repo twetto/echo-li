@@ -148,6 +148,9 @@ def main():
     ap.add_argument("--scale", type=float, default=0.5)
     ap.add_argument("--max-pool", type=int, default=4000)
     ap.add_argument("--sparse", action="append", default=[], metavar="KEY=VAL")
+    ap.add_argument("--rust-check", action="store_true",
+                    help="also run echo_li.dense_fuse / dense_fill (the Rust port) on every frame: assert the fused frame is "
+                         "bit-identical to fuse() and score the Rust fill next to the prototype fill")
     ap.add_argument("--fdf", action="append", default=[], metavar="KEY=VAL")
     ap.add_argument("--pixel-stride", type=int, default=2, help="score every Nth pixel in x and y")
     ap.add_argument("--slant-deg", type=float, default=60.0, help="surface slant prior for the *_slant rules")
@@ -205,7 +208,8 @@ def main():
           f"FlowDepF {fdf_settings}  scale_sigma {settings.get('scale_sigma', 0.0)}")
 
     sl = slice(None, None, args.pixel_stride)
-    fill_samples = []    # (err_rel, d_px, sigma_near_eta, local_std_eta) of FILLED pixels with valid GT
+    fill_samples = []
+    fill_samples_rust = []; rust_fill_stats = []; rust_fuse_diff = [0.0, 0]    # (err_rel, d_px, sigma_near_eta, local_std_eta) of FILLED pixels with valid GT
     fill_cov = []        # (measured share, filled share, gated share) per frame
     samples = {r: [] for r in RULES}   # arrays (err_rel, nees, sigma_eta, gt_spread)
     cover = {r: [] for r in RULES}
@@ -257,6 +261,12 @@ def main():
         mx = cv2.dilate(np.nan_to_num(g, nan=-np.inf).astype(np.float32), np.ones((5, 5), np.uint8))
         spread = np.where(valid_gt & np.isfinite(mn) & np.isfinite(mx), (mx - mn) / np.maximum(g, 1e-6), 9.0)
         fused = fuse(items, H, W)
+        if args.rust_check:
+            _arr = np.array(items, float).reshape(-1, 6)
+            _e, _v, _c, _d = echo_li.dense_fuse(_arr, H, W, SLANT_G[0])
+            _er, _vr, _cr = fused["nearest_disagree_slant"]
+            rust_fuse_diff[0] = max(rust_fuse_diff[0], float(np.abs(_e - _er).max()), float(np.abs(_v - _vr).max()), float(np.abs(_d - fused["_dist"]).max()))
+            rust_fuse_diff[1] += int((_c != _cr).sum())
         for r in RULES:
             eta_p, var_p, covered = fused[r]
             m = (covered & valid_gt)[sl, sl]
@@ -290,6 +300,14 @@ def main():
                 gated |= fillable & (off > args.fill_balance)
             filled = fillable & ~gated
             fill_cov.append((float(cov_m.mean()), float(filled.mean()), float(gated.mean())))
+            if args.rust_check:
+                _g = 2.0 * SLANT_G[0]
+                _ef, _vf, _fl, _gt, _dd = echo_li.dense_fill(eta_m, var_m, cov_m, args.fill_sigma, args.fill_gate, args.fill_balance if args.fill_balance > 0 else 1e9, args.fill_max_d, _g)
+                rust_fill_stats.append((int(_fl.sum()), int(filled.sum()), int((_fl != filled).sum()), float(np.abs(_ef[_fl & filled] - eta_f[_fl & filled]).max()) if (_fl & filled).any() else 0.0))
+                _m = (_fl & valid_gt)[sl, sl]
+                _e2 = _ef[sl, sl][_m] - lg[sl, sl][_m]
+                _sn = np.sqrt(np.maximum(_vf[sl, sl][_m] - (_g * _dd[sl, sl][_m]) ** 2, 1e-12))
+                fill_samples_rust.append(np.stack([np.exp(_e2) - 1.0, _dd[sl, sl][_m], _sn, np.zeros(_m.sum()), np.zeros(_m.sum())], axis=1).astype(np.float32))
             m = (filled & valid_gt)[sl, sl]
             e = eta_f[sl, sl][m] - lg[sl, sl][m]
             fill_samples.append(np.stack([np.exp(e) - 1.0, dist[sl, sl][m], np.sqrt(np.maximum(near_var[sl, sl][m], 1e-12)), lstd[sl, sl][m], off[sl, sl][m]], axis=1).astype(np.float32))
@@ -340,6 +358,23 @@ def main():
                 v = sn[mm] ** 2 + (mult * g0 * d[mm]) ** 2; nn = ee * ee / v
                 line += f"  {np.median(nn):5.2f} {100 * np.mean(nn > 3.84):5.1f}%"
             print(line)
+    if args.rust_check:
+        print(f"\nRUST PORT CHECK (echo_li.dense_fuse / dense_fill): fused frame max|diff| {rust_fuse_diff[0]:.3e}, covered mismatches {rust_fuse_diff[1]}")
+        if rust_fill_stats:
+            R = np.array(rust_fill_stats, float)
+            print(f"  fill: filled px rust {int(R[:, 0].sum())} vs prototype {int(R[:, 1].sum())}, mask mismatches {int(R[:, 2].sum())} ({100 * R[:, 2].sum() / max(R[:, 1].sum(), 1):.3f}% of filled), eta max|diff| on common {R[:, 3].max():.2e}")
+        if fill_samples_rust:
+            F = np.concatenate(fill_samples_rust); err, d, sn, _, _ = F.T
+            g0 = SLANT_G[0]
+            print(f"  RUST FILLED pixels by distance to evidence (exact EDT): n | err med / p90 / gross | NEES g = g0, 2 g0, 4 g0: median, >3.84%")
+            for lo_d, hi_d in ((0, 2), (2, 4), (4, 8), (8, 16), (16, 32), (32, 1000)):
+                mm = (d >= lo_d) & (d < hi_d)
+                if mm.sum() < 100: continue
+                ee = np.log1p(err[mm]); line = f"  [{lo_d:2d},{hi_d:4d}) {mm.sum():8d} | {100 * np.median(np.abs(err[mm])):4.1f} / {100 * np.percentile(np.abs(err[mm]), 90):4.1f} / {100 * np.mean(np.abs(err[mm]) > 0.2):4.1f} |"
+                for mult in (1, 2, 4):
+                    v = sn[mm] ** 2 + (mult * g0 * d[mm]) ** 2; nn = ee * ee / v
+                    line += f"  {np.median(nn):5.2f} {100 * np.mean(nn > 3.84):5.1f}%"
+                print(line)
     if args.save_npz:
         np.savez_compressed(args.save_npz, **{r: np.concatenate(samples[r]) for r in RULES if samples[r]},
                             cover=np.array([cover[r] for r in RULES]), rules=np.array(RULES), n_patches=np.array(n_patches),

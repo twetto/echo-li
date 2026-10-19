@@ -588,6 +588,137 @@ impl PatchDepthConfig {
     }
 }
 
+/// `FlowDepDense:` the dense depth mapper (design note §7 item 2): FlowDep-F patch tracker +
+/// its own Sparse3D + fusion/fill, replacing the patch mapper. Keys are snake_case. The
+/// patch-track Sparse3D copies the `SparseVog` section and overrides what differs for patch
+/// tracks (walk variance, pool, track length).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct FlowDepDenseConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Working scale of the pinhole frame (default 0.5).
+    #[serde(default)]
+    pub scale: Option<f64>,
+    /// "none" | "global" | "clahe" (default clahe, tile 64, clip 4).
+    #[serde(default)]
+    pub histeq: Option<String>,
+    #[serde(default)]
+    pub clahe_tile_size: Option<usize>,
+    #[serde(default)]
+    pub clahe_clip_limit: Option<f32>,
+    // --- tracker (FlowDepFSettings overrides; defaults are the rig arm of row 5m) ---
+    #[serde(default)]
+    pub max_mean_abs_residual: Option<f32>,
+    #[serde(default)]
+    pub min_birth_curvature: Option<f32>,
+    #[serde(default)]
+    pub min_track_curvature: Option<f32>,
+    #[serde(default)]
+    pub max_patches: Option<usize>,
+    #[serde(default)]
+    pub reanchor_br: Option<f64>,
+    #[serde(default)]
+    pub max_obs_br: Option<f64>,
+    #[serde(default)]
+    pub d_min: Option<f64>,
+    #[serde(default)]
+    pub d_max: Option<f64>,
+    // --- patch-track Sparse3D overrides on top of the SparseVog section ---
+    #[serde(default)]
+    pub bias_walk_var: Option<f64>,
+    #[serde(default)]
+    pub max_pool_size: Option<usize>,
+    #[serde(default)]
+    pub min_track_length: Option<usize>,
+    #[serde(default)]
+    pub scale_sigma: Option<f64>,
+    // --- fusion and fill ---
+    #[serde(default)]
+    pub slant_deg: Option<f64>,
+    #[serde(default)]
+    pub fill: Option<bool>,
+    #[serde(default)]
+    pub fill_sigma: Option<f64>,
+    #[serde(default)]
+    pub fill_gate: Option<f64>,
+    #[serde(default)]
+    pub fill_balance: Option<f64>,
+    #[serde(default)]
+    pub fill_max_d: Option<f64>,
+    /// Keep patch births off the corner tracker's live features (default true).
+    #[serde(default)]
+    pub exclude_corners: Option<bool>,
+}
+
+impl FlowDepDenseConfig {
+    pub fn to_settings(
+        &self,
+        base_sparse: &SparseVogSettings,
+    ) -> crate::depth::dense_mapper::DenseMapperSettings {
+        use crate::depth::dense::FillParams;
+        use crate::depth::flowdep_f::FlowDepFSettings;
+        use rudolf_v::histeq::HistEqMethod;
+        let scale = self.scale.unwrap_or(0.5);
+        let histeq = match self.histeq.as_deref().unwrap_or("clahe") {
+            "none" => HistEqMethod::None,
+            "global" => HistEqMethod::Global,
+            _ => HistEqMethod::Clahe {
+                tile_size: self.clahe_tile_size.unwrap_or(64),
+                clip_limit: self.clahe_clip_limit.unwrap_or(4.0),
+            },
+        };
+        let mut tracker = FlowDepFSettings::default();
+        tracker.max_mean_abs_residual = self.max_mean_abs_residual.unwrap_or(30.0);
+        tracker.min_birth_curvature = self.min_birth_curvature.unwrap_or(10.0);
+        tracker.min_track_curvature = self.min_track_curvature.unwrap_or(160.0);
+        if let Some(v) = self.max_patches {
+            tracker.max_patches = v;
+        }
+        if let Some(v) = self.reanchor_br {
+            tracker.reanchor_br = v;
+        }
+        if let Some(v) = self.max_obs_br {
+            tracker.max_obs_br = v;
+        }
+        if let Some(v) = self.d_min {
+            tracker.d_min = v;
+        }
+        if let Some(v) = self.d_max {
+            tracker.d_max = v;
+        }
+        let mut sparse = base_sparse.clone();
+        sparse.bias_walk_var = self.bias_walk_var.unwrap_or(0.3);
+        sparse.max_pool_size = self.max_pool_size.unwrap_or(4000);
+        sparse.min_track_length = self.min_track_length.unwrap_or(5);
+        if let Some(v) = self.scale_sigma {
+            sparse.scale_sigma = v;
+        }
+        let slant_deg = self.slant_deg.unwrap_or(35.0);
+        let fill = if self.fill.unwrap_or(true) {
+            Some(FillParams {
+                sigma_px: self.fill_sigma.unwrap_or(12.0),
+                gate: self.fill_gate.unwrap_or(0.15),
+                balance: self.fill_balance.unwrap_or(12.0),
+                max_d: self.fill_max_d.unwrap_or(48.0),
+                // g is set by the mapper from slant_deg and the working focal length
+                g: 0.0,
+            })
+        } else {
+            None
+        };
+        crate::depth::dense_mapper::DenseMapperSettings {
+            scale,
+            histeq,
+            tracker,
+            sparse,
+            slant_deg,
+            fill,
+            exclude_corners: self.exclude_corners.unwrap_or(true),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct LocalOccupancyConfig {
@@ -920,6 +1051,8 @@ pub struct VIOConfig {
     pub patch_depth: Option<PatchDepthConfig>,
     #[serde(rename = "LocalOccupancy", default)]
     pub local_occupancy: Option<LocalOccupancyConfig>,
+    #[serde(rename = "FlowDepDense", default)]
+    pub flowdep_dense: Option<FlowDepDenseConfig>,
     #[serde(rename = "Stereo", default)]
     pub stereo: Option<StereoConfig>,
     #[serde(rename = "MSCEqF", default)]

@@ -239,7 +239,7 @@ def main():
                          "seed sources are overlaid on the left panel; per-frame pixel counts by "
                          "status, SeedOnly disc components and the pixels only the in-state seeds "
                          "produce go to <out>_mapper.npz. Needs --sparse3d.")
-    ap.add_argument("--track-source", default="rudolf", choices=["rudolf", "fdf"],
+    ap.add_argument("--track-source", default="rudolf", choices=["rudolf", "fdf", "dense"],
                     help="fdf: ALSO run FlowDep-F (anchor-referenced epipolar patch tracker) on the "
                          "fisheye-undistorted frame, driven by the backend's pose, feeding a second "
                          "Sparse3D (pinhole camera) through the same sparse_feed; the rendered video "
@@ -411,6 +411,7 @@ def main():
 
     sparse = None
     fdf = None; sparse_fdf = None; undist_maps = None
+    dense = None; dense_last = {}   # --track-source dense: the node's DenseDepthMapper (Rust), the wired path
     dense_frames = {}      # k -> (undistorted gray, eta_p f16, sigma f16, covered) for rendered frames
     fdf_rng = {}           # k -> {fid: (u, v, range, converged)} on the pinhole frame
     fdf_stat = [0, 0]      # converged landmark-frames: fdf, klt (for the summary)
@@ -467,6 +468,28 @@ def main():
                     return np.clip((im.astype(np.float32) - lo_) * (255.0 / max(hi_ - lo_, 1.0)), 0, 255).astype(np.uint8)
                 print("FlowDep-F input: global 1..99 percentile stretch")
             print(f"FlowDep-F on the undistorted pinhole frame, settings {_fs}; second Sparse3D (pinhole, pool {_ps['max_pool_size']}); densify slant {args.slant_deg:.0f} deg")
+        elif args.track_source == "dense":
+            # The node's path end to end: echo_li.DenseDepthMapper equalises, undistorts and
+            # tracks the raw cache frame itself, runs its own clone-relative Sparse3D, fuses and
+            # fills in Rust, and is told the corner tracker's features so it births none there.
+            _fs = {k: float(v) for k, v in (kv.split("=", 1) for kv in args.fdf)}
+            _ps = dict(settings); _ps["max_pool_size"] = max(int(_ps.get("max_pool_size", 300)), 4000)
+            for _kv in args.fdf_sparse:
+                _k, _v = _kv.split("=", 1)
+                _cur = _ps.get(_k, scfg.get(_k, 0.0))
+                _ps[_k] = (_v.lower() == "true") if isinstance(_cur, bool) else type(_cur)(_v) if isinstance(_cur, (int, float)) else float(_v)
+            with open(cfg_path) as fh:
+                _rv = (yaml.safe_load(fh) or {}).get("RudolfV", {}) or {}
+            _tile = int(_rv.get("claheTileSize", 64)); _clip = float(_rv.get("claheClipLimit", 4.0))
+            if args.fdf_clahe:
+                args.fdf_input = "clahe"
+            _he = args.fdf_input if args.fdf_input in ("clahe", "global") else "none"
+            dense = echo_li.DenseDepthMapper(cam, FX, FY, CX, CY, W, H, _ps, tracker=_fs or None, scale=1.0,
+                                             histeq=_he, clahe_tile_size=_tile, clahe_clip_limit=_clip,
+                                             slant_deg=args.slant_deg, fill=bool(args.fill), exclude_corners=True)
+            dz.SLANT_G[0] = np.tan(np.radians(args.slant_deg)) / FX
+            print(f"DenseDepthMapper (the node's path, Rust): histeq {_he} tile {_tile} clip {_clip}; tracker {_fs}; "
+                  f"Sparse3D pool {_ps['max_pool_size']} walk {_ps.get('bias_walk_var')}; fill {bool(args.fill)}; births excluded on corners")
         print(f"Sparse3D via VIOFilter.sparse_feed: direct={settings.get('pose_range_direct', False)} "
               f"consider={settings.get('consider_relpose', False)} "
               f"bias_walk_var={settings.get('bias_walk_var', 0.0)} "
@@ -602,6 +625,21 @@ def main():
                         _eta = np.where(_filled, _ef, _eta); _var = np.where(_filled, _vf, _var)
                         _cls[_filled] = 2
                     dense_frames[k] = (_ug.copy(), _eta.astype(np.float16), np.sqrt(np.maximum(_var, 1e-12)).astype(np.float16), _cls)
+            elif dense is not None:
+                _T = np.eye(4)
+                _pp, _qq = vio.get_pose()
+                _T[:3, :3] = Rot.from_quat(np.asarray(_qq, float)).as_matrix(); _T[:3, 3] = np.asarray(_pp, float)
+                _Twc = _T @ T_BS
+                _corn = [(float(v[0]), float(v[1])) for v in uvs.values()]
+                _eta, _var, _cls, _st = dense.process(np.ascontiguousarray(gray), float(ts), np.ascontiguousarray(_Twc), vio, _corn)
+                dense_last = dict(_st)
+                fdf_rng[k] = {}
+                fdf_stat[0] += int(_st["landmarks_converged"]); fdf_stat[1] += sum(1 for v in sp_rng.get(k, {}).values() if v[2])
+                if os.environ.get("DBG_FDF") and (k - args.start) % 100 == 0:
+                    print(f"  DBG_DENSE k={k} {_st}", file=sys.stderr)
+                if (k - args.start) % args.stride == 0 and not args.no_render:
+                    dense_frames[k] = (np.asarray(dense.last_frame()).copy(), _eta.astype(np.float16),
+                                       np.sqrt(np.maximum(_var.astype(np.float64), 1e-12)).astype(np.float16), _cls.astype(np.uint8))
         if use_msceqf:
             p, _rm, _v = vio.nav_pose()
             p = np.asarray(p, float)
@@ -975,12 +1013,12 @@ def main():
         print("--no-render: stopping after the filter pass")
         return
 
-    if fdf is not None:
+    if fdf is not None or dense is not None:
         _cv = [float((v[3] > 0).mean()) for v in dense_frames.values()]
         _cvm = [float((v[3] == 1).mean()) for v in dense_frames.values()]
-        _st = fdf.stats()
+        _st = fdf.stats() if fdf is not None else dense_last
         print(f"FlowDep-F: converged landmark-frames {fdf_stat[0]} vs KLT {fdf_stat[1]} over {n} frames "
-              f"({fdf_stat[0] / max(n, 1):.1f} vs {fdf_stat[1] / max(n, 1):.1f} per frame); live {fdf.n_live()}; "
+              f"({fdf_stat[0] / max(n, 1):.1f} vs {fdf_stat[1] / max(n, 1):.1f} per frame); live {fdf.n_live() if fdf is not None else dense_last.get('patches_live', 0)}; "
               f"densified coverage per rendered frame median {100 * np.median(_cv) if _cv else 0:.1f}% p10 {100 * np.percentile(_cv, 10) if _cv else 0:.1f}% p90 {100 * np.percentile(_cv, 90) if _cv else 0:.1f}% (measured {100 * np.median(_cvm) if _cvm else 0:.1f}%)")
 
     # --- render ------------------------------------------------------------
@@ -1003,10 +1041,10 @@ def main():
         u = (xy - mid) / span + 0.5
         return int(u[0] * (RW - 20)) + 10, int((1 - u[1]) * (H * SC - 20)) + 10
 
-    rows = 2 if fdf is not None else 1
+    rows = 2 if (fdf is not None or dense is not None) else 1
     vw = cv2.VideoWriter(args.out, cv2.VideoWriter_fourcc(*"mp4v"), args.fps,
                          (W * SC + RW, H * SC * rows))
-    if fdf is not None:
+    if fdf is not None or dense is not None:
         _lr = np.array([v[2] for d in fdf_rng.values() for v in d.values() if v[3]])
         if len(_lr):
             vlo, vhi = min(vlo, np.percentile(_lr, 5)), max(vhi, np.percentile(_lr, 95))
@@ -1085,7 +1123,7 @@ def main():
             line += f"   |est-ctrl| {err[j]:.2f} m"
         txt(right, line, (10, 56))
         frame_out = np.hstack([left, right])
-        if fdf is not None:
+        if fdf is not None or dense is not None:
             # Second row: FlowDep-F converged landmarks on the undistorted frame + the
             # densified range (nearest patch + disagreement + footprint sigma) | per-pixel sigma.
             _ug, _eta, _sig, _cls = dense_frames.get(k, (None, None, None, None))

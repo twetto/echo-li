@@ -1,3 +1,5 @@
+pub mod dense;
+pub mod dense_mapper;
 pub mod flowdep;
 pub mod flowdep_f;
 pub mod flowdep_kernels;
