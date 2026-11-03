@@ -2720,6 +2720,7 @@ dependencies = [
  "nalgebra",
  "numpy",
  "pyo3",
+ "rayon",
  "rudolf-v",
 ]
 

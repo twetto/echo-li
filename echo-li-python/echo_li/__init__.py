@@ -11,6 +11,7 @@ from echo_li._echo_li import (
     PatchDepthMapper,
     LocalOccupancyMap,
     Stereo,
+    CheckerboardDetector,
     static_initialize,
 )
 
@@ -27,5 +28,6 @@ __all__ = [
     "PatchDepthMapper",
     "LocalOccupancyMap",
     "Stereo",
+    "CheckerboardDetector",
     "static_initialize",
 ]
