@@ -3,7 +3,7 @@
 Boards are rendered here (4x4 supersampled, turned by any angle), so every test
 knows the true inner corners. The detector's own accuracy is tested in Rudolf-V;
 these check what the binding adds: arrays in and out, the region, the thread
-pool, strided input, and errors instead of crashes.
+pool, strided input, the GPU option, and errors instead of crashes.
 """
 
 from __future__ import annotations
@@ -119,3 +119,36 @@ def test_bad_input_raises():
         d.detect(np.zeros((100, 100), np.float32))
     with pytest.raises(TypeError):
         d.detect(np.zeros((100, 100, 3), np.uint8))
+
+
+@pytest.fixture(scope="module")
+def on_gpu():
+    try:
+        return CheckerboardDetector(gpu=True)
+    except RuntimeError as e:
+        pytest.skip(f"no Vulkan GPU: {e}")
+
+
+def test_gpu_gives_the_same_corners(on_gpu):
+    cpu = CheckerboardDetector()
+    assert on_gpu.gpu and not cpu.gpu and "gpu=True" in repr(on_gpu)
+    rng = np.random.default_rng(2)
+    images = [render(400, 300, 200.3, 150.6, 24.0)[0]]
+    images += [render(400, 400, 200.3, 200.6, 22.0, deg=deg)[0] for deg in (30.0, 145.0)]
+    images += [render(1280, 720, 640.4, 360.2, 60.0)[0]]  # big squares: the half size
+    images += [rng.integers(0, 256, (240, 320), dtype=np.uint8), np.zeros((5, 5), np.uint8)]
+    for img in images:
+        a, b = cpu.detect(img), on_gpu.detect(img)
+        assert (a is None and b is None) or np.array_equal(a, b)
+
+
+def test_gpu_windows_of_changing_size(on_gpu):
+    """As the mission looks: windows around the board, a different size each time."""
+    img, truth = render(640, 480, 320.3, 240.6, 20.0)
+    cpu = CheckerboardDetector()
+    for x, y, w, h in [(150, 110, 340, 260), (170, 130, 301, 223), (0, 0, 640, 480), (140, 100, 361, 281)]:
+        a = cpu.detect_region(img, x, y, w, h)
+        b = on_gpu.detect_region(img, x, y, w, h)
+        assert np.array_equal(a, b) and max_error(b, truth) < 0.15
+        view = img[y : y + h, x : x + w]  # a strided crop, as the mission passes it
+        assert np.array_equal(cpu.detect(view), on_gpu.detect(view))

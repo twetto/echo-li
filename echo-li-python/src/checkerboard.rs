@@ -1,8 +1,12 @@
+use std::sync::Mutex;
+
 use numpy::ndarray::Array2;
 use numpy::{PyArray2, PyReadonlyArray2, PyUntypedArrayMethods};
 use pyo3::prelude::*;
 
 use rudolf_v::checkerboard::{CheckerboardConfig, CheckerboardDetector};
+use rudolf_v::gpu::checkerboard::GpuCheckerboardDetector;
+use rudolf_v::gpu::device::GpuDevice;
 use rudolf_v::image::Image as RudolfImage;
 
 /// Checkerboard inner-corner detector wrapping `rudolf_v::checkerboard`.
@@ -18,12 +22,23 @@ use rudolf_v::image::Image as RudolfImage;
 /// image is computed in parallel rows). None uses rayon's global pool, which
 /// has a thread per core.
 ///
+/// `gpu`: the response and its candidates on the GPU (Vulkan), the lattice
+/// search on the CPU; the same corners, bit for bit. Raises RuntimeError when
+/// there is no Vulkan GPU. One look at a time per detector.
+///
 /// The other keyword arguments override `CheckerboardConfig`'s defaults.
 #[pyclass(name = "CheckerboardDetector")]
 pub struct PyCheckerboardDetector {
     inner: CheckerboardDetector,
+    gpu: Option<Mutex<OnGpu>>,
     pool: Option<rayon::ThreadPool>,
     threads: Option<usize>,
+}
+
+/// A GPU detector with its device.
+struct OnGpu {
+    device: GpuDevice,
+    detector: GpuCheckerboardDetector,
 }
 
 #[pymethods]
@@ -32,7 +47,7 @@ impl PyCheckerboardDetector {
     #[pyo3(signature = (
         cols=9, rows=6, threads=None, min_response=None, relative_threshold=None,
         grow_response=None, max_candidates=None, max_seeds=None, match_tolerance=None,
-        min_cell_contrast=None,
+        min_cell_contrast=None, gpu=false,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -46,6 +61,7 @@ impl PyCheckerboardDetector {
         max_seeds: Option<usize>,
         match_tolerance: Option<f32>,
         min_cell_contrast: Option<f32>,
+        gpu: bool,
     ) -> PyResult<Self> {
         if cols < 2 || rows < 2 {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -82,8 +98,18 @@ impl PyCheckerboardDetector {
             ),
             None => None,
         };
+        let gpu = if gpu {
+            let device = GpuDevice::new().map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("gpu=True: no Vulkan GPU ({e})"))
+            })?;
+            let detector = GpuCheckerboardDetector::new(&device, config.clone());
+            Some(Mutex::new(OnGpu { device, detector }))
+        } else {
+            None
+        };
         Ok(Self {
             inner: CheckerboardDetector::new(config),
+            gpu,
             pool,
             threads,
         })
@@ -98,7 +124,7 @@ impl PyCheckerboardDetector {
         image: PyReadonlyArray2<'py, u8>,
     ) -> Option<Bound<'py, PyArray2<f32>>> {
         let img = to_image(&image);
-        let corners = py.allow_threads(|| self.run(|d| d.detect(&img)))?;
+        let corners = py.allow_threads(|| self.detect_image(&img))?;
         Some(corners_array(py, corners))
     }
 
@@ -128,7 +154,14 @@ impl PyCheckerboardDetector {
             (x1 - x0) as usize,
             (y1 - y0) as usize,
         );
-        let corners = py.allow_threads(|| self.run(|d| d.detect_region(&img, rx, ry, rw, rh)))?;
+        let corners = py.allow_threads(|| match &self.gpu {
+            Some(g) => {
+                let mut g = g.lock().unwrap_or_else(|e| e.into_inner());
+                let OnGpu { device, detector } = &mut *g;
+                self.in_pool(|| detector.detect_region(device, &img, rx, ry, rw, rh))
+            }
+            None => self.run(|d| d.detect_region(&img, rx, ry, rw, rh)),
+        })?;
         Some(corners_array(py, corners))
     }
 
@@ -146,7 +179,8 @@ impl PyCheckerboardDetector {
         let c = &self.inner.config;
         format!(
             "CheckerboardDetector(cols={}, rows={}, threads={}, min_response={}, relative_threshold={}, \
-             grow_response={}, max_candidates={}, max_seeds={}, match_tolerance={}, min_cell_contrast={})",
+             grow_response={}, max_candidates={}, max_seeds={}, match_tolerance={}, min_cell_contrast={}, \
+             gpu={})",
             c.cols,
             c.rows,
             self.threads.map_or("None".to_string(), |n| n.to_string()),
@@ -157,16 +191,40 @@ impl PyCheckerboardDetector {
             c.max_seeds,
             c.match_tolerance,
             c.min_cell_contrast,
+            if self.gpu.is_some() { "True" } else { "False" },
         )
+    }
+
+    /// Whether the response and candidates run on the GPU.
+    #[getter]
+    fn gpu(&self) -> bool {
+        self.gpu.is_some()
     }
 }
 
 impl PyCheckerboardDetector {
     /// `f` on the detector, in this detector's pool when it has one.
     fn run<T: Send>(&self, f: impl FnOnce(&CheckerboardDetector) -> T + Send) -> T {
+        self.in_pool(|| f(&self.inner))
+    }
+
+    /// `f` in this detector's pool when it has one.
+    fn in_pool<T: Send>(&self, f: impl FnOnce() -> T + Send) -> T {
         match &self.pool {
-            Some(pool) => pool.install(|| f(&self.inner)),
-            None => f(&self.inner),
+            Some(pool) => pool.install(f),
+            None => f(),
+        }
+    }
+
+    /// The board in `img`, on the GPU or the CPU.
+    fn detect_image(&self, img: &RudolfImage<u8>) -> Option<Vec<[f32; 2]>> {
+        match &self.gpu {
+            Some(g) => {
+                let mut g = g.lock().unwrap_or_else(|e| e.into_inner());
+                let OnGpu { device, detector } = &mut *g;
+                self.in_pool(|| detector.detect(device, img))
+            }
+            None => self.run(|d| d.detect(img)),
         }
     }
 }
