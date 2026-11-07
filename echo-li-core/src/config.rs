@@ -69,6 +69,10 @@ pub struct RudolfVConfig {
 }
 
 /// Civera inverse-depth band is `[d0*exp(-rel), d0*exp(+rel)]`; 1.0 spans 0.37x-2.7x.
+fn default_civera_init_max_disparity() -> f64 {
+    2.0
+}
+
 fn default_civera_birth_rel_std() -> f64 {
     1.0
 }
@@ -825,6 +829,16 @@ pub struct MsceqfConfig {
     /// `MsceqfSettings::civera_birth_rel_std`.
     #[serde(default = "default_civera_birth_rel_std")]
     pub civera_birth_rel_std: f64,
+    /// Use the Civera birth (when `civera_birth_depth > 0`) only during
+    /// initialization, then triangulated births. See `MsceqfSettings::civera_init_only`.
+    #[serde(default)]
+    pub civera_init_only: bool,
+    /// Initialization ends, for good, at the first frame whose tracks moved more
+    /// than this on average since the previous frame, in PIXELS PER FRAME. The first
+    /// motion is seen in the image, not the IMU: a vibrating airframe at rest fails
+    /// IMU stationarity tests. Depends on resolution and frame rate; tune per camera.
+    #[serde(default = "default_civera_init_max_disparity")]
+    pub civera_init_max_disparity: f64,
     /// Gravity VECTOR in the world frame, m/s^2. Sign and axis are frame conventions,
     /// not preferences: NED wants +z, a z-up frame wants -z, and getting it backwards
     /// integrates gravity as phantom acceleration.

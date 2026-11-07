@@ -843,6 +843,24 @@ pub struct MsceqfSettings {
     /// `[d0*exp(-rel), d0*exp(+rel)]`, so 1.0 spans 0.37x to 2.7x the prior. Wide priors
     /// are known to be catastrophic in this chart, so this is not a free parameter.
     pub civera_birth_rel_std: f64,
+    /// Civera birth only while initializing: until the image first moves (see
+    /// `civera_init_max_disparity`), then triangulated birth for the rest of the run.
+    ///
+    /// At rest a structureless filter has no vision update (every triangulation has
+    /// zero baseline), so it leans entirely on a ZUPT that a vibrating airframe can
+    /// defeat. In-state landmarks born with an uninformative inverse depth need no
+    /// baseline: their bearings pin rotation directly and translation in proportion
+    /// to inverse depth. EuRoC V1_01, 50 in-state landmarks: pre-takeoff drift 63 cm
+    /// with triangulated birth and no ZUPT, 0.8 cm with Civera birth and no ZUPT. But
+    /// Civera birth THROUGHOUT doubled the flight ATE (0.063 -> 0.133 m) -- in flight
+    /// triangulated births are the better ones -- hence initialization only.
+    pub civera_init_only: bool,
+    /// Initialization ends at the first frame whose shared tracks (at least 20) moved
+    /// more than this on average since the previous frame (px/frame). Motion is taken
+    /// from the image, not the state: the filter's own pose is least trustworthy
+    /// while initializing, and the IMU cannot tell a vibrating airframe at rest from
+    /// motion. With fewer than 20 shared tracks initialization does not end.
+    pub civera_init_max_disparity: f64,
 
     /// Refuse to promote a landmark whose triangulated range exceeds this (metres).
     /// 0 = no cap.
@@ -884,6 +902,8 @@ impl Default for MsceqfSettings {
             direct_product_bias: false,
             civera_birth_depth: 0.0,
             civera_birth_rel_std: 1.0,
+            civera_init_only: false,
+            civera_init_max_disparity: 2.0,
         }
     }
 }
@@ -946,6 +966,10 @@ pub struct MsceqfBackend {
     zupt: Option<ZuptPolicy>,
     /// See [`CameraPoseCovariance::last_clone_eviction`]. Reset every frame step.
     last_eviction: Option<CloneEviction>,
+    /// Latched once initialization is over (first image motion).
+    init_moved: bool,
+    /// The previous frame's pixel tracks, for the first-motion test.
+    init_prev_px: HashMap<u64, Vector2<f32>>,
 }
 
 impl MsceqfBackend {
@@ -1048,6 +1072,8 @@ impl MsceqfBackend {
             direct_product_bias: cfg.direct_product_bias,
             civera_birth_depth: cfg.civera_birth_depth,
             civera_birth_rel_std: cfg.civera_birth_rel_std,
+            civera_init_only: cfg.civera_init_only,
+            civera_init_max_disparity: cfg.civera_init_max_disparity,
         };
         let mut b = Self::new(filter, cam, settings);
         b.set_clone_at_frame_stamp(cfg.clone_at_frame_stamp);
@@ -1081,6 +1107,8 @@ impl MsceqfBackend {
             clone_at_frame_stamp: false,
             zupt: None,
             last_eviction: None,
+            init_moved: false,
+            init_prev_px: HashMap::new(),
         }
     }
 
@@ -1155,6 +1183,32 @@ impl MsceqfBackend {
     /// default so existing traces stay comparable. See [`Self::propagate_to`].
     pub fn set_clone_at_frame_stamp(&mut self, on: bool) {
         self.clone_at_frame_stamp = on;
+    }
+
+    /// Latch the end of initialization at the first frame whose tracks moved more
+    /// than `civera_init_max_disparity` px on average since the previous frame (over
+    /// at least 20 of them).
+    fn note_init_motion(&mut self, m: &VisionMeasurement) {
+        let (mut sum, mut n) = (0.0_f64, 0usize);
+        for (id, uv) in &m.cam_coordinates {
+            if let Some(p) = self.init_prev_px.get(id) {
+                sum += (uv - p).norm() as f64;
+                n += 1;
+            }
+        }
+        if n >= 20 && sum / n as f64 > self.settings.civera_init_max_disparity {
+            self.init_moved = true;
+            self.init_prev_px.clear();
+        } else {
+            self.init_prev_px = m.cam_coordinates.clone();
+        }
+    }
+
+    /// Whether this frame's promotions use the Civera birth: always when it is
+    /// configured, or -- with `civera_init_only` -- until the first image motion.
+    fn civera_birth_now(&self) -> bool {
+        self.settings.civera_birth_depth > 0.0
+            && (!self.settings.civera_init_only || !self.init_moved)
     }
 
     /// Advance the filter from the last IMU sample to `stamp`, holding the last IMU
@@ -1273,6 +1327,9 @@ impl VioBackend for MsceqfBackend {
         measurement: VisionMeasurement,
         _depth_priors: &HashMap<u64, LandmarkDepthPrior>,
     ) {
+        if self.settings.civera_init_only && !self.init_moved {
+            self.note_init_motion(&measurement);
+        }
         let k = self.k;
         self.k += 1;
         self.last_eviction = None;
@@ -1352,13 +1409,14 @@ impl VioBackend for MsceqfBackend {
                     .then_with(|| a.cmp(b))
             });
             let room = self.settings.max_slam - self.slam.len();
+            let civera = self.civera_birth_now();
             for tid in cand.into_iter().take(room) {
                 let obs = self.obs_on_live_clones(&self.buf[&tid]);
                 if obs.len() < 2 || self.landmark_ids.contains(&tid) {
                     continue;
                 }
                 let track = crate::mathematical::msceqf_filter::MscTrack { obs };
-                let born = if self.settings.civera_birth_depth > 0.0 {
+                let born = if civera {
                     self.filter.birth_landmark_civera(
                         &track,
                         self.settings.pixel_std,
@@ -1733,6 +1791,8 @@ mod msceqf_backend_tests {
             clone_at_frame_stamp: false,
             civera_birth_depth: 0.0,
             civera_birth_rel_std: 1.0,
+            civera_init_only: false,
+            civera_init_max_disparity: 2.0,
             gravity: [0.0, 0.0, -9.81],
             initial_std: MsceqfInitialStd {
                 attitude: 2.0e-2,
@@ -2072,6 +2132,8 @@ mod msceqf_backend_tests {
             clone_at_frame_stamp: false,
             civera_birth_depth: 0.0,
             civera_birth_rel_std: 1.0,
+            civera_init_only: false,
+            civera_init_max_disparity: 2.0,
             gravity: [0.0, 0.0, -9.81],
             initial_std: MsceqfInitialStd {
                 attitude: 1e-2,
@@ -2543,6 +2605,8 @@ mod msceqf_backend_tests {
             clone_at_frame_stamp: false,
             civera_birth_depth: 0.0,
             civera_birth_rel_std: 1.0,
+            civera_init_only: false,
+            civera_init_max_disparity: 2.0,
             gravity: [0.0, 0.0, -9.81],
             initial_std: MsceqfInitialStd {
                 attitude: 2.0e-2,
@@ -2632,6 +2696,8 @@ mod msceqf_backend_tests {
                 direct_product_bias: false,
                 civera_birth_depth: 0.0,
                 civera_birth_rel_std: 1.0,
+                civera_init_only: false,
+                civera_init_max_disparity: 2.0,
             },
         );
 
