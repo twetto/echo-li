@@ -4,7 +4,12 @@ Python bindings for ECHO-LI via PyO3/maturin.
 
 ## Install
 
+`Frontend`, `FrontendConfig`, `Stereo` and `CheckerboardDetector` are Rudolf-V's
+own binding, the `rudolf-v` wheel, which `echo_li` re-exports. Install it first,
+from the Rudolf-V commit the workspace `Cargo.toml` pins:
+
 ```bash
+pip install "git+https://github.com/twetto/Rudolf-V.git@<rev>#subdirectory=crates/rudolf-v-python"
 cd echo-li-python
 pip install .
 ```
@@ -15,7 +20,8 @@ pip install maturin
 maturin develop --release
 ```
 
-Runtime dependencies (`numpy`) are pulled automatically. For the EuRoC demo:
+Runtime dependencies (`numpy`) are pulled automatically; `rudolf-v` is not on
+PyPI, hence the first step. For the EuRoC demo:
 ```bash
 pip install opencv-python pyyaml
 ```

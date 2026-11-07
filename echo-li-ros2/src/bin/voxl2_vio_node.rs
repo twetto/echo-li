@@ -29,10 +29,9 @@ use rudolf_v::camera::{
     CameraIntrinsics as RudolfCameraIntrinsics, DistortionModel as RudolfDistortionModel,
 };
 use rudolf_v::fast::Feature;
-use rudolf_v::frontend::{FrameStats, Frontend, FrontendConfig, LbpPolicy};
+use rudolf_v::frontend::{DetectorType, FrameStats, Frontend};
 use rudolf_v::gpu::device::GpuDevice;
 use rudolf_v::gpu::frontend::{GpuFrontend, GpuFrontendConfig};
-use rudolf_v::histeq::HistEqMethod;
 use rudolf_v::image::Image as RudolfImage;
 use rudolf_v::klt::LkMethod;
 
@@ -543,13 +542,9 @@ impl VioNode {
         let vio_config = VIOConfig::from_yaml(&params.config_path)
             .unwrap_or_else(|e| panic!("Failed to load config {}: {e}", params.config_path));
         let rv = &vio_config.rudolf_v;
-        let mut frontend_cfg = FrontendConfig::default();
-        frontend_cfg.max_features = rv.max_features;
-        if let Some(t) = rv.fast_threshold {
-            frontend_cfg.fast_threshold = t;
-        }
-        frontend_cfg.pyramid_levels = rv.max_level;
-        frontend_cfg.cell_size = rv.feature_dist as usize;
+        let mut frontend_cfg = rv
+            .to_frontend_config()
+            .unwrap_or_else(|e| panic!("{}: {e}", params.config_path));
         frontend_cfg.klt_method = match params.klt_method.as_str() {
             "inverse_compositional" | "ic" => LkMethod::InverseCompositional,
             "inverse_compositional_fixed" | "ic_fixed" => LkMethod::InverseCompositionalFixed,
@@ -559,40 +554,17 @@ impl VioNode {
                  inverse_compositional or inverse_compositional_fixed"
             ),
         };
-        frontend_cfg.klt_residual_enabled = rv.klt_residual;
-        frontend_cfg.enable_internal_ransac = rv.enable_ransac;
-        frontend_cfg.epipolar_gate_threshold = rv.epipolar_gate_threshold;
-        frontend_cfg.epipolar_refine = rv.epipolar_refine;
-        frontend_cfg.epipolar_min_baseline = rv.epipolar_min_baseline;
-        frontend_cfg.epipolar_max_reject_frac = rv.epipolar_max_reject_frac;
-        frontend_cfg.lbp_policy = match rv.lbp_policy.as_deref() {
-            Some("hardreject" | "hard_reject" | "hard-reject" | "hard") => LbpPolicy::HardReject,
-            _ => LbpPolicy::SoftPenalty,
-        };
-        frontend_cfg.histeq = match rv.histeq.as_deref() {
-            Some("global") | None => {
-                if rv.equalise_image_histogram {
-                    HistEqMethod::Global
-                } else {
-                    HistEqMethod::None
-                }
-            }
-            Some("clahe") => HistEqMethod::Clahe {
-                tile_size: rv.clahe_tile_size,
-                clip_limit: rv.clahe_clip_limit,
-            },
-            _ => HistEqMethod::None,
-        };
         frontend_cfg.camera = Some(cam_intrinsics);
         let frontend = match params.frontend_backend.as_str() {
             "cpu" => FrontendBackend::Cpu(Frontend::new(frontend_cfg, w, h)),
             "gpu" => {
                 // The GPU frontend has FAST + IC-KLT only; refuse config it
                 // would silently ignore.
-                if let Some(detector) = rv.detector.as_deref() {
-                    if detector != "fast" {
-                        panic!("frontend_backend=gpu supports only detector=fast, got {detector}");
-                    }
+                if frontend_cfg.detector != DetectorType::Fast {
+                    panic!(
+                        "frontend_backend=gpu supports only detector=fast, got {:?}",
+                        frontend_cfg.detector
+                    );
                 }
                 if rv.epipolar_gate_threshold > 0.0 {
                     panic!("frontend_backend=gpu has no pose-prior epipolar gate");

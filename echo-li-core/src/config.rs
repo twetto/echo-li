@@ -1,3 +1,4 @@
+use rudolf_v::config::{FrontendSection, StereoSection};
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::path::Path;
@@ -7,86 +8,9 @@ use crate::depth::patch_depth::{PatchDepthCameraMode, PatchDepthSettings, PatchD
 use crate::depth::sparse_gb::{DepthParametrization, SparseVogSettings};
 use crate::ImuBiasGroup;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[serde(deny_unknown_fields)]
-pub struct RudolfVConfig {
-    pub equalise_image_histogram: bool,
-    /// Histogram equalisation method: "none", "global", or "clahe". When
-    /// absent, falls back to `equaliseImageHistogram` (true => global).
-    #[serde(default)]
-    pub histeq: Option<String>,
-    /// CLAHE tile size in pixels (used when histeq == "clahe").
-    #[serde(default = "default_clahe_tile_size")]
-    pub clahe_tile_size: usize,
-    /// CLAHE clip limit (used when histeq == "clahe").
-    #[serde(default = "default_clahe_clip_limit")]
-    pub clahe_clip_limit: f32,
-    pub feature_dist: f64,
-    pub feature_search_threshold: f64,
-    #[serde(default)]
-    pub fast_threshold: Option<u8>,
-    /// Corner detector: "fast" (default), "harris", or "shi_tomasi".
-    #[serde(default)]
-    pub detector: Option<String>,
-    /// Shi-Tomasi minimum-eigenvalue floor (only used when detector == shi_tomasi).
-    #[serde(default)]
-    pub shi_tomasi_threshold: Option<f32>,
-    /// Shi-Tomasi structure-tensor block size (only used when detector == shi_tomasi).
-    #[serde(default)]
-    pub shi_tomasi_block_size: Option<usize>,
-    #[serde(default)]
-    pub lbp_policy: Option<String>,
-    /// Compute the level-0 patch residual per track to feed the KLT quality
-    /// term in the reservoir score (extra patch pass; off by default).
-    #[serde(default)]
-    pub klt_residual: bool,
-    /// Run the frontend essential-matrix RANSAC geometric verification. On by
-    /// default, but it degenerates under rotation-dominant motion (translation
-    /// ~0 => E ill-posed) and falsely rejects good tracks. Off => let the EqF's
-    /// soft outlier model handle outliers instead.
-    #[serde(default = "default_true")]
-    pub enable_ransac: bool,
-    /// Squared-Sampson threshold (normalized coords, like ransacParams.
-    /// inlierThreshold) for the pose-prior epipolar gate. Active only on
-    /// frames where a relative-pose prior is supplied (Frontend::
-    /// set_pose_prior); replaces RANSAC there. 0 disables.
-    #[serde(default)]
-    pub epipolar_gate_threshold: f64,
-    /// Consensus refit of the prior gate (kept only if it increases inliers).
-    #[serde(default)]
-    pub epipolar_refine: bool,
-    /// Skip the gate below this inter-frame baseline [m]: near-zero translation
-    /// makes the prior's E pure noise (detonated MH_02's slow segments).
-    #[serde(default = "default_epipolar_min_baseline")]
-    pub epipolar_min_baseline: f64,
-    /// Distrust the prior when it would reject more than this fraction of
-    /// tracks (breaks the reject->starve->diverge feedback loop).
-    #[serde(default = "default_epipolar_max_reject_frac")]
-    pub epipolar_max_reject_frac: f64,
-    pub max_features: usize,
-    pub max_level: usize,
-}
-
 /// Civera inverse-depth band is `[d0*exp(-rel), d0*exp(+rel)]`; 1.0 spans 0.37x-2.7x.
 fn default_civera_birth_rel_std() -> f64 {
     1.0
-}
-
-fn default_epipolar_min_baseline() -> f64 {
-    1e-3
-}
-
-fn default_clahe_tile_size() -> usize {
-    256
-}
-
-fn default_clahe_clip_limit() -> f32 {
-    4.0
-}
-
-fn default_epipolar_max_reject_frac() -> f64 {
-    0.5
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -703,35 +627,6 @@ impl LocalOccupancyConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub struct StereoConfig {
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    #[serde(default)]
-    pub pyramid_levels: Option<usize>,
-    #[serde(default)]
-    pub patch_half_size: Option<usize>,
-    #[serde(default)]
-    pub max_iterations: Option<usize>,
-    #[serde(default)]
-    pub convergence_eps: Option<f64>,
-    #[serde(default)]
-    pub min_inv_depth: Option<f64>,
-    #[serde(default)]
-    pub max_inv_depth: Option<f64>,
-    #[serde(default)]
-    pub init_inv_depth: Option<f64>,
-    #[serde(default)]
-    pub max_residual: Option<f32>,
-    #[serde(default)]
-    pub n_search_candidates: Option<usize>,
-    #[serde(default)]
-    pub knn_propagation: Option<usize>,
-    #[serde(default)]
-    pub histeq: Option<String>,
-}
-
 /// The MSCEqF backend, as a config section.
 ///
 /// Present and `enabled` selects it in place of the EqVIO filter. Everything here is
@@ -907,8 +802,9 @@ fn default_gravity() -> [f64; 3] {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VIOConfig {
+    /// The frontend's settings, as Rudolf-V reads them.
     #[serde(rename = "RudolfV")]
-    pub rudolf_v: RudolfVConfig,
+    pub rudolf_v: FrontendSection,
     #[serde(rename = "SparseVog", default)]
     pub sparse_vog: Option<SparseVogConfig>,
     #[serde(rename = "PatchDepth", default)]
@@ -916,7 +812,7 @@ pub struct VIOConfig {
     #[serde(rename = "LocalOccupancy", default)]
     pub local_occupancy: Option<LocalOccupancyConfig>,
     #[serde(rename = "Stereo", default)]
-    pub stereo: Option<StereoConfig>,
+    pub stereo: Option<StereoSection>,
     #[serde(rename = "MSCEqF", default)]
     pub msceqf: Option<MsceqfConfig>,
     /// Zero-velocity updates, applied by the BACKEND on every IMU sample the detector

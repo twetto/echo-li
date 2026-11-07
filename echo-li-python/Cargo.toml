@@ -12,6 +12,7 @@ pyo3 = { version = "0.25", features = ["extension-module"] }
 numpy = "0.25"
 echo-li-core = { path = "../echo-li-core" }
 echo-lie.workspace = true
+# Not used directly any more: its parallel feature, for echo-li-core.
 rudolf-v = { workspace = true, features = ["parallel"] }
 camera-geometry.workspace = true
 nalgebra.workspace = true

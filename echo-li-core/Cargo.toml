@@ -8,7 +8,8 @@ parallel = ["dep:rayon"]
 
 [dependencies]
 echo-lie.workspace = true
-rudolf-v.workspace = true
+# serde: the RudolfV and Stereo config sections
+rudolf-v = { workspace = true, features = ["serde"] }
 camera-geometry.workspace = true
 nalgebra.workspace = true
 anyhow.workspace = true

@@ -1,14 +1,11 @@
 use pyo3::prelude::*;
 
 mod camera;
-mod checkerboard;
-mod frontend;
 mod msceqf_backend;
 mod msceqf_native;
 mod occupancy;
 mod patch_depth;
 mod sparse_3d;
-mod stereo;
 mod vio_filter;
 
 #[pymodule]
@@ -16,16 +13,12 @@ fn _echo_li(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<camera::PinholeCamera>()?;
     m.add_class::<camera::RadTanCamera>()?;
     m.add_class::<camera::EquidistantCamera>()?;
-    m.add_class::<frontend::FrontendConfig>()?;
-    m.add_class::<frontend::PyFrontend>()?;
     m.add_class::<vio_filter::PyVIOFilter>()?;
     m.add_class::<msceqf_native::PyMSCEqFNativeFilter>()?;
     m.add_class::<msceqf_backend::PyMsceqfBackend>()?;
     m.add_class::<sparse_3d::PySparse3DFilter>()?;
     m.add_class::<patch_depth::PyPatchDepthMapper>()?;
     m.add_class::<occupancy::PyLocalOccupancyMap>()?;
-    m.add_class::<stereo::PyStereo>()?;
-    m.add_class::<checkerboard::PyCheckerboardDetector>()?;
     m.add_function(pyo3::wrap_pyfunction!(static_initialize, m)?)?;
     Ok(())
 }

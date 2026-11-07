@@ -24,7 +24,7 @@ use nalgebra::{Matrix3, Matrix4, Vector2};
 use rudolf_v::camera::CameraIntrinsics as RudolfCameraIntrinsics;
 use rudolf_v::camera::DistortionModel as RudolfDistortionModel;
 use rudolf_v::camera::StereoRig;
-use rudolf_v::frontend::{DetectorType, Frontend, FrontendConfig, LbpPolicy};
+use rudolf_v::frontend::{Frontend, FrontendConfig};
 use rudolf_v::image::Image as RudolfImage;
 use rudolf_v::klt::LkMethod;
 use rudolf_v::rigid_ransac::{Correspondence3d, Rigid3dRansacConfig};
@@ -719,81 +719,19 @@ fn build_frontend(
     img_h: usize,
     camera: Option<RudolfCameraIntrinsics>,
 ) -> Result<(Frontend, usize), Box<dyn std::error::Error>> {
-    let mut config = FrontendConfig::default();
+    let mut config = match vio_config {
+        Some(conf) => conf.rudolf_v.to_frontend_config()?,
+        None => FrontendConfig {
+            max_features: 40,
+            cell_size: 100,
+            histeq: rudolf_v::histeq::HistEqMethod::Global,
+            klt_method: LkMethod::InverseCompositional,
+            ..FrontendConfig::default()
+        },
+    };
     // Intrinsics enable the geometric-verification paths (pose-prior epipolar
     // gate / internal RANSAC); without them both are inert.
     config.camera = camera;
-    if let Some(conf) = vio_config {
-        config.max_features = conf.rudolf_v.max_features;
-        config.klt_residual_enabled = conf.rudolf_v.klt_residual;
-        config.enable_internal_ransac = conf.rudolf_v.enable_ransac;
-        config.epipolar_gate_threshold = conf.rudolf_v.epipolar_gate_threshold;
-        config.epipolar_refine = conf.rudolf_v.epipolar_refine;
-        config.epipolar_min_baseline = conf.rudolf_v.epipolar_min_baseline;
-        config.epipolar_max_reject_frac = conf.rudolf_v.epipolar_max_reject_frac;
-        config.pyramid_levels = conf.rudolf_v.max_level;
-        if let Some(fast_threshold) = conf.rudolf_v.fast_threshold {
-            config.fast_threshold = fast_threshold;
-        }
-        if let Some(detector) = &conf.rudolf_v.detector {
-            config.detector = match detector.to_ascii_lowercase().as_str() {
-                "fast" => DetectorType::Fast,
-                "harris" => DetectorType::Harris,
-                "shi_tomasi" | "shitomasi" | "shi-tomasi" => DetectorType::ShiTomasi,
-                _ => {
-                    return Err(format!(
-                        "unsupported RudolfV.detector '{}'; expected fast, harris, or shi_tomasi",
-                        detector
-                    )
-                    .into());
-                }
-            };
-        }
-        if let Some(v) = conf.rudolf_v.shi_tomasi_threshold {
-            config.shi_tomasi_threshold = v;
-        }
-        if let Some(v) = conf.rudolf_v.shi_tomasi_block_size {
-            config.shi_tomasi_block_size = v;
-        }
-        config.histeq = match conf.rudolf_v.histeq.as_deref() {
-            Some("none") => rudolf_v::histeq::HistEqMethod::None,
-            Some("global") => rudolf_v::histeq::HistEqMethod::Global,
-            Some("clahe") => rudolf_v::histeq::HistEqMethod::Clahe {
-                tile_size: conf.rudolf_v.clahe_tile_size,
-                clip_limit: conf.rudolf_v.clahe_clip_limit,
-            },
-            Some(other) => {
-                return Err(format!(
-                    "unsupported RudolfV.histeq '{other}'; expected none, global, or clahe"
-                )
-                .into());
-            }
-            // Legacy fallback: the equaliseImageHistogram bool.
-            None if conf.rudolf_v.equalise_image_histogram => {
-                rudolf_v::histeq::HistEqMethod::Global
-            }
-            None => rudolf_v::histeq::HistEqMethod::None,
-        };
-        config.cell_size = conf.rudolf_v.feature_dist as usize;
-        if let Some(policy) = &conf.rudolf_v.lbp_policy {
-            config.lbp_policy = match policy.to_ascii_lowercase().as_str() {
-                "softpenalty" | "soft_penalty" | "soft-penalty" => LbpPolicy::SoftPenalty,
-                "hardreject" | "hard_reject" | "hard-reject" => LbpPolicy::HardReject,
-                _ => {
-                    return Err(format!(
-                        "unsupported RudolfV.lbpPolicy '{}'; expected SoftPenalty or HardReject",
-                        policy
-                    )
-                    .into());
-                }
-            };
-        }
-    } else {
-        config.max_features = 40;
-        config.cell_size = 100;
-        config.histeq = rudolf_v::histeq::HistEqMethod::Global;
-    }
-    config.klt_method = LkMethod::InverseCompositional;
     let tracker_max_features = config.max_features;
     println!(
         "Tracker: Rudolf-V, detector={:?}, max_features={}",
@@ -825,45 +763,10 @@ fn build_stereo_matcher(
         &root.join("cam1/sensor.yaml"),
     )
     .expect("Failed to load stereo rig");
-    let mut stereo_cfg = RudolfStereoConfig::default();
-    if let Some(conf) = vio_config.and_then(|c| c.stereo.as_ref()) {
-        if let Some(v) = conf.pyramid_levels {
-            stereo_cfg.pyramid_levels = v;
-        }
-        if let Some(v) = conf.patch_half_size {
-            stereo_cfg.patch_half_size = v;
-        }
-        if let Some(v) = conf.max_iterations {
-            stereo_cfg.max_iterations = v;
-        }
-        if let Some(v) = conf.convergence_eps {
-            stereo_cfg.convergence_eps = v;
-        }
-        if let Some(v) = conf.min_inv_depth {
-            stereo_cfg.min_inv_depth = v;
-        }
-        if let Some(v) = conf.max_inv_depth {
-            stereo_cfg.max_inv_depth = v;
-        }
-        if let Some(v) = conf.init_inv_depth {
-            stereo_cfg.init_inv_depth = v;
-        }
-        if let Some(v) = conf.max_residual {
-            stereo_cfg.max_residual = v;
-        }
-        if let Some(v) = conf.n_search_candidates {
-            stereo_cfg.n_search_candidates = v;
-        }
-        if let Some(v) = conf.knn_propagation {
-            stereo_cfg.knn_propagation = v;
-        }
-        if let Some(h) = &conf.histeq {
-            stereo_cfg.histeq = match h.to_ascii_lowercase().as_str() {
-                "global" => rudolf_v::histeq::HistEqMethod::Global,
-                _ => rudolf_v::histeq::HistEqMethod::None,
-            };
-        }
-    }
+    let stereo_cfg = match vio_config.and_then(|c| c.stereo.as_ref()) {
+        Some(conf) => conf.to_stereo_config().expect("Invalid Stereo section"),
+        None => RudolfStereoConfig::default(),
+    };
     println!(
         "Stereo: baseline={:.4}m cam1 {}×{} patch_half={} levels={} iters={} search={}",
         rig.baseline_meters(),
