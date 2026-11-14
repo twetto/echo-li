@@ -45,3 +45,24 @@ the bag scripts look for the binaries there.
 Note the box is built from the ROS image rather than bare `ubuntu:22.04`, so Humble is
 already present and no ROS apt install is needed. The name still matches what the bag
 scripts tell you to enter; they only test for `setup.bash`.
+
+## Live view in a browser
+
+`voxl2_vio_node` publishes a throttled live-view feed when given `-p viz_rate_hz:=<Hz>` (0, the
+default, publishes nothing): the tracker's input image, its features, the odometry and the
+landmarks on `/echo_li/viz/{image,tracks,odometry,landmarks}`, all from the same frames.
+`tools/rerun_bridge.py` turns that feed into a Rerun stream:
+
+```sh
+. /opt/ros/humble/setup.bash
+python3 tools/rerun_bridge.py --connect rerun+http://<server>:9876/proxy
+```
+
+The Rerun server and every viewer must run the same version as the bridge's `rerun-sdk`
+(0.31.3). The bridge sends each frame as soon as it is logged rather than in Rerun's default
+200 ms batches: a viewer following live data shows only the newest frame of a batch, which
+capped the view at about 5 frames per second.
+
+Cost on the Pi 4, with the 320x200 rig camera at 58.8 Hz and `viz_rate_hz:=10`, measured as
+single 120 s replays: about 23% of a core for the bridge, and about 1.3 Mbit/s of upload.
+Most of the bridge's cost is rclpy delivering messages and Python handling them, not Rerun.

@@ -98,6 +98,7 @@ struct NodeParams {
     path_topic: String,
     mocap_path_topic: String,
     path_period_sec: f64,
+    viz_rate_hz: f64,
 }
 
 // ── Parameter helpers ────────────────────────────────────────────────────────
@@ -242,6 +243,73 @@ fn load_params(node: &r2r::Node) -> NodeParams {
         path_topic: get_str(node, "path_topic", "/echo_li/path"),
         mocap_path_topic: get_str(node, "mocap_path_topic", "/echo_li/mocap_path"),
         path_period_sec: get_f64(node, "path_period_sec", 0.5).max(0.05),
+        // A live-view feed under /echo_li/viz/, see VizPubs. 0 = off.
+        viz_rate_hz: get_f64(node, "viz_rate_hz", 0.0).max(0.0),
+    }
+}
+
+// ── Live-view feed ──────────────────────────────────────────────────────────
+
+/// A throttled copy of what a viewer draws: the tracker's input image, its
+/// features in that image's pixels, the odometry and the landmarks, all from the
+/// same frames. A viewer subscribing to these wakes `viz_rate_hz` times a second
+/// per topic instead of at the camera rate, which for a Python subscriber is most
+/// of its cost. The image is published raw: encoding it here would put that work
+/// on the VIO thread.
+struct VizPubs {
+    image: r2r::Publisher<r2r::sensor_msgs::msg::Image>,
+    tracks: r2r::Publisher<r2r::sensor_msgs::msg::PointCloud2>,
+    odometry: r2r::Publisher<r2r::nav_msgs::msg::Odometry>,
+    landmarks: r2r::Publisher<r2r::sensor_msgs::msg::PointCloud2>,
+    period_ns: i64,
+    last_ns: Option<i64>,
+}
+
+impl VizPubs {
+    /// Whether the frame at `stamp_ns` goes out; a stamp going backwards (a
+    /// replay restarting) re-arms the throttle.
+    fn due(&mut self, stamp_ns: i64) -> bool {
+        let due = self
+            .last_ns
+            .is_none_or(|last| stamp_ns < last || stamp_ns - last >= self.period_ns);
+        if due {
+            self.last_ns = Some(stamp_ns);
+        }
+        due
+    }
+}
+
+/// Features as an unordered `PointCloud2` of `x`, `y` (f32, pixels) and `id`
+/// (u32; ids wrap at 2^32, which only matters for telling tracks apart).
+fn tracks_cloud(
+    header: &r2r::std_msgs::msg::Header,
+    features: &[Feature],
+) -> r2r::sensor_msgs::msg::PointCloud2 {
+    const POINT_STEP: u32 = 12;
+    let n = features.len() as u32;
+    let mut data = Vec::with_capacity((POINT_STEP * n) as usize);
+    for f in features {
+        data.extend_from_slice(&f.x.to_le_bytes());
+        data.extend_from_slice(&f.y.to_le_bytes());
+        data.extend_from_slice(&(f.id as u32).to_le_bytes());
+    }
+    let field = |name: &str, offset: u32, datatype: u8| r2r::sensor_msgs::msg::PointField {
+        name: name.into(),
+        offset,
+        datatype,
+        count: 1,
+    };
+    r2r::sensor_msgs::msg::PointCloud2 {
+        header: header.clone(),
+        height: 1,
+        width: n,
+        // 7 = FLOAT32, 6 = UINT32
+        fields: vec![field("x", 0, 7), field("y", 4, 7), field("id", 8, 6)],
+        is_bigendian: false,
+        point_step: POINT_STEP,
+        row_step: POINT_STEP * n,
+        data,
+        is_dense: true,
     }
 }
 
@@ -422,6 +490,7 @@ struct VioNode {
     depth_status_pub: Option<r2r::Publisher<r2r::sensor_msgs::msg::Image>>,
     sparse_landmark_pub: r2r::Publisher<r2r::sensor_msgs::msg::PointCloud2>,
     occupancy_pub: Option<r2r::Publisher<r2r::sensor_msgs::msg::PointCloud2>>,
+    viz: Option<VizPubs>,
     occupancy_map: Option<LocalOccupancyMap>,
     mapping_stride: usize,
 
@@ -505,6 +574,7 @@ impl VioNode {
         depth_status_pub: Option<r2r::Publisher<r2r::sensor_msgs::msg::Image>>,
         sparse_landmark_pub: r2r::Publisher<r2r::sensor_msgs::msg::PointCloud2>,
         occupancy_pub: Option<r2r::Publisher<r2r::sensor_msgs::msg::PointCloud2>>,
+        viz: Option<VizPubs>,
     ) -> Self {
         let s = params.image_scale;
         let [fx, fy, cx, cy] = [
@@ -749,6 +819,7 @@ impl VioNode {
             depth_status_pub,
             sparse_landmark_pub,
             occupancy_pub,
+            viz,
             occupancy_map,
             mapping_stride: params.mapping_stride,
             imu_queue: VecDeque::new(),
@@ -1004,6 +1075,21 @@ impl VioNode {
         let total_tracks = frame_stats.total;
         let frontend_ms = frontend_started.elapsed().as_secs_f64() * 1000.0;
         log::debug!("frontend: {}", frame_stats.timing);
+        let viz_now = self.viz.as_mut().is_some_and(|v| v.due(stamp_ns));
+        if viz_now {
+            if let Some(v) = &self.viz {
+                let _ = v.image.publish(&r2r::sensor_msgs::msg::Image {
+                    header: msg.header.clone(),
+                    height: self.height as u32,
+                    width: self.width as u32,
+                    encoding: "mono8".to_string(),
+                    is_bigendian: 0,
+                    step: self.width as u32,
+                    data: gray.clone(),
+                });
+                let _ = v.tracks.publish(&tracks_cloud(&msg.header, &features));
+            }
+        }
 
         let observations: HashMap<u64, Vector2<f32>> = features
             .iter()
@@ -1063,6 +1149,18 @@ impl VioNode {
             odom_pub,
             tf_pub,
         );
+        if viz_now {
+            if let Some(v) = &self.viz {
+                self.publish_odometry(
+                    stamp_ns,
+                    &position,
+                    &quaternion,
+                    &velocity,
+                    &v.odometry,
+                    None,
+                );
+            }
+        }
 
         let global_landmarks = self.filter.landmarks_world();
         push_capped(&mut self.landmark_counts, global_landmarks.len(), 300);
@@ -1083,6 +1181,17 @@ impl VioNode {
             &cam_origin,
             landmark_pub,
         );
+        if viz_now {
+            if let Some(v) = &self.viz {
+                Self::publish_landmarks(
+                    stamp_ns,
+                    &self.odom_frame,
+                    &global_landmarks,
+                    &cam_origin,
+                    &v.landmarks,
+                );
+            }
+        }
 
         // Update sparse 3D filter
         if let Some(ref mut sparse) = self.sparse_3d {
@@ -1949,6 +2058,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         (None, None)
     };
+    let viz = if params.viz_rate_hz > 0.0 {
+        let qos = r2r::QosProfile::default;
+        Some(VizPubs {
+            image: node.create_publisher("/echo_li/viz/image", qos())?,
+            tracks: node.create_publisher("/echo_li/viz/tracks", qos())?,
+            odometry: node.create_publisher("/echo_li/viz/odometry", qos())?,
+            landmarks: node.create_publisher("/echo_li/viz/landmarks", qos())?,
+            period_ns: (NSEC_PER_SEC as f64 / params.viz_rate_hz).round() as i64,
+            last_ns: None,
+        })
+    } else {
+        None
+    };
     let path_pub = node.create_publisher::<r2r::nav_msgs::msg::Path>(
         &params.path_topic,
         r2r::QosProfile::default(),
@@ -2026,6 +2148,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         params.klt_method,
     );
+    if params.viz_rate_hz > 0.0 {
+        log::info!("live-view feed on /echo_li/viz/* at {} Hz", params.viz_rate_hz);
+    }
 
     let mut state = VioNode::new(
         &params,
@@ -2033,6 +2158,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         depth_status_pub,
         sparse_landmark_pub,
         occupancy_pub,
+        viz,
     );
     let traj_output = params.trajectory_output.clone();
 
