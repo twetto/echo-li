@@ -859,7 +859,10 @@ pub struct MsceqfSettings {
     /// more than this on average since the previous frame (px/frame). Motion is taken
     /// from the image, not the state: the filter's own pose is least trustworthy
     /// while initializing, and the IMU cannot tell a vibrating airframe at rest from
-    /// motion. With fewer than 20 shared tracks initialization does not end.
+    /// motion. CAUTION: with fewer than 20 shared tracks per frame (low texture, a
+    /// small `maxFeatures`) initialization never ends, and every birth for the rest
+    /// of the run is a Civera birth -- the configuration that doubled flight ATE on
+    /// the one V1_01 run above. Nothing reports it.
     pub civera_init_max_disparity: f64,
 
     /// Refuse to promote a landmark whose triangulated range exceeds this (metres).

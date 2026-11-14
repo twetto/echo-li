@@ -837,6 +837,9 @@ pub struct MsceqfConfig {
     /// than this on average since the previous frame, in PIXELS PER FRAME. The first
     /// motion is seen in the image, not the IMU: a vibrating airframe at rest fails
     /// IMU stationarity tests. Depends on resolution and frame rate; tune per camera.
+    /// Only frames with at least 20 tracks shared with the previous one count, so a
+    /// camera that keeps fewer than 20 never leaves initialization and keeps the
+    /// Civera birth for the whole run.
     #[serde(default = "default_civera_init_max_disparity")]
     pub civera_init_max_disparity: f64,
     /// Gravity VECTOR in the world frame, m/s^2. Sign and axis are frame conventions,
