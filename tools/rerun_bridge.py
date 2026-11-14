@@ -68,13 +68,12 @@ class Bridge(Node):
     def __init__(self, args):
         super().__init__("echo_li_rerun_bridge")
         self.args = args
-        # The trajectory goes out in segments. Re-sending the whole line grows
-        # without bound; a closed segment is sent once, as static data, so the
-        # server's memory limit drops old camera frames but never the path.
-        self.segment: list[np.ndarray] = []
-        self.segment_index = 0
-        self.trajectory_points = 0
-        self.trajectory_logged_at = 0.0
+        # The whole path of this run is re-sent every --path-period seconds as
+        # ordinary timed data, thinned to at most --path-max-points. Its newest
+        # copy is always in the server's buffer however small that is, while old
+        # copies, and earlier runs, age out of it like the camera frames.
+        self.path: list[np.ndarray] = []
+        self.path_logged_at = 0.0
         self.counts = {"image": 0, "tracks": 0, "odom": 0, "landmarks": 0}
         self.image_size = None  # (w, h), from the first image
         self.started = time.monotonic()
@@ -142,21 +141,17 @@ class Bridge(Node):
         )
         self.counts["odom"] += 1
 
-        if not self.segment or np.linalg.norm(pos - self.segment[-1]) >= self.args.path_step:
-            self.segment.append(pos)
-            self.trajectory_points += 1
-        full = len(self.segment) >= self.args.segment_points
-        if full or t - self.trajectory_logged_at >= 1.0 or t < self.trajectory_logged_at:
-            self.trajectory_logged_at = t
-            if len(self.segment) >= 2:
+        if not self.path or np.linalg.norm(pos - self.path[-1]) >= self.args.path_step:
+            self.path.append(pos)
+            if len(self.path) > self.args.path_max_points:
+                self.path = self.path[::2]  # thin the history, keep its extent
+        if t - self.path_logged_at >= self.args.path_period or t < self.path_logged_at:
+            self.path_logged_at = t
+            if len(self.path) >= 2:
                 rr.log(
-                    f"world/trajectory/{self.segment_index:05d}",
-                    rr.LineStrips3D([np.array(self.segment)], colors=[[255, 200, 40]]),
-                    static=True,
+                    "world/trajectory",
+                    rr.LineStrips3D([np.array(self.path)], colors=[[255, 200, 40]]),
                 )
-            if full:  # close it; the next one starts where this ended
-                self.segment = self.segment[-1:]
-                self.segment_index += 1
 
     def on_landmarks(self, msg: PointCloud2):
         rr.set_time(TIMELINE, timestamp=stamp_sec(msg.header))
@@ -170,7 +165,7 @@ class Bridge(Node):
     def report(self):
         el = time.monotonic() - self.started
         rates = ", ".join(f"{k} {v / el:.1f}/s" for k, v in self.counts.items())
-        self.get_logger().info(f"{rates}; trajectory {self.trajectory_points} pts")
+        self.get_logger().info(f"{rates}; path {len(self.path)} pts")
 
 
 def blueprint(width: int | None = None, height: int | None = None) -> rrb.Blueprint:
@@ -198,10 +193,12 @@ def main():
     ap.add_argument("--point-radius", type=float, default=2.0, help="feature marker, px")
     ap.add_argument("--path-step", type=float, default=0.01,
                     help="metres between kept trajectory points")
-    ap.add_argument("--segment-points", type=int, default=500,
-                    help="trajectory points per segment; only the open one is re-sent")
-    ap.add_argument("--recording-id", default=None,
-                    help="reuse one id across restarts so the viewer keeps one recording")
+    ap.add_argument("--path-period", type=float, default=2.0,
+                    help="seconds between re-sends of the whole path")
+    ap.add_argument("--path-max-points", type=int, default=3000)
+    ap.add_argument("--recording-id", default="echo-li-live",
+                    help="one id for every run, so a viewer sees one recording, not one per "
+                    "start; give each run its own to keep them apart")
     ap.add_argument("--stats-sec", type=float, default=10.0)
     args, ros_args = ap.parse_known_args()
 
