@@ -1625,46 +1625,63 @@ fn bearing_consider_update_3d(
         feat.p_stheta *= cr.m.transpose();
     }
 
-    let (pa, jpa) = pj_of(&feat.inv_s);
-    let q_c = r_ca * pa + t_ca_t;
-    if q_c[2] < settings.min_depth {
-        return false;
-    }
-    let proj = cam.projection_jacobian(&q_c); // 2x3
-    let mut j_pose = Matrix2x6::<f64>::zeros(); // d pixel / d theta
-    j_pose
-        .fixed_view_mut::<2, 3>(0, 0)
-        .copy_from(&(proj * base_skew(&q_c)));
-    j_pose.fixed_view_mut::<2, 3>(0, 3).copy_from(&proj);
-    let c = proj * r_ca * jpa; // 2x3
     let r_core = measurement_cov_px2(settings, feat);
-
-    // (19)
     let p = feat.inv_p;
     let pst = feat.p_stheta;
-    let cross_s = c * pst * j_pose.transpose(); // 2x2
-    let s_mat = c * p * c.transpose()
-        + cross_s
-        + cross_s.transpose()
-        + j_pose * sigma * j_pose.transpose()
-        + r_core;
-    let Some(s_inv) = (s_mat + Matrix2::identity() * 1e-8).try_inverse() else {
-        return true;
-    };
-    let det_s = s_mat.determinant();
-    if det_s < 1e-30 {
-        return true;
-    }
-    let gain = (p * c.transpose() + pst * j_pose.transpose()) * s_inv; // 3x2
 
-    let y_pred = cam.project(&q_c);
-    let residual = uv_obs - y_pred;
-    let maha_sq = (residual.transpose() * s_inv * residual)[(0, 0)];
-    feat.last_nis = maha_sq;
-    if settings.mahalanobis_reset_chi2 > 0.0 && maha_sq > settings.mahalanobis_reset_chi2 {
-        return false;
+    // (19), iterated: relinearize the projection at the landmark iterate s + delta
+    // (theta is considered, so its estimate stays zero). Gauss-Newton step from the
+    // prior, delta <- K (residual(s + delta) + C delta); gating uses the prior
+    // innovation (it == 0); the posterior uses the final linearization.
+    // `iekf_iterations` == 1 is the plain consider update.
+    let mut delta = Vector3::zeros();
+    let mut c = Matrix2x3::<f64>::zeros();
+    let mut j_pose = Matrix2x6::<f64>::zeros(); // d pixel / d theta
+    let mut gain = Matrix3x2::<f64>::zeros();
+    let mut full_delta = Vector3::zeros();
+    let mut maha_sq = 0.0;
+    let mut det_s = 1.0;
+    for it in 0..settings.iekf_iterations.max(1) {
+        let (pa, jpa) = pj_of(&(feat.inv_s + delta));
+        let q_c = r_ca * pa + t_ca_t;
+        if q_c[2] < settings.min_depth {
+            return false;
+        }
+        let proj = cam.projection_jacobian(&q_c); // 2x3
+        j_pose
+            .fixed_view_mut::<2, 3>(0, 0)
+            .copy_from(&(proj * base_skew(&q_c)));
+        j_pose.fixed_view_mut::<2, 3>(0, 3).copy_from(&proj);
+        c = proj * r_ca * jpa; // 2x3
+
+        let cross_s = c * pst * j_pose.transpose(); // 2x2
+        let s_mat = c * p * c.transpose()
+            + cross_s
+            + cross_s.transpose()
+            + j_pose * sigma * j_pose.transpose()
+            + r_core;
+        let Some(s_inv) = (s_mat + Matrix2::identity() * 1e-8).try_inverse() else {
+            return true;
+        };
+        gain = (p * c.transpose() + pst * j_pose.transpose()) * s_inv; // 3x2
+
+        let residual = uv_obs - cam.project(&q_c);
+        if it == 0 {
+            det_s = s_mat.determinant();
+            if det_s < 1e-30 {
+                return true;
+            }
+            maha_sq = (residual.transpose() * s_inv * residual)[(0, 0)];
+            feat.last_nis = maha_sq;
+            if settings.mahalanobis_reset_chi2 > 0.0
+                && maha_sq > settings.mahalanobis_reset_chi2
+            {
+                return false;
+            }
+        }
+        full_delta = gain * (residual + c * delta);
+        delta = full_delta;
     }
-    let full_delta = gain * residual;
 
     // (20), joint Joseph form: the posterior error is L [ds; dth] + K eps with
     // L = [I - K C, -K J].

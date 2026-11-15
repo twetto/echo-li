@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use echo_li_core::depth::sparse_3d::Sparse3DFilter;
 use echo_li_core::depth::sparse_gb::{SecondOrderMode, SparseVogSettings};
 use echo_li_core::mathematical::vision_measurement::VisionMeasurement;
-use nalgebra::{Matrix2, Matrix3, Matrix4, Vector2};
+use nalgebra::{Matrix2, Matrix3, Matrix4, Matrix6, Vector2};
 
 #[pyclass(name = "Sparse3DFilter")]
 pub struct PySparse3DFilter {
@@ -159,6 +159,28 @@ impl PySparse3DFilter {
         self.inner.set_observation_noise(m);
     }
 
+    /// This frame's per-anchor consider data for `consider_relpose` (call before
+    /// `update`): `{anchor_clone_id: (sigma, m)}`, `sigma` the 6x6 `[rot, trans]`
+    /// anchor->current relative-pose covariance and `m` the 6x6 regression operator
+    /// `Cov(a->cur, a->prev) Cov(a->prev)^-1` that carries the cross term from the
+    /// previous frame's relative pose to this one's.
+    fn set_consider_relpose(&mut self, map: HashMap<u64, ([[f64; 6]; 6], [[f64; 6]; 6])>) {
+        let to6 = |a: &[[f64; 6]; 6]| Matrix6::from_fn(|i, j| a[i][j]);
+        let m: echo_li_core::depth::sparse_3d::ConsiderRelMap = map
+            .into_iter()
+            .map(|(cid, (s, mm))| {
+                (
+                    cid,
+                    echo_li_core::depth::sparse_3d::ConsiderRel {
+                        sigma: to6(&s),
+                        m: to6(&mm),
+                    },
+                )
+            })
+            .collect();
+        self.inner.set_consider_relpose(m);
+    }
+
     fn query(&self, feature_id: u64) -> (f64, f64) {
         self.inner.query(feature_id)
     }
@@ -176,21 +198,27 @@ impl PySparse3DFilter {
     /// Returns how many landmarks moved. Passing `rel_pose_cov` as (P_vv, P_ww) of the
     /// old->new relative pose folds that uncertainty in; omitting it claims the two
     /// anchors are perfectly known relative to each other.
-    #[pyo3(signature = (old_clone_id, t_wc_new, new_clone_id, rel_pose_cov=None))]
+    /// `rel_full`, under `consider_relpose`: the full 6x6 `[rot, trans]` old->new relative
+    /// covariance, which the consider transfer (eq. 17) combines with the landmark's tracked
+    /// cross term; ignored when consider mode is off.
+    #[pyo3(signature = (old_clone_id, t_wc_new, new_clone_id, rel_pose_cov=None, rel_full=None))]
     fn reanchor_clone(
         &mut self,
         old_clone_id: u64,
         t_wc_new: [[f64; 4]; 4],
         new_clone_id: Option<u64>,
         rel_pose_cov: Option<([[f64; 3]; 3], [[f64; 3]; 3])>,
+        rel_full: Option<[[f64; 6]; 6]>,
     ) -> usize {
         let t = array_to_matrix4(&t_wc_new);
         let cov = rel_pose_cov.map(|(v, w)| (array_to_matrix3(&v), array_to_matrix3(&w)));
-        self.inner.reanchor_clone(
+        let full = rel_full.map(|a| Matrix6::from_fn(|i, j| a[i][j]));
+        self.inner.reanchor_clone_full(
             old_clone_id,
             &t,
             new_clone_id,
             cov.as_ref().map(|(v, w)| (v, w)),
+            full.as_ref(),
         )
     }
 

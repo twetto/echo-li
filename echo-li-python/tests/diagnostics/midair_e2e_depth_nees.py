@@ -43,6 +43,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import yaml
+from scipy import ndimage
 from scipy.spatial.transform import Rotation as Rot
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -308,7 +309,7 @@ class BackendAdapter:
 
     def __init__(self, cfg, cam, f, num_clones, pixel_std_px, max_slam,
                  acc_d, gyr_d, acc_rw, gyr_rw, update_span=0, max_track=200,
-                 direct_product_bias=False, bias_std=1e-2):
+                 direct_product_bias=False, bias_std=1e-2, chi2_mult=1.0):
         import echo_li
         import tempfile
         full = _deep_copy(cfg)
@@ -319,7 +320,7 @@ class BackendAdapter:
             "directProductBias": bool(direct_product_bias),
             "numClones": int(num_clones),
             "pixelStd": float(pixel_std_px),          # pixels; /fx inside
-            "chi2Mult": 1.0,
+            "chi2Mult": float(chi2_mult),
             "maxTrack": int(max_track),
             "maxSlam": int(max_slam),
             "curvature": False,                       # MSCEqFAdapter passes False
@@ -618,6 +619,58 @@ def vio_body_pose(vio):
     return T
 
 
+class PosePerturb:
+    """Known pose error on the fed camera position (ladder rungs 1 and 1o), world-frame and
+    isotropic, so its world- and camera-frame covariances coincide. One step per camera frame.
+      rw: eps_k = eps_{k-1} + w_k, w ~ N(0, q I).
+      ou: eps_k = eps_{k-1} + v_k, v_k = phi v_{k-1} + w_k, phi = exp(-1/tau), w ~ N(0, q I),
+          v stationary at the start: a velocity error that drifts ballistically at lags
+          below tau and like a random walk beyond, and persists across re-anchor epochs.
+    Exact second moments per axis: P_k = Cov([eps_k, v_k]); for i <= j,
+    Cov(eps_i, eps_j) = P_i[0,0] + P_i[0,1] phi (1 - phi^(j-i)) / (1 - phi)."""
+
+    def __init__(self, model, q, tau, rng):
+        self.model, self.q, self.rng = model, q, rng
+        self.eps = np.zeros(3)
+        self.P = {}
+        if model == "ou":
+            self.phi = float(np.exp(-1.0 / tau))
+            var_v = q / (1.0 - self.phi ** 2)
+            self.v = rng.normal(0.0, np.sqrt(var_v), 3)
+            self._P = np.array([[0.0, 0.0], [0.0, var_v]])
+        else:
+            self._P = np.zeros((2, 2))
+
+    def step(self, k):
+        w = self.rng.normal(0.0, np.sqrt(self.q), 3)
+        if self.model == "ou":
+            self.v = self.phi * self.v + w
+            self.eps = self.eps + self.v
+            F = np.array([[1.0, self.phi], [0.0, self.phi]])
+            self._P = F @ self._P @ F.T + self.q * np.ones((2, 2))
+        else:
+            self.eps = self.eps + w
+            self._P = self._P + np.array([[self.q, 0.0], [0.0, 0.0]])
+        self.P[int(k)] = self._P.copy()
+        return self.eps
+
+    def C(self, i, j):
+        i, j = (i, j) if i <= j else (j, i)
+        Pi = self.P[int(i)]
+        if self.model != "ou" or j == i:
+            return float(Pi[0, 0])
+        n = j - i
+        return float(Pi[0, 0] + Pi[0, 1] * self.phi * (1.0 - self.phi ** n) / (1.0 - self.phi))
+
+    def var_rel(self, a, k):
+        """Var of one axis of eps_k - eps_a."""
+        return self.C(k, k) - 2.0 * self.C(a, k) + self.C(a, a)
+
+    def cov_rel(self, a, k, l):
+        """Cov of one axis of (eps_k - eps_a, eps_l - eps_a)."""
+        return self.C(k, l) - self.C(k, a) - self.C(a, l) + self.C(a, a)
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="End-to-end depth NEES test for Sparse3D on MidAir.",
@@ -662,6 +715,11 @@ def main():
                          "used 11 == the clone window, which flushes every track one frame before "
                          "it can be promoted, so no in-state landmark ever existed; pass 11 to "
                          "reproduce those traces.")
+    ap.add_argument("--msceqf-pixel-std", type=float, default=None,
+                    help="backend pose source: MSCEqF pixelStd (px) on its own; default = --sigma-pixel or 1.0. "
+                         "Lets the VIO's measurement noise be swept without touching Sparse3D's sigma_pixel")
+    ap.add_argument("--msceqf-chi2-mult", type=float, default=1.0,
+                    help="backend pose source: MSCEqF chi2Mult (gate multiplier) for the structureless and landmark updates")
     ap.add_argument("--msceqf-dp-bias", action="store_true",
                     help="backend pose source: direct-product (static) bias chart instead of semi-direct")
     ap.add_argument("--vel-acc", type=float, default=None,
@@ -711,6 +769,8 @@ def main():
                          "increments, the Sparse3D update) with VIOFilter.sparse_feed, i.e. "
                          "the CloneRelFeed the CLI and ROS 2 node run. Byte-identity with "
                          "--feed python is the proof that the shipped path IS the harness")
+    ap.add_argument("--nis-dump", default=None, metavar="NPZ",
+                    help="save (k, fid, track_length, nis, b/r) for every landmark updated each frame")
     ap.add_argument("--consider", action="store_true",
                     help="with --feed rust: consider (Schmidt) treatment of the anchor->current "
                          "relative pose, filter_formulation §V-F (settings.consider_relpose + "
@@ -785,7 +845,24 @@ def main():
     ap.add_argument("--gt-anchored", action="store_true",
                     help="score against the reprojected GT BIRTH landmark instead of "
                          "GT depth at the current (drifted) tracked pixel")
-    ap.add_argument("--track-source", choices=("rudolf", "fdf"), default="rudolf",
+    ap.add_argument("--exact-noise-px", type=float, default=0.5,
+                    help="with --track-source exact: std (px) of the white Gaussian noise added to "
+                         "each exact reprojection, independently per axis and frame")
+    ap.add_argument("--exact-seed", type=int, default=0)
+    ap.add_argument("--obs-dump", default=None, metavar="NPZ",
+                    help="with --track-source exact: save each exact track's GT world point, every "
+                         "(frame, id) fed to Sparse3D, and the GT camera pose per frame (offline oracle)")
+    ap.add_argument("--pose-perturb-qt", type=float, default=0.0, metavar="M2_PER_FRAME",
+                    help="with --pose-source gt: add a world-frame isotropic random walk to the camera "
+                         "position fed to Sparse3D (increment N(0, q I) per camera frame, rotation exact) "
+                         "and feed its exact anchor->current covariance (k - anchor) q I as the "
+                         "clone-relative P_vv (P_ww = 0). Ladder rung 1.")
+    ap.add_argument("--pose-perturb-model", choices=("rw", "ou"), default="rw",
+                    help="with --pose-perturb-qt: rw = random walk (q per frame on the position); ou = "
+                         "Gauss-Markov velocity error (q per frame on the velocity, time constant "
+                         "--pose-perturb-tau), see PosePerturb")
+    ap.add_argument("--pose-perturb-tau", type=float, default=50.0, metavar="FRAMES")
+    ap.add_argument("--track-source", choices=("rudolf", "fdf", "exact"), default="rudolf",
                     help="tracks fed to Sparse3D. rudolf: the FAST+KLT front end; fdf: FlowDep-F "
                          "anchor-referenced epipolar patch tracker driven by the --pose-source pose "
                          "(GT with --pose-source gt). The pose source itself always runs on Rudolf-V.")
@@ -809,6 +886,13 @@ def main():
                          "scale term fully correlated) and score every 2nd pixel against GT; also scores the "
                          "same rule with the shared (reported - state) term dropped, to isolate eq. 35")
     ap.add_argument("--slant-deg", type=float, default=35.0)
+    ap.add_argument("--dense-dump", default="",
+                    help="with --densify: write the shipped dense frame (rule + fill) every frame to this .npz, "
+                         "every --dense-dump-stride pixel: log-range, variance WITHOUT the scale term (add "
+                         "sigma_s^2 to get the reported one: the shared term is fully correlated, so it is "
+                         "sigma_s in log-range), class (0 unknown, 1 measured, 2 filled), GT range, and the "
+                         "estimated and GT camera poses")
+    ap.add_argument("--dense-dump-stride", type=int, default=4)
     ap.add_argument("--fdf-dump", default="",
                     help="write every FlowDep-F observation (frame, id, u, v, level, eta, eta_sigma, "
                          "sigma_px, dir, residual, anchor) to this .npz")
@@ -928,12 +1012,13 @@ def main():
         vio = BackendAdapter(
             cfg, cam, f,
             num_clones=max(args.clone_window, 11), max_slam=args.msceqf_max_slam,
-            pixel_std_px=(args.sigma_pixel or 1.0),
+            pixel_std_px=(args.msceqf_pixel_std or args.sigma_pixel or 1.0),
             acc_d=_vn.get("acc", 3.28e-3), gyr_d=_vn.get("gyr", 3.94e-3),
             acc_rw=_vn.get("accBias", 4.462e-3), gyr_rw=_vn.get("gyrBias", 1.337e-4),
             direct_product_bias=args.msceqf_dp_bias, bias_std=args.msceqf_bias_std,
-            update_span=args.msceqf_update_span)
-        print(f"  MSCEqF chart: {'direct-product' if args.msceqf_dp_bias else 'semi-direct'} bias; max_slam={args.msceqf_max_slam}")
+            update_span=args.msceqf_update_span, chi2_mult=args.msceqf_chi2_mult)
+        print(f"  MSCEqF chart: {'direct-product' if args.msceqf_dp_bias else 'semi-direct'} bias; max_slam={args.msceqf_max_slam}; "
+              f"pixelStd={args.msceqf_pixel_std or args.sigma_pixel or 1.0} px; chi2Mult={args.msceqf_chi2_mult}")
         print("pose source: shipping backend (VIOFilter + MSCEqF: section, "
               f"CameraPoseCovariance seam); config {vio.config_path}; "
               f"seed |v0_world|={np.linalg.norm(v0_w):.2f} m/s; "
@@ -957,9 +1042,13 @@ def main():
             sys.exit("--reanchor-age needs --feed rust")
         vio.set_sparse_reanchor_age(args.reanchor_age)   # AFTER the seed: reseed resets the feed
         print(f"re-anchor age sweep: age >= {args.reanchor_age} frames")
-    if args.consider:
-        if args.feed != "rust":
-            sys.exit("--consider needs --feed rust")
+    if args.consider and args.feed != "rust":
+        # Known-pose arm only: the harness feeds the consider recursion the exact
+        # covariance of the injected random walk (see the clone loop).
+        if not (args.pose_source == "gt" and args.pose_perturb_qt > 0.0):
+            sys.exit("--consider needs --feed rust, or --pose-source gt with --pose-perturb-qt")
+        print("CONSIDER mode (known pose + injected walk): exact Sigma and M fed by the harness")
+    elif args.consider:
         vio.set_sparse_consider(True)
         vio.set_sparse_consider_m_mode({"vio": 0, "identity": 1, "zero": 2}[args.consider_m])
         vio.set_sparse_consider_sigma_mode({"full": 0, "iso-t": 1, "iso": 2, "trans": 3}[args.consider_sigma])
@@ -988,7 +1077,8 @@ def main():
         if _k not in SPARSE_KEYS:
             sys.exit(f"--sparse: unknown key {_k}")
         _cur = settings.get(_k, sparse_cfg.get(_k))
-        settings[_k] = (_v.lower() == "true") if isinstance(_cur, bool) else type(_cur)(_v) if isinstance(_cur, (int, float)) else float(_v)
+        settings[_k] = ((_v.lower() == "true") if isinstance(_cur, bool) else type(_cur)(_v) if isinstance(_cur, (int, float))
+                        else int(_v) if _k in ("iekf_iterations", "max_pool_size", "min_track_length") else float(_v))
         print(f"SparseVog override {_k} = {settings[_k]!r}")
     sparse = echo_li.Sparse3DFilter.bearing_invdepth_additive3d(cam, **settings)
     fdf = None
@@ -998,6 +1088,7 @@ def main():
     import functools
     ds.depth = functools.lru_cache(maxsize=2)(ds.depth)   # read each frame's depth PNG once (scorer + densify)
     dense_samples = {"corr": [], "noshared": []}; dense_cov = {"corr": [], "noshared": []}; dense_n = []
+    dd = {"k": [], "eta": [], "var": [], "cls": [], "gt": [], "T_est": [], "T_gt": [], "fid": [], "items": []}   # --dense-dump
     dz.SLANT_G[0] = np.tan(np.radians(args.slant_deg)) / f
     if args.track_source == "fdf":
         _fs = {k: float(v) for k, v in (cfg.get("FlowDepF", {}) or {}).items()}
@@ -1045,6 +1136,16 @@ def main():
     xblock_rows = []  # (lag, T_filter 16, T_gt 16, Sigma6x6 36) for --xblock-dump       # (age, 3dof NEES, |err| m, sigma m, NEES_along, NEES_perp)
     srr = []              # sigma_rho / rho -- delta-method validity at the operating point
     gt_anchor = {}        # fid -> GT world point of the BIRTH landmark (--gt-anchored)
+    exact_world = {}      # fid -> GT world point (NED) of a --track-source exact track, None if unborn
+    obs_rows = []         # --obs-dump: (frame, id) fed to Sparse3D
+    obs_pose = {}         # --obs-dump: frame -> GT T_wc (NED world, same frame as exact_world)
+    exact_rng = np.random.default_rng(args.exact_seed)
+    perturb_rng = np.random.default_rng(10_000 + args.exact_seed)
+    perturb_eps = np.zeros(3)
+    perturb = PosePerturb(args.pose_perturb_model, args.pose_perturb_qt, args.pose_perturb_tau,
+                          perturb_rng) if args.pose_perturb_qt > 0.0 else None
+    consider_prev_R = None
+    nis_rows = []; nis_last_tl = {}
     clone_pose = {}       # clone_id (= frame k) -> T_wc (4x4) anchor pose
     clone_rel_prev = {}   # clone_id -> (P_vv, P_ww) accumulated Cov_rel(k→t−1)
     if args.clone_relative:
@@ -1102,6 +1203,42 @@ def main():
                     n_epoch[0] += sparse.reset_bias(_changed, args.bias_epoch_var)
             for _kk, _vv in fdf.stats().items():
                 fdf_acc[_kk] = fdf_acc.get(_kk, 0.0) + _vv
+        elif args.track_source == "exact":
+            # Synthetic tracks: Rudolf-V decides which ids exist and for how long (same
+            # population and lifetimes as the KLT arm), but each pixel is the exact
+            # reprojection of the id's GT birth point through the GT pose, plus white
+            # Gaussian noise of known std. No drift, no wrong matches, no occlusion.
+            _Tg = ds.pose(k) @ ext
+            _Rg, _tg = _Tg[:3, :3], _Tg[:3, 3]
+            _dm = None
+            all_uvs = {}
+            for _fid, (_u, _v) in klt_uvs.items():
+                if _fid not in exact_world:
+                    if _dm is None:
+                        _dm = ds.depth(k)
+                    _gx, _gy = int(round(_u)), int(round(_v))
+                    exact_world[_fid] = None
+                    if R_MARGIN < _gx < W - R_MARGIN and R_MARGIN < _gy < H - R_MARGIN:
+                        _d = float(_dm[_gy, _gx])
+                        _w = _dm[_gy - 2:_gy + 3, _gx - 2:_gx + 3]
+                        # Born only on a single surface: the 5x5 GT range spread under 5 %.
+                        if 0.5 < _d < md.SKY and np.all(np.isfinite(_w)) and (_w.max() - _w.min()) < 0.05 * _d:
+                            _b = np.array([(_gx - cx) / f, (_gy - cy) / f, 1.0])
+                            exact_world[_fid] = _Rg @ (_d * _b / np.linalg.norm(_b)) + _tg
+                _X = exact_world[_fid]
+                if _X is None:
+                    continue
+                _q = _Rg.T @ (_X - _tg)
+                if _q[2] < 0.1:
+                    continue
+                _uu = f * _q[0] / _q[2] + cx + exact_rng.normal(0.0, args.exact_noise_px)
+                _vv = f * _q[1] / _q[2] + cy + exact_rng.normal(0.0, args.exact_noise_px)
+                if R_MARGIN < _uu < W - R_MARGIN and R_MARGIN < _vv < H - R_MARGIN:
+                    all_uvs[_fid] = (float(_uu), float(_vv))
+                    if args.obs_dump:
+                        obs_rows.append((k, _fid))
+            if args.obs_dump:
+                obs_pose[k] = _Tg.copy()
         else:
             all_uvs = klt_uvs
 
@@ -1154,6 +1291,10 @@ def main():
         if args.pose_source == "gt":
             T_wc = T_nwu4 @ ds.pose(k) @ ext
             pvv_arg = pww_arg = None
+            if args.pose_perturb_qt > 0.0:
+                perturb_eps = perturb.step(k)
+                T_wc = T_wc.copy()
+                T_wc[:3, 3] += perturb_eps
 
         # --- Clone-relative pose covariance ---
         # Clone THIS frame's pose (= anchor for any landmark born now), roll the
@@ -1218,8 +1359,14 @@ def main():
                         if not args.reanchor_cov:
                             _cov = None
                         _dbg_reanchor[0 if _cov is None else 1] += 1
+                        _full = None
+                        if args.consider and perturb is not None:
+                            # Consider transfer (eq. 17): the exact old->new relative covariance.
+                            _full = np.zeros((6, 6))
+                            _full[3:, 3:] = perturb.var_rel(_old, _new) * np.eye(3)
+                            _full = _full.tolist()
                         n_reanchored[0] += sparse.reanchor_clone(
-                            _old, clone_pose[_new].tolist(), _new, _cov)
+                            _old, clone_pose[_new].tolist(), _new, _cov, _full)
 
                 vio.clone_pose(int(k), stamp)
                 clone_pose[int(k)] = T_wc.copy()
@@ -1232,6 +1379,7 @@ def main():
                         clone_pose.pop(cid, None)
                         clone_rel_prev.pop(cid, None)
                 rel_cov_arg = {}
+                consider_map = {}
                 for cid in vio.clone_ids():
                     cid = int(cid)
                     Tc = clone_pose.get(cid)
@@ -1241,6 +1389,30 @@ def main():
                         # Known-pose arm: clones and re-anchoring as on the filter arm, but
                         # NO relative covariance (the bystander EqVIO's would be injected
                         # into the range channel otherwise: reported sigma_r 9 m on Kite).
+                        # With --pose-perturb-qt: the exact covariance of the injected walk.
+                        # Isotropic, so its world-frame and camera-frame forms coincide.
+                        if args.pose_perturb_qt <= 0.0:
+                            continue
+                        pvv_rel = perturb.var_rel(cid, k) * np.eye(3)
+                        pww_rel = np.zeros((3, 3))
+                        prev = clone_rel_prev.get(cid)
+                        dv = np.zeros((3, 3)) if prev is None else psd_clip(pvv_rel - prev[0])
+                        clone_rel_prev[cid] = (pvv_rel, pww_rel)
+                        rel_cov_arg[cid] = (pvv_rel.tolist(), pww_rel.tolist(), dv.tolist(),
+                                            np.zeros((3, 3)).tolist())
+                        if args.consider:
+                            # theta_t (current camera frame) = -R_cw,k (eps_k - eps_a), so
+                            # Sigma_t = var_rel(a, k) I and Cov(theta_k, theta_{k-1}) =
+                            # cov_rel(a, k, k-1) R_cw,k R_wc,k-1: M = m R_cw,k R_wc,k-1 with
+                            # m = cov_rel / var_rel(a, k-1) (1 for the random walk; zero when the
+                            # anchor is the previous frame, where no cross term exists yet).
+                            S6 = np.zeros((6, 6)); S6[3:, 3:] = pvv_rel
+                            M6 = np.zeros((6, 6))
+                            if k - 1 - cid > 0 and consider_prev_R is not None:
+                                Rk = T_wc[:3, :3].T @ consider_prev_R
+                                m = perturb.cov_rel(cid, k, k - 1) / perturb.var_rel(cid, k - 1)
+                                M6[:3, :3] = Rk; M6[3:, 3:] = m * Rk
+                            consider_map[cid] = (S6.tolist(), M6.tolist())
                         continue
                     rc = vio.get_relative_pose_covariance(cid, np.ascontiguousarray(Tc))
                     if rc is None:
@@ -1352,6 +1524,10 @@ def main():
                     rel_cov_arg[cid] = (pvv_rel.tolist(), pww_rel.tolist(),
                                         dv.tolist(), dw.tolist())
                 clone_id_arg = int(k)
+                if args.consider:
+                    consider_map[int(k)] = (np.zeros((6, 6)).tolist(), np.zeros((6, 6)).tolist())
+                    sparse.set_consider_relpose(consider_map)
+                    consider_prev_R = T_wc[:3, :3].copy()
 
             if os.environ.get("DBG_COV") and n_frames % 40 == 0:
                 tv = np.trace(np.asarray(pvv_arg)) if pvv_arg is not None else float("nan")
@@ -1363,6 +1539,21 @@ def main():
                       f"n_rel={nrel} tr(rel_vv[0])={rv:.3e}", file=sys.stderr)
             sparse.update(stamp, all_uvs, T_wc.tolist(), pvv_arg, pww_arg,
                           clone_id_arg, rel_cov_arg)
+        if args.nis_dump:
+            # Every landmark updated this frame (track length grew): its prior-innovation NIS,
+            # converged or not. Uncensored only with the reset gate off.
+            for _fid, _fd in sparse.get_features().items():
+                _tl = int(_fd["track_length"])
+                if _tl <= nis_last_tl.get(_fid, 0):
+                    continue
+                nis_last_tl[_fid] = _tl
+                _Ta = clone_pose.get(int(_fd.get("anchor_clone_id", -1) or -1))
+                _br = np.nan
+                if _Ta is not None:
+                    _rr = float(np.linalg.norm(_fd["position"]))   # current-camera-frame point
+                    if np.isfinite(_rr) and _rr > 0:
+                        _br = float(np.linalg.norm(_Ta[:3, 3] - T_wc[:3, 3]) / _rr)
+                nis_rows.append((k, _fid, _tl, float(_fd["nis"]), _br))
         if fdf is not None and args.fdf_posterior:
             # Flat per-feature summary (one binding call): every feature's range posterior.
             _ids, _r, _vc, _vr, _cvg, _tl = sparse.range_summary()
@@ -1372,12 +1563,13 @@ def main():
                 fdf.set_posterior(_post)
             if args.densify and k >= args.score_from_frame:
                 _lev = {o[0]: o[3] for o in fdf.last_observations()}
-                _items = []
+                _items = []; _ifid = []
                 for _fid, _rr, _vc1, _vr1, _cv1 in zip(_ids, _r, _vc, _vr, _cvg):
                     _fid = int(_fid)
                     if not _cv1 or _vc1 <= 0 or _fid not in all_uvs:
                         continue
                     _items.append((all_uvs[_fid][0], all_uvs[_fid][1], _lev.get(_fid, 0), float(np.log(_rr)), float(_vc1), float(np.sqrt(max(_vr1 - _vc1, 0.0)))))
+                    _ifid.append(_fid)
                 dense_n.append(len(_items))
                 if _items:
                     _gt = ds.depth(k)
@@ -1389,6 +1581,26 @@ def main():
                     _spread = np.where(_vg & np.isfinite(_mn) & np.isfinite(_mx), (_mx - _mn) / np.maximum(_g, 1e-6), 9.0)
                     _sl = slice(None, None, 2)
                     _fused = dz.fuse(_items, H, W)
+                    if args.dense_dump:
+                        _e0, _v0, _c0 = _fused["nearest_disagree_slant_noshared"]
+                        _ef, _vf, _fl, _gtd = dz.fill(_e0, _v0, _c0)
+                        _cls = np.where(_c0, 1, np.where(_fl, 2, 0)).astype(np.uint8)
+                        # nearest patch per pixel: its own for measured, the nearest measured pixel's for filled
+                        _ni = _fused["_nearest"]
+                        _ei = ndimage.distance_transform_edt(~_c0, return_distances=False, return_indices=True)
+                        _ni = _ni[_ei[0], _ei[1]]
+                        _nf = np.where(_ni >= 0, np.asarray(_ifid, np.int64)[np.maximum(_ni, 0)], -1)
+                        _nf = np.where(_cls > 0, _nf, -1)
+                        _ss = slice(None, None, args.dense_dump_stride)
+                        dd["fid"].append(_nf[_ss, _ss].astype(np.int64))
+                        dd["items"].append(np.array([(k, _f, _it[3], _it[4], _it[5]) for _f, _it in zip(_ifid, _items)], float))
+                        dd["k"].append(k)
+                        dd["eta"].append(np.where(_c0, _e0, np.where(_fl, _ef, np.nan))[_ss, _ss].astype(np.float32))
+                        dd["var"].append(np.where(_c0, _v0, np.where(_fl, _vf, np.nan))[_ss, _ss].astype(np.float32))
+                        dd["cls"].append(_cls[_ss, _ss])
+                        dd["gt"].append(np.where(_vg, _gt, np.where(_gt >= md.SKY, np.inf, np.nan))[_ss, _ss].astype(np.float32))
+                        dd["T_est"].append(np.asarray(T_wc, float).copy())
+                        dd["T_gt"].append(T_nwu4 @ ds.pose(k) @ ext)
                     for _name, _key in (("corr", "nearest_disagree_slant"), ("noshared", "nearest_disagree_slant_noshared")):
                         _eta, _var, _covm = _fused[_key]
                         _m = (_covm & _vg)[_sl, _sl]
@@ -1475,6 +1687,14 @@ def main():
             if not (R_MARGIN < gx < W - R_MARGIN and R_MARGIN < gy < H - R_MARGIN):
                 continue
             gt_range = float(depth_map[gy, gx])
+            if args.track_source == "exact":
+                # The exact track's own world point is the truth, not the depth map under
+                # its noisy pixel.
+                _Xe = exact_world.get(int(fid))
+                if _Xe is None:
+                    continue
+                _Te = ds.pose(k) @ ext
+                gt_range = float(np.linalg.norm(_Te[:3, :3].T @ (_Xe - _Te[:3, 3])))
             if not (0.5 < gt_range < md.SKY):
                 continue
             # GT ambiguity at the scored pixel: relative spread of GT range over the 5x5
@@ -1543,14 +1763,19 @@ def main():
                         nees_rho = (_rho_e - rho_gt) ** 2 / _vrho
 
             nees_r = (re - gt_range) ** 2 / var_r
+            # Baseline / range anchor -> now, from the harness's pose book (clone poses).
+            _Ta = clone_pose.get(int(fd.get("anchor_clone_id", -1)))
+            br = float(np.linalg.norm(_Ta[:3, 3] - T_wc[:3, 3]) / re) if _Ta is not None else np.nan
             if args.nees_space == "invdepth":
                 if not np.isfinite(nees_rho):
                     continue
                 rows.append((k, tl, _rho_e - rho_gt, rho_gt, nees_rho,
-                             np.sqrt(_vrho), _rho_e, nees_r, gt_spread, int(fid)))
+                             np.sqrt(_vrho), _rho_e, nees_r, gt_spread, int(fid), br,
+                             int(fd.get("anchor_clone_id", -1))))
             else:
                 rows.append((k, tl, re - gt_range, gt_range, nees_r,
-                             np.sqrt(var_r), re, nees_rho, gt_spread, int(fid)))
+                             np.sqrt(var_r), re, nees_rho, gt_spread, int(fid), br,
+                             int(fd.get("anchor_clone_id", -1))))
 
         n_frames += 1
         if not args.no_progress and n_frames % 100 == 0:
@@ -1566,7 +1791,7 @@ def main():
         _n0 = len(rows)
         rows = [r for r in rows if r[0] >= args.score_from_frame]
         print(f"  score-from-frame {args.score_from_frame}: kept {len(rows)} of {_n0} obs")
-    A = np.array(rows, float) if rows else np.empty((0, 10))
+    A = np.array(rows, float) if rows else np.empty((0, 12))
     if len(A) == 0:
         print("No scored observations!")
         return
@@ -1580,6 +1805,12 @@ def main():
                                                          "sigma_px", "dir_x", "dir_y", "residual",
                                                          "anchor_u", "anchor_v", "anchor_frame"]))
         print(f"FlowDep-F observations written: {args.fdf_dump} ({len(_D)} rows)")
+    if args.dense_dump and dd["k"]:
+        dd["items"] = np.concatenate(dd["items"])     # (frame, fid, eta, var_cond, sigma_shared) of every fused patch
+        np.savez_compressed(args.dense_dump, **{_k: np.array(_v) for _k, _v in dd.items()},
+                            stride=args.dense_dump_stride, f=f, cx=cx, cy=cy, W=W, H=H,
+                            scale_sigma=float(settings.get("scale_sigma", 0.0)))
+        print(f"dense frames written: {args.dense_dump} ({len(dd['k'])} frames)")
     if args.densify and dense_samples["corr"]:
         print(f"\nDENSIFIED FRAME (rule nearest+disagreement+footprint {args.slant_deg:.0f} deg; every 2nd pixel vs GT, frames >= {args.score_from_frame}); converged patches per frame median {np.median(dense_n):.0f}")
         for _name, _lab in (("corr", "shared scale term fully correlated (eq. 35)"), ("noshared", "shared term DROPPED")):
@@ -1724,6 +1955,21 @@ def main():
     if args.xblock_dump is not None and xblock_rows:
         np.savez(args.xblock_dump, rows=np.array(xblock_rows, dtype=float))
         print(f"\nxblock dump: {len(xblock_rows)} (anchor, frame) pairs -> {args.xblock_dump}")
+    if args.nis_dump:
+        np.savez_compressed(args.nis_dump, rows=np.array(nis_rows, float).reshape(-1, 5),
+                            cols=np.array(["k", "fid", "tl", "nis", "br"]))
+        print(f"nis dump: {len(nis_rows)} updates -> {args.nis_dump}")
+    if args.obs_dump:
+        _ids = np.array([i for i, X in exact_world.items() if X is not None], np.int64)
+        _ks = np.array(sorted(obs_pose), np.int64)
+        np.savez_compressed(args.obs_dump, obs=np.array(obs_rows, np.int64), world_id=_ids,
+                            world=np.array([exact_world[i] for i in _ids], float).reshape(-1, 3),
+                            pose_k=_ks, pose=np.array([obs_pose[i] for i in _ks], float).reshape(-1, 4, 4),
+                            f=f, cx=cx, cy=cy, noise_px=args.exact_noise_px, qt=args.pose_perturb_qt,
+                            model=args.pose_perturb_model, tau=args.pose_perturb_tau,
+                            perturb_k=np.array(sorted(perturb.P), np.int64) if perturb else np.zeros(0, np.int64),
+                            perturb_P=np.array([perturb.P[i] for i in sorted(perturb.P)]) if perturb else np.zeros((0, 2, 2)))
+        print(f"obs dump: {len(obs_rows)} observations, {len(_ids)} points -> {args.obs_dump}")
     if args.save_npz:
         provenance = {
             "config_file": str(Path(args.config).resolve()),
@@ -1734,7 +1980,7 @@ def main():
         }
         np.savez(args.save_npz,
                  cols=np.array(["k", "tl", "derr", "rng", "nees", "sig", "r_est",
-                                "nees_alt", "gt_spread", "fid"]),
+                                "nees_alt", "gt_spread", "fid", "br", "anc"]),
                  data=A,
                  provenance=json.dumps(provenance))
         print(f"\nSaved → {args.save_npz}")
