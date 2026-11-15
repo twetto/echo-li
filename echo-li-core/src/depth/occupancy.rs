@@ -19,6 +19,13 @@ pub enum OccupancyUpdateMode {
     /// σ: a measurement is spread over the cells its uncertainty actually covers,
     /// so a far/noisy return updates many cells weakly instead of one strongly.
     UncertaintyAware,
+    /// **v2** — one-sided bound. The return's uncertainty widens nothing: the
+    /// endpoint cell gets the full `log_odds_hit`, and free space is carved only
+    /// up to `range − band_k·σ_m`, the lower confidence bound on the obstacle
+    /// distance. Cells between that bound and the endpoint are left untouched,
+    /// so a return that is too far by up to `band_k·σ_m` never carves a real
+    /// surface free, and the map never asserts an obstacle it did not see.
+    OneSided,
 }
 
 #[derive(Debug, Clone)]
@@ -111,6 +118,10 @@ pub struct OccupancyGridSnapshot {
     pub origin_y: f64,
     pub origin_z: f64,
     pub log_odds: Vec<f32>,
+    /// Per-cell surface-position uncertainty (m): the tightest σ_m of any ray whose
+    /// `range ± band_k·σ_m` band covered the cell; `+inf` where no band ever reached. Written
+    /// by every `Measured` ray regardless of `update_mode`; the occupancy never reads it.
+    pub sigma: Vec<f32>,
 }
 
 /// Ego-centric, scrolling **3D** log-odds occupancy grid fed by dense
@@ -127,6 +138,9 @@ pub struct LocalOccupancyMap {
     center_iy: i64,
     center_iz: i64,
     log_odds: Vec<f32>,
+    /// The σ channel (see `OccupancyGridSnapshot::sigma`): the picture is the log-odds, the
+    /// margin a planner takes is this, so the uncertainty never reshapes the map.
+    sigma: Vec<f32>,
 }
 
 impl LocalOccupancyMap {
@@ -171,6 +185,7 @@ impl LocalOccupancyMap {
             center_iy: 0,
             center_iz: 0,
             log_odds: vec![0.0; n],
+            sigma: vec![f32::INFINITY; n],
         })
     }
 
@@ -193,6 +208,7 @@ impl LocalOccupancyMap {
             origin_y: self.origin_y,
             origin_z: self.origin_z,
             log_odds: self.log_odds.clone(),
+            sigma: self.sigma.clone(),
         }
     }
 
@@ -301,6 +317,9 @@ impl LocalOccupancyMap {
                     OccupancyUpdateMode::UncertaintyAware => {
                         self.integrate_ray_sigma(cam_origin, endpoint, rel_std, &mut stats);
                     }
+                    OccupancyUpdateMode::OneSided => {
+                        self.integrate_ray_one_sided(cam_origin, endpoint, rel_std, &mut stats);
+                    }
                 }
             }
         }
@@ -358,6 +377,9 @@ impl LocalOccupancyMap {
                 let p_w_h = t_wc * Vector4::new(p_c[0], p_c[1], p_c[2], 1.0);
                 let endpoint = Vector3::new(p_w_h[0], p_w_h[1], p_w_h[2]);
                 stats.rays_integrated += 1;
+                if class == DenseClass::Measured {
+                    self.write_sigma_band(cam_origin, endpoint, rel_std);
+                }
                 match class {
                     DenseClass::Measured => match self.settings.update_mode {
                         OccupancyUpdateMode::FixedIncrement => {
@@ -365,6 +387,9 @@ impl LocalOccupancyMap {
                         }
                         OccupancyUpdateMode::UncertaintyAware => {
                             self.integrate_ray_sigma(cam_origin, endpoint, rel_std, &mut stats);
+                        }
+                        OccupancyUpdateMode::OneSided => {
+                            self.integrate_ray_one_sided(cam_origin, endpoint, rel_std, &mut stats);
                         }
                     },
                     DenseClass::Filled => {
@@ -388,6 +413,79 @@ impl LocalOccupancyMap {
             }
         }
         stats
+    }
+
+    /// The σ channel: walk the cells of `range ± band_k·σ_m` along the ray and keep, per cell,
+    /// the tightest σ_m that could have ended there. Independent of the occupancy rule.
+    fn write_sigma_band(&mut self, origin: Vector3<f64>, endpoint: Vector3<f64>, rel_std: f64) {
+        let res = self.settings.resolution;
+        let diff = endpoint - origin;
+        let range = diff.norm();
+        if range <= 0.0 {
+            return;
+        }
+        let unit = diff / range;
+        let sigma_floor = res * self.settings.sigma_floor_factor;
+        let sigma_m = (range * rel_std).max(sigma_floor);
+        let half_band = self.settings.band_k * sigma_m;
+        let d0 = (range - half_band).max(0.0);
+        let d1 = range + half_band;
+        // step at half a cell so no cell on the segment is skipped
+        let n = ((d1 - d0) / (0.5 * res)).ceil().max(1.0) as usize;
+        let s = sigma_m as f32;
+        let mut last = [i64::MIN; 3];
+        for i in 0..=n {
+            let d = d0 + (d1 - d0) * (i as f64) / (n as f64);
+            let p = origin + unit * d;
+            let c = [
+                ((p.x - self.origin_x) / res).floor() as i64,
+                ((p.y - self.origin_y) / res).floor() as i64,
+                ((p.z - self.origin_z) / res).floor() as i64,
+            ];
+            if c == last {
+                continue;
+            }
+            last = c;
+            if self.cell_in_bounds(c[0], c[1], c[2]) {
+                let idx = self.index(c[0] as usize, c[1] as usize, c[2] as usize);
+                if s < self.sigma[idx] {
+                    self.sigma[idx] = s;
+                }
+            }
+        }
+    }
+
+    /// v2: carve free up to the one-sided lower bound `range − band_k·σ_m` (full weight),
+    /// leave the band itself untouched, and give the endpoint cell the full `log_odds_hit`.
+    fn integrate_ray_one_sided(
+        &mut self,
+        origin: Vector3<f64>,
+        endpoint: Vector3<f64>,
+        rel_std: f64,
+        stats: &mut OccupancyUpdateStats,
+    ) {
+        let res = self.settings.resolution;
+        let diff = endpoint - origin;
+        let range = diff.norm();
+        if range <= 0.0 {
+            return;
+        }
+        let unit = diff / range;
+        let sigma_floor = res * self.settings.sigma_floor_factor;
+        let sigma_m = (range * rel_std).max(sigma_floor);
+        let free_len = range - self.settings.band_k * sigma_m;
+        if free_len > 0.0 {
+            self.carve_free(origin, origin + unit * free_len, 1.0, stats);
+        }
+        let hit = [
+            ((endpoint.x - self.origin_x) / res).floor() as i64,
+            ((endpoint.y - self.origin_y) / res).floor() as i64,
+            ((endpoint.z - self.origin_z) / res).floor() as i64,
+        ];
+        if self.cell_in_bounds(hit[0], hit[1], hit[2]) {
+            self.add_log_odds(hit[0], hit[1], hit[2], self.settings.log_odds_hit);
+            stats.occupied_updates += 1;
+        }
     }
 
     /// Free-space-only traversal from `origin` to `endpoint` (both inclusive of the cells
@@ -476,6 +574,7 @@ impl LocalOccupancyMap {
         let h = self.settings.height_cells;
         let d = self.depth_cells;
         let mut shifted = vec![0.0; self.log_odds.len()];
+        let mut shifted_sigma = vec![f32::INFINITY; self.sigma.len()];
         for z in 0..d {
             for y in 0..h {
                 for x in 0..w {
@@ -489,13 +588,15 @@ impl LocalOccupancyMap {
                         && src_z >= 0
                         && src_z < d as i64
                     {
-                        shifted[self.index(x, y, z)] = self.log_odds
-                            [self.index(src_x as usize, src_y as usize, src_z as usize)];
+                        let src = self.index(src_x as usize, src_y as usize, src_z as usize);
+                        shifted[self.index(x, y, z)] = self.log_odds[src];
+                        shifted_sigma[self.index(x, y, z)] = self.sigma[src];
                     }
                 }
             }
         }
         self.log_odds = shifted;
+        self.sigma = shifted_sigma;
         self.center_ix = new_center_ix;
         self.center_iy = new_center_iy;
         self.center_iz = new_center_iz;

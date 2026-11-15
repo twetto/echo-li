@@ -812,6 +812,7 @@ impl LocalOccupancyConfig {
             settings.update_mode = match v.as_str() {
                 "fixed" | "fixed_increment" | "v0" => OccupancyUpdateMode::FixedIncrement,
                 "uncertainty_aware" | "sigma" | "v1" => OccupancyUpdateMode::UncertaintyAware,
+                "one_sided" | "v2" => OccupancyUpdateMode::OneSided,
                 other => {
                     log::warn!(
                         "LocalOccupancy.update_mode {other:?} unrecognised; using fixed_increment (v0)"

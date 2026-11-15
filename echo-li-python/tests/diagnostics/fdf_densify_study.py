@@ -58,7 +58,8 @@ def fuse(items, H, W):
     S_a = np.zeros((H, W)); S_ae = np.zeros((H, W)); S_a2v = np.zeros((H, W)); S_ae2 = np.zeros((H, W)); S_as = np.zeros((H, W))
     S_w = np.zeros((H, W)); S_we = np.zeros((H, W)); min_v = np.full((H, W), np.inf)
     best_d2 = np.full((H, W), np.inf); n_eta = np.zeros((H, W)); n_var = np.zeros((H, W)); n_s = np.zeros((H, W))
-    for px, py, level, eta, vc, ss in items:
+    n_idx = np.full((H, W), -1, np.int64)
+    for j, (px, py, level, eta, vc, ss) in enumerate(items):
         half = 4 * (2 ** level)
         x0, x1 = max(0, int(round(px)) - half), min(W, int(round(px)) + half + 1)
         y0, y1 = max(0, int(round(py)) - half), min(H, int(round(py)) + half + 1)
@@ -76,6 +77,7 @@ def fuse(items, H, W):
         better = d2 < best_d2[y0:y1, x0:x1]
         sub = best_d2[y0:y1, x0:x1]; sub[better] = d2[better]
         n_eta[y0:y1, x0:x1][better] = eta; n_var[y0:y1, x0:x1][better] = vc; n_s[y0:y1, x0:x1][better] = ss
+        n_idx[y0:y1, x0:x1][better] = j
     covered = S_a > 1e-9
     Sa = np.maximum(S_a, 1e-12); Sw = np.maximum(S_w, 1e-12)
     t_mean = S_ae / Sa
@@ -98,6 +100,7 @@ def fuse(items, H, W):
         "nearest_disagree": (n_eta, n_var + n_s * n_s + disagree, covered),
     }
     out["_dist"] = d_near
+    out["_nearest"] = n_idx       # index into items of the patch each pixel took its eta from (-1 = none)
     return out
 
 

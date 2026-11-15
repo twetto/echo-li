@@ -216,6 +216,160 @@ impl PyLocalOccupancyMap {
         PyArray3::from_owned_array(py, arr)
     }
 
+    /// The σ channel as (depth, height, width) float32 metres; `inf` where no ray's band reached.
+    fn sigma_grid<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray3<f32>> {
+        let snap = self.inner.snapshot();
+        let arr = Array3::from_shape_vec((snap.depth, snap.height, snap.width), snap.sigma)
+            .expect("occupancy grid shape is valid");
+        PyArray3::from_owned_array(py, arr)
+    }
+
+    /// `LocalOccupancyMap.from_settings({...})`: a map from a dict of
+    /// `LocalOccupancySettings` fields (resolution, width_cells, height_cells, sample_stride,
+    /// min_range, max_range, max_eta_std, log_odds_hit, log_odds_miss, log_odds_min,
+    /// log_odds_max, occupied_threshold, free_threshold, update_mode "fixed"|"sigma", band_k,
+    /// sigma_floor_factor, min_confidence_weight, min_obstacle_height, max_obstacle_height).
+    /// For `update_dense` only; `update` needs the camera the other constructor takes.
+    #[staticmethod]
+    fn from_settings(settings: &Bound<'_, pyo3::types::PyDict>) -> PyResult<Self> {
+        use echo_li_core::depth::occupancy::OccupancyUpdateMode;
+        let mut st = LocalOccupancySettings::default();
+        for (k, v) in settings.iter() {
+            let key: String = k.extract()?;
+            match key.as_str() {
+                "enabled" => st.enabled = v.extract()?,
+                "resolution" => st.resolution = v.extract()?,
+                "width_cells" => st.width_cells = v.extract()?,
+                "height_cells" => st.height_cells = v.extract()?,
+                "sample_stride" => st.sample_stride = v.extract()?,
+                "min_range" => st.min_range = v.extract()?,
+                "max_range" => st.max_range = v.extract()?,
+                "max_eta_std" => st.max_eta_std = v.extract()?,
+                "log_odds_hit" => st.log_odds_hit = v.extract()?,
+                "log_odds_miss" => st.log_odds_miss = v.extract()?,
+                "log_odds_min" => st.log_odds_min = v.extract()?,
+                "log_odds_max" => st.log_odds_max = v.extract()?,
+                "occupied_threshold" => st.occupied_threshold = v.extract()?,
+                "free_threshold" => st.free_threshold = v.extract()?,
+                "band_k" => st.band_k = v.extract()?,
+                "sigma_floor_factor" => st.sigma_floor_factor = v.extract()?,
+                "min_confidence_weight" => st.min_confidence_weight = v.extract()?,
+                "min_obstacle_height" => st.min_obstacle_height = v.extract()?,
+                "max_obstacle_height" => st.max_obstacle_height = v.extract()?,
+                "update_mode" => {
+                    let m: String = v.extract()?;
+                    st.update_mode = match m.as_str() {
+                        "sigma" | "uncertainty_aware" | "v1" => {
+                            OccupancyUpdateMode::UncertaintyAware
+                        }
+                        "one_sided" | "v2" => OccupancyUpdateMode::OneSided,
+                        _ => OccupancyUpdateMode::FixedIncrement,
+                    };
+                }
+                other => {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "unknown LocalOccupancy setting {other:?}"
+                    )))
+                }
+            }
+        }
+        let inner = LocalOccupancyMap::new(st).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "Failed to create LocalOccupancyMap: {e}"
+            ))
+        })?;
+        let cam: std::sync::Arc<dyn echo_li_core::mathematical::camera::CameraModel> =
+            std::sync::Arc::new(echo_li_core::mathematical::camera::PinholeModel {
+                fx: 1.0,
+                fy: 1.0,
+                cx: 0.0,
+                cy: 0.0,
+            });
+        Ok(Self {
+            inner,
+            camera: cam,
+            intrinsics: CameraIntrinsics {
+                fx: 1.0,
+                fy: 1.0,
+                cx: 0.0,
+                cy: 0.0,
+            },
+            seed_coordinates: PatchDepthSeedCoordinates::UndistortedPinhole,
+            image_width: 0,
+            image_height: 0,
+        })
+    }
+
+    /// Integrate a dense frame from `DenseDepthMapper` (pinhole frame with intrinsics
+    /// `fx, fy, cx, cy` at the frame's own resolution; `cls` 0 unknown / 1 measured / 2 filled).
+    /// Measured pixels integrate as returns; Filled pixels only carve free space.
+    #[allow(clippy::too_many_arguments)]
+    fn update_dense<'py>(
+        &mut self,
+        py: Python<'py>,
+        eta: PyReadonlyArray2<'py, f32>,
+        eta_var: PyReadonlyArray2<'py, f32>,
+        cls: PyReadonlyArray2<'py, u8>,
+        fx: f64,
+        fy: f64,
+        cx: f64,
+        cy: f64,
+        t_wc: [[f64; 4]; 4],
+    ) -> PyResult<PyObject> {
+        use echo_li_core::depth::dense_mapper::{DenseClass, DenseOutput, DenseStats};
+        let [h, w] = *eta.shape() else {
+            return Err(pyo3::exceptions::PyValueError::new_err("eta must be 2-D"));
+        };
+        if eta_var.shape() != [h, w] || cls.shape() != [h, w] {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "eta, eta_var and cls must share a shape",
+            ));
+        }
+        let class: Vec<DenseClass> = cls
+            .as_slice()?
+            .iter()
+            .map(|&c| match c {
+                1 => DenseClass::Measured,
+                2 => DenseClass::Filled,
+                _ => DenseClass::Unknown,
+            })
+            .collect();
+        let out = DenseOutput {
+            width: w,
+            height: h,
+            eta: eta.as_slice()?.to_vec(),
+            eta_var: eta_var.as_slice()?.to_vec(),
+            class,
+            stats: DenseStats::default(),
+        };
+        let pose = array_to_matrix4(&t_wc);
+        let stats = self
+            .inner
+            .update_from_dense(&out, CameraIntrinsics { fx, fy, cx, cy }, &pose);
+        let dict = pyo3::types::PyDict::new(py);
+        dict.set_item("rays_considered", stats.rays_considered)?;
+        dict.set_item("rays_integrated", stats.rays_integrated)?;
+        dict.set_item("occupied_updates", stats.occupied_updates)?;
+        dict.set_item("free_updates", stats.free_updates)?;
+        Ok(dict.into_any().unbind())
+    }
+
+    /// `(origin_x, origin_y, origin_z, resolution, width, height, depth)` of the grid as it
+    /// stands (the map recentres on the camera; cell `(z, y, x)` of `log_odds_grid()` has its
+    /// centre at `origin + (idx + 0.5) * resolution`).
+    fn grid_info(&self) -> (f64, f64, f64, f64, usize, usize, usize) {
+        let snap = self.inner.snapshot();
+        (
+            snap.origin_x,
+            snap.origin_y,
+            snap.origin_z,
+            snap.resolution,
+            snap.width,
+            snap.height,
+            snap.depth,
+        )
+    }
+
     fn __repr__(&self) -> String {
         let (u, f, o) = self.inner.counts();
         format!(
