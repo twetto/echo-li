@@ -167,16 +167,6 @@ FlowDepDense:
   fill_max_d: 48.0
   exclude_corners: true
 
-DISDepth:
-  # DIS optical flow preset: ultrafast / fast / medium.
-  preset: medium
-  # Assumed flow noise in pixels — drives depth uncertainty.
-  sigma_flow_px: 1.0
-  # Minimum sin²(parallax angle) for triangulation.
-  min_parallax_sin2: 1.0e-5
-  # Number of keyframes to keep for baseline selection.
-  max_keyframes: 5
-
 LocalOccupancy:
   enabled: true
   resolution: 0.10

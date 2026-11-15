@@ -72,7 +72,10 @@ eqf:
     useDiscreteVelocityLift: false
     useEquivariantOutput: true
     useFeaturePredictions: true
-    useMedianDepth: true
+    # Fixed-depth seeding (initialValue.sceneDepth). The median seed doubled the ATE on VOXL
+    # bags (0914_152018 0.090 -> 0.19 m, 0929_151853 0.25 -> 0.55 m); this key was inert before
+    # 2026-09-24, so every earlier VOXL result ran without it.
+    useMedianDepth: false
     riccatiVariant: faster
     imuBiasGroup: additive
   velocityNoise:
@@ -132,16 +135,6 @@ PatchDepth:
   min_structure_eigen: 0.0
   vis_min_depth: 0.2
   vis_max_depth: 8.0
-
-DISDepth:
-  # DIS optical flow preset: ultrafast / fast / medium.
-  preset: medium
-  # Assumed flow noise in pixels — drives depth uncertainty.
-  sigma_flow_px: 1.0
-  # Minimum sin²(parallax angle) for triangulation.
-  min_parallax_sin2: 1.0e-5
-  # Number of keyframes to keep for baseline selection.
-  max_keyframes: 5
 
 LocalOccupancy:
   enabled: true
