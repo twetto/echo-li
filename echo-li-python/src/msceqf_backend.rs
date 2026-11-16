@@ -63,7 +63,8 @@ impl PyMsceqfBackend {
         num_clones=11, pixel_std=1.0, chi2_mult=1.0, slam_chi2_mult=0.0,
         max_track=200, slam_min_len=0, max_slam=0, curvature=true, update_span=0,
         max_promote_range=0.0, direct_product_bias=false,
-        clone_at_frame_stamp=false, civera_birth_depth=0.0, civera_birth_rel_std=1.0
+        clone_at_frame_stamp=false, civera_birth_depth=0.0, civera_birth_rel_std=1.0,
+        civera_init_only=false, civera_init_max_disparity=2.0
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -97,6 +98,8 @@ impl PyMsceqfBackend {
         clone_at_frame_stamp: bool,
         civera_birth_depth: f64,
         civera_birth_rel_std: f64,
+        civera_init_only: bool,
+        civera_init_max_disparity: f64,
     ) -> PyResult<Self> {
         let t0 = SE23::new(SO3::from_matrix(&mat3(r0)), vec3(&p0), vec3(&v0));
         let origin = SystemOrigin::new(t0, vec6(&b0), SE3::from_matrix(&mat4(s0)), vec3(&g));
@@ -136,6 +139,8 @@ impl PyMsceqfBackend {
             direct_product_bias,
             civera_birth_depth,
             civera_birth_rel_std,
+            civera_init_only,
+            civera_init_max_disparity,
         };
         let mut inner = MsceqfBackend::new(filter, cam, settings);
         inner.set_clone_at_frame_stamp(clone_at_frame_stamp);
