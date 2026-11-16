@@ -15,3 +15,4 @@ echo-lie.workspace = true
 rudolf-v = { workspace = true, features = ["parallel"] }
 camera-geometry.workspace = true
 nalgebra.workspace = true
+rayon.workspace = true

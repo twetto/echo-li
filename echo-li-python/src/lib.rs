@@ -1,6 +1,7 @@
 use pyo3::prelude::*;
 
 mod camera;
+mod checkerboard;
 mod dense;
 mod frontend;
 mod msceqf_backend;
@@ -28,6 +29,7 @@ fn _echo_li(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<occupancy::PyLocalOccupancyMap>()?;
     m.add_class::<stereo::PyStereo>()?;
     m.add_class::<dense::PyDenseDepthMapper>()?;
+    m.add_class::<checkerboard::PyCheckerboardDetector>()?;
     m.add_function(pyo3::wrap_pyfunction!(static_initialize, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(dense::dense_fuse, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(dense::dense_fill, m)?)?;

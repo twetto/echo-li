@@ -477,13 +477,8 @@ impl MSCEqFFilter {
         // down by CLONE_DOF to make room for the clone block at [ins, ins+6).
         let remap = |r: usize| if r < ins { r } else { r + CLONE_DOF };
 
-        let mut cov = DMatrix::<f64>::zeros(new, new);
-        for r in 0..old {
-            let nr = remap(r);
-            for c in 0..old {
-                cov[(nr, remap(c))] = self.cov[(r, c)];
-            }
-        }
+        let _ = new;
+        let mut cov = insert_band(&self.cov, ins, CLONE_DOF);
         // New clone block: diagonal = E block, cross to every old state = that
         // state's cross to E (the clone is born perfectly correlated with E).
         let e_diag = self.cov.view((E_IDX, E_IDX), (E_DOF, E_DOF)).into_owned();
@@ -516,7 +511,7 @@ impl MSCEqFFilter {
         cross: Option<&DMatrix<f64>>,
     ) -> usize {
         let old = self.dim();
-        let mut cov = self.cov.clone().resize(old + LM_DOF, old + LM_DOF, 0.0);
+        let mut cov = std::mem::take(&mut self.cov).resize(old + LM_DOF, old + LM_DOF, 0.0);
         cov.view_mut((old, old), (LM_DOF, LM_DOF))
             .copy_from(p_block);
         if let Some(c) = cross {
@@ -537,15 +532,8 @@ impl MSCEqFFilter {
         assert!(j < self.x.landmarks.len(), "landmark index out of range");
         let idx = self.landmark_idx(j);
         let dim = self.dim();
-        let keep: Vec<usize> = (0..dim).filter(|&r| r < idx || r >= idx + LM_DOF).collect();
-        let new_dim = dim - LM_DOF;
-        let mut cov = DMatrix::<f64>::zeros(new_dim, new_dim);
-        for (rr, &r) in keep.iter().enumerate() {
-            for (cc, &c) in keep.iter().enumerate() {
-                cov[(rr, cc)] = self.cov[(r, c)];
-            }
-        }
-        self.cov = cov;
+        let _ = dim;
+        self.cov = remove_band(&self.cov, idx, LM_DOF);
         self.x.landmarks.remove(j);
     }
 
@@ -555,17 +543,8 @@ impl MSCEqFFilter {
         assert!(i < self.x.clones.len(), "clone index out of range");
         let idx = self.clone_idx(i);
         let dim = self.dim();
-        let keep: Vec<usize> = (0..dim)
-            .filter(|&r| r < idx || r >= idx + CLONE_DOF)
-            .collect();
-        let new_dim = dim - CLONE_DOF;
-        let mut cov = DMatrix::<f64>::zeros(new_dim, new_dim);
-        for (rr, &r) in keep.iter().enumerate() {
-            for (cc, &c) in keep.iter().enumerate() {
-                cov[(rr, cc)] = self.cov[(r, c)];
-            }
-        }
-        self.cov = cov;
+        let _ = dim;
+        self.cov = remove_band(&self.cov, idx, CLONE_DOF);
         self.x.clones.remove(i);
     }
 
@@ -799,15 +778,23 @@ impl MSCEqFFilter {
         h.view_mut((21, 21), (21, 21)).copy_from(&(-a.transpose()));
         h.view_mut((0, 21), (21, 21)).copy_from(&bqbt);
 
-        let disc: SMatrix<f64, 42, 42> = if self.noise.state_transition_order == 1 {
-            SMatrix::<f64, 42, 42>::identity() + h * dt
+        // exp(H dt) = [[Phi, F], [0, Phi^-T]]; only Phi and F are used.
+        let (phi, f) = if self.noise.state_transition_order == 1 {
+            (SMatrix::<f64, 21, 21>::identity() + a * dt, bqbt * dt)
         } else {
-            (h * dt).exp()
+            match van_loan_exp(&(a * dt), &(bqbt * dt)) {
+                Some(pf) => pf,
+                None => {
+                    let disc: SMatrix<f64, 42, 42> = (h * dt).exp();
+                    (
+                        disc.fixed_view::<21, 21>(0, 0).into_owned(),
+                        disc.fixed_view::<21, 21>(0, 21).into_owned(),
+                    )
+                }
+            }
         };
-
-        let phi = disc.fixed_view::<21, 21>(0, 0).into_owned();
-        // Qd = upper-tri-symmetrized( disc[0:21, 21:42] * phi^T ).
-        let m = disc.fixed_view::<21, 21>(0, 21).into_owned() * phi.transpose();
+        // Qd = upper-tri-symmetrized( F * phi^T ).
+        let m = f * phi.transpose();
         // Symmetrize from the upper triangle (matches M.selfadjointView<Upper>()).
         let mut qd = SMatrix::<f64, 21, 21>::zeros();
         for i in 0..21 {
@@ -837,14 +824,13 @@ impl MSCEqFFilter {
 
         if dim > n {
             let tail = dim - n;
-            // Cross cols: cov[0:n, n:] = Phi * cov[0:n, n:].
-            let cc = self.cov.view((0, n), (n, tail)).into_owned();
-            let new_cc = &phi * cc;
+            // Cross cols: cov[0:n, n:] = Phi * cov[0:n, n:]. Cross rows
+            // cov[n:, 0:n] = cov[n:, 0:n] * Phi^T are their transpose: the covariance
+            // is exactly symmetric outside the core (every update symmetrizes, and
+            // this step writes the two blocks as transposes).
+            let new_cc = phi * self.cov.view((0, n), (n, tail));
+            self.cov.view_mut((n, 0), (tail, n)).copy_from(&new_cc.transpose());
             self.cov.view_mut((0, n), (n, tail)).copy_from(&new_cc);
-            // Cross rows: cov[n:, 0:n] = cov[n:, 0:n] * Phi^T.
-            let cr = self.cov.view((n, 0), (tail, n)).into_owned();
-            let new_cr = cr * phi.transpose();
-            self.cov.view_mut((n, 0), (tail, n)).copy_from(&new_cr);
         }
     }
 
@@ -871,6 +857,207 @@ impl MSCEqFFilter {
         self.propagate_covariance(u, dt);
         self.propagate_mean(u, dt);
     }
+}
+
+/// `P <- (P + Pᵀ)/2` in place: the same arithmetic as the dense expression,
+/// without its transpose and two dim x dim temporaries.
+fn symmetrize(cov: &mut DMatrix<f64>) {
+    let dim = cov.nrows();
+    for i in 0..dim {
+        for j in (i + 1)..dim {
+            let v = (cov[(i, j)] + cov[(j, i)]) * 0.5;
+            cov[(i, j)] = v;
+            cov[(j, i)] = v;
+        }
+    }
+}
+
+/// `src` with the `width` rows and columns starting at `at` removed, as four block
+/// copies (a marginalization is exactly this deletion).
+fn remove_band(src: &DMatrix<f64>, at: usize, width: usize) -> DMatrix<f64> {
+    let n = src.nrows();
+    let (tail, m) = (n - at - width, n - width);
+    let mut dst = DMatrix::<f64>::zeros(m, m);
+    dst.view_mut((0, 0), (at, at)).copy_from(&src.view((0, 0), (at, at)));
+    dst.view_mut((0, at), (at, tail)).copy_from(&src.view((0, at + width), (at, tail)));
+    dst.view_mut((at, 0), (tail, at)).copy_from(&src.view((at + width, 0), (tail, at)));
+    dst.view_mut((at, at), (tail, tail)).copy_from(&src.view((at + width, at + width), (tail, tail)));
+    dst
+}
+
+/// `src` with `width` zero rows and columns inserted at `at`, as four block copies.
+fn insert_band(src: &DMatrix<f64>, at: usize, width: usize) -> DMatrix<f64> {
+    let n = src.nrows();
+    let (tail, m) = (n - at, n + width);
+    let mut dst = DMatrix::<f64>::zeros(m, m);
+    dst.view_mut((0, 0), (at, at)).copy_from(&src.view((0, 0), (at, at)));
+    dst.view_mut((0, at + width), (at, tail)).copy_from(&src.view((0, at), (at, tail)));
+    dst.view_mut((at + width, 0), (tail, at)).copy_from(&src.view((at, 0), (tail, at)));
+    dst.view_mut((at + width, at + width), (tail, tail)).copy_from(&src.view((at, at), (tail, tail)));
+    dst
+}
+
+/// One EKF measurement update of `cov`, for rows `h` (rows x dim) whose non-zero
+/// columns are all in `cols`, residual `res` and diagonal noise `r_diag`. Returns
+/// the full-state correction `K res` and the Mahalanobis distance, or `None` when
+/// the χ² `gate` rejects it or `S` is singular -- leaving `cov` untouched.
+///
+/// The same filter as the dense form (`G = P Hᵀ`, `S = H G + R`, `K = G S⁻¹`,
+/// `P -= K Gᵀ`, then symmetrize) without its waste: `G` is accumulated from the
+/// few touched columns of `P` (EqVIO's sparse `v = Σ c`), the downdate goes into
+/// `P` in place, and the symmetrization averages the two triangles in place
+/// instead of building `P + Pᵀ`.
+fn sparse_ekf_update(
+    cov: &mut DMatrix<f64>,
+    h: &DMatrix<f64>,
+    cols: &[usize],
+    res: &DVector<f64>,
+    r_diag: &[f64],
+    gate: f64,
+) -> Option<(DVector<f64>, f64)> {
+    let (rows, dim) = (h.nrows(), cov.nrows());
+    let mut g = DMatrix::<f64>::zeros(dim, rows);
+    for r in 0..rows {
+        let mut gr = g.column_mut(r);
+        for &c in cols {
+            let hrc = h[(r, c)];
+            if hrc != 0.0 {
+                gr.axpy(hrc, &cov.column(c), 1.0);
+            }
+        }
+    }
+    let mut s = DMatrix::<f64>::zeros(rows, rows);
+    for r1 in 0..rows {
+        for r2 in 0..rows {
+            s[(r1, r2)] = cols.iter().map(|&c| h[(r1, c)] * g[(c, r2)]).sum::<f64>();
+        }
+        s[(r1, r1)] += r_diag[r1];
+    }
+    let s_inv = s.clone().try_inverse()?;
+    let d = (res.transpose() * &s_inv * res)[(0, 0)];
+    if !d.is_finite() || d > gate {
+        return None;
+    }
+    let gt = g.transpose();
+    let kt = s.cholesky()?.solve(&gt); // rows x dim, = (G S⁻¹)ᵀ
+    let inn = kt.transpose() * res;
+    cov.gemm(-1.0, &kt.transpose(), &gt, 1.0);
+    symmetrize(cov);
+    Some((inn, d))
+}
+
+/// `cov <- E cov E^T` for a block-diagonal `E` given as `(first index, block)`
+/// pairs, identity elsewhere: rows of each block, then its columns, so the cost is
+/// dim^2 x block size rather than dim^3, and the identity part costs nothing.
+fn apply_block_congruence(cov: &mut DMatrix<f64>, blocks: &[(usize, DMatrix<f64>)]) {
+    let n = cov.ncols();
+    for (s, e) in blocks {
+        let b = e.nrows();
+        let rows = e * cov.view((*s, 0), (b, n));
+        cov.view_mut((*s, 0), (b, n)).copy_from(&rows);
+    }
+    for (s, e) in blocks {
+        let b = e.nrows();
+        let cols = cov.view((0, *s), (n, b)) * e.transpose();
+        cov.view_mut((0, *s), (n, b)).copy_from(&cols);
+    }
+}
+
+type M21 = SMatrix<f64, 21, 21>;
+
+/// A 42x42 block upper-triangular matrix `[[a, b], [0, c]]` with 21x21 blocks:
+/// the shape of the Van Loan matrix `X = [[A dt, BQB^T dt], [0, -A^T dt]]` and of
+/// every polynomial in it, so products need three block multiplies, not eight.
+#[derive(Clone, Copy)]
+struct UpperBlock {
+    a: M21,
+    b: M21,
+    c: M21,
+}
+
+impl UpperBlock {
+    fn mul(&self, o: &UpperBlock) -> UpperBlock {
+        UpperBlock { a: self.a * o.a, b: self.a * o.b + self.b * o.c, c: self.c * o.c }
+    }
+    fn lin(&self, s: f64, o: &UpperBlock, t: f64) -> UpperBlock {
+        UpperBlock { a: self.a * s + o.a * t, b: self.b * s + o.b * t, c: self.c * s + o.c * t }
+    }
+    fn plus_identity(mut self, s: f64) -> UpperBlock {
+        for i in 0..21 {
+            self.a[(i, i)] += s;
+            self.c[(i, i)] += s;
+        }
+        self
+    }
+    fn one_norm(&self) -> f64 {
+        let col = |m: &M21, j: usize| m.column(j).iter().map(|v| v.abs()).sum::<f64>();
+        (0..21).map(|j| col(&self.a, j).max(col(&self.b, j) + col(&self.c, j))).fold(0.0, f64::max)
+    }
+    fn full(&self) -> SMatrix<f64, 42, 42> {
+        let mut m = SMatrix::<f64, 42, 42>::zeros();
+        m.fixed_view_mut::<21, 21>(0, 0).copy_from(&self.a);
+        m.fixed_view_mut::<21, 21>(0, 21).copy_from(&self.b);
+        m.fixed_view_mut::<21, 21>(21, 21).copy_from(&self.c);
+        m
+    }
+}
+
+/// nalgebra's backward-error check for Pade degree `m` (`linalg/exp.rs::ell`),
+/// so the degree chosen here is the one `exp()` would choose.
+fn pade_ell(x: &SMatrix<f64, 42, 42>, m: usize) -> u64 {
+    let x_norm = (0..42).map(|j| x.column(j).iter().map(|v| v.abs()).sum::<f64>()).fold(0.0, f64::max);
+    let abs_t = x.map(|v| v.abs()).transpose();
+    let mut v = SVector::<f64, 42>::repeat(1.0);
+    for _ in 0..(2 * m + 1) {
+        v = abs_t * v;
+    }
+    let abs_pow_norm = v.max();
+    if abs_pow_norm == 0.0 {
+        return 0;
+    }
+    let fact = |n: usize| (1..=n as u128).product::<u128>();
+    let abs_c_recip = (fact(2 * m) / (fact(m) * fact(m))) * fact(2 * m + 1);
+    let alpha = abs_pow_norm / x_norm / abs_c_recip as f64;
+    let value = ((alpha / 2_f64.powf(-53.0)).log2() / (2.0 * m as f64)).ceil();
+    if value > 0.0 { value as u64 } else { 0 }
+}
+
+/// `exp(X)` for the Van Loan matrix `X = [[p, q], [0, -p^T]]`, returning its top
+/// blocks `(Phi, F)`. Same algorithm as nalgebra's `exp()` -- the same exact
+/// 1-norms of X^4 and X^6 and the same `ell` checks pick Pade degree 3 or 5, with
+/// the same coefficients -- evaluated on the block structure: each 42x42 product
+/// becomes three 21x21 ones and the final 42x42 LU solve two 21x21 ones. `None`
+/// when `exp()` would need degree 7 or more (larger `||X||`): the caller falls back
+/// to the full 42x42 exponential. Over the rig's IMU steps the norm estimate
+/// stayed under 0.07, against 0.254 for degree 5.
+fn van_loan_exp(p: &M21, q: &M21) -> Option<(M21, M21)> {
+    let x = UpperBlock { a: *p, b: *q, c: -p.transpose() };
+    let x2 = x.mul(&x);
+    let x4 = x2.mul(&x2);
+    let x6 = x4.mul(&x2);
+    let eta = x4.one_norm().powf(0.25).max(x6.one_norm().powf(1.0 / 6.0));
+    let zero = UpperBlock { a: M21::zeros(), b: M21::zeros(), c: M21::zeros() };
+    let xf = x.full();
+    let (u, v) = if eta < 1.495_585_217_958_292e-2 && pade_ell(&xf, 3) == 0 {
+        let b = [120.0, 60.0, 12.0, 1.0];
+        (x.mul(&x2.lin(b[3], &zero, 0.0).plus_identity(b[1])), x2.lin(b[2], &zero, 0.0).plus_identity(b[0]))
+    } else if eta < 2.539_398_330_063_23e-1 && pade_ell(&xf, 5) == 0 {
+        let b = [30240.0, 15120.0, 3360.0, 420.0, 30.0, 1.0];
+        (
+            x.mul(&x4.lin(b[5], &x2, b[3]).plus_identity(b[1])),
+            x4.lin(b[4], &x2, b[2]).plus_identity(b[0]),
+        )
+    } else {
+        return None;
+    };
+    // Solve (V - U) Y = (V + U) blockwise: Y = [[ya, yb], [0, yc]].
+    let n = v.lin(1.0, &u, 1.0);
+    let d = v.lin(1.0, &u, -1.0);
+    let lu_a = d.a.lu();
+    let ya = lu_a.solve(&n.a)?;
+    let yc = d.c.lu().solve(&n.c)?;
+    let yb = lu_a.solve(&(n.b - d.b * yc))?;
+    Some((ya, yb))
 }
 
 /// Apply a 15-dim SDB increment (MSCEqF tangent order) by RIGHT multiplication
@@ -1058,42 +1245,37 @@ pub struct LmStreamUpdate {
 }
 
 impl MSCEqFFilter {
-    /// Build the block-diagonal curvature-correction transform `expΓ`
+    /// The block-diagonal curvature-correction transform `expΓ`
     /// (`symmetry.cpp:137-169`): second-order BCH term, `Γ = blkdiag(ad's) * -0.5`,
-    /// returned as `Γ.exp()`. `inn` is the full-state left-update increment.
-    fn curvature_correction(&self, inn: &DVector<f64>) -> DMatrix<f64> {
-        let dim = self.dim();
-        let mut gamma = DMatrix::<f64>::zeros(dim, dim);
-        // Dd[0:9,0:9] = ad_SE23(inn[Dd .. +9]).
+    /// with `inn` the full-state left-update increment. Γ is block-diagonal -- a
+    /// 15x15 Dd block, a 6x6 E block, one 6x6 block per clone, and zero over the
+    /// landmarks -- so `exp(Γ)` is the block-diagonal of the blocks' exponentials,
+    /// identity over the landmarks. Returned as `(first index, block)` pairs; see
+    /// [`apply_block_congruence`]. Exponentiating the dense dim x dim Γ (dim up to
+    /// 237 with 11 clones and 50 landmarks) was the largest single cost of an update.
+    fn curvature_correction(&self, inn: &DVector<f64>) -> Vec<(usize, DMatrix<f64>)> {
+        // Dd (15x15): [0:9,0:9] = ad_SE23(inn[Dd .. +9]); [9:15,0:6] = ad_se3(inn[Dd+9 ..
+        // +6]) (delta<->D coupling); [9:15,9:15] = ad_se3(inn[Dd .. +6]) (delta<->delta).
+        let mut dd = SMatrix::<f64, 15, 15>::zeros();
         let se23 = SVector::<f64, 9>::from_iterator(inn.rows(DD_IDX, 9).iter().copied());
-        gamma
-            .view_mut((DD_IDX, DD_IDX), (9, 9))
-            .copy_from(&se23_algebra_adjoint_msceqf(&se23));
-        // Dd[9:15, 0:6] = ad_se3(inn[Dd+9 .. +6])  (delta<->D coupling).
+        dd.view_mut((0, 0), (9, 9)).copy_from(&se23_algebra_adjoint_msceqf(&se23));
         let d_delta: Vector6<f64> = inn.fixed_rows::<6>(DD_IDX + 9).into_owned();
-        gamma
-            .view_mut((DD_IDX + 9, DD_IDX), (6, 6))
-            .copy_from(&SE3::adjoint_algebra(&d_delta));
-        // Dd[9:15, 9:15] = ad_se3(inn[Dd .. +6])  (delta<->delta).
+        dd.view_mut((9, 0), (6, 6)).copy_from(&SE3::adjoint_algebra(&d_delta));
         let d_att_vel: Vector6<f64> = inn.fixed_rows::<6>(DD_IDX).into_owned();
-        gamma
-            .view_mut((DD_IDX + 9, DD_IDX + 9), (6, 6))
-            .copy_from(&SE3::adjoint_algebra(&d_att_vel));
-        // E[15:21,15:21] = ad_se3(inn[E .. +6]).
-        let e_inn: Vector6<f64> = inn.fixed_rows::<6>(E_IDX).into_owned();
-        gamma
-            .view_mut((E_IDX, E_IDX), (6, 6))
-            .copy_from(&SE3::adjoint_algebra(&e_inn));
-        // clone_i = ad_se3(inn[clone_i .. +6]).
+        dd.view_mut((9, 9), (6, 6)).copy_from(&SE3::adjoint_algebra(&d_att_vel));
+        let e = (dd * -0.5).exp();
+        let mut blocks = vec![(DD_IDX, DMatrix::from_column_slice(15, 15, e.as_slice()))];
+        // E and each clone: ad_se3 of their own increment.
+        let mut push6 = |start: usize| {
+            let v: Vector6<f64> = inn.fixed_rows::<6>(start).into_owned();
+            let e = (SE3::adjoint_algebra(&v) * -0.5).exp();
+            blocks.push((start, DMatrix::from_column_slice(6, 6, e.as_slice())));
+        };
+        push6(E_IDX);
         for i in 0..self.x.clones.len() {
-            let ci = self.clone_idx(i);
-            let c_inn: Vector6<f64> = inn.fixed_rows::<6>(ci).into_owned();
-            gamma
-                .view_mut((ci, ci), (6, 6))
-                .copy_from(&SE3::adjoint_algebra(&c_inn));
+            push6(self.clone_idx(i));
         }
-        gamma *= -0.5;
-        gamma.exp()
+        blocks
     }
 
     /// Structureless multi-state-constraint update (`mscUpdate` + `UpdateMSCEqF`,
@@ -1329,13 +1511,12 @@ impl MSCEqFFilter {
         // Covariance downdate: cov -= K·Gᵀ, then symmetrize from the upper triangle.
         let downdate = &k * g.transpose();
         self.cov -= downdate;
-        let sym = (&self.cov + self.cov.transpose()) * 0.5;
-        self.cov = sym;
+        symmetrize(&mut self.cov);
 
         // Optional curvature correction.
         if curvature {
             let exp_gamma = self.curvature_correction(&inn_vec);
-            self.cov = &exp_gamma * &self.cov * exp_gamma.transpose();
+            apply_block_congruence(&mut self.cov, &exp_gamma);
         }
 
         accepted
@@ -1412,8 +1593,7 @@ impl MSCEqFFilter {
         self.apply_left_increment(&inn_vec);
 
         self.cov -= &k * s * k.transpose();
-        let sym = (&self.cov + self.cov.transpose()) * 0.5;
-        self.cov = sym;
+        symmetrize(&mut self.cov);
         true
     }
 
@@ -1584,7 +1764,22 @@ impl MSCEqFFilter {
                 .view_mut((0, col), (3, 6))
                 .copy_from(&hx_init.view((0, 6 * a), (3, 6)));
         }
-        let m_a = &self.cov * h_r_full.transpose(); // dim×3
+        // Σ H_Rᵀ from the observing clones' columns only (H_R is zero elsewhere).
+        let mut r_cols: Vec<usize> = (0..nobs).map(|a| self.clone_idx(clone_of[a])).collect();
+        r_cols.sort_unstable();
+        r_cols.dedup();
+        let mut m_a = DMatrix::<f64>::zeros(dim, 3);
+        for r in 0..3 {
+            let mut mr = m_a.column_mut(r);
+            for &col in &r_cols {
+                for c in col..col + 6 {
+                    let hv = h_r_full[(r, c)];
+                    if hv != 0.0 {
+                        mr.axpy(hv, &self.cov.column(c), 1.0);
+                    }
+                }
+            }
+        } // dim×3
         let mut cross_old = -(m_a * h_linv.transpose()); // dim×3
 
         if !p_ll_d.iter().all(|v| v.is_finite()) || !cross_old.iter().all(|v| v.is_finite()) {
@@ -1628,8 +1823,7 @@ impl MSCEqFFilter {
         };
         let j = self.insert_landmark(lm, &p_ll, Some(&cross_old));
         // Symmetrize after the correlated insert (guards accumulated round-off).
-        let sym = (&self.cov + self.cov.transpose()) * 0.5;
-        self.cov = sym;
+        symmetrize(&mut self.cov);
 
         // 7. Update rows: a structureless clone correction (feature already removed
         //    by the QR). Scatter hup into the clone-tail columns and run the EKF core;
@@ -1647,17 +1841,14 @@ impl MSCEqFFilter {
                 .cov
                 .view((CLONE_BASE, CLONE_BASE), (nc, nc))
                 .into_owned();
-            let sub_cov_cols = self.cov.view((0, CLONE_BASE), (dim, nc)).into_owned();
-            let g = &sub_cov_cols * c.transpose(); // dim×dof
+            let g = self.cov.view((0, CLONE_BASE), (dim, nc)) * c.transpose(); // dim×dof
             let s = &c * &p_cc * c.transpose() + DMatrix::<f64>::identity(dof, dof) * sigma2;
             if let Some(chol) = s.clone().cholesky() {
                 let k = chol.solve(&g.transpose()).transpose(); // dim×dof
                 let inn_vec = &k * &res_up; // dim
                 self.apply_left_increment(&inn_vec);
-                let downdate = &k * g.transpose();
-                self.cov -= downdate;
-                let sym = (&self.cov + self.cov.transpose()) * 0.5;
-                self.cov = sym;
+                self.cov.gemm(-1.0, &k, &g.transpose(), 1.0);
+                symmetrize(&mut self.cov);
             }
         }
 
@@ -2028,8 +2219,7 @@ impl MSCEqFFilter {
             self.apply_left_increment(&inn_vec);
             let downdate = &k * g.transpose();
             self.cov -= downdate;
-            let sym = (&self.cov + self.cov.transpose()) * 0.5;
-            self.cov = sym;
+            symmetrize(&mut self.cov);
             accepted += 1;
         }
 
@@ -2197,34 +2387,24 @@ impl MSCEqFFilter {
                 continue;
             }
 
-            // EKF innovation covariance, χ² gate, gain, update, downdate.
-            let g_mat = &self.cov * h.transpose(); // dim×rows
-            let mut s = &h * &g_mat;
-            for k in 0..rows {
-                s[(k, k)] += r_diag[k];
+            // EKF innovation covariance, χ² gate, gain, downdate. H touches only the
+            // landmark, anchor and observing-clone columns.
+            let mut cols: Vec<usize> = (lcol..lcol + 3).chain(acol..acol + 6).collect();
+            for o in &obs {
+                cols.extend(self.clone_idx(o.clone)..self.clone_idx(o.clone) + 6);
             }
-            let s_inv = match s.clone().try_inverse() {
-                Some(mm) => mm,
-                None => continue,
-            };
-            let d = (res.transpose() * &s_inv * &res)[(0, 0)];
-            if !d.is_finite() || d > chi2_mult * msckf::chi2_095(rows) {
-                continue;
-            }
-            let chol = match s.cholesky() {
-                Some(c) => c,
-                None => continue,
-            };
-            let k_gain = chol.solve(&g_mat.transpose()).transpose(); // dim×rows
-            let inn_vec = &k_gain * &res;
+            cols.sort_unstable();
+            cols.dedup();
+            let gate = chi2_mult * msckf::chi2_095(rows);
+            let (inn_vec, d) =
+                match sparse_ekf_update(&mut self.cov, &h, &cols, &res, &r_diag.as_slice()[..rows], gate) {
+                    Some(v) => v,
+                    None => continue,
+                };
             // DIAGNOSTIC: pre-update world velocity direction, for the along-v̂
             // (scale-channel) projection of the nav correction this landmark injects.
             let v_pre = self.phi().t.velocity;
             self.apply_left_increment(&inn_vec);
-            let downdate = &k_gain * g_mat.transpose();
-            self.cov -= downdate;
-            let sym = (&self.cov + self.cov.transpose()) * 0.5;
-            self.cov = sym;
             accepted += 1;
             // DIAGNOSTIC (see `lm_upd_diag` doc): attribute this single landmark's
             // nav-state correction to its anchor baseline. inn_vec tangent order is
@@ -2641,6 +2821,173 @@ mod tests {
         let delta_init = SMatrix::<f64, 6, 6>::identity() * 1e-4;
         let e_init = SMatrix::<f64, 6, 6>::identity() * 1e-6;
         MSCEqFFilter::new(origin, &d_init, &delta_init, &e_init, test_noise())
+    }
+
+    /// Block-copy band insertion/removal against the index-remap loops they replace.
+    #[test]
+    fn band_helpers_match_index_loops() {
+        for (n, at, w) in [(30, 0, 6), (30, 21, 6), (30, 24, 6), (40, 37, 3), (40, 10, 3)] {
+            let a = DMatrix::<f64>::from_fn(n, n, |i, j| (i * 100 + j) as f64);
+            let keep: Vec<usize> = (0..n).filter(|&r| r < at || r >= at + w).collect();
+            let mut want = DMatrix::<f64>::zeros(n - w, n - w);
+            for (rr, &r) in keep.iter().enumerate() {
+                for (cc, &c) in keep.iter().enumerate() {
+                    want[(rr, cc)] = a[(r, c)];
+                }
+            }
+            assert_eq!(remove_band(&a, at, w), want);
+            if at <= n {
+                let remap = |r: usize| if r < at { r } else { r + w };
+                let mut want_ins = DMatrix::<f64>::zeros(n + w, n + w);
+                for r in 0..n {
+                    for c in 0..n {
+                        want_ins[(remap(r), remap(c))] = a[(r, c)];
+                    }
+                }
+                assert_eq!(insert_band(&a, at.min(n), w), want_ins);
+            }
+        }
+        let a = DMatrix::<f64>::from_fn(37, 37, |i, j| ((i * 3 + j * 17) as f64 * 0.61).sin());
+        let mut t = a.clone();
+        symmetrize(&mut t);
+        assert_eq!(t, (&a + a.transpose()) * 0.5);
+    }
+
+    /// `sparse_ekf_update` against the dense EKF it replaces, on a sparse H.
+    #[test]
+    fn sparse_ekf_update_matches_dense() {
+        let dim = 120;
+        let l = DMatrix::<f64>::from_fn(dim, dim, |i, j| ((i * 5 + j * 11) as f64 * 0.37).sin() * 0.2);
+        let cov0 = &l * l.transpose() + DMatrix::<f64>::identity(dim, dim) * 0.5;
+        let cols: Vec<usize> = (40..43).chain(60..66).chain(90..96).collect();
+        let rows = 4;
+        let mut h = DMatrix::<f64>::zeros(rows, dim);
+        for r in 0..rows {
+            for (k, &c) in cols.iter().enumerate() {
+                h[(r, c)] = ((r * 13 + k * 7) as f64 * 0.91).cos();
+            }
+        }
+        let res = DVector::<f64>::from_fn(rows, |r, _| 0.1 * (r as f64 + 1.0));
+        let r_diag = vec![1.0; rows];
+        // Dense reference, as the update was written before.
+        let g_mat = &cov0 * h.transpose();
+        let mut s = &h * &g_mat;
+        for k in 0..rows {
+            s[(k, k)] += r_diag[k];
+        }
+        let d_ref = (res.transpose() * s.clone().try_inverse().unwrap() * &res)[(0, 0)];
+        let k_gain = s.cholesky().unwrap().solve(&g_mat.transpose()).transpose();
+        let inn_ref = &k_gain * &res;
+        let mut cov_ref = &cov0 - &k_gain * g_mat.transpose();
+        cov_ref = (&cov_ref + cov_ref.transpose()) * 0.5;
+
+        let mut cov = cov0.clone();
+        let (inn, d) = sparse_ekf_update(&mut cov, &h, &cols, &res, &r_diag, 1e9).unwrap();
+        assert!(((d - d_ref) / d_ref).abs() < 1e-13);
+        assert!((&inn - &inn_ref).amax() / inn_ref.amax() < 1e-13);
+        assert!((&cov - &cov_ref).amax() / cov_ref.amax() < 1e-13);
+        assert_eq!(cov, cov.transpose());
+        // A gated update leaves the covariance untouched.
+        let mut cov_g = cov0.clone();
+        assert!(sparse_ekf_update(&mut cov_g, &h, &cols, &res, &r_diag, 0.0).is_none());
+        assert_eq!(cov_g, cov0);
+    }
+
+    /// The blockwise curvature correction against the dense `exp(Γ) cov exp(Γ)^T`
+    /// it replaces, with clones and in-state landmarks present.
+    #[test]
+    fn blockwise_curvature_matches_dense() {
+        let mut f = hover_filter();
+        let u = Imu { ang: Vector3::new(0.3, -0.2, 0.5), acc: Vector3::new(0.4, -0.1, 9.9) };
+        for k in 0..5 {
+            f.propagate_step(&u, 0.008);
+            f.stochastic_clone(k as f64 * 0.008);
+        }
+        let dim = f.dim();
+        let inn = DVector::<f64>::from_fn(dim, |i, _| 0.02 * ((i as f64) * 0.7).sin());
+        let blocks = f.curvature_correction(&inn);
+        // The same blocks assembled into a dense E, applied as E cov E^T.
+        let mut e_dense = DMatrix::<f64>::identity(dim, dim);
+        for (s, e) in &blocks {
+            e_dense.view_mut((*s, *s), (e.nrows(), e.ncols())).copy_from(e);
+        }
+        let l = DMatrix::<f64>::from_fn(dim, dim, |i, j| ((i * 7 + j * 3) as f64 * 0.1).cos() * 0.1);
+        let cov0 = &l * l.transpose() + DMatrix::<f64>::identity(dim, dim);
+        let dense = &e_dense * &cov0 * e_dense.transpose();
+        let mut fast = cov0.clone();
+        apply_block_congruence(&mut fast, &blocks);
+        let rel = (&fast - &dense).amax() / dense.amax();
+        assert!(rel < 1e-13, "blockwise vs dense rel diff {rel:e}");
+    }
+
+    /// Each exp(Γ) block against the exponential of the dense Γ it came from.
+    #[test]
+    fn curvature_blocks_are_the_dense_exponential() {
+        let mut f = hover_filter();
+        let u = Imu { ang: Vector3::new(0.3, -0.2, 0.5), acc: Vector3::new(0.4, -0.1, 9.9) };
+        for k in 0..3 {
+            f.propagate_step(&u, 0.008);
+            f.stochastic_clone(k as f64 * 0.008);
+        }
+        let dim = f.dim();
+        let inn = DVector::<f64>::from_fn(dim, |i, _| 0.05 * ((i as f64) * 1.3).cos());
+        // The dense Γ exactly as the previous implementation built it.
+        let mut gamma = DMatrix::<f64>::zeros(dim, dim);
+        let se23 = SVector::<f64, 9>::from_iterator(inn.rows(DD_IDX, 9).iter().copied());
+        gamma.view_mut((DD_IDX, DD_IDX), (9, 9)).copy_from(&se23_algebra_adjoint_msceqf(&se23));
+        let d_delta: Vector6<f64> = inn.fixed_rows::<6>(DD_IDX + 9).into_owned();
+        gamma.view_mut((DD_IDX + 9, DD_IDX), (6, 6)).copy_from(&SE3::adjoint_algebra(&d_delta));
+        let d_att_vel: Vector6<f64> = inn.fixed_rows::<6>(DD_IDX).into_owned();
+        gamma.view_mut((DD_IDX + 9, DD_IDX + 9), (6, 6)).copy_from(&SE3::adjoint_algebra(&d_att_vel));
+        let e_inn: Vector6<f64> = inn.fixed_rows::<6>(E_IDX).into_owned();
+        gamma.view_mut((E_IDX, E_IDX), (6, 6)).copy_from(&SE3::adjoint_algebra(&e_inn));
+        for i in 0..f.x.clones.len() {
+            let ci = f.clone_idx(i);
+            let c_inn: Vector6<f64> = inn.fixed_rows::<6>(ci).into_owned();
+            gamma.view_mut((ci, ci), (6, 6)).copy_from(&SE3::adjoint_algebra(&c_inn));
+        }
+        let dense = (gamma * -0.5).exp();
+        let mut blockwise = DMatrix::<f64>::identity(dim, dim);
+        for (s, e) in f.curvature_correction(&inn) {
+            blockwise.view_mut((s, s), (e.nrows(), e.ncols())).copy_from(&e);
+        }
+        let diff = (&blockwise - &dense).amax();
+        assert!(diff < 1e-14, "blockwise exp(Γ) vs dense exp(Γ): {diff:e}");
+    }
+
+    /// The structured Van Loan exponential against nalgebra's full 42x42 `exp()`,
+    /// over IMU inputs and step lengths spanning both Pade degrees it serves.
+    #[test]
+    fn van_loan_exp_matches_full_exponential() {
+        let mut f = hover_filter();
+        let b = f.input_matrix();
+        let q = f.noise.q();
+        let bqbt = b * q * b.transpose();
+        let mut worst = (0.0_f64, 0.0_f64);
+        let mut served = 0;
+        for k in 0..60 {
+            let t = k as f64;
+            let u = Imu {
+                ang: Vector3::new(0.9 * (0.7 * t).sin(), -1.3 * (0.3 * t).cos(), 2.1 * (0.11 * t).sin()),
+                acc: Vector3::new(3.0 * (0.5 * t).cos(), -2.0 * (0.2 * t).sin(), 9.81 + 4.0 * (0.9 * t).sin()),
+            };
+            let dt = 0.002 + 0.0005 * (k % 50) as f64;
+            let a = f.state_matrix(&u);
+            let mut h = SMatrix::<f64, 42, 42>::zeros();
+            h.view_mut((0, 0), (21, 21)).copy_from(&a);
+            h.view_mut((21, 21), (21, 21)).copy_from(&(-a.transpose()));
+            h.view_mut((0, 21), (21, 21)).copy_from(&bqbt);
+            let full = (h * dt).exp();
+            if let Some((phi, fb)) = van_loan_exp(&(a * dt), &(bqbt * dt)) {
+                served += 1;
+                let rel = |x: &M21, y: SMatrix<f64, 21, 21>| (x - y).amax() / y.amax().max(1e-300);
+                worst.0 = worst.0.max(rel(&phi, full.fixed_view::<21, 21>(0, 0).into_owned()));
+                worst.1 = worst.1.max(rel(&fb, full.fixed_view::<21, 21>(0, 21).into_owned()));
+            }
+            f.propagate_step(&u, dt); // move the state so A changes too
+        }
+        assert!(served > 40, "structured path served only {served} of 60");
+        assert!(worst.0 < 1e-13 && worst.1 < 1e-12, "max rel diff Phi {:e}, F {:e}", worst.0, worst.1);
     }
 
     #[test]
